@@ -88,6 +88,9 @@ export interface Engine {
    *  check reads it instead of the disk. Deliberately NOT sourceRepo/sourceBranch (ADR-088): those
    *  mean "built from source" and would send a prebuilt down the rebuild path. */
   release?: ReleaseProvenance
+  /** Set only on the Android app's in-app engine (kind 'turbollm-sdk'): where its HTTP server listens. Its bearer
+   *  token is deliberately not stored here: it changes every app process and is read from the environment. */
+  baseUrl?: string
 }
 
 /** A custom (non-catalog) engine's identity, remembered independent of its live

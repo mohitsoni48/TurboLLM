@@ -71,6 +71,7 @@ const ENGINE_NAMES: Record<string, string> = {
   sglang: 'SGLang',
   'litert-lm': 'LiteRT-LM',
   laya: 'The Laya engine',
+  'turbollm-sdk': 'TurboLLM SDK',
 }
 
 function engineName(engineKind: string): string {
@@ -158,6 +159,8 @@ function audioIncompatibility(engineKind: string): Incompatibility {
  *     scanner tags 'mlx' (config.json + *.safetensors + tokenizer)
  *   - SGLang (kind 'sglang') → the same HF safetensors directories as vLLM
  *   - LiteRT-LM (kind 'litert-lm') → `.litertlm` bundles, a format no other engine reads
+ *   - TurboLLM SDK (kind 'turbollm-sdk', the Android app's in-app engine) → GGUF and `.litertlm`: it hosts both
+ *     llama.cpp and LiteRT-LM behind one server
  *   - Laya (kind 'laya') → no plain format: it loads only Laya models, which modelIncompatibility
  *     recognises by `entry.laya` before the format is ever checked
  */
@@ -170,6 +173,7 @@ export function engineAcceptsFormat(engineKind: string, format: ModelFormat): bo
   if (engineKind === 'laya') return false
   // .litertlm is LiteRT-LM's alone, and LiteRT-LM reads nothing else.
   if (engineKind === 'litert-lm') return format === 'litertlm'
+  if (engineKind === TURBOLLM_SDK) return format === 'gguf' || format === 'litertlm'
   // llama-server / forks, llamafile, koboldcpp — all GGUF.
   return format === 'gguf'
 }
@@ -196,6 +200,21 @@ export function engineAcceptsFormat(engineKind: string, format: ModelFormat): bo
  */
 export function engineRejectsAudioModel(engineKind: string): boolean {
   return engineKind === 'rapid-mlx' || engineKind === 'mlx-vlm'
+}
+
+/** The Android app's in-app engine (the TurboLLM SDK), reached over HTTP rather than spawned. */
+const TURBOLLM_SDK = 'turbollm-sdk'
+
+/** True when requests to `engineKind` must go without tools, tool_choice and a non-text response_format: the SDK
+ *  refuses them with a 400 in this version, so every in-app agent turn would fail (ADR-447 point 7's precedent). */
+export function engineWithholdsTools(engineKind: string): boolean {
+  return engineKind === TURBOLLM_SDK
+}
+
+/** True when `engineKind` cannot read image parts, so an image must be refused or replaced before it is sent. The
+ *  SDK has no vision in this version. */
+export function engineWithholdsVision(engineKind: string): boolean {
+  return engineKind === TURBOLLM_SDK
 }
 
 /**
@@ -234,6 +253,8 @@ export function engineModelAlias(engineKind: string, modelPath?: string | null):
   // LiteRT-LM is the same shape as MLX-VLM: its `model` field is a real, load-bearing reference (here the .litertlm
   // file path), not a name it ignores and not an alias it was launched under.
   if (engineKind === 'litert-lm') return modelPath ?? null
+  // The SDK serves the model it loaded from a path, and names it by that path in /v1/models.
+  if (engineKind === TURBOLLM_SDK) return modelPath ?? null
   return engineKind === 'mlx' || engineKind === 'vllm' || engineKind === 'sglang' ? ENGINE_MODEL_ALIAS : null
 }
 
