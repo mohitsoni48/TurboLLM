@@ -10,7 +10,7 @@ import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { abortAllInFlightChats, chatHoldsEngine, chatTurnsEnded, inFlightChatIds, registerChatRoutes } from './chat-routes.js'
 import { chatRuns } from './chat-runs.js'
-import { ConversationStore, type Message } from './db.js'
+import { ConversationStore, IN_MEMORY_DATA_DIR, type Message } from './db.js'
 import { activeWork } from '../api/active-work.js'
 import { endLanTurns, endStaleStreams, hashKey, lanAuth, provisionRemoteApiKey } from '../auth.js'
 import { defaultConfig, type Config } from '../config/config.js'
@@ -20,7 +20,10 @@ import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
 
 /** Every test here talks to real sockets: one that waits on a frame that never comes fails instead of hanging. */
-const it = (name: string, fn: (t: TestContext) => Promise<void>) => test(name, { timeout: 20_000 }, fn)
+// Only a guard against a hang. On a hosted Windows runner, with other test files competing for its few cores and slow
+// disk, one test here has stalled for over 20 s and the one after it with it; a real hang still fails, a minute on.
+const GUARD_MS = 60_000
+const it = (name: string, fn: (t: TestContext) => Promise<void>) => test(name, { timeout: GUARD_MS }, fn)
 
 // ── a stand-in engine whose every streaming request the test drives by hand ───────────────────────────────────────
 
@@ -101,9 +104,11 @@ const executed: string[] = []
 
 /** The real chat routes over a real store, generating on `engineUrl`. `run_code` is the one tool, with `toolPolicy`;
  *  `executed` lists every call that ran. */
-function routes(engineUrl: string, opts: { titles?: boolean; toolPolicy?: 'ask' | 'allow'; remote?: { id: string; baseUrl: string } } = {}) {
+function routes(engineUrl: string, opts: { titles?: boolean; toolPolicy?: 'ask' | 'allow'; remote?: { id: string; baseUrl: string }; persist?: boolean } = {}) {
   const dir = tmpDir('tllm-chat-detached-')
-  const store = new ConversationStore(dir)
+  // In memory unless the test reads the database back from disk: an on-disk store cost about a second per test (and
+  // multi-second stalls) on a hosted Windows runner, ten times a quiet machine, and nothing here is about the file.
+  const store = new ConversationStore(opts.persist ? dir : IN_MEMORY_DATA_DIR)
   executed.length = 0
   const cfg = {
     modelDefaults: { maxTokens: 0 },
@@ -793,7 +798,7 @@ it('(p) a viewer gets an SSE keepalive comment every 20 s while nothing else is 
 it('(q) a reply\'s text is saved while it streams: a kill leaves it, the restart marks it stopped, and the end replaces it', async (t) => {
   t.mock.timers.enable({ apis: ['setInterval'] }) // the partial saves' 10 s
   const engine = await standInEngine()
-  const h = routes(engine.url)
+  const h = routes(engine.url, { persist: true }) // the restart below reads the database back from disk
   const dir = (h.d.store as unknown as { dir(): string }).dir()
   try {
     const conv = h.store.createConversation()
@@ -867,7 +872,7 @@ class FakeProvider implements RemoteProvider {
  *  does what api/routes.ts's does: drop the key and end what it held (endStaleStreams). */
 async function gatedRoutes(engineUrl: string, opts: { requireApiKey?: boolean } = {}) {
   const dir = tmpDir('tllm-chat-detached-gated-')
-  const store = new ConversationStore(dir)
+  const store = new ConversationStore(IN_MEMORY_DATA_DIR)
   const cfg: Config = defaultConfig()
   cfg.daemon.lanBind = true
   cfg.daemon.requireApiKey = opts.requireApiKey ?? cfg.daemon.requireApiKey
