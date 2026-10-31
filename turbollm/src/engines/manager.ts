@@ -16,7 +16,8 @@ import { llamafileServerCommand } from './llamafile'
 import { slotCacheDir } from './slot-cache'
 import { rememberLitertLmModel, type LitertLmRequestInfo } from './litert-lm-request'
 import { litertlmHeaderFromFile } from '../models/litertlm'
-import { isTetheredGroupLeader, killTetheredTree, spawnTethered } from '../util/tether'
+import { isTetheredGroupLeader, spawnTethered } from '../util/tether'
+import { exitedWithin, SpawnedTransport, type EngineTransport } from './transport'
 import { START_TIME_TOLERANCE_MS, processStartTimes } from '../util/process-start-time'
 import { hostUname, vllmModelRunnerEnv, vllmServerCommand, vllmServeBlocker } from './vllm'
 import { sglangServerCommand, sgLangServeBlocker } from './sglang'
@@ -203,6 +204,8 @@ export class Manager {
   private port = 0
   private pid = 0
   private child: ChildProcess | null = null
+  /** How the engine is reached and stopped; set exactly while `child` is. */
+  private transport: EngineTransport | null = null
   private startedAt = 0
   private errInfo: ErrInfo | null = null
   /** Optional observer for load outcomes, wired in cli.ts (ADR-299). Kept as a
@@ -541,6 +544,7 @@ export class Manager {
     this.exited = new Promise<void>((res) => {
       this.resolveExited = res
     })
+    this.transport = new SpawnedTransport(child, port, this.exited)
 
     child.on('error', (e) => this.onTerminated(child, -1, logStream, e.message))
     child.on('close', (code) => this.onTerminated(child, code ?? -1, logStream, null))
@@ -552,19 +556,19 @@ export class Manager {
       this.state = 'stopped'
       this.errInfo = null
     }
-    const child = this.child
-    if (!child || (this.state !== 'running' && this.state !== 'starting')) return
+    const transport = this.transport
+    if (!transport || (this.state !== 'running' && this.state !== 'starting')) return
     this.state = 'stopping'
-    void gracefulStop(child, this.exited)
+    void transport.stop()
   }
 
   /** Kill the engine immediately (SIGKILL / taskkill /F) to free VRAM without the
    *  graceful grace period. The `close` handler still runs and resolves `exited`. */
   private forceStop(): void {
-    const child = this.child
-    if (!child || (this.state !== 'running' && this.state !== 'starting')) return
+    const transport = this.transport
+    if (!transport || (this.state !== 'running' && this.state !== 'starting')) return
     this.state = 'stopping'
-    forceKill(child)
+    transport.kill()
   }
 
   /** `onPausedLoad`: the ComfyUI guard's stop for a render. A load() still starting, or up and not yet reported, is
@@ -589,9 +593,9 @@ export class Manager {
       // A force request landing while a graceful stop is ALREADY in flight (e.g. auto-tune's
       // cancel arriving in the narrow window right after a probe's own non-forced stop already
       // started) must not just passively wait out the remainder of that graceful timer — kill
-      // now. Bypasses forceStop()'s running/starting-only guard by calling the module-level
-      // forceKill directly, since state is already 'stopping' (ADR-220).
-      if (opts?.force && this.child) forceKill(this.child)
+      // now. Bypasses forceStop()'s running/starting-only guard by killing through the
+      // transport directly, since state is already 'stopping' (ADR-220).
+      if (opts?.force) this.transport?.kill()
       await this.waitForExit(exited)
     } else if (this.state === 'error') {
       this.state = 'stopped'
@@ -604,12 +608,12 @@ export class Manager {
    *  process still alive and `state` stuck at 'stopping' (e.g. a slow Windows tree-kill) —
    *  the very next startInternal() would then throw BusyError, silently abandoning a model
    *  swap (the caller in routes.ts fires load() without awaiting and only logs the
-   *  rejection). Bypasses forceStop()'s running/starting-only guard by calling the
-   *  module-level forceKill directly, since by this point state is already 'stopping'. */
+   *  rejection). Bypasses forceStop()'s running/starting-only guard by killing through the
+   *  transport directly, since by this point state is already 'stopping'. */
   private async waitForExit(exited: Promise<void>): Promise<void> {
     const result = await exitedWithin(exited, 10_000)
-    if (result === 'timeout' && this.child) {
-      forceKill(this.child)
+    if (result === 'timeout' && this.transport) {
+      this.transport.kill()
       // Bounded too: forceKill's taskkill is fire-and-forget (failures swallowed), so an
       // unbounded await here on an unkillable/zombie process would wedge this forever —
       // and since stopAndWait() runs inside the exclusive load gate, that deadlocks every
@@ -706,7 +710,7 @@ export class Manager {
   }
 
   target(): string | null {
-    return this.state === 'running' ? `http://127.0.0.1:${this.port}` : null
+    return this.state === 'running' ? this.transport?.target() ?? null : null
   }
 
   /** The StartOpts of the currently loaded (or loading) model, or null when nothing
@@ -787,15 +791,15 @@ export class Manager {
   }
 
   async shutdown(): Promise<void> {
-    const child = this.child
+    const transport = this.transport
     // A stop already under way (a Stop, an eject, the idle unload, a restart's teardown: SIGTERM sent) is waited out.
     // Returning at once let the daemon exit about 1.5 s into that stop's 8 s grace, and the exit handler SIGKILLed the
     // engine's group before it could exit by itself. gracefulStop's own force kill bounds the wait, waitForExit too.
-    if (child && this.state === 'stopping') return this.waitForExit(this.exited)
+    if (transport && this.state === 'stopping') return this.waitForExit(this.exited)
     const running = this.state === 'running' || this.state === 'starting'
-    if (!child || !running) return
+    if (!transport || !running) return
     this.state = 'stopping'
-    await gracefulStop(child, this.exited)
+    await transport.stop()
   }
 
   // ---- internal ----------------------------------------------------------
@@ -844,6 +848,7 @@ export class Manager {
       }
     }
     this.child = null
+    this.transport = null
     this.pid = 0
     if (this.watchdog) clearInterval(this.watchdog)
     this.watchdog = null
@@ -1172,59 +1177,6 @@ export async function probeReady(port: number): Promise<boolean> {
     return r.status === 200
   } catch {
     return false
-  }
-}
-
-async function gracefulStop(child: ChildProcess, exited: Promise<void>): Promise<void> {
-  signalTerm(child)
-  const result = await exitedWithin(exited, 8000)
-  if (result === 'timeout') {
-    forceKill(child)
-    await exited
-  }
-}
-
-/** 'exited' once `exited` resolves, or 'timeout' after `ms`. The timer is cleared once the race is decided: a bare
- *  sleep() left its ref'd timer running after a prompt exit, which held the event loop (a test file, a CLI run) open
- *  for the rest of it. A prompt exit left two per stopAndWait(): gracefulStop's 8 s grace and waitForExit's 10 s. */
-async function exitedWithin(exited: Promise<void>, ms: number): Promise<'exited' | 'timeout'> {
-  let grace: ReturnType<typeof setTimeout> | undefined
-  try {
-    return await Promise.race([
-      exited.then(() => 'exited' as const),
-      new Promise<'timeout'>((resolve) => { grace = setTimeout(() => resolve('timeout'), ms) }),
-    ])
-  } finally {
-    clearTimeout(grace)
-  }
-}
-
-function signalTerm(child: ChildProcess): void {
-  if (!child.pid) return
-  if (process.platform === 'win32') {
-    // Force the tree at once. A plain `taskkill /PID <pid> /T` (no /F) only posts WM_CLOSE to the process's windows,
-    // and the engines are console programs with none (spawned windowsHide with piped stdio), so Windows refuses it
-    // ("This process can only be terminated forcefully (with /F option)") and every Stop, model swap, pool eviction
-    // and update stop sat out the whole 8 s grace in 'stopping', with every load queued behind the gate waiting too,
-    // before forceKill ended it anyway. llama-server, KoboldCpp and llamafile exit cleanly only on a console
-    // Ctrl+C, which taskkill never sends, so there is no gentler request to make from here.
-    forceKill(child)
-  } else {
-    child.kill('SIGTERM')
-  }
-}
-
-function forceKill(child: ChildProcess): void {
-  if (!child.pid) return
-  if (process.platform === 'win32') {
-    // Not once Node has seen the engine exit (a worker holding its stdout keeps 'close', and so the stop, waiting):
-    // libuv has closed the process handle that kept the pid from being reused, so `/PID <pid> /T` may name another
-    // process tree by then, as in killTetheredTree (util/tether.ts). An exited root is no tree for taskkill anyway.
-    if (child.exitCode !== null || child.signalCode !== null) return
-    execFile('taskkill', ['/PID', String(child.pid), '/F', '/T'], () => {})
-  } else {
-    // The engine's whole group (its workers too); the pid alone when it leads none (the Android helper).
-    killTetheredTree(child, 'SIGKILL')
   }
 }
 
