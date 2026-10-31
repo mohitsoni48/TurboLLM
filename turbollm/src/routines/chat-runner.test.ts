@@ -553,3 +553,26 @@ test('I3: an aborted signal mid-fetch resolves to the standard cancelled message
     assert.deepEqual(outcome, { status: 'errored', error: 'Routine run timed out or was cancelled.' })
   } finally { globalThis.fetch = original }
 })
+
+// The in-app SDK engine answers only its own per-process bearer (plan D-3).
+test('a routine turn to the SDK engine carries its bearer; llama.cpp gets no authorization', async (t) => {
+  const realFetch = globalThis.fetch
+  const realToken = process.env.TURBOLLM_ANDROID_SDK_TOKEN
+  process.env.TURBOLLM_ANDROID_SDK_TOKEN = 'sdk-process-token'
+  const seen: Array<string | null> = []
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    seen.push(new Headers(init?.headers).get('authorization'))
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'done' } }] }), { status: 200 })
+  }) as typeof fetch
+  t.after(() => {
+    globalThis.fetch = realFetch
+    if (realToken === undefined) delete process.env.TURBOLLM_ANDROID_SDK_TOKEN
+    else process.env.TURBOLLM_ANDROID_SDK_TOKEN = realToken
+  })
+  for (const engineKind of ['turbollm-sdk', 'llama-server']) {
+    const { d, db } = fakeDeps({ engineKind })
+    const r = routine(db)
+    await runChatRoutine(d, r, db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) }), new AbortController().signal)
+  }
+  assert.deepEqual(seen, ['Bearer sdk-process-token', null])
+})

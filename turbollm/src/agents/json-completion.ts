@@ -18,6 +18,7 @@ import type { Deps } from '../deps'
 import { shapeForEngine } from '../engines/compat'
 import { engineErrorReason, engineErrorText } from '../engines/engine-error'
 import { servingEngineKind } from '../engines/serving'
+import { engineRequestHeaders } from '../engines/engine-headers'
 
 /** The model's text for `body` (a non-streaming chat request), or why there is none: the engine's own reason when it
  *  refused the request. */
@@ -33,7 +34,7 @@ export async function jsonCompletion(
   try {
     const res = await fetch(`${target}/v1/chat/completions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: engineRequestHeaders(kind, new Headers({ 'Content-Type': 'application/json' })),
       body: JSON.stringify(shapeForEngine(kind, b)),
       signal: AbortSignal.timeout(timeoutMs),
     })

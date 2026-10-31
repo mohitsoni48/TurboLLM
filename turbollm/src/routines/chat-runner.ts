@@ -29,6 +29,7 @@ import { executeToolCallWithApproval } from '../tools/execute-with-approval'
 import { ToolLoopTracker, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER } from './runaway-guard'
 import { stallRoutineRun, type PendingRoutineToolCall } from './approval'
 import { servingEngineKind } from '../engines/serving'
+import { engineRequestHeaders } from '../engines/engine-headers'
 import type { PinnedRoute } from './model-swap'
 
 /** Mirrors chat-routes.ts's own MAX_TOOL_ITER (16) — same headroom reasoning: a handful of
@@ -235,7 +236,8 @@ async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent
     // of escaping the loop.
     let message: { content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } | undefined
     try {
-      const res = await fetch(`${target}/v1/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(reqBody), signal })
+      const headers = engineRequestHeaders(engineKind, new Headers({ 'Content-Type': 'application/json' }))
+      const res = await fetch(`${target}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify(reqBody), signal })
       if (!res.ok) {
         // The engine's reason, as the chat gives it: the run recorded only the status code.
         const reason = await engineErrorReason(res)

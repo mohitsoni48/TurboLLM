@@ -60,6 +60,7 @@ import { clampMaxTokens } from '../config/config.js'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval.js'
 import { initParseState, feedChunk, flushState, type ParseState } from '../chat/parser.js'
 import { servingEngineKind } from '../engines/serving'
+import { engineRequestHeaders } from '../engines/engine-headers'
 
 /** Mirrors chat-routes.ts's own MAX_TOOL_ITER / chat-runner.ts's identical constant — a
  *  ceiling, not a target. Ordinary chats finish in 1 round; this only bounds a runaway loop. */
@@ -326,7 +327,7 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
     try {
       res = await fetch(`${target}/v1/chat/completions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: engineRequestHeaders(engineKind, new Headers({ 'Content-Type': 'application/json' })),
         body: JSON.stringify(reqBody),
         signal,
         duplex: 'half',

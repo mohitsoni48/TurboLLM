@@ -25,6 +25,7 @@ import type { Deps } from '../deps'
 import { isTextClassifier } from '../models/text-classifier'
 import { extractParams, summarizeRequest, drainOpenAiSseForLog, requestLogConfig } from '../observability/request-log'
 import { servingEngineKind } from '../engines/serving'
+import { engineRequestHeaders } from '../engines/engine-headers'
 
 /** Everything a chat turn needs to know about where it is being generated. */
 export interface ChatUpstream {
@@ -174,7 +175,7 @@ export function callChatUpstream(
       })
     : () => fetchImpl(`${upstream.target}/v1/chat/completions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: engineRequestHeaders(upstream.engineKind ?? '', new Headers({ 'Content-Type': 'application/json' })),
         body: payload,
         signal,
         // Required by undici whenever a body is present on some Node versions; harmless for a

@@ -18,6 +18,7 @@ import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
 import { backendIdFromBinPath } from '../engines/update'
 import { isEngineInBuildDir } from '../engines/build-runner'
+import { engineRequestHeaders } from '../engines/engine-headers'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import { automaticProfile, deriveDefault, deriveTensorSplit, estimateVram, estimateVramPerGpu, gpuBudgetMb, legacySeedProfile, mergeUserSet, profileToArgs, resolveProfile, userSetProfile, type GpuProfile, type LoadProfile } from '../models/profile'
 import { isSpilling, spillFloor, spillMb } from './spill'
@@ -1364,7 +1365,7 @@ export class BenchRunner {
     try {
       const res = await fetch(`${target}/v1/chat/completions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: this.engineHeaders(),
         body: JSON.stringify({ model: 'bench', messages, max_tokens: 8, temperature: 0, seed: 42, stream: true, return_progress: true }),
         signal: AbortSignal.any(signals),
       })
@@ -1412,6 +1413,12 @@ export class BenchRunner {
     return { fault: this.cancelled ? 'crash' : 'timeout' }
   }
 
+  /** The JSON request headers for the engine the probe runs on, with the in-app SDK engine's bearer when it is one. */
+  private engineHeaders(): Headers {
+    const engineKind = this.manager.currentOpts()?.engine.kind ?? ''
+    return engineRequestHeaders(engineKind, new Headers({ 'Content-Type': 'application/json' }))
+  }
+
   /** One non-streaming /v1/chat/completions request. Returns engine-reported tps + ttftMs, or null.
    *  Aborts on the per-test timeout, the cancel kill-switch, or `extraSignal` (the fault watchdog). */
   private async chat(target: string, messages: BenchMessage[], maxTokens: number, timeoutMs: number, extraSignal?: AbortSignal): Promise<{ tps: number; prefillTps: number | null; ttftMs: number } | null> {
@@ -1420,7 +1427,7 @@ export class BenchRunner {
     if (extraSignal) signals.push(extraSignal)
     const res = await fetch(`${target}/v1/chat/completions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: this.engineHeaders(),
       body: JSON.stringify({
         model: 'bench',
         messages,
@@ -1551,7 +1558,7 @@ export class BenchRunner {
     if (this.abort) signals.push(this.abort.signal)
     const res = await fetch(`${target}/v1/chat/completions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: this.engineHeaders(),
       body: JSON.stringify({
         model: 'bench',
         messages: [{ role: 'user', content }],

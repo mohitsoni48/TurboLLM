@@ -34,6 +34,7 @@ import {
   serverToolSseEvents,
 } from './server-tools'
 import { servingEngineKind } from '../engines/serving'
+import { engineRequestHeaders } from '../engines/engine-headers'
 import { redactLocalPaths } from '../util/redact-paths'
 
 /** Resolve the Code session (if any) a gateway request belongs to, from the same token a
@@ -473,9 +474,10 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
         headers.set('content-type', 'application/json') // re-serialised body; never inherited
         return proxyStream(remote, '/v1/chat/completions', { method: 'POST', headers, body }, ac.signal)
       }
+      const localKind = routeResult.engineKind ?? servingEngineKind(d)
       return fetch(`${target}/v1/chat/completions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: engineRequestHeaders(localKind, new Headers({ 'Content-Type': 'application/json' })),
         body,
         signal: ac.signal,
       })
@@ -826,7 +828,8 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       .join('\n')
     const estimate = Math.ceil(promptText.length / 3.5)
 
-    if (target) {
+    // The in-app SDK engine serves no /tokenize in this version, so its count is the estimate.
+    if (target && servingEngineKind(d) !== 'turbollm-sdk') {
       try {
         const r = await fetch(`${target}/tokenize`, {
           method: 'POST',
@@ -1149,6 +1152,8 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // engine's own check (main.cc CrossSiteRefusal: a cross-origin POST must be application/json) refused a browser
   // app on another origin that posts its JSON as text/plain, and the daemon relayed the 403.
   if (!remote) for (const h of ['cookie', 'x-turbollm-auth', 'x-turbollm-app', 'origin', 'referer']) headers.delete(h)
+  // The in-app SDK engine takes only its own bearer, never the client's key (engineRequestHeaders); others are unchanged.
+  if (!remote) engineRequestHeaders(routeResult.engineKind ?? servingEngineKind(d), headers)
 
   const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
   // Cancel the upstream engine request if the client disconnects (same reason as
