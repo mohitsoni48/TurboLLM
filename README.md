@@ -177,7 +177,7 @@ the detail:
   `ollama pull` live in Ollama's own blob store, which TurboLLM doesn't read.)
 - **Browse & download from Hugging Face**, in-app: a live, sortable list (trending / downloads
   / likes / recently updated / newest) alongside a permanent detail pane — pick a quant, read
-  the **rendered model card**, and download with **resume + SHA-256 verification**. Each model
+  the **rendered model card**, and download with **pause / resume + SHA-256 verification**. Each model
   lands in its own folder (mirroring Hugging Face's own layout) with its **vision projector and
   every shard of a split/multipart quant fetched alongside it automatically**. Gated models
   (Llama, Gemma) work via your own HF token, which **never leaves your machine**.
@@ -185,6 +185,20 @@ the detail:
   sites, mirrors, private servers) and it disk-space-checks and downloads through the same
   manager; paste a Hugging Face **model page** link instead and it opens that repo's quant
   picker so you can choose which one to download.
+- **Pause and resume downloads** — pause one download or all of them, close TurboLLM, and resume later from the exact
+  byte; a download cut off by a restart comes back as Paused. Discard deletes a paused or failed download's partial file
+  (it asks first above 50 MB).
+- **Hide a model** from the Library and every model picker (a model's ⋯ menu → Hide; "Show hidden models" brings them
+  back). A hidden model keeps its files and settings and still loads when something names it, such as an API client, a
+  routine or `launch --model`.
+- **Show models for every engine** *(Settings → Models & loading, off by default)* — list every model in the Models
+  screen, the pickers and `/v1/models`, also those the selected engine isn't expected to run. A model still loads only
+  on the selected engine.
+- **Search in the Load a model picker** (Chat, Code, the terminal toolbar) — type to filter by name, quant, machine or
+  repo; arrow keys and Enter pick a model.
+- **Default KV cache types** *(Settings → Models & loading → Advanced)* — pick the K and V cache type a model loads with
+  when it has none saved of its own (q8_0 roughly halves KV memory, q4_0 quarters it). Automatic keeps f16 (q4_0 on
+  Android); the list is the selected engine's.
 - **Quant recommendation per GPU** and a **VRAM-fit verdict** so you pick a quant that
   actually fits before you commit.
 - **Primary download folder**, real-time **measured t/s per model**, **delete-from-disk**, and
@@ -267,9 +281,13 @@ the detail:
   points); delete and copy still work as before. **Persistent, searchable conversations** with
   rename, delete, and **auto-generated titles**, organized into **drag-resizable, collapsible
   folders** you create/rename/move conversations into.
-- **Switching chats never cancels a reply** — an in-flight generation keeps running in the
-  background and saves normally; the sidebar shows a live indicator on any chat still generating,
-  and a dot on one that finished while you were elsewhere.
+- **A reply runs in TurboLLM, not in the page** — switching chats, closing or reloading the tab, or a dropped
+  connection never cancels it. It keeps running in the background and saves normally; open the chat again, on this
+  device or another, and it shows the reply live with its Stop button. The sidebar shows a live indicator on any chat
+  still generating, and a dot on one that finished while you were elsewhere.
+- **Desktop app keeps running in the tray** — on Windows and Linux, closing the window leaves TurboLLM running (Open
+  TurboLLM / Quit TurboLLM in the tray), so replies, Code runs, downloads and auto-tunes go on. On a Linux desktop with
+  no tray icons, closing minimizes instead.
 - **Preserve thinking across turns** (on by default) — the model's past reasoning is resent on
   later turns, not just its final answers, so follow-ups have real context to work with.
 - **Per-chat system prompt** and **per-chat sampling** overrides — temperature, top-p/k, min-p,
@@ -286,7 +304,9 @@ the detail:
 - **Tool-call approval gate** — every tool call asks for your approval by default before it runs,
   with **Deny**, **Allow**, **Allow for this chat**, or **Always Allow** on an inline bar above the
   composer. Set per-tool defaults globally from Settings → Tools & safety, or flip **Auto-allow
-  all** to skip prompts entirely — a tool set to Deny still stays blocked either way.
+  all** to skip prompts entirely — a tool set to Deny still stays blocked either way. A call set to Ask that nobody
+  answers is not run: a chat reply waits a set time (Settings → Tools & safety → Tool permissions → Wait for an answer,
+  30 minutes by default, 0 = forever), says so, and goes on as after a Deny.
 - **Usage dashboard** — a GitHub-style activity heatmap of your local generation history (adaptive
   1h/12h/24h boxes for the 7-day/30-day/all-time views), streaks, peak hour, a per-model
   breakdown, a lifetime token-milestone tracker, and a separate **API tab** tracking tokens hitting
@@ -562,9 +582,14 @@ the right upstream prebuilt for your GPU automatically — and a **backend picke
 switch between CUDA / ROCm / Metal / SYCL / Vulkan / CPU at any time (it downloads the variant
 you choose, LM Studio-style).
 
+**Install a prebuilt from a GitHub release.** Engines → Add engine → *From a GitHub release* (or a card's *Install
+prebuilt*): name a repo or pick a known fork, and TurboLLM lists the newest release's builds for your OS, CPU and GPU,
+downloads the one you choose, checks that it runs, and only then adds it. Release engines update from new tags with the
+same check-before-swap, and the install keeps going if you close the dialog or reload.
+
 **Engine types.** **llama.cpp / GGUF**, **KoboldCpp** and **llamafile** (GGUF, every OS),
 **MLX** and **MLX-VLM** (macOS), **vLLM** (Linux + NVIDIA), and **LiteRT-LM** (Google's on-device
-runtime for `.litertlm` models, CPU or GPU, incl. Android via Termux; experimental) are all first-class engine kinds —
+runtime for `.litertlm` models, CPU or GPU, incl. Android via Termux and built into the Android app; experimental) are all first-class engine kinds —
 install from the curated catalog, pick the right one per model, and switch from a single dropdown.
 
 **Fully supervised.** Every engine runs under a real state machine: health-gated readiness,
@@ -795,10 +820,7 @@ access your GPU directly for accelerated local LLM inference.
 
 ### Getting your API key
 
-The container uses host networking (`network_mode: host`, Linux Docker Engine only — Docker Desktop does not
-support it), so the daemon listens on `0.0.0.0:6996` of the host itself. Requests from the host arrive as
-loopback, which is what lets the in-browser folder picker work; `~/workspace` on the host is mounted at
-`/root/workspace`. Because the port is reachable from the LAN, TurboLLM's daemon requires an API key
+The container publishes port 6996 on `0.0.0.0`, so TurboLLM's daemon requires an API key
 for every request the moment it starts — there is no browser inside the container to log
 in with. Both images launch with **`--print-token`**, which mints a fresh key and prints
 it on every container start (not just the first), so it's always one command away:
