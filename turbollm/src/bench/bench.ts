@@ -570,6 +570,8 @@ export class BenchRunner {
     if (active.kind === 'mlx' || active.kind === 'rapid-mlx' || active.kind === 'mlx-vlm' || active.kind === 'koboldcpp') {
       throw new BenchError('unsupported_model', 'Auto-tune supports llama.cpp / llamafile (GGUF) engines only.')
     }
+    // The in-app SDK engine is loaded through its own API, which takes none of the swept launch flags.
+    if (active.kind === 'turbollm-sdk') throw new BenchError('unsupported_model', 'Auto-tune is not available for the in-app engine.')
     const entry = this.scanner.get(modelKey)
     if (!entry) throw new BenchError('no_such_model', 'No model with that key.')
     if (entry.format !== 'gguf') throw new BenchError('unsupported_model', 'Auto-tune supports GGUF models only.')
