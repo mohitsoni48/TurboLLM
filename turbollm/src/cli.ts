@@ -26,6 +26,9 @@ import { BuildState } from './engines/build-state'
 import { UpdateChecker } from './engines/update'
 import { UpdateScheduler } from './engines/update-scheduler'
 import { RoutineScheduler } from './routines/scheduler'
+import { RetentionSweeper } from './chat/retention'
+import { AttachmentJanitor } from './chat/attachment-janitor'
+import { SearchIndexBackfill } from './chat/search-index-backfill'
 import { executeRoutine } from './routines/execute'
 import { sweepInteractiveCliRuns, terminalLookupsBySession, type CliInteractiveSweepDeps } from './routines/cli-interactive-runner'
 import { getTerminalManager } from './terminal/terminal-routes'
@@ -1072,6 +1075,31 @@ const remote = new RemoteAccessManager({
 deps.remote = remote
 
 await registerCodeRoutesIfSupported(app, deps)
+// Data retention (scalability review 2.4, chat/retention.ts): old gateway usage folds into daily totals and each
+// routine keeps its newest runs. Started after the Code routes, which hand it the Code session delete's cleanup
+// (deps.deleteCodeSession); its first sweep waits a minute, clear of boot.
+const retentionSweeper = new RetentionSweeper({
+  db,
+  settings: () => store.snapshot().retention,
+  deleteCodeSession: deps.deleteCodeSession,
+  log: (line) => console.log(line),
+})
+retentionSweeper.start()
+// Chat images as files (scalability review 2.7, chat/attachment-janitor.ts): moves images stored inline before 2.7
+// into files, and deletes files no message names any more. Its first run waits two minutes, clear of boot.
+const attachmentJanitor = new AttachmentJanitor({
+  db,
+  log: (line) => console.log(line),
+})
+attachmentJanitor.start()
+// Chat search's full-text index (scalability review 2.2, chat/search-index-backfill.ts): the rows written before it
+// existed are indexed in the background, a batch per transaction, starting a few seconds after boot; search uses
+// LIKE until it is done.
+const searchIndexBackfill = new SearchIndexBackfill({
+  db,
+  log: (line) => console.log(line),
+})
+searchIndexBackfill.start()
 // Must be registered last — it's a catch-all `GET /*`, and Hono shadows any route added
 // after an overlapping catch-all (see registerSpaFallback's doc comment in server.ts).
 registerSpaFallback(app)
@@ -1627,6 +1655,9 @@ if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean })
   for (const id of deps.codeRuns?.activeSessionIds() ?? []) deps.codeRuns?.stop(id)
   updateScheduler.stop() // don't let an update tick fire mid-teardown
   routineScheduler.stop() // don't let a routine tick fire mid-teardown
+  retentionSweeper.stop()
+  attachmentJanitor.stop()
+  searchIndexBackfill.stop()
   clearInterval(cliInteractiveSweepTimer)
   comfy.stop() // don't let a tick reload a model mid-teardown
   // The MCP servers stop first, as on a signal (their pending calls fail as "disconnected"): the replacement starts
@@ -1733,6 +1764,9 @@ beginShutdown = (reason: string) => {
   abortAllInFlightChats()
   updateScheduler.stop()
   routineScheduler.stop()
+  retentionSweeper.stop()
+  attachmentJanitor.stop()
+  searchIndexBackfill.stop()
   clearInterval(cliInteractiveSweepTimer)
   comfy.stop()
   toolRegistry.disconnectAll()

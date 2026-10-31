@@ -10,7 +10,7 @@ import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, isModelHidden, setModelHidden, isUnsafeMapKey, ownEntry, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Config, type DeepReadonly, type Engine, type McpServer } from '../config/config'
-import { CHAT_APPROVAL_WAIT_MINUTES, CONFIG_BOUNDS, KV_TYPE_MESSAGE, coerceBounded, isChatApprovalWaitMinutes, isConfigTheme, isKvTypeName } from '../config/config-bounds'
+import { CHAT_APPROVAL_WAIT_MINUTES, CONFIG_BOUNDS, KV_TYPE_MESSAGE, RETENTION_BOUNDS, coerceBounded, isChatApprovalWaitMinutes, isConfigTheme, isKvTypeName, isRetentionValue } from '../config/config-bounds'
 import type { Deps } from '../deps'
 import { getLanIp } from '../net'
 import { stripBodies } from '../observability/request-log'
@@ -2974,6 +2974,7 @@ export function registerApi(app: Hono, d: Deps): void {
       comfyui?: { enabled?: boolean; url?: string; reverseGate?: boolean }
       gateway?: { autoSwap?: boolean; keepN?: number }
       requestLog?: { enabled?: boolean; captureBodies?: boolean }
+      retention?: { enabled?: boolean; apiUsageRawDays?: number; routineRunsKept?: number }
       tavilyApiKey?: string
       search?: { provider?: string; tavilyApiKey?: string; kagiApiKey?: string; searxngUrl?: string }
       ghToken?: string
@@ -3041,6 +3042,7 @@ export function registerApi(app: Hono, d: Deps): void {
       ['gateway.autoSwap', b.gateway?.autoSwap, 'boolean'],
       ['requestLog.enabled', b.requestLog?.enabled, 'boolean'],
       ['requestLog.captureBodies', b.requestLog?.captureBodies, 'boolean'],
+      ['retention.enabled', b.retention?.enabled, 'boolean'],
       ...(['memory', 'cloudDeploy', 'routines', 'turboLink', 'remoteAccess'] as const)
         .map((f): [string, unknown, 'boolean'] => [`experimental.${f}`, b.experimental?.[f], 'boolean']),
       ['remoteAccess.ingressPort', raBody?.ingressPort, 'number'],
@@ -3260,6 +3262,11 @@ export function registerApi(app: Hono, d: Deps): void {
     if (b.chatApprovalWaitMinutes !== undefined && !isChatApprovalWaitMinutes(b.chatApprovalWaitMinutes)) {
       return err(c, 400, 'invalid_config_value', CHAT_APPROVAL_WAIT_MINUTES.message)
     }
+    // Data retention (chat/retention.ts): each bounded field checked here, before anything is applied.
+    for (const field of ['apiUsageRawDays', 'routineRunsKept'] as const) {
+      const v: unknown = b.retention?.[field]
+      if (v !== undefined && !isRetentionValue(field, v)) return err(c, 400, 'invalid_config_value', RETENTION_BOUNDS[field].message)
+    }
 
     // Remote-access provider changes only while no tunnel is up. Saved mid-session, the new
     // provider is what the next crash/health restart (or boot) starts — publishing the box
@@ -3312,6 +3319,10 @@ export function registerApi(app: Hono, d: Deps): void {
       // default, and vice versa for a future toggle that touches only `enabled`.
       if (b.requestLog?.enabled !== undefined) cfg.requestLog.enabled = !!b.requestLog.enabled
       if (b.requestLog?.captureBodies !== undefined) cfg.requestLog.captureBodies = !!b.requestLog.captureBodies
+      // Data retention: per-field merge, like requestLog just above.
+      if (b.retention?.enabled !== undefined) cfg.retention.enabled = b.retention.enabled
+      if (b.retention?.apiUsageRawDays !== undefined) cfg.retention.apiUsageRawDays = b.retention.apiUsageRawDays
+      if (b.retention?.routineRunsKept !== undefined) cfg.retention.routineRunsKept = b.retention.routineRunsKept
       // Experimental feature flags (2026-07-14, Settings → Experimental): per-field merge, not
       // Object.assign(cfg.daemon, updates) — a patch touching only one flag must not clobber
       // the other back to whatever `updates.experimental` would otherwise silently overwrite it
@@ -4104,6 +4115,11 @@ function hostOnlySettingChanged(before: Config, after: Config): { field: string;
     // the way to start that capture. Turning the log off hides from the owner what was sent.
     ['requestLog.enabled', 'the request log', (c) => c.requestLog.enabled],
     ['requestLog.captureBodies', '"Log prompts and responses"', (c) => c.requestLog.captureBodies],
+    // Lower limits (or the sweep switched on) delete gateway usage rows and old routine runs with the
+    // chats they made (chat/retention.ts), so only the host chooses them.
+    ['retention.enabled', 'data retention', (c) => c.retention.enabled],
+    ['retention.apiUsageRawDays', 'data retention', (c) => c.retention.apiUsageRawDays],
+    ['retention.routineRunsKept', 'data retention', (c) => c.retention.routineRunsKept],
     ['hfToken', 'the Hugging Face token', (c) => c.hf.token],
     ['ghToken', 'the GitHub token', (c) => c.gh?.token ?? ''],
     // Field by field: the handler creates an empty `search` block on every save.
@@ -4141,6 +4157,7 @@ function settingsPayload(d: Deps) {
     comfyui: cfg.comfyui,
     gateway: cfg.gateway,
     requestLog: cfg.requestLog,
+    retention: cfg.retention,
     // The HF token is write-only over the wire (spec 10 §4): we never echo it back,
     // only whether one is set, so the UI can show "configured" without leaking it.
     hfTokenSet: cfg.hf.token.length > 0,

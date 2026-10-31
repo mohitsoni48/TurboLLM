@@ -8,7 +8,8 @@
 //   - deduped + background: ensure() never blocks the caller; the badge appears on a
 //     later refetch once the hash lands.
 import { createHash } from 'node:crypto'
-import { createReadStream, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { createReadStream, mkdirSync, readFileSync } from 'node:fs'
+import { writeFileAtomicSync } from '../util/atomic-write'
 import { join } from 'node:path'
 
 interface HashRow {
@@ -74,7 +75,7 @@ export class HashStore {
     const entries: Record<string, HashRow> = {}
     for (const [k, v] of this.cache) entries[k] = v
     try {
-      writeFileSync(this.path, JSON.stringify({ version: 1, entries }))
+      writeFileAtomicSync(this.path, JSON.stringify({ version: 1, entries }))
     } catch {
       /* never fatal */
     }

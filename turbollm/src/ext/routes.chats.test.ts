@@ -766,6 +766,27 @@ test('an attachments-only message (no content) is accepted with generate:false, 
   }
 })
 
+test('include=attachments never reads a local image file for another tenant that posts its reference', async () => {
+  const { app, db, cleanup } = harness()
+  try {
+    // An in-app image saved as a file: a tenant that learns its hash must not get the bytes back through this API.
+    const [ref] = await db.attachments.save(['data:image/png;base64,iVBORw0KGgo='])
+    assert.match(ref, /^attachment:/)
+    const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'Files', owner: 'u1' }))
+    const chatId = (await made.json() as { id: string }).id
+    const posted = await app.request(`/api/ext/v1/chats/${chatId}/messages?include=attachments`,
+      json(ACME, { role: 'user', owner: 'u1', generate: false, attachments: [ref] }))
+    assert.deepEqual((await posted.json() as { attachments: string[] }).attachments, [ref], 'returned as posted')
+
+    const one = await app.request(`/api/ext/v1/messages/${(await db.chatStore.listMessages({ tenant: 'acme', owner: 'u1' }, chatId, {})).data[0].id}?owner=u1&include=attachments`, json(ACME))
+    assert.deepEqual((await one.json() as { attachments: string[] }).attachments, [ref])
+    const list = await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1&include=attachments`, json(ACME))
+    assert.deepEqual((await list.json() as { data: Array<{ attachments: string[] }> }).data.map((m) => m.attachments), [[ref]])
+  } finally {
+    cleanup()
+  }
+})
+
 test('metadata is also forwarded into addMessage on the generate:false path', async () => {
   const { app, cleanup } = harness()
   try {

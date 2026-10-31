@@ -1,4 +1,5 @@
 // Chat API routes (spec 07). Conversations CRUD + SSE streaming send + message actions.
+import { readFile } from 'node:fs/promises'
 import type { Context, Hono, MiddlewareHandler } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
@@ -13,7 +14,8 @@ import type { EmitSink } from './emit-sink.js'
 import { chatRuns, type ChatRun, type ChatRunMeta } from './chat-runs.js'
 import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent, type EngineMessage } from './chat-compaction.js'
 
-import type { ClaimVerdict, ConversationStore, Message, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
+import type { ClaimVerdict, ConversationStore, Message, MessageStats, PageOpts, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
+import { InvalidCursorError } from './db'
 import { checkReply } from '../tools/research-referee.js'
 import { buildSnapshot } from './chat-export'
 import type { ExportFormat } from './chat-export'
@@ -325,6 +327,17 @@ type S = 200 | 201 | 202 | 400 | 403 | 404 | 409 | 500 | 503
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
 
+/** One page of a keyset-paged list, from the request's ?limit and ?cursor — or the 400 a
+ *  cursor the list never issued gets. */
+function listPage<T>(c: Context, read: (page: PageOpts) => T): T | Response {
+  try {
+    return read({ limit: Number(c.req.query('limit')), cursor: c.req.query('cursor') })
+  } catch (e) {
+    if (e instanceof InvalidCursorError) return err(c, 400, 'invalid_cursor', 'That cursor is not one this list issued.')
+    throw e
+  }
+}
+
 const STALE_MESSAGE = 'This message is no longer on the shown branch: the chat changed in another tab or device.'
 
 /** A Code session's conversation through the chat routes, to a caller codeAuth refuses (see
@@ -409,7 +422,12 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   // ── auto-memory (Release 3) ────────────────────────────────────────────────
 
-  app.get('/api/v1/memory', (c) => c.json({ facts: db.listMemoryFacts() }))
+  // Newest first, a page at a time (?limit, 200 by default and at most; ?cursor, the previous
+  // page's nextCursor, which is null on the last page).
+  app.get('/api/v1/memory', (c) => {
+    const page = listPage(c, (p) => db.listMemoryFactsPage(p))
+    return page instanceof Response ? page : c.json(page)
+  })
 
   app.delete('/api/v1/memory/:id', (c) => {
     const ok = db.deleteMemoryFact(c.req.param('id'))
@@ -470,11 +488,18 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   app.use('/api/v1/conversations/:id', conversationGate)
   app.use('/api/v1/conversations/:id/*', conversationGate)
 
+  // Without `q`: most recently updated first, a page at a time (?limit, 200 by default and at
+  // most; ?cursor, the previous page's nextCursor, null on the last page). A search (`q`) is one
+  // capped result list, with nextCursor null.
   app.get('/api/v1/conversations', (c) => {
     const q = c.req.query('q')
+    const page = q
+      ? { conversations: db.listConversations(q, 'chat'), nextCursor: null }
+      : listPage(c, (p) => db.listConversationsPage('chat', p))
+    if (page instanceof Response) return page
     // `running`: a turn holds the chat's slot (slotState), for the sidebar of a page that did not start it.
-    const conversations = db.listConversations(q, 'chat').map((conv) => ({ ...conv, running: slotState(conv.id).runningReplyId !== null }))
-    return c.json({ conversations })
+    const conversations = page.conversations.map((conv) => ({ ...conv, running: slotState(conv.id).runningReplyId !== null }))
+    return c.json({ conversations, nextCursor: page.nextCursor })
   })
 
   app.post('/api/v1/conversations', async (c) => {
@@ -509,8 +534,11 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.get('/api/v1/conversations/:id', (c) => {
-    const conv = db.getConversation(c.req.param('id'), true)
+    const conv = db.getConversation(c.req.param('id'))
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
+    // Every active message, each image as its short reference (2.7). Not paged within the conversation: a very long
+    // chat still sends all its text on each open and poll (left for a later change).
+    conv.messages = db.getMessagesForDisplay(conv.id)
     // The compaction as the turns see it: one cut on a branch the user left is not this
     // branch's, so the chat shows no divider, summary or Undo for it (Undo would delete the
     // other branch's compaction) and the meter shows its measured reading, no projection. (The
@@ -518,6 +546,21 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // maybeAutoCompact, which raises it to the estimated size of the full history replayed.)
     const shown = setAsideFrozenCut(db, conv)
     return c.json({ ...shown, messages: forClient(shown.messages ?? []), ...slotState(conv.id) })
+  })
+
+  // A chat image (attachments.ts), for the web UI to show. Under /api/v1 like the conversation that names it, so
+  // lanAuth admits the same callers, and a remote-access token needs models:use (auth.ts requiredCapability). The id
+  // is checked against the one shape the store writes, so it can only name a file in the attachments folder. Its
+  // name is the hash of its bytes, so it never changes: cacheable for good.
+  app.get('/api/v1/attachments/:id', async (c) => {
+    const file = db.attachments.file(c.req.param('id'))
+    const bytes = file ? await readFile(file.path).catch(() => null) : null
+    if (!file || !bytes) return err(c, 404, 'not_found', 'Attachment not found.')
+    return c.body(new Uint8Array(bytes), 200, {
+      'Content-Type': file.mime,
+      'Cache-Control': 'private, max-age=31536000, immutable',
+      'X-Content-Type-Options': 'nosniff',
+    })
   })
 
   app.patch('/api/v1/conversations/:id', async (c) => {
@@ -681,6 +724,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // attachment — image-only / file-only sends are allowed.
     if (!content && images.length === 0 && textAttachments.length === 0)
       return err(c, 400, 'invalid_input', 'Type a message or attach an image or file.')
+    // Each image to its file before the row names it (attachments.ts); the engine is sent data URLs (below).
+    // Before the conversation is read and the busy check, so nothing they decide goes stale across this await.
+    const storedImages = await db.attachments.save(images)
 
     const conv = db.getConversation(convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
@@ -700,7 +746,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // Persist user message — only the typed text is stored as content; images are
     // kept in attachments (the full doc context is folded into the engine prompt below,
     // and kept in docContext so /continue can send this turn again with it).
-    const userMsg = db.addMessage(convId, 'user', content, { attachments: images, textAttachments, docContext: b.docContext })
+    const userMsg = db.addMessage(convId, 'user', content, { attachments: storedImages, textAttachments, docContext: b.docContext })
 
     // Create a placeholder assistant message
     db.addMessage(convId, 'assistant', '', { stats: { aborted: false } })
@@ -736,6 +782,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, undefined, { reasoningField: reasoningAsField(d, upstream) })
       // Fold any attached document text into the prompt; attach images as multimodal parts.
       engineMessages.push({ role: 'user', content: userTurnContent(content, b.docContext, images) })
+      // Every stored reference as its data URL, as /continue does: the history's, and this turn's when a caller sent
+      // references it was shown (`attachment:<id>`) rather than the image itself. No engine understands a reference.
+      await db.attachments.resolveImages(engineMessages)
 
       await runGeneration(d, sink, { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), userText: content, isCodeAuthorized })
     })
@@ -852,6 +901,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // POST /messages first sent it — the text alone is not what the user asked about.
       const allMsgs = (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id)
       const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id, { reasoningField: reasoningAsField(d, upstream) })
+      // Its stored images as the data URLs the first send carried (a local engine and a Turbo Link host alike).
+      await db.attachments.resolveImages(engineMessages)
 
       await runGeneration(d, sink, { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), replacedId: replaced?.role === 'assistant' ? replaced.id : undefined, edited, isCodeAuthorized })
     })

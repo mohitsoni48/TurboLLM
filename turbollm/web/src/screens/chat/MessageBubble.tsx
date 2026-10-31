@@ -12,6 +12,7 @@ import { CopyButton } from '../../components/ui/copy-button'
 import { ArtifactCard, isArtifactLang } from '../../components/ArtifactCard'
 import { isRoutineConfirmTool, isSupersededUpdatePreview, RoutineConfirmToolCard } from '../../components/routines/RoutineConfirmToolCard'
 import { friendlyName } from '../../lib/tool-explain'
+import { AttachmentImage, isImageAttachment } from './AttachmentImage'
 import { ApiError, track } from '../../lib/api'
 import { toast } from '../../components/ui/sonner'
 import { saveThinkingBlockHeight, useThinkingBlockHeight } from '../../lib/thinking-block-size'
@@ -876,8 +877,8 @@ export function MessageBubble({
               <div ref={displayRef} className="whitespace-pre-wrap break-words rounded-[var(--radius-lg)] bg-accent px-4 py-2.5 text-[15px] leading-[1.6] text-on-accent">
                 {message.content}
               </div>
-              {message.attachments?.filter((a) => a.startsWith('data:image')).map((url, i) => (
-                <img key={i} src={url} className="mt-2 max-h-48 max-w-xs rounded-lg object-contain" alt="attached image" />
+              {message.attachments?.filter(isImageAttachment).map((attachment, i) => (
+                <AttachmentImage key={i} attachment={attachment} />
               ))}
               {message.textAttachments?.length > 0 && (
                 <div className="mt-1.5 flex flex-wrap gap-1 justify-end">

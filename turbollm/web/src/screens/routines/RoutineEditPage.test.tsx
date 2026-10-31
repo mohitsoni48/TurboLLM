@@ -51,6 +51,9 @@ let routineData: Routine | undefined
  *  that, because it is id-blind. */
 let routinesById: Record<string, Routine> | null = null
 let runsData: RoutineRun[] = []
+/** The paging half of useRoutineRuns: whether older runs exist, and the call that loads them. */
+const runsPaging = { hasNextPage: false, isFetchingNextPage: false }
+const fetchOlderRuns = vi.fn()
 const queryState = { isLoading: false, isError: false }
 const routineRefetch = vi.fn()
 const createMutate = vi.fn()
@@ -71,7 +74,7 @@ vi.mock('../../lib/routine-queries', async (importOriginal) => {
       data: routinesById ? (id ? routinesById[id] : undefined) : routineData,
       isLoading: queryState.isLoading, isError: queryState.isError, refetch: routineRefetch,
     }),
-    useRoutineRuns: () => ({ data: runsData, isLoading: false, isError: false, refetch: vi.fn() }),
+    useRoutineRuns: () => ({ data: runsData, isLoading: false, isError: false, refetch: vi.fn(), fetchNextPage: fetchOlderRuns, ...runsPaging }),
     useRoutineMutations: () => ({
       create: { mutate: createMutate, isPending: false },
       confirm: { mutate: confirmMutate, isPending: false },
@@ -179,6 +182,9 @@ beforeEach(() => {
   routinesById = null
   routerNavigate = null
   runsData = []
+  runsPaging.hasNextPage = false
+  runsPaging.isFetchingNextPage = false
+  fetchOlderRuns.mockReset()
   queryState.isLoading = false
   queryState.isError = false
   routineRefetch.mockReset()
@@ -737,5 +743,34 @@ describe('RoutineEditPage — a real route change to a different routine discard
     expect(screen.getByText('New routine')).toBeInTheDocument()
     expect(screen.queryByDisplayValue('Draft for a routine I abandoned')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled()
+  })
+})
+
+describe('RoutineEditPage — run history paging', () => {
+  const oneRun = (): RoutineRun[] => [{ id: 'run1', routineId: 'r1', status: 'ok', configSnapshot: '{}', startedAt: '2026-08-01T09:00:00.000Z' }]
+
+  it('offers "Load older runs" while the daemon has more, and asks for them on click', async () => {
+    routineData = activeRoutine()
+    runsData = oneRun()
+    runsPaging.hasNextPage = true
+    renderDetail()
+    await userEvent.click(screen.getByRole('button', { name: 'Load older runs' }))
+    expect(fetchOlderRuns).toHaveBeenCalledOnce()
+  })
+
+  it('does not offer it when every run is already shown', () => {
+    routineData = activeRoutine()
+    runsData = oneRun()
+    renderDetail()
+    expect(screen.queryByRole('button', { name: /older runs/i })).not.toBeInTheDocument()
+  })
+
+  it('shows the button as loading while the older page is on its way', () => {
+    routineData = activeRoutine()
+    runsData = oneRun()
+    runsPaging.hasNextPage = true
+    runsPaging.isFetchingNextPage = true
+    renderDetail()
+    expect(screen.getByRole('button', { name: 'Loading…' })).toBeDisabled()
   })
 })

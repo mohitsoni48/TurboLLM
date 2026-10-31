@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { Routine, RoutineRun, RoutineFlavor, RoutineStatus, RoutineRunStatus, CodingAgentChoice, ScheduleRule } from '../routines/schema'
 import { SqliteChatStore } from './store/sqlite-chat-store.js'
+import { AttachmentStore } from './attachments.js'
+import { LOCAL_SCOPE } from './store/chat-store.js'
 
 export interface Conversation {
   id: string
@@ -307,6 +309,48 @@ export interface TokenUsageStats {
  *  (gateway.ts): the Anthropic-protocol translation and the OpenAI-compatible pass-through. */
 export type ApiUsageSource = 'anthropic' | 'openai'
 
+/** Where the next rollUpApiUsageBatch starts: just past this (created_at, rowid). */
+export interface ApiUsageCursor {
+  createdAt: string
+  seq: number
+}
+
+interface ApiUsageRollupRow {
+  seq: number
+  id: string
+  created_at: string
+  source: string
+  model_key: string | null
+  harness: string | null
+  code_session_id: string | null
+  prompt_tokens: number
+  gen_tokens: number
+}
+
+/** A routine run the retention sweep may delete, with what it links to (v42). */
+export interface PrunableRoutineRun {
+  id: string
+  startedAt: string
+  conversationId: string | null
+  codeSessionId: string | null
+}
+
+/** True (SQL, over `routine_runs r`) when someone went on with a routine run's chat or Code session after the run
+ *  ended: either opens as a full interactive chat (RoutineEditPage), so the retention sweep must never delete it then.
+ *  The signal is the messages, not conversations.updated_at, which renames, folder moves and auto-titles also touch.
+ *  A user message after the end is the user's own (every prompt a run sends is written before it ends); any message
+ *  more than a minute after the end is a regenerate or the like (a run's own reply may still be saved just after the
+ *  end, so not every later message counts). A run with no end recorded is measured from its start, which its own
+ *  prompt always follows: kept, when unsure. */
+const ROUTINE_RUN_CONTINUED = `EXISTS (
+  SELECT 1 FROM messages m
+  WHERE m.conv_id IN (r.conversation_id, (SELECT a.conv_id FROM agent_runs a WHERE a.id = r.code_session_id))
+    AND (
+      (m.role = 'user' AND m.created_at > COALESCE(r.ended_at, r.started_at))
+      OR m.created_at > strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(r.ended_at, r.started_at), '+60 seconds')
+    )
+)`
+
 export interface ApiModelUsage {
   modelKey: string
   displayName: string
@@ -540,6 +584,149 @@ type P = Record<string, SqlValue>
 
 function safeJson(s: string): unknown { try { return JSON.parse(s) } catch { return {} } }
 
+/** A reply that recorded a usable generation speed — `typeof stats.tps === 'number' && tps > 0`,
+ *  in SQL. It is both lastGenTpsByModel's filter and the WHERE of the partial index
+ *  idx_messages_model_tps (v53): SQLite only uses a partial index when the query repeats its
+ *  terms, so the two share this one string. The CASE keeps json_type/json_extract off malformed
+ *  stats, where they would throw (and fail the write that stored them). */
+const USABLE_TPS_ROW = `role = 'assistant' AND model_key IS NOT NULL AND CASE WHEN json_valid(stats) THEN json_type(stats, '$.tps') IN ('integer', 'real') AND json_extract(stats, '$.tps') > 0 ELSE 0 END`
+
+/** A chat turn's reply still holding the placeholder stats its turn started with (see
+ *  abortUnfinishedReplies). Shared with the partial index idx_messages_unfinished (v53), as above. */
+const UNFINISHED_REPLY = `role = 'assistant' AND stats = '{"aborted":false}' AND edited = 0`
+
+/** A column chat search indexes (v54), and its full-text table `<table>_fts`. */
+interface SearchIndexedColumn { table: 'messages' | 'conversations'; column: 'content' | 'title' }
+const SEARCH_INDEXED: SearchIndexedColumn[] = [{ table: 'messages', column: 'content' }, { table: 'conversations', column: 'title' }]
+
+/** Every schema object of the search index: the FTS tables and their triggers. */
+const SEARCH_INDEX_TRIGGERS = SEARCH_INDEXED.flatMap(({ table }) => ['insert', 'delete', 'update'].map((op) => `${table}_fts_${op}`))
+const SEARCH_INDEX_TABLES = SEARCH_INDEXED.map(({ table }) => `${table}_fts`)
+
+/** The rowids of each indexed table still waiting for the background backfill (search-index-backfill.ts):
+ *  [next_rowid, end_rowid]. A table's row goes once its last batch is indexed; no rows, the index is complete. */
+const SEARCH_INDEX_BACKFILL_TABLE = `CREATE TABLE IF NOT EXISTS search_index_backfill (tbl TEXT PRIMARY KEY, next_rowid INTEGER NOT NULL, end_rowid INTEGER NOT NULL)`
+
+/** Search needs at least one trigram: shorter queries take the LIKE path. */
+const TRIGRAM_CHARS = 3
+
+/** Chat search's full-text index over one column (v54): an external-content FTS5 table, so the text
+ *  is stored once, in its own table. The trigram tokenizer, case-insensitive, matches any substring
+ *  of three characters or more — what the LIKE scan it replaces found, mid-word, CJK and punctuation
+ *  included. Triggers keep it in step: insert, delete (a conversation's cascade included) and only an
+ *  UPDATE OF the indexed column, so the many updates that leave it alone cost nothing. A row still
+ *  in the backfill's pending range is left to the backfill, never touched by a trigger: an
+ *  external-content index must never be told to delete a row it does not hold, nor hold one twice.
+ *  Rows join on rowid: the tables have TEXT primary keys, and VACUUM may renumber such a table's
+ *  rowids, so any future VACUUM must run `INSERT INTO <fts>(<fts>) VALUES('rebuild')` after. */
+function searchIndexSchema({ table, column }: SearchIndexedColumn): string {
+  const fts = `${table}_fts`
+  const indexed = (row: 'new' | 'old') => `NOT EXISTS (SELECT 1 FROM search_index_backfill WHERE tbl = '${table}' AND ${row}.rowid BETWEEN next_rowid AND end_rowid)`
+  return `
+    CREATE VIRTUAL TABLE ${fts} USING fts5(${column}, content='${table}', tokenize='trigram case_sensitive 0');
+    CREATE TRIGGER ${fts}_insert AFTER INSERT ON ${table} WHEN ${indexed('new')} BEGIN
+      INSERT INTO ${fts}(rowid, ${column}) VALUES (new.rowid, new.${column});
+    END;
+    CREATE TRIGGER ${fts}_delete AFTER DELETE ON ${table} WHEN ${indexed('old')} BEGIN
+      INSERT INTO ${fts}(${fts}, rowid, ${column}) VALUES ('delete', old.rowid, old.${column});
+    END;
+    CREATE TRIGGER ${fts}_update AFTER UPDATE OF ${column} ON ${table} WHEN ${indexed('old')} BEGIN
+      INSERT INTO ${fts}(${fts}, rowid, ${column}) VALUES ('delete', old.rowid, old.${column});
+      INSERT INTO ${fts}(rowid, ${column}) VALUES (new.rowid, new.${column});
+    END;
+  `
+}
+
+/** Above this many messages, the v53 index build is announced: it reads the whole table once. */
+const LARGE_HISTORY_ROWS = 100_000
+
+/** Conversations whose title or any message (inactive variants included, as before) matches. The
+ *  FTS form computes each side's matches once; the LIKE form (sql.js, no FTS5, short queries, an
+ *  index still being backfilled) stops at the first matching message per conversation. */
+const SEARCH_MATCH_FTS = `(
+  c.rowid IN (SELECT rowid FROM conversations_fts WHERE conversations_fts MATCH $q)
+  OR c.id IN (SELECT messages.conv_id FROM messages_fts JOIN messages ON messages.rowid = messages_fts.rowid WHERE messages_fts MATCH $q)
+)`
+const SEARCH_MATCH_LIKE = `(
+  c.title LIKE $q ESCAPE '\\'
+  OR EXISTS (SELECT 1 FROM messages m WHERE m.conv_id = c.id AND m.content LIKE $q ESCAPE '\\')
+)`
+
+/** A trigram MATCH for `text` anywhere: one quoted phrase, so FTS syntax in it (AND, NEAR, *, :, -,
+ *  parentheses) is plain text, and its trigrams must appear in a row, in order — a substring. */
+function ftsSubstring(text: string): string {
+  return `"${text.replaceAll('"', '""')}"`
+}
+
+/** A LIKE pattern for `text` anywhere, its own %, _ and \ taken literally (with ESCAPE '\'). */
+function likeSubstring(text: string): string {
+  return `%${text.replace(/[\\%_]/g, '\\$&')}%`
+}
+
+/** `stats.<field>` when it is a JSON number, else 0: the dashboards' old
+ *  `typeof s.field === 'number' ? s.field : 0` over safeJson, evaluated by SQLite so the rows
+ *  never reach JavaScript. Malformed stats read as 0 (CASE checks validity first; json_type on
+ *  malformed text throws). */
+function statsNumber(field: string): string {
+  return `CASE WHEN NOT json_valid(stats) THEN 0 WHEN json_type(stats, '$.${field}') IN ('integer', 'real') THEN json_extract(stats, '$.${field}') ELSE 0 END`
+}
+
+/** The UTC quarter hour an ISO `created_at` falls in, as `YYYY-MM-DDTHH:MM`. Every real time
+ *  zone's offset is a whole number of quarter hours, so all instants in one quarter share a
+ *  local day and a local hour: grouping by this in SQL keeps everything dayKey and getHours need
+ *  while handing JavaScript one row per quarter instead of one per message. */
+function quarterHour(column: string): string {
+  return `substr(${column}, 1, 14) || printf('%02d', CAST(substr(${column}, 15, 2) AS INTEGER) / 15 * 15)`
+}
+
+/** A `quarterHour` key back as an ISO instant, for dayKey / getHours. */
+function quarterStartIso(quarter: string): string {
+  return `${quarter}:00.000Z`
+}
+
+/** Thrown for a list cursor this store did not issue; the list routes answer 400 invalid_cursor. */
+export class InvalidCursorError extends Error {
+  constructor() {
+    super('invalid_cursor: not a cursor this list issued')
+    this.name = 'InvalidCursorError'
+  }
+}
+
+/** One page request of a newest-first list. `cursor` is the previous page's `nextCursor`. */
+export interface PageOpts { limit?: number; cursor?: string }
+
+/** Keyset position (sort value, id) as opaque base64url JSON — the same shape
+ *  sqlite-chat-store.ts's chat list uses. */
+function encodePageCursor(sortValue: string, id: string): string {
+  return Buffer.from(JSON.stringify({ u: sortValue, i: id }), 'utf8').toString('base64url')
+}
+
+function decodePageCursor(raw: string): { u: string; i: string } {
+  let parsed: { u?: unknown; i?: unknown } | null
+  try {
+    parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as { u?: unknown; i?: unknown } | null
+  } catch {
+    throw new InvalidCursorError()
+  }
+  if (typeof parsed?.u !== 'string' || typeof parsed?.i !== 'string') throw new InvalidCursorError()
+  return { u: parsed.u, i: parsed.i }
+}
+
+function clampPageLimit(limit: number | undefined, fallback: number, max: number): number {
+  if (!limit || !Number.isFinite(limit) || limit < 1) return fallback
+  return Math.min(Math.floor(limit), max)
+}
+
+/** Conversation list rows: every column but compaction_summary, which can run to thousands of
+ *  words and only the opened conversation (getConversation) shows. */
+const CONV_LIST_COLUMNS = `id, title, system_prompt, model_key, sampling, expert_mode, tool_policy, kind, folder_id, tool_overrides, agent_id, completed_at, read_scope, agent_mode, skill_ids, allowed_tools, preserve_thinking, NULL AS compaction_summary, compaction_upto_message_id, compaction_tokens_before, compaction_applied_at, created_at, updated_at`
+
+/** Message rows for display: every column but doc_context (getMessagesForDisplay). */
+const MSG_DISPLAY_COLUMNS = `id, conv_id, seq, role, content, reasoning, attachments, text_attachments, tool_calls, timeline, stats, model_key, research_meta, created_at, variant_group, is_active, branch_of, edited, NULL AS doc_context`
+
+/** Agent-run list rows, slimmed the same way (getAgentRun has the summary). */
+const AGENT_RUN_LIST_COLUMNS = `id, conv_id, title, status, allowed_tools, agent_id, error, created_at, updated_at, started_at, ended_at, archived_at, completion, repo_root, repo_branch, use_worktree, worktree_branch, worktree_base, worktree_path, lines_added, lines_removed, NULL AS compaction_summary, compaction_upto_message_id, compaction_tokens_before, cleared_upto_message_id, reverted_from_message_id, title_auto_synced, code_agent, terminal_launched_once`
+
 function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
   if (!s) return {}
   const parsed = safeJson(s)
@@ -553,6 +740,12 @@ function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
 
 function rowToConv(r: ConvRow): Conversation {
   return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : r.kind === 'code' ? 'code' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, readScope: r.read_scope ? (safeJson(r.read_scope) as string[]) : undefined, agentMode: r.agent_mode ?? undefined, skillIds: r.skill_ids ? (safeJson(r.skill_ids) as string[]) : undefined, allowedTools: r.allowed_tools ? (safeJson(r.allowed_tools) as string[]) : undefined, preserveThinking: r.preserve_thinking === 1, compactionSummary: r.compaction_summary ?? undefined, compactionUpToMessageId: r.compaction_upto_message_id ?? undefined, compactionTokensBefore: r.compaction_tokens_before ?? undefined, compactionAppliedAt: r.compaction_applied_at ?? undefined, createdAt: r.created_at, updatedAt: r.updated_at }
+}
+
+interface MemoryFactRow { id: string; fact_text: string; source_conv_id: string | null; created_at: string }
+
+function rowToMemoryFact(r: MemoryFactRow): MemoryFact {
+  return { id: r.id, factText: r.fact_text, sourceConvId: r.source_conv_id ?? undefined, createdAt: r.created_at }
 }
 
 function rowToFolder(r: FolderRow): Folder {
@@ -668,6 +861,15 @@ export class ConversationStore {
 
   private _chatStore?: SqliteChatStore
 
+  /** Whether chat search's v54 full-text index exists and is kept in step (FTS5 compiled in; never on sql.js). */
+  private searchIndexBuilt = false
+
+  /** Whether rows written before the index existed still wait for the backfill (search-index-backfill.ts). */
+  private searchIndexBackfillPending = false
+
+  /** The chat images messages.attachments refers to (2.7), in the same data directory as the database. */
+  readonly attachments: AttachmentStore
+
   /** The raw handle, so the pluggable ChatStore can run over the SAME connection and
    *  tables rather than opening a second one (WAL + locking would bite otherwise).
    *  Phase 1 amendment 1: SqliteChatStore sits ALONGSIDE this class, not beneath it. */
@@ -682,8 +884,21 @@ export class ConversationStore {
 
   constructor(dataDir: string) {
     this.db = openSqlDb(dataDir === IN_MEMORY_DATA_DIR ? IN_MEMORY_DATA_DIR : join(dataDir, 'turbollm.db'))
-    this.migrate()
+    this.attachments = new AttachmentStore(dataDir)
+    try {
+      this.migrate()
+      this.reconcileSearchIndex()
+    } catch (e) {
+      this.db.close()
+      throw e
+    }
   }
+
+  /** Chat search reads the full-text index: it exists and holds every row. Until then, LIKE. */
+  get searchIndexReady(): boolean { return this.searchIndexBuilt && !this.searchIndexBackfillPending }
+
+  /** Rows written before the index existed are not indexed yet: the backfill has work. */
+  get searchIndexPending(): boolean { return this.searchIndexBuilt && this.searchIndexBackfillPending }
 
   /** Whether `table` already has `column` — guards ADD COLUMN migrations that may have
    *  already run under an earlier version number (this branch's migration ladder has
@@ -697,7 +912,7 @@ export class ConversationStore {
   private migrate(): void {
     this.db.exec(`PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;`)
     const { user_version: v } = this.db.prepare('PRAGMA user_version').get() as { user_version: number }
-    if (v < 1) {
+    this.migrationStep(v, 1, () => {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS conversations (
           id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New chat',
@@ -712,67 +927,60 @@ export class ConversationStore {
           created_at TEXT NOT NULL, UNIQUE (conv_id, seq)
         );
         CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conv_id, seq);
-        PRAGMA user_version = 1;
       `)
-    }
+    })
     // v2 (spec 04 §5): attribute each assistant reply to the model that produced it
     // so the Models screen can show last-session gen t/s per model. Nullable — old
     // rows stay NULL and are simply not counted (non-breaking).
-    if (v < 2) {
+    this.migrationStep(v, 2, () => {
       this.db.exec(`
         ALTER TABLE messages ADD COLUMN model_key TEXT;
         CREATE INDEX IF NOT EXISTS idx_messages_model ON messages(model_key, created_at);
-        PRAGMA user_version = 2;
       `)
-    }
+    })
     // v3 (spec 08 §2): mark the built-in TurboLLM Expert thread so its server-managed
     // system prompt stays hidden from the UI. Additive — existing conversations get 0.
-    if (v < 3) {
+    this.migrationStep(v, 3, () => {
       this.db.exec(`
         ALTER TABLE conversations ADD COLUMN expert_mode INTEGER NOT NULL DEFAULT 0;
-        PRAGMA user_version = 3;
       `)
-    }
+    })
     // v4 (spec 07 §9b): store text-file attachment filenames on user messages so the
     // UI can render file chips in the sent bubble. Nullable — existing rows get NULL
     // and are decoded as [] in rowToMsg (non-breaking).
-    if (v < 4) {
+    this.migrationStep(v, 4, () => {
       this.db.exec(`
         ALTER TABLE messages ADD COLUMN text_attachments TEXT;
-        PRAGMA user_version = 4;
       `)
-    }
+    })
     // v5 (v0.7.0 agentic): store tool call records on assistant messages so the UI
     // can render tool invocations + results inline. Nullable — existing rows get NULL
     // and are decoded as [] in rowToMsg (non-breaking).
-    if (v < 5) {
+    this.migrationStep(v, 5, () => {
       this.db.exec(`
         ALTER TABLE messages ADD COLUMN tool_calls TEXT;
-        PRAGMA user_version = 5;
       `)
-    }
+    })
     // v6 (v0.7.0 agentic): per-conversation tool policy. 'force_web_search' forces
     // the model to call web_search on the first iteration. Nullable — existing rows
     // get NULL and default to standard auto tool_choice (non-breaking).
-    if (v < 6) {
+    this.migrationStep(v, 6, () => {
       this.db.exec(`
         ALTER TABLE conversations ADD COLUMN tool_policy TEXT;
-        PRAGMA user_version = 6;
       `)
-    }
+    })
     // v7 (F-021/F-022): research metadata — confidence score, ranked sources, and
     // referee verdicts stored as JSON alongside the assistant message. Nullable —
     // only set on Research-persona replies that use the retrieval service.
-    if (v < 7) {
+    this.migrationStep(v, 7, () => {
       this.db.exec(`
         ALTER TABLE messages ADD COLUMN research_meta TEXT;
-        PRAGMA user_version = 7;
       `)
-    }
+    })
     // v8 (ADR-112): background agent runs table. Each run maps to a dedicated
     // conversation of kind='agent'. Ring buffer events are in-memory only;
     // this table stores the durable run record and status.
-    if (v < 8) {
+    this.migrationStep(v, 8, () => {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS agent_runs (
           id TEXT PRIMARY KEY,
@@ -787,23 +995,21 @@ export class ConversationStore {
           ended_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status, created_at);
-        PRAGMA user_version = 8;
       `)
-    }
+    })
     // v9 (ADR-112): conversations.kind column — 'chat' (default) or 'agent'.
     // Agent conversations are owned by a run and excluded from the chat sidebar.
-    if (v < 9) {
+    this.migrationStep(v, 9, () => {
       this.db.exec(`
         ALTER TABLE conversations ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat';
-        PRAGMA user_version = 9;
       `)
-    }
+    })
     // v10: chat folders. Flat (no nesting) — conversations reference a folder via the
     // nullable folder_id column. Deleting a folder UNASSIGNS its members (folder_id set
     // to NULL in app code — see deleteFolder), it never cascade-deletes conversations,
     // so no inline REFERENCES/ON DELETE constraint is added here. sort_order is reserved
     // for a future drag-to-reorder; folders currently list in insertion order.
-    if (v < 10) {
+    this.migrationStep(v, 10, () => {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS folders (
           id TEXT PRIMARY KEY, name TEXT NOT NULL,
@@ -812,39 +1018,35 @@ export class ConversationStore {
         );
         ALTER TABLE conversations ADD COLUMN folder_id TEXT;
         CREATE INDEX IF NOT EXISTS idx_conversations_folder ON conversations(folder_id);
-        PRAGMA user_version = 10;
       `)
-    }
+    })
     // v11 (tool-call approval gate): per-conversation "Allow for this chat" overrides,
     // persisted as JSON so they survive a restart. Nullable — existing rows get NULL
     // and are decoded as {} in rowToConv (non-breaking).
-    if (v < 11) {
+    this.migrationStep(v, 11, () => {
       this.db.exec("ALTER TABLE conversations ADD COLUMN tool_overrides TEXT")
-      this.db.exec("PRAGMA user_version = 11")
-    }
+    })
     // v12: agent_runs.agent_id — link runs to the AgentType config.
     // Additive column; existing rows get NULL (backwards-compatible with pre-agent-id runs).
-    if (v < 12) {
+    this.migrationStep(v, 12, () => {
       this.db.exec(`
         ALTER TABLE agent_runs ADD COLUMN agent_id TEXT;
-        PRAGMA user_version = 12;
       `)
-    }
+    })
     // v13 (spec 13 §13): the durable working doc — one current doc per run. Survives
     // /compact (it is NOT part of the compressible transcript). Cascades on run delete.
-    if (v < 13) {
+    this.migrationStep(v, 13, () => {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS agent_run_docs (
           run_id     TEXT PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE,
           content    TEXT NOT NULL DEFAULT '',
           updated_at TEXT NOT NULL
         );
-        PRAGMA user_version = 13;
       `)
-    }
+    })
     // v14 (spec 13 §13): per-Hitman track record — one row per finished contract
     // (incl. first-try successes). agent_id is a config id (not a DB FK); run_id cascades.
-    if (v < 14) {
+    this.migrationStep(v, 14, () => {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS agent_track_record (
           id          TEXT PRIMARY KEY,
@@ -856,27 +1058,24 @@ export class ConversationStore {
           ran_at      TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_track_agent ON agent_track_record(agent_id);
-        PRAGMA user_version = 14;
       `)
-    }
+    })
     // v15 (spec 13 §13): archive + completion outcome on the run row.
-    if (v < 15) {
+    this.migrationStep(v, 15, () => {
       this.db.exec(`
         ALTER TABLE agent_runs ADD COLUMN archived_at TEXT;
         ALTER TABLE agent_runs ADD COLUMN completion TEXT;
-        PRAGMA user_version = 15;
       `)
-    }
+    })
     // v16 (spec 13 redesign §1): bind a CHAT conversation to an Agent. Null = a plain
     // chat (no agent, no FS/tools). Additive; existing chats get NULL = unchanged behavior.
-    if (v < 16) {
+    this.migrationStep(v, 16, () => {
       if (!this.hasColumn('conversations', 'agent_id')) this.db.exec(`ALTER TABLE conversations ADD COLUMN agent_id TEXT;`)
-      this.db.exec(`PRAGMA user_version = 16;`)
-    }
+    })
     // v17 (spec 13 redesign §2/§3): completion marker on a conversation + the per-agent
     // lessons store (Reflexion). completed_at null = in-progress. agent_lessons is keyed by
     // the config agent id (not a DB FK); pruned when the agent is deleted.
-    if (v < 17) {
+    this.migrationStep(v, 17, () => {
       if (!this.hasColumn('conversations', 'completed_at')) this.db.exec(`ALTER TABLE conversations ADD COLUMN completed_at TEXT;`)
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS agent_lessons (
@@ -888,13 +1087,12 @@ export class ConversationStore {
           created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_lessons_agent ON agent_lessons(agent_id, created_at);
-        PRAGMA user_version = 17;
       `)
-    }
+    })
     // v18 (spec 13 redesign §3.3): per-agent SKILLS grown from experience (Voyager) — a
     // distilled name + description + procedure, injected on future runs. Keyed by config
     // agent id (not a DB FK); pruned on agent delete.
-    if (v < 18) {
+    this.migrationStep(v, 18, () => {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS agent_skills (
           id          TEXT PRIMARY KEY,
@@ -906,73 +1104,64 @@ export class ConversationStore {
           created_at  TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_skills_agent ON agent_skills(agent_id, created_at);
-        PRAGMA user_version = 18;
       `)
-    }
+    })
     // v19 (spec 13 redesign): per-conversation read scope — JSON array of file/folder paths
     // the bound agent may read. Read access is chat-bound (attached via picker), not agent-bound.
-    if (v < 19) {
+    this.migrationStep(v, 19, () => {
       if (!this.hasColumn('conversations', 'read_scope')) this.db.exec(`ALTER TABLE conversations ADD COLUMN read_scope TEXT;`)
-      this.db.exec(`PRAGMA user_version = 19;`)
-    }
+    })
     // v20: per-conversation pi permission mode ('ask'|'auto'|'bypass'|'read'). Null = 'auto'.
-    if (v < 20) {
+    this.migrationStep(v, 20, () => {
       if (!this.hasColumn('conversations', 'agent_mode')) this.db.exec(`ALTER TABLE conversations ADD COLUMN agent_mode TEXT;`)
-      this.db.exec(`PRAGMA user_version = 20;`)
-    }
+    })
     // v21: skill ids enabled for a conversation (JSON string[]) — the shared SKILL.md
     // library injected into chat directly, replacing the agent-bound tool/skill picker.
-    if (v < 21) {
+    this.migrationStep(v, 21, () => {
       if (!this.hasColumn('conversations', 'skill_ids')) this.db.exec(`ALTER TABLE conversations ADD COLUMN skill_ids TEXT;`)
-      this.db.exec(`PRAGMA user_version = 21;`)
-    }
+    })
     // v22 (Customize → Agents): tool-name allow-list baked in from a custom chat
     // Agent at conversation creation (JSON string[]). Null/absent = unrestricted —
     // built-in personas never set this, preserving today's behavior byte-for-byte.
-    if (v < 22) {
+    this.migrationStep(v, 22, () => {
       if (!this.hasColumn('conversations', 'allowed_tools')) this.db.exec(`ALTER TABLE conversations ADD COLUMN allowed_tools TEXT;`)
-      this.db.exec(`PRAGMA user_version = 22;`)
-    }
+    })
     // v23 (GitHub #52 item 2 — chat branching): regenerating a reply used to delete it
     // outright. Now the old message is kept and deactivated instead — `variant_group`
     // groups a message with its regenerated siblings (defaults to the group's own first
     // message id), `is_active` marks which one is currently shown/sent as history.
     // Existing rows default to is_active=1, variant_group=NULL (no branch UI for them).
-    if (v < 23) {
+    this.migrationStep(v, 23, () => {
       if (!this.hasColumn('messages', 'variant_group')) this.db.exec(`ALTER TABLE messages ADD COLUMN variant_group TEXT;`)
       if (!this.hasColumn('messages', 'is_active')) this.db.exec(`ALTER TABLE messages ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1;`)
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_variant_group ON messages(conv_id, variant_group);`)
-      this.db.exec(`PRAGMA user_version = 23;`)
-    }
+    })
     // v24 (GitHub #52 item 2, extended to user-message edits): editing an earlier user
     // message used to hard-delete everything after it. Now that whole downstream tail is
     // frozen (deactivated) instead, tagged with `branch_of` = the specific message version
     // it was frozen under, so switching back to that version can restore exactly what was
     // there — including whichever regenerate-sibling (variant_group) was active within it.
-    if (v < 24) {
+    this.migrationStep(v, 24, () => {
       if (!this.hasColumn('messages', 'branch_of')) this.db.exec(`ALTER TABLE messages ADD COLUMN branch_of TEXT;`)
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_branch_of ON messages(conv_id, branch_of);`)
-      this.db.exec(`PRAGMA user_version = 24;`)
-    }
+    })
     // v25 (GitHub #52 item 1): per-conversation "preserve thinking across turns" toggle.
     // Off by default — matches today's behavior, where only the final visible content of
     // past turns is ever resent to the engine, never raw reasoning.
-    if (v < 25) {
+    this.migrationStep(v, 25, () => {
       if (!this.hasColumn('conversations', 'preserve_thinking')) this.db.exec(`ALTER TABLE conversations ADD COLUMN preserve_thinking INTEGER NOT NULL DEFAULT 0;`)
-      this.db.exec(`PRAGMA user_version = 25;`)
-    }
+    })
     // v26: "Edited" tag — set only when a user explicitly edits an assistant reply's text
     // in place (the PUT /messages/:msgId assistant-role path), never by the normal
     // generation-completion save, so it means what it says.
-    if (v < 26) {
+    this.migrationStep(v, 26, () => {
       if (!this.hasColumn('messages', 'edited')) this.db.exec(`ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0;`)
-      this.db.exec(`PRAGMA user_version = 26;`)
-    }
+    })
     // v27 (Release 3, auto-memory): durable facts extracted from the user's own chat
     // messages, injected into future new conversations. No FK to conversations — deleting
     // a source chat shouldn't delete the fact it produced (same provenance-column pattern
     // as agent_lessons above).
-    if (v < 27) {
+    this.migrationStep(v, 27, () => {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS memory_facts (
           id             TEXT PRIMARY KEY,
@@ -981,16 +1170,15 @@ export class ConversationStore {
           created_at     TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_memory_facts_created ON memory_facts(created_at);
-        PRAGMA user_version = 27;
       `)
-    }
+    })
     // v28 (Code, real pi-SDK agent): a 'code'-kind run stores the scratch/repo folder it
     // runs against (the pi cwd + containment root), the sidebar branch label, and the
     // composer's worktree intent (captured but NOT acted on in Phase 1). Diff stat columns
     // default to 0 for Phase 1. All additive + nullable — existing agent_runs rows get NULL
     // and are decoded as undefined in rowToAgentRun (non-breaking). hasColumn-guarded because
     // this branch's migration ladder has been renumbered before (see hasColumn's comment).
-    if (v < 28) {
+    this.migrationStep(v, 28, () => {
       if (!this.hasColumn('agent_runs', 'repo_root'))       this.db.exec(`ALTER TABLE agent_runs ADD COLUMN repo_root TEXT;`)
       if (!this.hasColumn('agent_runs', 'repo_branch'))     this.db.exec(`ALTER TABLE agent_runs ADD COLUMN repo_branch TEXT;`)
       if (!this.hasColumn('agent_runs', 'use_worktree'))    this.db.exec(`ALTER TABLE agent_runs ADD COLUMN use_worktree INTEGER;`)
@@ -998,27 +1186,24 @@ export class ConversationStore {
       if (!this.hasColumn('agent_runs', 'worktree_base'))   this.db.exec(`ALTER TABLE agent_runs ADD COLUMN worktree_base TEXT;`)
       if (!this.hasColumn('agent_runs', 'lines_added'))     this.db.exec(`ALTER TABLE agent_runs ADD COLUMN lines_added INTEGER;`)
       if (!this.hasColumn('agent_runs', 'lines_removed'))   this.db.exec(`ALTER TABLE agent_runs ADD COLUMN lines_removed INTEGER;`)
-      this.db.exec(`PRAGMA user_version = 28;`)
-    }
+    })
     // v29 (Code, manual /compact): one active compaction per session — a summary plus the last
     // DB message id it covers. Not incremental (a second /compact re-summarizes everything up
     // to that point again, replacing the old summary), which keeps seedPriorHistory's replay
     // logic (code-session.ts) simple: at most one summary entry, then raw messages after it.
-    if (v < 29) {
+    this.migrationStep(v, 29, () => {
       if (!this.hasColumn('agent_runs', 'compaction_summary'))          this.db.exec(`ALTER TABLE agent_runs ADD COLUMN compaction_summary TEXT;`)
       if (!this.hasColumn('agent_runs', 'compaction_upto_message_id'))  this.db.exec(`ALTER TABLE agent_runs ADD COLUMN compaction_upto_message_id TEXT;`)
       if (!this.hasColumn('agent_runs', 'compaction_tokens_before'))    this.db.exec(`ALTER TABLE agent_runs ADD COLUMN compaction_tokens_before INTEGER;`)
-      this.db.exec(`PRAGMA user_version = 29;`)
-    }
+    })
     // v30 (Code, /clear + /resume): a soft "clear chat" marker — the last DB message id
     // covered by a clear, mirroring compaction_upto_message_id's shape but with no summary
     // text (a clear is a blank slate, not a summarized carry-forward). Null = never cleared,
     // or resumed back from one. resolveEffectiveHistory (code-session.ts) takes whichever of
     // this and the compaction cut point is later in the message sequence.
-    if (v < 30) {
+    this.migrationStep(v, 30, () => {
       if (!this.hasColumn('agent_runs', 'cleared_upto_message_id')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN cleared_upto_message_id TEXT;`)
-      this.db.exec(`PRAGMA user_version = 30;`)
-    }
+    })
     // v31 (Code, founder-reported gap 2026-07-13, item 6): an ordered text/tool-call timeline
     // for assistant messages, so a completed Code turn can render in TRUE chronological order
     // instead of today's fixed "reasoning → all tool calls grouped → final text" layout — the
@@ -1026,10 +1211,9 @@ export class ConversationStore {
     // JSON array of {type:'text',text} | {type:'tool',id} blocks (tool blocks reference an id in
     // `toolCalls` rather than duplicating it). Nullable — existing rows get NULL and the UI falls
     // back to the pre-fix grouped rendering for them (non-breaking, no backfill).
-    if (v < 31) {
+    this.migrationStep(v, 31, () => {
       if (!this.hasColumn('messages', 'timeline')) this.db.exec(`ALTER TABLE messages ADD COLUMN timeline TEXT;`)
-      this.db.exec(`PRAGMA user_version = 31;`)
-    }
+    })
     // v32 (Code, founder-reported gap 2026-07-14): a manual session rename used to silently
     // revert on the next completed turn — code-run-manager.ts's pump() unconditionally mirrored
     // conversations.title onto agent_runs.title after EVERY successful turn (auto-title's own
@@ -1040,10 +1224,9 @@ export class ConversationStore {
     // NULL (their title may already have been mirrored under the old unconditional behavior —
     // treated as "not yet synced" is harmless, it just allows exactly one more mirror before
     // this fix's guard takes over for good).
-    if (v < 32) {
+    this.migrationStep(v, 32, () => {
       if (!this.hasColumn('agent_runs', 'title_auto_synced')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN title_auto_synced INTEGER;`)
-      this.db.exec(`PRAGMA user_version = 32;`)
-    }
+    })
     // v33 (Code, founder-reported bug 2026-07-17, found live against a real 40-message session):
     // revert-to-message previously reused clearedUpToMessageId (a movable prefix cursor), which
     // can only hide "everything before X, show everything after" — backwards from what a revert
@@ -1052,17 +1235,16 @@ export class ConversationStore {
     // deactivation (is_active=0, the same mechanism Chat's branching already uses — getMessages()
     // filters is_active=1 unconditionally) fixes both: it needs a marker of its own so /resume
     // knows what to reactivate. Nullable — existing rows get NULL (never reverted).
-    if (v < 33) {
+    this.migrationStep(v, 33, () => {
       if (!this.hasColumn('agent_runs', 'reverted_from_message_id')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN reverted_from_message_id TEXT;`)
-      this.db.exec(`PRAGMA user_version = 33;`)
-    }
+    })
     // v34 (GitHub #71): tokens hitting the gateway (/v1/messages, /v1/chat/completions) from
     // external clients — Claude Code, other CLIs/extensions — never landed in `messages` (that
     // table is chat-conversation rows only; gateway requests create no conversation). Usage was
     // silently invisible to the Tokens dashboard. One row per completed gateway request, kept
     // deliberately separate from `messages` (no conv_id/role — it isn't a chat turn) rather than
     // merged into the existing streak/session semantics there, which are chat-specific concepts.
-    if (v < 34) {
+    this.migrationStep(v, 34, () => {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS api_usage (
           id             TEXT PRIMARY KEY,
@@ -1073,28 +1255,25 @@ export class ConversationStore {
           gen_tokens     INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_api_usage_created ON api_usage(created_at);
-        PRAGMA user_version = 34;
       `)
-    }
+    })
     // v35 (ADR-283, Code agent selector): which coding agent a session launches with
     // (config.ts's code.defaultAgent, snapshotted at creation). Additive + nullable —
     // existing rows get NULL, decoded as undefined (→ 'turbollm') in rowToAgentRun.
-    if (v < 35) {
+    this.migrationStep(v, 35, () => {
       if (!this.hasColumn('agent_runs', 'code_agent')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN code_agent TEXT;`)
-      this.db.exec(`PRAGMA user_version = 35;`)
-    }
+    })
     // v36 (ADR-284, terminal-agent composer parity): api_usage rows gain a code_session_id
     // (which Code session a gateway request belongs to, resolved from the session-scoped
     // token — session-auth.ts) and duration_ms (elapsed wall-clock time of the request, so
     // prompt/gen tokens-per-second can be computed the same way lastRealStats already is for
     // chat sessions). Both additive + nullable — pre-existing rows (and any request whose
     // token doesn't resolve to a Code session) simply have no session/timing to attribute.
-    if (v < 36) {
+    this.migrationStep(v, 36, () => {
       if (!this.hasColumn('api_usage', 'code_session_id')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN code_session_id TEXT;`)
       if (!this.hasColumn('api_usage', 'duration_ms')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN duration_ms INTEGER;`)
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_api_usage_code_session ON api_usage(code_session_id, created_at);`)
-      this.db.exec(`PRAGMA user_version = 36;`)
-    }
+    })
     // v37 (terminal-agent auto-resume across a daemon restart): whether a terminal has ever
     // been created for this session — lets terminal-routes.ts tell a genuinely first-ever
     // launch apart from a restart-reconnect (the in-memory PTY died with the daemon, the
@@ -1102,10 +1281,9 @@ export class ConversationStore {
     // defaulted to 0 — every pre-existing row reads as "never launched", which just means its
     // NEXT terminal open is treated as fresh (the same behavior as today), never wrongly
     // resumed into a conversation that was never actually interrupted.
-    if (v < 37) {
+    this.migrationStep(v, 37, () => {
       if (!this.hasColumn('agent_runs', 'terminal_launched_once')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN terminal_launched_once INTEGER NOT NULL DEFAULT 0;`)
-      this.db.exec(`PRAGMA user_version = 37;`)
-    }
+    })
     // v38 (one-time data fix, same day as v37): v37's terminal_launched_once meant "has a
     // terminal been created before" and its next-launch flag was claude's --continue (resume
     // the most recent conversation in this DIRECTORY). Found live within hours of shipping:
@@ -1117,10 +1295,9 @@ export class ConversationStore {
     // terminal launch is treated as a fresh --session-id registration exactly once, then
     // resumes correctly from then on — a strictly safe replay of v37's own default for rows
     // that, in practice, only existed for a few hours before this fix landed.
-    if (v < 38) {
+    this.migrationStep(v, 38, () => {
       this.db.exec(`UPDATE agent_runs SET terminal_launched_once = 0;`)
-      this.db.exec(`PRAGMA user_version = 38;`)
-    }
+    })
     // v39 (ADR-300): the engine's OWN per-phase rates, as llama.cpp measured them
     // (`timings.prompt_per_second` / `timings.predicted_per_second`). v36 stored only a single
     // `duration_ms` for the whole request and derived both rates from it, which cannot be right
@@ -1128,11 +1305,10 @@ export class ConversationStore {
     // by the TOTAL duration understates both. Measured on a live claude session: 763 generated
     // tokens over a 62 s request read as 12.3 tok/s while the engine's own decode rate was ~78.
     // Additive + nullable: pre-existing rows keep the old derived approximation (below).
-    if (v < 39) {
+    this.migrationStep(v, 39, () => {
       if (!this.hasColumn('api_usage', 'prompt_tps')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN prompt_tps REAL;`)
       if (!this.hasColumn('api_usage', 'gen_tps')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN gen_tps REAL;`)
-      this.db.exec(`PRAGMA user_version = 39;`)
-    }
+    })
     // v40 (Code, real worktrees): the ABSOLUTE path of the git worktree a session actually runs
     // in, when it was created with "Use worktree". Kept separate from `repo_root` rather than
     // overwriting it: repo_root stays the base repository, which is what worktree removal has to
@@ -1140,15 +1316,14 @@ export class ConversationStore {
     // Null for every session that isn't using a worktree — including all existing rows, whose
     // `use_worktree` intent was captured but never acted on (v28's comment), so they correctly
     // decode as "no worktree" rather than claiming one that was never created.
-    if (v < 40) {
+    this.migrationStep(v, 40, () => {
       if (!this.hasColumn('agent_runs', 'worktree_path')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN worktree_path TEXT;`)
-      this.db.exec(`PRAGMA user_version = 40;`)
-    }
+    })
     // v41 (Routines, Phase 1 foundation): scheduled tasks (chat or code) that fire on a
     // cron-like schedule. routine_runs cascades on routine delete (FK + ON DELETE CASCADE,
     // relying on the `PRAGMA foreign_keys = ON` set above) — unlike agent_runs' explicit
     // multi-table delete, a routine's runs have no other referents to clean up.
-    if (v < 41) {
+    this.migrationStep(v, 41, () => {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS routines (
           id TEXT PRIMARY KEY,
@@ -1180,30 +1355,27 @@ export class ConversationStore {
           ended_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_routine_runs_routine ON routine_runs(routine_id, started_at);
-        PRAGMA user_version = 41;
       `)
-    }
+    })
     // v42 (Routines: open a run as a real chat/Code session): a chat-flavor run already creates a
     // full conversation (chat-runner.ts) and a code-flavor run already creates a full Code session
     // (code-runner.ts) — both were previously un-lookup-able from the run row itself, so the only
     // way to see what a run actually did was the flattened `result` text. Nullable/additive: every
     // pre-existing run correctly decodes as "no linked session" (it genuinely has none — the id was
     // never persisted), falling back to `result`.
-    if (v < 42) {
+    this.migrationStep(v, 42, () => {
       if (!this.hasColumn('routine_runs', 'conversation_id')) this.db.exec(`ALTER TABLE routine_runs ADD COLUMN conversation_id TEXT;`)
       if (!this.hasColumn('routine_runs', 'code_session_id')) this.db.exec(`ALTER TABLE routine_runs ADD COLUMN code_session_id TEXT;`)
-      this.db.exec(`PRAGMA user_version = 42;`)
-    }
+    })
     // v43 (spec 23 §3.5, telemetry Phase 5): which coding-tool CLI made this gateway request,
     // classified from its User-Agent header (classify.ts's classifyHarness) at the two gateway
     // entry points (gateway.ts) — the gateway read zero request headers before this. Additive +
     // nullable: every pre-existing row simply has no header to have classified, and reads as
     // 'unknown' (gatewayDailyStats' own fallback), the same bucket a genuinely unrecognized
     // client falls into going forward.
-    if (v < 43) {
+    this.migrationStep(v, 43, () => {
       if (!this.hasColumn('api_usage', 'harness')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN harness TEXT;`)
-      this.db.exec(`PRAGMA user_version = 43;`)
-    }
+    })
     // v44 (founder-reported: a terminal-agent session's ctx-fill ring jumped between full and
     // empty within the same session): getLastApiUsageForSession now picks the row with the
     // MAX prompt_tokens for the session instead of literally the most-recently-inserted one —
@@ -1211,11 +1383,10 @@ export class ConversationStore {
     // share the main turn's code_session_id, and a smaller sub-agent row finishing after the
     // real turn used to silently win). This index serves that new query pattern the same way
     // idx_api_usage_code_session (v36) served the old ORDER BY created_at.
-    if (v < 44) {
+    this.migrationStep(v, 44, () => {
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_api_usage_code_session_tokens ON api_usage(code_session_id, prompt_tokens);`)
-      this.db.exec(`PRAGMA user_version = 44;`)
-    }
-    if (v < 45) {
+    })
+    this.migrationStep(v, 45, () => {
       // Spec 27 §9.1: tenancy for the public chat API. Every column is NOT NULL with a
       // DEFAULT, so this is a metadata-only ALTER in SQLite and existing rows land in the
       // local scope untouched. hasColumn guards each ADD because this branch's ladder has
@@ -1237,9 +1408,8 @@ export class ConversationStore {
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_msg_scope_chat_seq ON messages(tenant, owner, conv_id, seq);`)
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_msg_variant ON messages(tenant, conv_id, variant_group);`)
 
-      this.db.exec(`PRAGMA user_version = 45;`)
-    }
-    if (v < 46) {
+    })
+    this.migrationStep(v, 46, () => {
       // Phase 2 Task 4: folder scoping for the FolderStore capability group (spec 27
       // §4.2). Deliberately a NEW block rather than an extension of v45 above — v45 has
       // already run (and bumped user_version to 45) on every database that has been
@@ -1250,9 +1420,8 @@ export class ConversationStore {
       if (!this.hasColumn('folders', 'tenant')) this.db.exec(`ALTER TABLE folders ADD COLUMN tenant TEXT NOT NULL DEFAULT 'local';`)
       if (!this.hasColumn('folders', 'owner'))  this.db.exec(`ALTER TABLE folders ADD COLUMN owner TEXT NOT NULL DEFAULT 'default';`)
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_folders_scope ON folders(tenant, owner, sort_order);`)
-      this.db.exec(`PRAGMA user_version = 46;`)
-    }
-    if (v < 47) {
+    })
+    this.migrationStep(v, 47, () => {
       // Public API run records (spec 27 §6.4). Local-only: a run is node-local operational
       // state (an abort controller, a cursor, an engine target), never integrator data, so it
       // must NOT sit behind the pluggable store — that would force every adapter author to
@@ -1273,9 +1442,8 @@ export class ConversationStore {
         CREATE INDEX IF NOT EXISTS idx_ext_runs_tenant ON ext_runs(tenant, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_ext_runs_status ON ext_runs(status);
       `)
-      this.db.exec(`PRAGMA user_version = 47;`)
-    }
-    if (v < 48) {
+    })
+    this.migrationStep(v, 48, () => {
       // Audit trail for tenant-scoped mutations (spec 27 §10). There is deliberately NO
       // content column: the log records THAT a chat or message changed, never what was said.
       // A content-carrying audit log is a second, unscoped copy of every conversation.
@@ -1293,25 +1461,22 @@ export class ConversationStore {
         );
         CREATE INDEX IF NOT EXISTS idx_ext_audit_tenant_at ON ext_audit(tenant, at DESC);
       `)
-      this.db.exec(`PRAGMA user_version = 48;`)
-    }
-    if (v < 49) {
+    })
+    this.migrationStep(v, 49, () => {
       // v49 (ADR-386, ctx-gauge-freeze fix): api_usage gains a `ctx_used` column that tracks the
       // current context size, updated during /compact so the ring reflects post-compaction reality.
       // `prompt_tokens` still carries the largest-request value (sub-agent safety net), but the
       // ring now reads `ctx_used` — the actual context window fill — which compaction updates.
       if (!this.hasColumn('api_usage', 'ctx_used')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN ctx_used INTEGER DEFAULT 0;`)
-      this.db.exec(`PRAGMA user_version = 49;`)
-    }
+    })
     // v50 (ADR-420): chat compaction — mirrors agent_runs's compaction_summary /
     // compaction_upto_message_id / compaction_tokens_before columns exactly (same names,
     // same semantics), so the pattern reads as one system across Chat and Code.
-    if (v < 50) {
+    this.migrationStep(v, 50, () => {
       if (!this.hasColumn('conversations', 'compaction_summary'))         this.db.exec(`ALTER TABLE conversations ADD COLUMN compaction_summary TEXT;`)
       if (!this.hasColumn('conversations', 'compaction_upto_message_id')) this.db.exec(`ALTER TABLE conversations ADD COLUMN compaction_upto_message_id TEXT;`)
       if (!this.hasColumn('conversations', 'compaction_tokens_before'))   this.db.exec(`ALTER TABLE conversations ADD COLUMN compaction_tokens_before INTEGER;`)
-      this.db.exec(`PRAGMA user_version = 50;`)
-    }
+    })
     // v51: when the compaction was applied. The chat header's context meter reads the LAST
     // assistant message's recorded ctxUsed — a measurement of what THAT turn actually sent,
     // which compaction deliberately never rewrites. So right after compacting, the meter
@@ -1320,35 +1485,208 @@ export class ConversationStore {
     // measurement predates the compaction, project the new size" apart from "a real turn has
     // since run on the compacted prompt, trust the measurement" — the two cases are otherwise
     // indistinguishable, and survive a reload only if it's persisted.
-    if (v < 51) {
+    this.migrationStep(v, 51, () => {
       if (!this.hasColumn('conversations', 'compaction_applied_at')) this.db.exec(`ALTER TABLE conversations ADD COLUMN compaction_applied_at TEXT;`)
-      this.db.exec(`PRAGMA user_version = 51;`)
-    }
+    })
     // v52: a user turn's attached-document text (Message.docContext). It used to exist only in
     // the request that first sent the turn, so a regenerate or edit-and-resend sent the turn
     // again without its documents. Nullable, no default: most turns attach nothing.
-    if (v < 52) {
+    this.migrationStep(v, 52, () => {
       if (!this.hasColumn('messages', 'doc_context')) this.db.exec(`ALTER TABLE messages ADD COLUMN doc_context TEXT;`)
-      this.db.exec(`PRAGMA user_version = 52;`)
+    })
+    // v53 (scalability review Tier 2): indexes so the hot reads stop scanning whole history
+    // tables on the event loop. All CREATE INDEX IF NOT EXISTS, so a crash before the version
+    // bump just re-runs them.
+    //  - messages(created_at): the dashboards' and daily roll-ups' date ranges.
+    //  - idx_messages_model_tps: partial, only replies that recorded a usable t/s, in
+    //    (model_key, created_at, seq) order, so lastGenTpsByModel is one seek per model. Its
+    //    WHERE must stay word-for-word USABLE_TPS_ROW, or SQLite will not use it.
+    //  - idx_messages_unfinished: partial, only the turn placeholders the startup reconcile
+    //    looks for, which a finished turn's stats save removes from it — so it stays tiny.
+    //  - the list views' keyset orders: conversations by kind, agent runs, a routine's runs,
+    //    memory facts.
+    this.migrationStep(v, 53, () => {
+      const messages = this.maxRowid('messages')
+      if (messages > LARGE_HISTORY_ROWS) console.log(`[db] indexing ${messages} chat messages, once; this can take a while`)
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+        CREATE INDEX IF NOT EXISTS idx_messages_model_tps ON messages(model_key, created_at, seq) WHERE ${USABLE_TPS_ROW};
+        CREATE INDEX IF NOT EXISTS idx_messages_unfinished ON messages(conv_id) WHERE ${UNFINISHED_REPLY};
+        CREATE INDEX IF NOT EXISTS idx_conversations_kind_updated ON conversations(kind, updated_at, id);
+        CREATE INDEX IF NOT EXISTS idx_agent_runs_updated ON agent_runs(updated_at, id);
+        CREATE INDEX IF NOT EXISTS idx_routine_runs_routine_started ON routine_runs(routine_id, started_at, id);
+        CREATE INDEX IF NOT EXISTS idx_memory_facts_created_id ON memory_facts(created_at, id);
+      `)
+    })
+    // v54 (scalability review 2.2): full-text indexes for chat search, which used to LIKE-scan
+    // every message body. The migration adds only the backfill's progress table, on every
+    // runtime; the index itself follows the runtime that opens the database (reconcileSearchIndex),
+    // since only some have FTS5: node:sqlite from Node 22.16, never the bundled sql.js (Android).
+    this.migrationStep(v, 54, () => {
+      this.db.exec(SEARCH_INDEX_BACKFILL_TABLE)
+    })
+    // v55 (scalability review 2.4, data retention): `api_usage` gains a row per gateway request
+    // forever. The retention sweep (chat/retention.ts) folds rows older than its cutoff into one
+    // row per local day and dashboard group here, then deletes them; every reader sums both.
+    // model_key/harness hold '' for api_usage's NULL, so the primary key can upsert them.
+    // first_at/first_seq carry the group's earliest created_at and rowid, which apiUsageStats
+    // orders its groups by. idx_api_usage_code_session_ctx finds a Code session's peak-context
+    // row (getLastApiUsageForSession's MAX), which the sweep keeps raw, in one seek.
+    this.migrationStep(v, 55, () => {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS api_usage_daily (
+          day           TEXT NOT NULL,
+          source        TEXT NOT NULL,
+          model_key     TEXT NOT NULL DEFAULT '',
+          harness       TEXT NOT NULL DEFAULT '',
+          requests      INTEGER NOT NULL,
+          prompt_tokens INTEGER NOT NULL,
+          gen_tokens    INTEGER NOT NULL,
+          first_at      TEXT NOT NULL,
+          first_seq     INTEGER NOT NULL,
+          PRIMARY KEY (day, source, model_key, harness)
+        );
+        CREATE INDEX IF NOT EXISTS idx_api_usage_code_session_ctx ON api_usage(code_session_id, ctx_used);
+      `)
+    })
+  }
+
+  /** Applies migration `version` when the database is older, as one transaction together with
+   *  its user_version bump: a step that throws (or a crash midway) leaves neither half of it,
+   *  and the next open runs it again. PRAGMAs that do nothing inside a transaction
+   *  (journal_mode, foreign_keys) stay in migrate()'s preamble, outside every step. */
+  private migrationStep(current: number, version: number, step: () => void): void {
+    if (current >= version) return
+    this.transaction(() => {
+      step()
+      this.db.exec(`PRAGMA user_version = ${version}`)
+    })
+  }
+
+  private fts5Compiled(): boolean {
+    return (this.db.prepare(`SELECT sqlite_compileoption_used('ENABLE_FTS5') AS yes`).get() as { yes: number }).yes === 1
+  }
+
+  private maxRowid(table: string): number {
+    return (this.db.prepare(`SELECT COALESCE(MAX(rowid), 0) AS n FROM ${table}`).get() as { n: number }).n
+  }
+
+  private schemaHas(name: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM sqlite_master WHERE name = $name`).get({ $name: name } as P)
+  }
+
+  /** Fits chat search's index to the runtime that opened the database, each open, cheaply:
+   *  - no FTS5 (sql.js, Node before 22.16): its triggers go, or every message write would fail
+   *    on the missing module; search stays on LIKE. The FTS tables stay (dropping one needs the module).
+   *  - FTS5, the index whole: kept, with whatever backfill is still pending.
+   *  - FTS5, the index missing or partial (a fresh database, or one written meanwhile by a runtime
+   *    without FTS5, whose writes it never saw): created empty, and every existing row is left to
+   *    the background backfill — never tokenized here, on the boot path. */
+  private reconcileSearchIndex(): void {
+    if (!this.fts5Compiled()) {
+      this.db.exec(SEARCH_INDEX_TRIGGERS.map((t) => `DROP TRIGGER IF EXISTS ${t};`).join('\n'))
+      return
+    }
+    if (![...SEARCH_INDEX_TABLES, ...SEARCH_INDEX_TRIGGERS].every((name) => this.schemaHas(name))) {
+      this.transaction(() => this.createSearchIndex())
+    }
+    this.searchIndexBuilt = true
+    this.refreshSearchIndexBackfillPending()
+  }
+
+  private createSearchIndex(): void {
+    this.db.exec([
+      ...SEARCH_INDEX_TRIGGERS.map((t) => `DROP TRIGGER IF EXISTS ${t};`),
+      ...SEARCH_INDEX_TABLES.map((t) => `DROP TABLE IF EXISTS ${t};`),
+      `${SEARCH_INDEX_BACKFILL_TABLE};`,
+      'DELETE FROM search_index_backfill;',
+    ].join('\n'))
+    const pending = this.db.prepare(`INSERT INTO search_index_backfill (tbl, next_rowid, end_rowid) VALUES ($tbl, $next, $end)`)
+    for (const indexed of SEARCH_INDEXED) {
+      this.db.exec(searchIndexSchema(indexed))
+      const { lo, hi } = this.db.prepare(`SELECT MIN(rowid) AS lo, MAX(rowid) AS hi FROM ${indexed.table}`).get() as { lo: number | null; hi: number | null }
+      if (lo !== null && hi !== null) pending.run({ $tbl: indexed.table, $next: lo, $end: hi } as P)
     }
   }
 
+  private refreshSearchIndexBackfillPending(): void {
+    this.searchIndexBackfillPending = !!this.db.prepare(`SELECT 1 FROM search_index_backfill LIMIT 1`).get()
+  }
+
+  /** Indexes the next `batchRows` rowids the search index's backfill still has, in one transaction
+   *  that also moves its persisted progress past them — so a row is indexed once, by this or (past
+   *  the range) by a trigger. Whether there was a batch to do. For search-index-backfill.ts. */
+  backfillSearchIndex(batchRows: number): boolean {
+    if (!this.searchIndexPending) return false
+    this.transaction(() => {
+      const range = this.db.prepare(`SELECT tbl, next_rowid, end_rowid FROM search_index_backfill ORDER BY tbl LIMIT 1`)
+        .get() as unknown as { tbl: string; next_rowid: number; end_rowid: number }
+      const { table, column } = SEARCH_INDEXED.find((s) => s.table === range.tbl)!
+      const upTo = Math.min(range.next_rowid + batchRows - 1, range.end_rowid)
+      this.db.prepare(`INSERT INTO ${table}_fts (rowid, ${column}) SELECT rowid, ${column} FROM ${table} WHERE rowid BETWEEN $from AND $upTo`)
+        .run({ $from: range.next_rowid, $upTo: upTo } as P)
+      if (upTo >= range.end_rowid) this.db.prepare(`DELETE FROM search_index_backfill WHERE tbl = $tbl`).run({ $tbl: table } as P)
+      else this.db.prepare(`UPDATE search_index_backfill SET next_rowid = $next WHERE tbl = $tbl`).run({ $tbl: table, $next: upTo + 1 } as P)
+    })
+    this.refreshSearchIndexBackfillPending()
+    return true
+  }
+
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
-    if (q) {
-      const kindClause = kind !== 'all' ? ' AND c.kind = $kind' : ''
-      const params = kind !== 'all' ? { $q: `%${q}%`, $kind: kind } : { $q: `%${q}%` }
-      const rows = this.db.prepare(`
-        SELECT DISTINCT c.* FROM conversations c
-        LEFT JOIN messages m ON m.conv_id = c.id
-        WHERE (c.title LIKE $q OR m.content LIKE $q)${kindClause}
-        ORDER BY c.updated_at DESC LIMIT 200
-      `).all(params as P) as unknown as ConvRow[]
-      return rows.map(rowToConv)
+    const query = q?.trim()
+    return query ? this.searchConversations(query, kind) : this.listConversationsPage(kind).conversations
+  }
+
+  /** Up to 200 conversations whose title or messages hold `query`, case-insensitively, most recently
+   *  updated first. The whole query is one substring, spaces included, as it always was. The v54
+   *  trigram index answers it once complete and the query has a trigram; otherwise a LIKE scan does.
+   *  (The index also folds non-ASCII case, where LIKE folds only ASCII.) */
+  private searchConversations(query: string, kind: 'chat' | 'agent' | 'all'): Conversation[] {
+    const indexed = this.searchIndexReady && [...query].length >= TRIGRAM_CHARS
+    const params: P = { $q: indexed ? ftsSubstring(query) : likeSubstring(query) }
+    const kindClause = kind === 'all' ? '' : ' AND c.kind = $kind'
+    if (kind !== 'all') params.$kind = kind
+    const rows = this.db.prepare(`
+      SELECT c.* FROM conversations c
+      WHERE ${indexed ? SEARCH_MATCH_FTS : SEARCH_MATCH_LIKE}${kindClause}
+      ORDER BY c.updated_at DESC LIMIT 200
+    `).all(params) as unknown as ConvRow[]
+    return rows.map(rowToConv)
+  }
+
+  /** The sidebar list, most recently updated first, a keyset page at a time (200 by default
+   *  and at most). Rows leave out the compaction summary (CONV_LIST_COLUMNS). */
+  listConversationsPage(kind: 'chat' | 'agent' | 'all', page: PageOpts = {}): { conversations: Conversation[]; nextCursor: string | null } {
+    const { rows, nextCursor } = this.keysetPage<ConvRow>({
+      columns: CONV_LIST_COLUMNS, table: 'conversations', sortColumn: 'updated_at', sortValue: (r) => r.updated_at,
+      where: kind === 'all' ? [] : ['kind = $kind'], params: kind === 'all' ? {} : { $kind: kind },
+    }, page, 200, 200)
+    return { conversations: rows.map(rowToConv), nextCursor }
+  }
+
+  /** One newest-first page of `table` in (sortColumn DESC, id DESC) order. Keyset, not OFFSET:
+   *  the cursor is the last row's position, so a deep page costs what the first one does, and a
+   *  row updated between pages can't shift the others into a duplicate or a gap. */
+  private keysetPage<R extends { id: string }>(
+    q: { columns: string; table: string; sortColumn: string; sortValue: (row: R) => string; where: string[]; params: P },
+    page: PageOpts, defaultLimit: number, maxLimit: number,
+  ): { rows: R[]; nextCursor: string | null } {
+    const limit = clampPageLimit(page.limit, defaultLimit, maxLimit)
+    const where = [...q.where]
+    const params: P = { ...q.params, $lim: limit + 1 }
+    if (page.cursor) {
+      const at = decodePageCursor(page.cursor)
+      where.push(`(${q.sortColumn}, id) < ($cu, $ci)`)
+      params.$cu = at.u
+      params.$ci = at.i
     }
-    if (kind !== 'all') {
-      return (this.db.prepare(`SELECT * FROM conversations WHERE kind = $kind ORDER BY updated_at DESC LIMIT 200`).all({ $kind: kind } as P) as unknown as ConvRow[]).map(rowToConv)
-    }
-    return (this.db.prepare(`SELECT * FROM conversations ORDER BY updated_at DESC LIMIT 200`).all() as unknown as ConvRow[]).map(rowToConv)
+    const whereSql = where.length ? ` WHERE ${where.join(' AND ')}` : ''
+    const rows = this.db.prepare(`SELECT ${q.columns} FROM ${q.table}${whereSql} ORDER BY ${q.sortColumn} DESC, id DESC LIMIT $lim`)
+      .all(params) as unknown as R[]
+    if (rows.length <= limit) return { rows, nextCursor: null }
+    const pageRows = rows.slice(0, limit)
+    const last = pageRows[limit - 1]
+    return { rows: pageRows, nextCursor: encodePageCursor(q.sortValue(last), last.id) }
   }
 
   createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'sampling' | 'expertMode' | 'toolPolicy' | 'kind' | 'folderId' | 'agentId' | 'skillIds' | 'allowedTools' | 'preserveThinking'>>): Conversation {
@@ -1437,6 +1775,51 @@ export class ConversationStore {
     return (this.db.prepare(`SELECT * FROM messages WHERE conv_id = $id AND is_active = 1 ORDER BY seq ASC`).all({ $id: convId } as P) as unknown as MsgRow[]).map(rowToMsg)
   }
 
+  /** getMessages for the chat to show (GET /conversations/:id, which the web UI polls): without docContext, the
+   *  attached documents' full text, which only a resend reads and no client is sent. */
+  getMessagesForDisplay(convId: string): Message[] {
+    return (this.db.prepare(`SELECT ${MSG_DISPLAY_COLUMNS} FROM messages WHERE conv_id = $id AND is_active = 1 ORDER BY seq ASC`).all({ $id: convId } as P) as unknown as MsgRow[]).map(rowToMsg)
+  }
+
+  /** Ids of the messages in rowids (afterRowid, afterRowid + window] whose attachments JSON contains `needle`, and
+   *  where the next window starts (null past the last message). A window of rowids, not a LIMIT of matches, bounds
+   *  how much one statement scans however few rows match. Only `tenant`'s rows when given (the backfill: the app's
+   *  own), every row when not (the collection, which must see each reference). For the attachment janitor. */
+  messagesWithAttachment(needle: string, afterRowid: number, window: number, tenant?: string): { ids: string[]; next: number | null } {
+    const upTo = afterRowid + window
+    const tenantClause = tenant === undefined ? '' : ' AND tenant = $tenant'
+    const ids = (this.db.prepare(`SELECT id FROM messages WHERE rowid > $after AND rowid <= $upTo AND instr(attachments, $needle) > 0${tenantClause} ORDER BY rowid`)
+      .all({ $after: afterRowid, $upTo: upTo, $needle: needle, ...(tenant === undefined ? {} : { $tenant: tenant }) } as P) as unknown as Array<{ id: string }>).map((r) => r.id)
+    const { last } = this.db.prepare(`SELECT MAX(rowid) AS last FROM messages`).get() as unknown as { last: number | null }
+    return { ids, next: last !== null && last > upTo ? upTo : null }
+  }
+
+  /** A message's attachments as stored (JSON text), for replaceMessageAttachments; null when there is no such row. */
+  messageAttachmentsJson(id: string): string | null {
+    const row = this.db.prepare(`SELECT attachments FROM messages WHERE id = $id`).get({ $id: id } as P) as unknown as { attachments: string } | undefined
+    return row?.attachments ?? null
+  }
+
+  /** Replaces a message's attachments only while they are still `previousJson` (messageAttachmentsJson): a row edited
+   *  or deleted since it was read is left alone. Only the app's own (local) rows: an External Chat API row keeps what
+   *  its client wrote. A replaced row's version goes up, as any change to it does. Whether it was replaced. */
+  replaceMessageAttachments(id: string, previousJson: string, attachments: string[]): boolean {
+    return ((this.db.prepare(`UPDATE messages SET attachments = $next, version = version + 1 WHERE id = $id AND tenant = $local AND attachments = $previous`)
+      .run({ $id: id, $local: LOCAL_SCOPE.tenant, $previous: previousJson, $next: JSON.stringify(attachments) } as P) as unknown) as Changes).changes > 0
+  }
+
+  /** The active-branch messages after `markerId`, in order — the tail a compacted Code session
+   *  replays, read without loading what the compaction already summarized. null when the marker
+   *  is not an active message of this conversation (deleted, regenerated away, or another
+   *  conversation's), exactly the cases where it is absent from getMessages. */
+  getActiveMessagesAfter(convId: string, markerId: string): Message[] | null {
+    const marker = this.db.prepare(`SELECT seq FROM messages WHERE id = $id AND conv_id = $cid AND is_active = 1`)
+      .get({ $id: markerId, $cid: convId } as P) as unknown as { seq: number } | undefined
+    if (!marker) return null
+    return (this.db.prepare(`SELECT * FROM messages WHERE conv_id = $cid AND is_active = 1 AND seq > $seq ORDER BY seq ASC`)
+      .all({ $cid: convId, $seq: marker.seq } as P) as unknown as MsgRow[]).map(rowToMsg)
+  }
+
   /** Like {@link deactivateMessagesFrom}'s own range (seq >= fromMessageId's seq) — but returns
    *  the actual rows regardless of is_active, unlike getMessages' unconditional is_active=1
    *  filter. Needed for Code's /revert file-revert path: a SUPERSEDING revert (ADR-278) that
@@ -1506,46 +1889,63 @@ export class ConversationStore {
    *  (kind 'code') are Code's own: its run reconcile marks them, and a finished Code turn can carry those same
    *  stats. Returns how many replies were marked. */
   abortUnfinishedReplies(): number {
+    // Reads only the partial index idx_messages_unfinished (v53), then checks each hit's
+    // conversation by primary key — this runs at every startup, so it must not scan history.
     return ((this.db.prepare(
       `UPDATE messages SET stats = '{"aborted":true}'
-        WHERE role = 'assistant' AND stats = '{"aborted":false}' AND edited = 0
-          AND conv_id IN (SELECT id FROM conversations WHERE kind <> 'code')`,
+        WHERE ${UNFINISHED_REPLY}
+          AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = messages.conv_id AND c.kind <> 'code')`,
     ).run() as unknown) as Changes).changes
   }
 
   /** Most-recent assistant gen t/s per model (spec 04 §5 `lastTps`). For each
    *  model_key, takes the newest assistant message that recorded a positive
    *  `stats.tps` and returns its value. Rows with NULL model_key (pre-v2) or no
-   *  usable t/s are skipped. Returns an empty map when there's no chat history. */
+   *  usable t/s are skipped. Returns an empty map when there's no chat history.
+   *  GET /api/v1/models runs this on every poll, so it walks the partial index
+   *  idx_messages_model_tps (only rows with a usable t/s): the model keys one seek at a
+   *  time (MIN above the previous one — a skip scan), then the newest row of each. */
   lastGenTpsByModel(): Map<string, number> {
-    const rows = this.db.prepare(`
-      SELECT model_key, stats FROM messages
-      WHERE role = 'assistant' AND model_key IS NOT NULL
-      ORDER BY created_at DESC, seq DESC
-    `).all() as unknown as { model_key: string; stats: string }[]
+    const firstModel = this.db.prepare(`SELECT MIN(model_key) AS m FROM messages WHERE ${USABLE_TPS_ROW}`)
+    const nextModel = this.db.prepare(`SELECT MIN(model_key) AS m FROM messages WHERE ${USABLE_TPS_ROW} AND model_key > $after`)
+    const newestTps = this.db.prepare(`
+      SELECT json_extract(stats, '$.tps') AS tps FROM messages
+      WHERE ${USABLE_TPS_ROW} AND model_key = $m
+      ORDER BY created_at DESC, seq DESC LIMIT 1
+    `)
     const out = new Map<string, number>()
-    for (const r of rows) {
-      if (out.has(r.model_key)) continue // rows are newest-first → newest valid wins
-      const tps = (safeJson(r.stats) as Partial<MessageStats>).tps
-      if (typeof tps === 'number' && tps > 0) out.set(r.model_key, Math.round(tps * 10) / 10)
+    type ModelRow = { m: string | null } | undefined
+    for (let r = firstModel.get() as ModelRow; r?.m != null; r = nextModel.get({ $after: r.m } as P) as ModelRow) {
+      const { tps } = newestTps.get({ $m: r.m } as P) as { tps: number }
+      out.set(r.m, Math.round(tps * 10) / 10)
     }
     return out
   }
 
   /** Token usage dashboard (Release 3): sessions/messages/tokens/active-days scoped to
    *  `range`, lifetime streaks (a streak isn't a "last N days" concept), the local hour
-   *  with the most activity, a per-model breakdown, and the heatmap day buckets — all from
-   *  one pass over `messages`. Days are bucketed by LOCAL calendar date (this daemon and its
-   *  user are always the same machine), not UTC, so a late-night session lands on the day
-   *  the user actually thinks of as "today". */
+   *  with the most activity, a per-model breakdown, and the heatmap day buckets. Days are
+   *  bucketed by LOCAL calendar date (this daemon and its user are always the same machine),
+   *  not UTC, so a late-night session lands on the day the user actually thinks of as "today".
+   *
+   *  The lifetime streaks need every day ever active whatever `range` is, so SQLite sums the
+   *  whole history per (UTC quarter hour, model) — see quarterHour for why that keeps local days
+   *  and hours exact — and JavaScript gets one row per active quarter, not one per reply, with no
+   *  stats JSON to parse. Rows come in order of first appearance, so Map insertion order (which
+   *  breaks peak-hour and favorite-model ties) is what the per-reply pass it replaced had.
+   *  Still one aggregate pass over the table per call; a daily roll-up table would make it
+   *  O(days), but has to stay in step with every stats write, so it is left for later. */
   tokenUsageStats(range: TokenUsageRange = 'all'): TokenUsageStats {
-    const rows = this.db.prepare(`
-      SELECT conv_id, created_at, stats, model_key FROM messages
-      WHERE role = 'assistant'
-      ORDER BY created_at ASC
-    `).all() as unknown as { conv_id: string; created_at: string; stats: string; model_key: string | null }[]
+    const quarters = (this.db.prepare(`
+      SELECT ${quarterHour('created_at')} AS quarter, model_key, COUNT(*) AS messages,
+        SUM(${statsNumber('promptTokens')}) AS prompt_tokens, SUM(${statsNumber('genTokens')}) AS gen_tokens
+      FROM messages WHERE role = 'assistant'
+      GROUP BY quarter, model_key
+      ORDER BY quarter, MIN(created_at), MIN(rowid)
+    `).all() as unknown as { quarter: string; model_key: string | null; messages: number; prompt_tokens: number; gen_tokens: number }[])
+      .map((q) => ({ at: quarterStartIso(q.quarter), modelKey: q.model_key, messages: q.messages, promptTokens: q.prompt_tokens, genTokens: q.gen_tokens }))
 
-    if (rows.length === 0) {
+    if (quarters.length === 0) {
       // Computed independently — a user with zero in-app chats but real gateway (Claude
       // Code / extension) traffic still has something to show here. "Total tokens" /
       // "Lifetime tokens" (below and in the main branch) are the founder-directed
@@ -1566,16 +1966,15 @@ export class ConversationStore {
     // Per-local-day totals across the FULL history — needed for the lifetime streaks
     // regardless of `range`, and reused below for the heatmap window.
     const dayBuckets = new Map<string, { promptTokens: number; genTokens: number; messageCount: number }>()
-    const firstMessageAt = rows[0].created_at
-    for (const r of rows) {
-      const key = dayKey(r.created_at)
+    for (const q of quarters) {
+      const key = dayKey(q.at)
       const b = dayBuckets.get(key) ?? { promptTokens: 0, genTokens: 0, messageCount: 0 }
-      const s = safeJson(r.stats) as Partial<MessageStats>
-      b.promptTokens += typeof s.promptTokens === 'number' ? s.promptTokens : 0
-      b.genTokens += typeof s.genTokens === 'number' ? s.genTokens : 0
-      b.messageCount++
+      b.promptTokens += q.promptTokens
+      b.genTokens += q.genTokens
+      b.messageCount += q.messages
       dayBuckets.set(key, b)
     }
+    const firstMessageAt = (this.db.prepare(`SELECT MIN(created_at) AS at FROM messages WHERE role = 'assistant'`).get() as { at: string }).at
 
     const todayKey = dayKey(new Date().toISOString())
     const firstKey = dayKey(firstMessageAt)
@@ -1603,29 +2002,27 @@ export class ConversationStore {
     // String comparison is safe and deliberately used over Date parsing here — both sides
     // are zero-padded "YYYY-MM-DD" keys, and `new Date("YYYY-MM-DD")` parses as UTC
     // midnight (not local), a classic footgun this sidesteps entirely.
-    const scopedRows = range === 'all' ? rows : rows.filter((r) => dayKey(r.created_at) >= heatStart)
+    const scoped = range === 'all' ? quarters : quarters.filter((q) => dayKey(q.at) >= heatStart)
+    const sessions = this.chatSessionsSince(range === 'all' ? null : this.dayWindow(heatStart).start)
 
-    const convIds = new Set<string>()
     const hourTally = new Map<number, number>()
     const modelTally = new Map<string, { messageCount: number; promptTokens: number; genTokens: number }>()
     const dayModelTally = new Map<string, Map<string, number>>()
-    let totalTokens = 0
-    for (const r of scopedRows) {
-      convIds.add(r.conv_id)
-      const s = safeJson(r.stats) as Partial<MessageStats>
-      const pt = typeof s.promptTokens === 'number' ? s.promptTokens : 0
-      const gt = typeof s.genTokens === 'number' ? s.genTokens : 0
-      totalTokens += pt + gt
-      const hour = new Date(r.created_at).getHours()
-      hourTally.set(hour, (hourTally.get(hour) ?? 0) + 1)
-      if (r.model_key) {
-        const m = modelTally.get(r.model_key) ?? { messageCount: 0, promptTokens: 0, genTokens: 0 }
-        m.messageCount++; m.promptTokens += pt; m.genTokens += gt
-        modelTally.set(r.model_key, m)
+    let totalTokens = 0, messages = 0
+    for (const q of scoped) {
+      const tokens = q.promptTokens + q.genTokens
+      totalTokens += tokens
+      messages += q.messages
+      const hour = new Date(q.at).getHours()
+      hourTally.set(hour, (hourTally.get(hour) ?? 0) + q.messages)
+      if (q.modelKey) {
+        const m = modelTally.get(q.modelKey) ?? { messageCount: 0, promptTokens: 0, genTokens: 0 }
+        m.messageCount += q.messages; m.promptTokens += q.promptTokens; m.genTokens += q.genTokens
+        modelTally.set(q.modelKey, m)
 
-        const day = dayKey(r.created_at)
+        const day = dayKey(q.at)
         const dm = dayModelTally.get(day) ?? new Map<string, number>()
-        dm.set(r.model_key, (dm.get(r.model_key) ?? 0) + pt + gt)
+        dm.set(q.modelKey, (dm.get(q.modelKey) ?? 0) + tokens)
         dayModelTally.set(day, dm)
       }
     }
@@ -1672,17 +2069,14 @@ export class ConversationStore {
     } else {
       const granularityHours = range === '7d' ? 1 : 12
       const subTally = new Map<string, { totalTokens: number; messageCount: number }>()
-      for (const r of scopedRows) {
-        const d = new Date(r.created_at)
-        const day = dayKey(r.created_at)
+      for (const q of scoped) {
+        const d = new Date(q.at)
+        const day = dayKey(q.at)
         const bucketKey = granularityHours === 1
           ? `${day}T${String(d.getHours()).padStart(2, '0')}`
           : `${day}-${d.getHours() < 12 ? 'AM' : 'PM'}`
-        const s = safeJson(r.stats) as Partial<MessageStats>
-        const pt = typeof s.promptTokens === 'number' ? s.promptTokens : 0
-        const gt = typeof s.genTokens === 'number' ? s.genTokens : 0
         const b = subTally.get(bucketKey) ?? { totalTokens: 0, messageCount: 0 }
-        b.totalTokens += pt + gt; b.messageCount++
+        b.totalTokens += q.promptTokens + q.genTokens; b.messageCount += q.messages
         subTally.set(bucketKey, b)
       }
       const buckets: ActivityBucket[] = []
@@ -1721,13 +2115,22 @@ export class ConversationStore {
     const milestone = milestoneFor(combinedLifetimeTotalTokens)
 
     return {
-      range, sessions: convIds.size, messages: scopedRows.length, totalTokens: combinedTotalTokens, activeDays,
+      range, sessions, messages, totalTokens: combinedTotalTokens, activeDays,
       currentStreak, longestStreak, peakHour,
       favoriteModel: byModel[0]?.displayName ?? null,
       firstMessageAt, lifetimeTotalTokens: combinedLifetimeTotalTokens, milestone,
       activity, dailyByModel, byModel,
       api,
     }
+  }
+
+  /** Conversations with an assistant reply at or after `since` (an ISO instant; null: ever). */
+  private chatSessionsSince(since: string | null): number {
+    // INDEXED BY: for a DISTINCT, SQLite's planner otherwise prefers walking idx_messages_conv
+    // (sorted conv_ids, no temp sort) over the whole table instead of seeking the date range.
+    const range = since === null ? '' : ' INDEXED BY idx_messages_created WHERE created_at >= $since AND'
+    return (this.db.prepare(`SELECT COUNT(DISTINCT conv_id) AS n FROM messages${range || ' WHERE'} role = 'assistant'`)
+      .get(since === null ? {} : { $since: since } as P) as { n: number }).n
   }
 
   /** Insert one completed gateway request (GitHub #71) — called from the two gateway entry
@@ -1828,7 +2231,7 @@ export class ConversationStore {
     const row = this.db.prepare(`
       SELECT prompt_tokens, gen_tokens, duration_ms, prompt_tps, gen_tps, ctx_used FROM api_usage
       WHERE code_session_id = $codeSessionId
-      ORDER BY created_at DESC LIMIT 1
+      ORDER BY created_at DESC, rowid DESC LIMIT 1
     `).get({ $codeSessionId: codeSessionId } as P) as unknown as { prompt_tokens: number; gen_tokens: number; duration_ms: number | null; prompt_tps: number | null; gen_tps: number | null; ctx_used: number } | undefined
     if (!row) return null
     // ctx_used is the MAX across all rows — same high-water-mark semantics as the old
@@ -1849,37 +2252,47 @@ export class ConversationStore {
 
   /** Gateway (external-client) token usage — see `ApiUsageStats`'s doc comment for why this
    *  is a separate bucket from `tokenUsageStats`. Same local-day range scoping as the chat
-   *  stats above, but no streak/session concepts (a gateway request isn't a chat turn). */
+   *  stats above, but no streak/session concepts (a gateway request isn't a chat turn).
+   *  SQLite does the sums: the range is a WHERE on the indexed created_at, and JavaScript gets
+   *  one row per (source, model), in order of first appearance like the per-request pass it
+   *  replaced (Map order breaks byModel ties). */
   apiUsageStats(range: TokenUsageRange = 'all'): ApiUsageStats {
-    const rows = this.db.prepare(`
-      SELECT created_at, source, model_key, prompt_tokens, gen_tokens FROM api_usage
-      ORDER BY created_at ASC
-    `).all() as unknown as { created_at: string; source: ApiUsageSource; model_key: string | null; prompt_tokens: number; gen_tokens: number }[]
-
-    let lifetimeTotalTokens = 0
-    for (const r of rows) lifetimeTotalTokens += r.prompt_tokens + r.gen_tokens
-
-    if (rows.length === 0) {
-      return { range, requests: 0, totalTokens: 0, lifetimeTotalTokens: 0, bySource: [], byModel: [] }
-    }
+    const lifetimeTotalTokens = (this.db.prepare(`
+      SELECT (SELECT COALESCE(SUM(prompt_tokens + gen_tokens), 0) FROM api_usage)
+           + (SELECT COALESCE(SUM(prompt_tokens + gen_tokens), 0) FROM api_usage_daily) AS n
+    `).get() as { n: number }).n
 
     const todayKey = dayKey(new Date().toISOString())
-    const heatStart = range === 'all' ? null : addDays(todayKey, -(RANGE_WINDOW_DAYS[range] - 1))
-    const scoped = heatStart === null ? rows : rows.filter((r) => dayKey(r.created_at) >= heatStart)
+    const sinceDay = range === 'all' ? null : addDays(todayKey, -(RANGE_WINDOW_DAYS[range] - 1))
+    const params = sinceDay === null ? {} : { $since: this.dayWindow(sinceDay).start, $sinceDay: sinceDay }
+    // Raw rows and the retention sweep's daily totals (v55) together: a row is in exactly one.
+    const groups = this.db.prepare(`
+      SELECT source, model_key, SUM(requests) AS requests, SUM(prompt_tokens) AS prompt_tokens, SUM(gen_tokens) AS gen_tokens
+      FROM (
+        SELECT source, model_key, 1 AS requests, prompt_tokens, gen_tokens, created_at AS first_at, rowid AS first_seq
+        FROM api_usage${sinceDay === null ? '' : ' WHERE created_at >= $since'}
+        UNION ALL
+        SELECT source, NULLIF(model_key, ''), requests, prompt_tokens, gen_tokens, first_at, first_seq
+        FROM api_usage_daily${sinceDay === null ? '' : ' WHERE day >= $sinceDay'}
+      )
+      GROUP BY source, model_key
+      ORDER BY MIN(first_at), MIN(first_seq)
+    `).all(params as P) as unknown as { source: ApiUsageSource; model_key: string | null; requests: number; prompt_tokens: number; gen_tokens: number }[]
 
     const sourceTally = new Map<ApiUsageSource, { requests: number; totalTokens: number }>()
     const modelTally = new Map<string, { requests: number; promptTokens: number; genTokens: number }>()
-    let totalTokens = 0
-    for (const r of scoped) {
-      const tokens = r.prompt_tokens + r.gen_tokens
+    let totalTokens = 0, requests = 0
+    for (const g of groups) {
+      const tokens = g.prompt_tokens + g.gen_tokens
       totalTokens += tokens
-      const st = sourceTally.get(r.source) ?? { requests: 0, totalTokens: 0 }
-      st.requests++; st.totalTokens += tokens
-      sourceTally.set(r.source, st)
-      if (r.model_key) {
-        const mt = modelTally.get(r.model_key) ?? { requests: 0, promptTokens: 0, genTokens: 0 }
-        mt.requests++; mt.promptTokens += r.prompt_tokens; mt.genTokens += r.gen_tokens
-        modelTally.set(r.model_key, mt)
+      requests += g.requests
+      const st = sourceTally.get(g.source) ?? { requests: 0, totalTokens: 0 }
+      st.requests += g.requests; st.totalTokens += tokens
+      sourceTally.set(g.source, st)
+      if (g.model_key) {
+        const mt = modelTally.get(g.model_key) ?? { requests: 0, promptTokens: 0, genTokens: 0 }
+        mt.requests += g.requests; mt.promptTokens += g.prompt_tokens; mt.genTokens += g.gen_tokens
+        modelTally.set(g.model_key, mt)
       }
     }
 
@@ -1892,9 +2305,73 @@ export class ConversationStore {
       .sort((a, b) => b.totalTokens - a.totalTokens)
 
     return {
-      range, requests: scoped.length, totalTokens, lifetimeTotalTokens,
+      range, requests, totalTokens, lifetimeTotalTokens,
       bySource: [...sourceTally.entries()].map(([source, s]) => ({ source, ...s })),
       byModel,
+    }
+  }
+
+  /** Retention (scalability review 2.4): folds up to `limit` raw `api_usage` rows created before
+   *  `before` into `api_usage_daily` and deletes them, in one transaction. Walks in (created_at,
+   *  rowid) order from `after`; `next` is where the following batch starts, null once done.
+   *  A Code session's latest and peak-context rows stay raw: getLastApiUsageForSession reads
+   *  them, and the rows it skips are walked past, never revisited. */
+  rollUpApiUsageBatch(before: string, limit: number, after: ApiUsageCursor | null = null): { rolledUp: number; next: ApiUsageCursor | null } {
+    return this.transaction(() => {
+      const rows = this.db.prepare(`
+        SELECT rowid AS seq, id, created_at, source, model_key, harness, code_session_id, prompt_tokens, gen_tokens FROM api_usage
+        WHERE created_at < $before${after ? ' AND created_at >= $afterAt AND (created_at > $afterAt OR rowid > $afterSeq)' : ''}
+        ORDER BY created_at, rowid LIMIT $limit
+      `).all({ $before: before, $limit: limit, ...(after ? { $afterAt: after.createdAt, $afterSeq: after.seq } : {}) } as P) as unknown as ApiUsageRollupRow[]
+      const kept = this.codeSessionGaugeRowIds(rows)
+      const folded = rows.filter((r) => !kept.has(r.id))
+      this.addToDailyApiUsage(folded)
+      const del = this.db.prepare(`DELETE FROM api_usage WHERE rowid = $seq`)
+      for (const r of folded) del.run({ $seq: r.seq } as P)
+      const last = rows[rows.length - 1]
+      return { rolledUp: folded.length, next: rows.length < limit ? null : { createdAt: last.created_at, seq: last.seq } }
+    })
+  }
+
+  /** The ids of the rows getLastApiUsageForSession reads for each Code session among `rows`:
+   *  its newest, and one holding its peak ctx_used. */
+  private codeSessionGaugeRowIds(rows: ApiUsageRollupRow[]): Set<string> {
+    const sessions = new Set(rows.map((r) => r.code_session_id).filter((s): s is string => s !== null))
+    const latest = this.db.prepare(`SELECT id FROM api_usage WHERE code_session_id = $s ORDER BY created_at DESC, rowid DESC LIMIT 1`)
+    const peak = this.db.prepare(`SELECT id FROM api_usage WHERE code_session_id = $s ORDER BY ctx_used DESC LIMIT 1`)
+    const ids = new Set<string>()
+    for (const s of sessions) {
+      for (const stmt of [latest, peak]) ids.add((stmt.get({ $s: s } as P) as { id: string }).id)
+    }
+    return ids
+  }
+
+  private addToDailyApiUsage(rows: ApiUsageRollupRow[]): void {
+    const groups = new Map<string, { day: string; source: string; model: string; harness: string; requests: number; prompt: number; gen: number; firstAt: string; firstSeq: number }>()
+    for (const r of rows) {
+      const day = dayKey(r.created_at)
+      const key = [day, r.source, r.model_key ?? '', r.harness ?? ''].join('\x00')
+      const g = groups.get(key) ?? { day, source: r.source, model: r.model_key ?? '', harness: r.harness ?? '', requests: 0, prompt: 0, gen: 0, firstAt: r.created_at, firstSeq: r.seq }
+      g.requests++; g.prompt += r.prompt_tokens; g.gen += r.gen_tokens
+      if (r.created_at < g.firstAt) g.firstAt = r.created_at
+      if (r.seq < g.firstSeq) g.firstSeq = r.seq
+      groups.set(key, g)
+    }
+    const upsert = this.db.prepare(`
+      INSERT INTO api_usage_daily (day, source, model_key, harness, requests, prompt_tokens, gen_tokens, first_at, first_seq)
+      VALUES ($day, $source, $model, $harness, $requests, $prompt, $gen, $firstAt, $firstSeq)
+      ON CONFLICT (day, source, model_key, harness) DO UPDATE SET
+        requests = requests + excluded.requests,
+        prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+        gen_tokens = gen_tokens + excluded.gen_tokens,
+        first_at = MIN(first_at, excluded.first_at),
+        first_seq = MIN(first_seq, excluded.first_seq)
+    `)
+    for (const g of groups.values()) {
+      upsert.run({
+        $day: g.day, $source: g.source, $model: g.model, $harness: g.harness, $requests: g.requests,
+        $prompt: g.prompt, $gen: g.gen, $firstAt: g.firstAt, $firstSeq: g.firstSeq,
+      } as P)
     }
   }
 
@@ -1992,17 +2469,24 @@ export class ConversationStore {
    *  unrecognized live client falls into, so the two cases don't need telling apart downstream. */
   gatewayDailyStats(dayIso: string): { protocol: ApiUsageSource; harness: string; requests: number; promptTokens: number; genTokens: number; distinctModels: number }[] {
     const { start, end } = this.dayWindow(dayIso)
+    // Raw rows and the retention sweep's daily totals for the day (v55), which keep the same
+    // (source, model, harness) detail. In order of first appearance, so the groups come out in
+    // the same order whether or not the day has been rolled up.
     const rows = this.db.prepare(`
-      SELECT source, model_key, harness, prompt_tokens, gen_tokens FROM api_usage
+      SELECT source, model_key, harness, 1 AS requests, prompt_tokens, gen_tokens, created_at AS first_at, rowid AS first_seq FROM api_usage
       WHERE created_at >= ? AND created_at < ?
-    `).all(start, end) as unknown as { source: ApiUsageSource; model_key: string | null; harness: string | null; prompt_tokens: number; gen_tokens: number }[]
+      UNION ALL
+      SELECT source, NULLIF(model_key, ''), NULLIF(harness, ''), requests, prompt_tokens, gen_tokens, first_at, first_seq FROM api_usage_daily
+      WHERE day = ?
+      ORDER BY first_at, first_seq
+    `).all(start, end, dayIso) as unknown as { source: ApiUsageSource; model_key: string | null; harness: string | null; requests: number; prompt_tokens: number; gen_tokens: number }[]
 
     const byGroup = new Map<string, { protocol: ApiUsageSource; harness: string; requests: number; promptTokens: number; genTokens: number; models: Set<string> }>()
     for (const r of rows) {
       const harness = r.harness ?? 'unknown'
       const key = `${r.source}\x00${harness}`
       const t = byGroup.get(key) ?? { protocol: r.source, harness, requests: 0, promptTokens: 0, genTokens: 0, models: new Set<string>() }
-      t.requests++
+      t.requests += r.requests
       t.promptTokens += r.prompt_tokens
       t.genTokens += r.gen_tokens
       if (r.model_key) t.models.add(r.model_key)
@@ -2029,8 +2513,10 @@ export class ConversationStore {
       WHERE c.kind = 'code' AND ar.created_at >= ? AND ar.created_at < ?
     `).get(start, end) as unknown as { n: number }).n
 
+    // CROSS JOIN keeps messages the outer loop, so the day is a seek on idx_messages_created
+    // (v53) rather than every code conversation's messages read and filtered.
     const rows = this.db.prepare(`
-      SELECT m.tool_calls FROM messages m JOIN conversations c ON c.id = m.conv_id
+      SELECT m.tool_calls FROM messages m CROSS JOIN conversations c ON c.id = m.conv_id
       WHERE c.kind = 'code' AND m.role = 'assistant' AND m.is_active = 1
         AND m.created_at >= ? AND m.created_at < ?
     `).all(start, end) as unknown as { tool_calls: string | null }[]
@@ -2053,16 +2539,18 @@ export class ConversationStore {
    *  CODE_STATS/mockSessionDays (which were always fake). Mirrors tokenUsageStats' own
    *  day-bucket/streak/range pattern closely (dayKey/addDays are the same shared helpers) —
    *  everything computed fresh from agent_runs + messages on each call, not from a maintained
-   *  running counter, so it's always internally consistent with whatever data actually exists. */
+   *  running counter, so it's always internally consistent with whatever data actually exists.
+   *  As in tokenUsageStats, SQLite does the counting: lifetime runs per quarter hour for the
+   *  streaks, the range's runs per model, and only the range's tool calls reach JavaScript. */
   codeStats(range: CodeStatsRange = 'all'): CodeStatsResult {
-    const runs = this.db.prepare(`
-      SELECT ar.id, ar.status, ar.created_at, c.model_key
+    const quarters = this.db.prepare(`
+      SELECT ${quarterHour('ar.created_at')} AS quarter, COUNT(*) AS runs
       FROM agent_runs ar JOIN conversations c ON c.id = ar.conv_id
       WHERE c.kind = 'code'
-      ORDER BY ar.created_at ASC
-    `).all() as unknown as { id: string; status: string; created_at: string; model_key: string }[]
+      GROUP BY quarter ORDER BY quarter
+    `).all() as unknown as { quarter: string; runs: number }[]
 
-    if (runs.length === 0) {
+    if (quarters.length === 0) {
       return {
         range, sessions: 0, tasksShipped: 0, filesTouched: 0, diffAdded: 0, diffRemoved: 0,
         activeDays: 0, currentStreak: 0, longestStreak: 0, favoriteModel: null, heatmap: [],
@@ -2072,11 +2560,11 @@ export class ConversationStore {
     // Per-local-day run counts across the FULL history — needed for lifetime streaks
     // regardless of `range`, and reused below for the heatmap window.
     const dayBuckets = new Map<string, number>()
-    for (const r of runs) {
-      const key = dayKey(r.created_at)
-      dayBuckets.set(key, (dayBuckets.get(key) ?? 0) + 1)
+    for (const q of quarters) {
+      const key = dayKey(quarterStartIso(q.quarter))
+      dayBuckets.set(key, (dayBuckets.get(key) ?? 0) + q.runs)
     }
-    const firstKey = dayKey(runs[0].created_at)
+    const firstKey = dayKey(quarterStartIso(quarters[0].quarter))
     const todayKey = dayKey(new Date().toISOString())
 
     let longestStreak = 0, run = 0
@@ -2095,16 +2583,25 @@ export class ConversationStore {
       ? (firstKey < minAllStart ? firstKey : minAllStart)
       : addDays(todayKey, -(RANGE_WINDOW_DAYS[range] - 1))
 
-    const scopedRuns = range === 'all' ? runs : runs.filter((r) => dayKey(r.created_at) >= heatStart)
+    const since = range === 'all' ? null : this.dayWindow(heatStart).start
+    const sinceClause = since === null ? '' : ' AND ar.created_at >= $since'
+    const sinceParams = since === null ? {} : { $since: since } as P
+    // Per model in order of first appearance, so Map order breaks favorite-model ties as before.
+    const byModel = this.db.prepare(`
+      SELECT c.model_key, COUNT(*) AS runs, SUM(ar.status = 'done') AS done
+      FROM agent_runs ar JOIN conversations c ON c.id = ar.conv_id
+      WHERE c.kind = 'code'${sinceClause}
+      GROUP BY c.model_key ORDER BY MIN(ar.created_at), MIN(ar.rowid)
+    `).all(sinceParams) as unknown as { model_key: string; runs: number; done: number }[]
 
     const modelTally = new Map<string, number>()
-    let tasksShipped = 0
-    const activeDaySet = new Set<string>()
-    for (const r of scopedRuns) {
-      if (r.status === 'done') tasksShipped++
-      if (r.model_key) modelTally.set(r.model_key, (modelTally.get(r.model_key) ?? 0) + 1)
-      activeDaySet.add(dayKey(r.created_at))
+    let sessions = 0, tasksShipped = 0
+    for (const m of byModel) {
+      sessions += m.runs
+      tasksShipped += m.done
+      if (m.model_key) modelTally.set(m.model_key, m.runs)
     }
+    const activeDays = [...dayBuckets.keys()].filter((key) => key >= heatStart).length
     let favoriteModelKey: string | null = null, favoriteCount = -1
     for (const [k, n] of modelTally) if (n > favoriteCount) { favoriteModelKey = k; favoriteCount = n }
 
@@ -2116,15 +2613,19 @@ export class ConversationStore {
     // filesTouched + diffAdded/diffRemoved: scoped by each MESSAGE's own created_at (when the
     // tool call actually ran), not the owning run's — a long session's later turns land on a
     // later day than its first message, so this is the more honest scoping of the two.
-    const msgRows = this.db.prepare(`
-      SELECT m.created_at, m.tool_calls FROM messages m JOIN conversations c ON c.id = m.conv_id
+    // With a range, CROSS JOIN pins messages as the outer loop (SQLite keeps the written join
+    // order for it), so the date range is an index seek rather than every code message read.
+    const msgRows = this.db.prepare(since === null ? `
+      SELECT m.tool_calls FROM messages m JOIN conversations c ON c.id = m.conv_id
       WHERE c.kind = 'code' AND m.role = 'assistant' AND m.tool_calls IS NOT NULL
-    `).all() as unknown as { created_at: string; tool_calls: string }[]
+    ` : `
+      SELECT m.tool_calls FROM messages m CROSS JOIN conversations c ON c.id = m.conv_id
+      WHERE c.kind = 'code' AND m.role = 'assistant' AND m.tool_calls IS NOT NULL AND m.created_at >= $since
+    `).all(sinceParams) as unknown as { tool_calls: string }[]
 
     const filePaths = new Set<string>()
     let diffAdded = 0, diffRemoved = 0
     for (const r of msgRows) {
-      if (range !== 'all' && dayKey(r.created_at) < heatStart) continue
       const calls = safeJson(r.tool_calls) as ToolCallRecord[] | undefined
       if (!Array.isArray(calls)) continue
       for (const tc of calls) {
@@ -2139,8 +2640,8 @@ export class ConversationStore {
     }
 
     return {
-      range, sessions: scopedRuns.length, tasksShipped, filesTouched: filePaths.size,
-      diffAdded, diffRemoved, activeDays: activeDaySet.size, currentStreak, longestStreak,
+      range, sessions, tasksShipped, filesTouched: filePaths.size,
+      diffAdded, diffRemoved, activeDays, currentStreak, longestStreak,
       favoriteModel: favoriteModelKey ? titleCaseModelName(favoriteModelKey) : null,
       heatmap,
     }
@@ -2352,13 +2853,20 @@ export class ConversationStore {
   }
 
   listAgentRuns(opts?: { statuses?: string[] }): AgentRun[] {
-    if (opts?.statuses?.length) {
-      const placeholders = opts.statuses.map((_, i) => `$s${i}`).join(',')
-      const params: Record<string, SqlValue> = {}
-      opts.statuses.forEach((s, i) => { params[`$s${i}`] = s })
-      return (this.db.prepare(`SELECT * FROM agent_runs WHERE status IN (${placeholders}) ORDER BY updated_at DESC LIMIT 200`).all(params) as unknown as AgentRunRow[]).map(rowToAgentRun)
-    }
-    return (this.db.prepare(`SELECT * FROM agent_runs ORDER BY updated_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
+    return this.listAgentRunsPage(opts).runs
+  }
+
+  /** Agent runs, most recently updated first, a keyset page at a time (200 by default and at
+   *  most), optionally only those in `statuses`. Rows leave out the compaction summary
+   *  (AGENT_RUN_LIST_COLUMNS). */
+  listAgentRunsPage(opts: { statuses?: string[] } & PageOpts = {}): { runs: AgentRun[]; nextCursor: string | null } {
+    const params: P = {}
+    opts.statuses?.forEach((s, i) => { params[`$s${i}`] = s })
+    const where = opts.statuses?.length ? [`status IN (${opts.statuses.map((_, i) => `$s${i}`).join(',')})`] : []
+    const { rows, nextCursor } = this.keysetPage<AgentRunRow>({
+      columns: AGENT_RUN_LIST_COLUMNS, table: 'agent_runs', sortColumn: 'updated_at', sortValue: (r) => r.updated_at, where, params,
+    }, opts, 200, 200)
+    return { runs: rows.map(rowToAgentRun), nextCursor }
   }
 
   updateAgentRun(id: string, patch: Partial<Pick<AgentRun, 'status' | 'error' | 'startedAt' | 'endedAt' | 'title' | 'compactionSummary' | 'compactionUpToMessageId' | 'compactionTokensBefore' | 'titleAutoSynced' | 'terminalLaunchedOnce'>>): boolean {
@@ -2471,6 +2979,65 @@ export class ConversationStore {
       'SELECT * FROM routine_runs WHERE routine_id = $routineId ORDER BY started_at DESC',
     ).all({ $routineId: routineId } as P) as unknown as RoutineRunRow[]
     return rows.map(rowToRoutineRun)
+  }
+
+  /** A routine's runs, newest first, a keyset page at a time (50 by default, 200 at most) —
+   *  its history grows by a row per fire for good. Full rows: the run list shows `result`. */
+  listRoutineRunsPage(routineId: string, page: PageOpts = {}): { runs: RoutineRun[]; nextCursor: string | null } {
+    const { rows, nextCursor } = this.keysetPage<RoutineRunRow>({
+      columns: '*', table: 'routine_runs', sortColumn: 'started_at', sortValue: (r) => r.started_at,
+      where: ['routine_id = $routineId'], params: { $routineId: routineId },
+    }, page, 50, 200)
+    return { runs: rows.map(rowToRoutineRun), nextCursor }
+  }
+
+  countRoutineRuns(routineId: string): number {
+    return (this.db.prepare('SELECT COUNT(*) AS n FROM routine_runs WHERE routine_id = $routineId').get({ $routineId: routineId } as P) as { n: number }).n
+  }
+
+  /** Retention (scalability review 2.4): up to `limit` of a routine's runs older than its newest
+   *  `keep`, oldest first, after `after` — never one still running or parked for an approval, nor
+   *  one the user went on with (ROUTINE_RUN_CONTINUED). Those still count toward the newest `keep`.
+   *  Both seeks walk idx_routine_runs_routine_started. */
+  routineRunsBeyondNewest(routineId: string, keep: number, limit: number, after: Pick<PrunableRoutineRun, 'startedAt' | 'id'> | null = null): PrunableRoutineRun[] {
+    const oldestKept = this.db.prepare(`
+      SELECT started_at, id FROM routine_runs WHERE routine_id = $routineId
+      ORDER BY started_at DESC, id DESC LIMIT 1 OFFSET $offset
+    `).get({ $routineId: routineId, $offset: keep - 1 } as P) as { started_at: string; id: string } | undefined
+    if (!oldestKept) return []
+    const rows = this.db.prepare(`
+      SELECT id, started_at, conversation_id, code_session_id FROM routine_runs r
+      WHERE routine_id = $routineId
+        AND (started_at < $keptAt OR (started_at = $keptAt AND id < $keptId))
+        ${after ? 'AND (started_at > $afterAt OR (started_at = $afterAt AND id > $afterId))' : ''}
+        AND status NOT IN ('running', 'needs_approval')
+        AND NOT ${ROUTINE_RUN_CONTINUED}
+      ORDER BY started_at, id LIMIT $limit
+    `).all({
+      $routineId: routineId, $keptAt: oldestKept.started_at, $keptId: oldestKept.id, $limit: limit,
+      ...(after ? { $afterAt: after.startedAt, $afterId: after.id } : {}),
+    } as P) as unknown as { id: string; started_at: string; conversation_id: string | null; code_session_id: string | null }[]
+    return rows.map((r) => ({ id: r.id, startedAt: r.started_at, conversationId: r.conversation_id, codeSessionId: r.code_session_id }))
+  }
+
+  /** Deletes `runs` and each one's own chat conversation (chat-runner.ts creates a kind='agent'
+   *  one per run; its messages go with it, ON DELETE CASCADE), in one transaction. A linked
+   *  conversation of any other kind is left alone. A code run's session is not touched here: it
+   *  is deleted first, through the Code session delete's own cleanup (chat/retention.ts). A run
+   *  the user went on with since it was listed (ROUTINE_RUN_CONTINUED) is skipped, with its chat. */
+  deleteRoutineRuns(runs: PrunableRoutineRun[]): { runs: number; conversations: number } {
+    return this.transaction(() => {
+      const continued = this.db.prepare(`SELECT 1 AS yes FROM routine_runs r WHERE r.id = $id AND ${ROUTINE_RUN_CONTINUED}`)
+      const delRun = this.db.prepare(`DELETE FROM routine_runs WHERE id = $id`)
+      const delConv = this.db.prepare(`DELETE FROM conversations WHERE id = $id AND kind = 'agent'`)
+      let deletedRuns = 0, conversations = 0
+      for (const run of runs) {
+        if (continued.get({ $id: run.id } as P)) continue
+        deletedRuns += ((delRun.run({ $id: run.id } as P) as unknown) as Changes).changes
+        if (run.conversationId) conversations += ((delConv.run({ $id: run.conversationId } as P) as unknown) as Changes).changes
+      }
+      return { runs: deletedRuns, conversations }
+    })
   }
 
   /** Every run row currently parked awaiting an approval decision, across all routines.
@@ -2657,15 +3224,15 @@ export class ConversationStore {
 
   /** Active (non-archived) runs, newest first. */
   listActiveAgentRuns(): AgentRun[] {
-    return (this.db.prepare(`SELECT * FROM agent_runs WHERE archived_at IS NULL ORDER BY created_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
+    return (this.db.prepare(`SELECT ${AGENT_RUN_LIST_COLUMNS} FROM agent_runs WHERE archived_at IS NULL ORDER BY created_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
   }
 
   /** Archived contracts, optionally filtered to one Hitman (§15). */
   listArchivedAgentRuns(agentId?: string): AgentRun[] {
     if (agentId) {
-      return (this.db.prepare(`SELECT * FROM agent_runs WHERE archived_at IS NOT NULL AND agent_id = $a ORDER BY archived_at DESC LIMIT 200`).all({ $a: agentId } as P) as unknown as AgentRunRow[]).map(rowToAgentRun)
+      return (this.db.prepare(`SELECT ${AGENT_RUN_LIST_COLUMNS} FROM agent_runs WHERE archived_at IS NOT NULL AND agent_id = $a ORDER BY archived_at DESC LIMIT 200`).all({ $a: agentId } as P) as unknown as AgentRunRow[]).map(rowToAgentRun)
     }
-    return (this.db.prepare(`SELECT * FROM agent_runs WHERE archived_at IS NOT NULL ORDER BY archived_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
+    return (this.db.prepare(`SELECT ${AGENT_RUN_LIST_COLUMNS} FROM agent_runs WHERE archived_at IS NOT NULL ORDER BY archived_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
   }
 
   /** Prune a deleted Hitman's track-record rows (agent_id is a config id, not a DB FK). */
@@ -2730,9 +3297,22 @@ export class ConversationStore {
   }
 
   listMemoryFacts(): MemoryFact[] {
-    const rows = this.db.prepare(`SELECT * FROM memory_facts ORDER BY created_at DESC`)
-      .all() as Array<{ id: string; fact_text: string; source_conv_id: string | null; created_at: string }>
-    return rows.map((r) => ({ id: r.id, factText: r.fact_text, sourceConvId: r.source_conv_id ?? undefined, createdAt: r.created_at }))
+    const rows = this.db.prepare(`SELECT * FROM memory_facts ORDER BY created_at DESC`).all() as unknown as MemoryFactRow[]
+    return rows.map(rowToMemoryFact)
+  }
+
+  /** Facts newest first, a keyset page at a time (200 by default and at most). */
+  listMemoryFactsPage(page: PageOpts = {}): { facts: MemoryFact[]; nextCursor: string | null } {
+    const { rows, nextCursor } = this.keysetPage<MemoryFactRow>({
+      columns: 'id, fact_text, source_conv_id, created_at', table: 'memory_facts', sortColumn: 'created_at', sortValue: (r) => r.created_at, where: [], params: {},
+    }, page, 200, 200)
+    return { facts: rows.map(rowToMemoryFact), nextCursor }
+  }
+
+  /** The text of the `limit` newest facts — the window extraction dedupes a new fact against. */
+  recentMemoryFactTexts(limit: number): string[] {
+    return (this.db.prepare(`SELECT fact_text FROM memory_facts ORDER BY created_at DESC, id DESC LIMIT $n`)
+      .all({ $n: limit } as P) as Array<{ fact_text: string }>).map((r) => r.fact_text)
   }
 
   deleteMemoryFact(id: string): boolean {

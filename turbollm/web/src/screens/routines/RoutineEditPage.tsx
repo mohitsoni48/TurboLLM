@@ -5,6 +5,7 @@ import { Markdown } from '../chat/MessageBubble'
 import { ChatScreen } from '../ChatScreen'
 import { CodeSessionScreen } from '../code/CodeSessionScreen'
 import { Button } from '../../components/ui/button'
+import { LoadMore } from '../../components/LoadMore'
 import { Skeleton } from '../../components/ui/skeleton'
 import { InlineError } from '../../components/common'
 import { toast } from '../../components/ui/sonner'
@@ -466,6 +467,10 @@ function RoutineEditPageInner() {
                   )
                 })}
               </div>
+            )}
+            {/* The daemon sends the 50 newest runs; older ones come on request. */}
+            {runsQ.hasNextPage && (
+              <LoadMore label="Load older runs" onLoadMore={() => void runsQ.fetchNextPage()} loading={runsQ.isFetchingNextPage} />
             )}
           </div>
         </div>

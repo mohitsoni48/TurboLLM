@@ -127,6 +127,10 @@ const HOST_ONLY: [string, (cfg: Config) => unknown][] = [
   // Capture on records the host's Code prompts for the caller to read; the log off blinds the owner.
   ['requestLog.captureBodies', (cfg) => ({ requestLog: { captureBodies: !cfg.requestLog.captureBodies } })],
   ['requestLog.enabled', (cfg) => ({ requestLog: { enabled: !cfg.requestLog.enabled } })],
+  // Lowering a limit (or switching the sweep on after it was off) deletes data on the next sweep: only the host may.
+  ['retention.enabled', (cfg) => ({ retention: { enabled: !cfg.retention.enabled } })],
+  ['retention.apiUsageRawDays', () => ({ retention: { apiUsageRawDays: 31 } })],
+  ['retention.routineRunsKept', () => ({ retention: { routineRunsKept: 10 } })],
 ]
 
 /** Every host-only change is refused (and nothing changes); a cosmetic one and an echo are not.

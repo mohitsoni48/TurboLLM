@@ -5,12 +5,16 @@
 // content. If the visible content is empty/whitespace, make one extra inference
 // pass with tool_choice:'none' and use that result as the final reply.
 import assert from 'node:assert/strict'
+import { randomBytes } from 'node:crypto'
 import { test } from 'node:test'
 import { readFileSync, rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { stripThinkingBlocks, needsExtraPass } from './think-utils.js'
 import { recentTitleTurns, abortAllInFlightChats, chatCodeAuthorization, inFlightChatIds, registerChatRoutes } from './chat-routes.js'
 import { ConversationStore } from './db.js'
+import { attachmentRefId } from './attachments.js'
+import { hashKey, lanAuth } from '../auth.js'
+import { defaultConfig } from '../config/config.js'
 import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
 
@@ -1457,6 +1461,141 @@ test('the chat and folder routes refuse a text field that is not a string with 4
     assert.deepEqual(h.store.getMessages(conv.id).map((m) => m.role), ['user', 'user', 'assistant'])
   } finally {
     engine.restore()
+    h.cleanup()
+  }
+})
+
+// ── 2.7: chat images stored as files ─────────────────────────────────────────────────────────────
+
+/** A ~3 MB phone-photo-sized PNG data URL (the bytes need not be a real image). */
+const bigImage = () => `data:image/png;base64,${randomBytes(3 * 1024 * 1024).toString('base64')}`
+
+test('a sent image is stored as a file reference; the engine gets the same data URL on the send and on a resend', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  const image = bigImage()
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    await (await h.app.request(`${base}/messages`, json({ content: 'what is this', images: [image] }))).text()
+    const [user] = h.store.getMessages(conv.id)
+    assert.equal(user.attachments.length, 1)
+    const id = attachmentRefId(user.attachments[0])
+    assert.ok(id, `stored as a reference, got ${user.attachments[0].slice(0, 40)}`)
+    assert.equal(h.store.messageAttachmentsJson(user.id)!.length < 200, true, 'the row holds no image bytes')
+
+    await h.app.request(`${base}/regenerate`, { method: 'POST' })
+    await (await h.app.request(`${base}/continue`, json({}))).text()
+    const parts = (n: number) => engine.bodies[n].messages.at(-1)!.content as Array<{ type: string; image_url?: { url: string } }>
+    assert.equal(parts(0)[1].image_url!.url, image, 'first send')
+    assert.equal(parts(1)[1].image_url!.url, image, 'resend reads the file back byte for byte')
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('POST /messages with stored references (an API caller resending a shown image) sends the engine data URLs', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  const image = bigImage()
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    await (await h.app.request(`${base}/messages`, json({ content: 'what is this', images: [image] }))).text()
+    const [ref] = h.store.getMessages(conv.id)[0].attachments
+    await (await h.app.request(`${base}/messages`, json({ content: 'and again', images: [ref] }))).text()
+
+    const urls = engine.bodies[1].messages.flatMap((m) => Array.isArray(m.content)
+      ? (m.content as Array<{ type: string; image_url?: { url: string } }>).flatMap((p) => p.image_url ? [p.image_url.url] : [])
+      : [])
+    assert.ok(urls.length >= 1)
+    assert.ok(urls.every((u) => u === image), 'no reference reaches the engine, in this turn or the history')
+    assert.equal(urls.at(-1), image)
+    assert.deepEqual(h.store.getMessages(conv.id).at(-2)!.attachments, [ref], 'the row keeps the reference')
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('a row from before (image inline in messages.attachments) still opens and still prompts', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    h.store.addMessage(conv.id, 'user', 'old question', { attachments: ['data:image/png;base64,AAAA'] })
+    h.store.addMessage(conv.id, 'assistant', 'old answer')
+    const shown = await (await h.app.request(`/api/v1/conversations/${conv.id}`)).json() as { messages: Array<{ attachments: string[] }> }
+    assert.deepEqual(shown.messages[0].attachments, ['data:image/png;base64,AAAA'])
+    await (await h.app.request(`/api/v1/conversations/${conv.id}/continue`, json({ regenerate: true }))).text()
+    assert.deepEqual(engine.bodies[0].messages.at(-1)!.content, [
+      { type: 'text', text: 'old question' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+    ])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('opening a chat with many photos no longer ships megabytes', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    for (let i = 0; i < 3; i++) {
+      await (await h.app.request(`/api/v1/conversations/${conv.id}/messages`, json({ content: `photo ${i}`, images: [bigImage()] }))).text()
+    }
+    const text = await (await h.app.request(`/api/v1/conversations/${conv.id}`)).text()
+    assert.ok(text.length < 20_000, `GET /conversations/:id sent ${text.length} bytes for 3 photos of ~4 MB each`)
+    assert.equal((text.match(/"attachment:[0-9a-f]{64}\.png"/g) ?? []).length, 3)
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('GET /api/v1/attachments/:id serves the image bytes, cacheable for good; a malformed or unknown id is a 404', async () => {
+  const h = inFlightHarness()
+  try {
+    const bytes = randomBytes(1000)
+    const [ref] = await h.store.attachments.save([`data:image/jpeg;base64,${bytes.toString('base64')}`])
+    const id = attachmentRefId(ref)!
+    const res = await h.app.request(`/api/v1/attachments/${id}`)
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get('content-type'), 'image/jpeg')
+    assert.match(res.headers.get('cache-control') ?? '', /immutable/)
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff')
+    assert.deepEqual(Buffer.from(await res.arrayBuffer()), bytes)
+
+    for (const bad of ['..%2Fturbollm.db', '..%5Cturbollm.db', '%2E%2E', id.toUpperCase(), `${id.slice(0, -4)}.svg`, `${'0'.repeat(64)}.png`]) {
+      const r = await h.app.request(`/api/v1/attachments/${bad}`)
+      assert.equal(r.status, 404, bad)
+    }
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('GET /api/v1/attachments/:id sits behind lanAuth: a LAN caller needs a key, the owner\'s browser does not', async () => {
+  const h = inFlightHarness()
+  const raw = 'tllm-attachmentsattachmentsattachmentsat1'
+  const cfg = defaultConfig()
+  cfg.daemon.lanBind = true
+  cfg.apiKeys.push({ id: 'k', name: 'k', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null })
+  const app = new Hono()
+  app.use('*', lanAuth({ ...h.d, store: { ...h.d.store, snapshot: () => cfg, read: () => cfg } } as unknown as Deps))
+  app.route('/', h.app)
+  const from = (remoteAddress: string, headers: Record<string, string> = {}) => (path: string) =>
+    app.request(path, { headers }, { incoming: { socket: { localPort: 6996, remoteAddress, remotePort: 5555, remoteFamily: 'IPv4' } } } as never)
+  try {
+    const [ref] = await h.store.attachments.save(['data:image/png;base64,AAAA'])
+    const path = `/api/v1/attachments/${attachmentRefId(ref)}`
+    assert.equal((await from('192.168.1.50')(path)).status, 401)
+    assert.equal((await from('192.168.1.50', { 'X-TurboLLM-Auth': raw })(path)).status, 200)
+    assert.equal((await from('127.0.0.1')(path)).status, 200)
+  } finally {
     h.cleanup()
   }
 })

@@ -938,6 +938,10 @@ export type DaemonSettings = {
    *  — it lives in Settings → Privacy & telemetry, not Developer/Engines, because it's a
    *  privacy choice: the log itself is always in-memory-only regardless of this flag. */
   requestLog: { enabled: boolean; captureBodies: boolean }
+  /** Data retention (daemon chat/retention.ts): a daily sweep folds raw gateway usage older than `apiUsageRawDays`
+   *  (31-3650) into daily totals, which the usage dashboards still count, and keeps the newest `routineRunsKept`
+   *  (10-100000) runs per routine. On by default (90 days, 200 runs). */
+  retention: { enabled: boolean; apiUsageRawDays: number; routineRunsKept: number }
   /** Whether a Tavily API key is configured (legacy mirror of `search.tavilyKeySet`). */
   tavilyKeySet: boolean
   /** Web-search provider config (F-020). Keys are write-only — only "is it set" booleans
@@ -1013,7 +1017,7 @@ export type SearchProvider = 'tavily' | 'kagi' | 'searxng'
  *  `hfToken` (spec 10 §4) that sets/clears the stored Hugging Face token. `comfyui`
  *  is patchable per-field (only `enabled` is set here; `gatePath` is owned by the
  *  install endpoints). */
-export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental' | 'code' | 'requestLog' | 'remoteAccess' | 'modelDefaults' | 'gateway'>> & {
+export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental' | 'code' | 'requestLog' | 'retention' | 'remoteAccess' | 'modelDefaults' | 'gateway'>> & {
   comfyui?: Partial<ComfyUiSettings>
   /** Patchable per-field, same reason as `experimental`: routes.ts keeps every member this patch
    *  leaves out, and Settings' Save sends only the members edited on the page. */
@@ -1043,6 +1047,8 @@ export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavi
    *  and responses" checkbox must be able to flip `captureBodies` without also resending
    *  `enabled`. */
   requestLog?: Partial<DaemonSettings['requestLog']>
+  /** Patchable per-field, like `requestLog`. */
+  retention?: Partial<DaemonSettings['retention']>
   hfToken?: string
   /** Write-only: set or clear ('') the stored GitHub token. Raises the GitHub API rate limit
    *  for branch lookups from 60 to 5,000 requests/hour. Never echoed back — read the boolean

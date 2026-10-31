@@ -24,6 +24,13 @@ import type { CodeRunManager } from './code/code-run-manager'
 import type { LinkManager } from './link/link-manager'
 import type { RemoteCatalog } from './link/remote-catalog'
 
+/** What deleting a Code session came to (code-routes.ts deleteCodeSessionWithCleanup). */
+export type CodeSessionDeletion =
+  | { deleted: true; worktreeNote?: string }
+  | { deleted: false; reason: 'not_found' | 'run_active' }
+  /** Only when asked to keep a session whose worktree could not be removed (the retention sweep): it is still there. */
+  | { deleted: false; reason: 'worktree_kept'; worktreeNote: string }
+
 export interface Deps {
   store: ConfigStore
   registry: Registry
@@ -110,6 +117,10 @@ export interface Deps {
    *  the SAME kind of observable session a live one is. Optional: only wired in the real
    *  serve() entrypoint (cli.ts); absent under tests that don't exercise Code/Routines. */
   codeRuns?: CodeRunManager
+  /** Deletes a Code session the way its DELETE route does: LSP clients, background jobs and worktree, then its rows
+   *  (code-routes.ts deleteCodeSessionWithCleanup). Set by registerCodeRoutes, so absent where Code is (Android,
+   *  tests without Code routes); the retention sweep then leaves Code routine runs alone. */
+  deleteCodeSession?: (sessionId: string) => Promise<CodeSessionDeletion>
   /** The live RoutineScheduler instance (Phase 1, turbollm/src/routines/scheduler.ts), exposed
    *  so routine-routes.ts's POST .../run-now can trigger an immediate fire through the exact
    *  same overlap guard a normal scheduled tick uses. Optional: only wired in the real serve()

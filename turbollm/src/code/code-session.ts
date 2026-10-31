@@ -188,21 +188,19 @@ const COMPACTION_SUFFIX = '\n\n(End of summary — the actual conversation conti
  *  runCodeSession (normal turns) and compactCodeSession (re-summarizing), so both always agree
  *  on what "history so far" means. */
 export function resolveEffectiveHistory(d: Deps, convId: string, sessionId: string): { summaryText: string | null; messages: DbMessage[] } {
-  const all = d.db.getConversation(convId, true)?.messages ?? []
   const run = d.db.getAgentRun(sessionId)
-  // /clear (v34, ADR-261) now DEACTIVATES its messages (is_active=0), so getConversation →
-  // getMessages has already dropped them from `all` — no cursor slice needed here anymore. A
-  // cleared session is a blank slate: also drop any earlier compaction summary (it summarized
-  // history that now sits behind the clear), returning just the still-active post-clear messages.
-  // /resume reactivates that history and nulls this marker, falling straight through to the
-  // compaction/full path below again (exactly as if the clear never happened).
-  if (run?.clearedUpToMessageId) return { summaryText: null, messages: all }
-  if (!run?.compactionUpToMessageId) return { summaryText: null, messages: all }
+  // /clear (v34, ADR-261) now DEACTIVATES its messages (is_active=0), so getMessages has already
+  // dropped them — no cursor slice needed here anymore. A cleared session is a blank slate: also
+  // drop any earlier compaction summary (it summarized history that now sits behind the clear),
+  // returning just the still-active post-clear messages. /resume reactivates that history and
+  // nulls this marker, falling straight through to the compaction/full path below again
+  // (exactly as if the clear never happened).
+  if (run?.clearedUpToMessageId || !run?.compactionUpToMessageId) return { summaryText: null, messages: d.db.getMessages(convId) }
+  // Only the rows after the cut are read: every turn of a long, compacted session runs this.
   // An unresolvable compaction marker (cut message deleted/corrupt) still surfaces its summary —
   // replaying every raw message alongside a redundant summary loses nothing, whereas resolving
   // it as "no compaction at all" would silently discard a real (if now unanchored) summary.
-  const compactionIdx = all.findIndex((m) => m.id === run.compactionUpToMessageId)
-  const rest = compactionIdx === -1 ? all : all.slice(compactionIdx + 1)
+  const rest = d.db.getActiveMessagesAfter(convId, run.compactionUpToMessageId) ?? d.db.getMessages(convId)
   return { summaryText: `${COMPACTION_PREFIX}${run.compactionSummary}${COMPACTION_SUFFIX}`, messages: rest }
 }
 

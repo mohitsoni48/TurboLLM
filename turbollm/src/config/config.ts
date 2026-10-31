@@ -9,7 +9,8 @@ import { basename, dirname, join } from 'node:path'
 import type { LinkGrant, LinkRecord } from '../link/types'
 import type { ChatStoreConfig } from '../chat/store/load-adapter.js'
 import type { ReleaseProvenance } from '../engines/release-install'
-import { CHAT_APPROVAL_WAIT_MINUTES } from './config-bounds'
+import { CHAT_APPROVAL_WAIT_MINUTES, RETENTION_BOUNDS, type RetentionBoundedField } from './config-bounds'
+import { writeFileAtomicSync } from '../util/atomic-write'
 
 export const SCHEMA_VERSION = 4
 
@@ -316,6 +317,16 @@ export interface RequestLogConfig {
    *  the app. Metadata (params, tokens, timings, status) is captured either way. */
   captureBodies: boolean
   maxEntries: number
+}
+
+/** Data retention (scalability review 2.4, chat/retention.ts): a daily sweep folds raw gateway usage rows older than
+ *  `apiUsageRawDays` into daily totals (the dashboards read both, so their numbers do not change) and keeps the newest
+ *  `routineRunsKept` runs per routine, deleting older ones with the conversation or Code session each one made. On by
+ *  default. Bounds: config-bounds.ts RETENTION_BOUNDS. */
+export interface RetentionConfig {
+  enabled: boolean
+  apiUsageRawDays: number
+  routineRunsKept: number
 }
 
 /** ComfyUI GPU-coordination (so the LLM engine and ComfyUI don't fight over VRAM).
@@ -648,6 +659,7 @@ export interface Config {
   comfyui: ComfyUI
   gateway: Gateway
   requestLog: RequestLogConfig
+  retention: RetentionConfig
   tools: ToolsConfig
   mcp: McpConfig
   /** Agents + skills configuration (spec 13 §2.1). */
@@ -812,6 +824,7 @@ export function defaultConfig(): Config {
     comfyui: { enabled: false, gatePath: '', url: '', reverseGate: false, cachePersist: false },
     gateway: { autoSwap: true, keepN: 1 },
     requestLog: { enabled: true, captureBodies: false, maxEntries: 500 },
+    retention: { enabled: true, apiUsageRawDays: RETENTION_BOUNDS.apiUsageRawDays.default, routineRunsKept: RETENTION_BOUNDS.routineRunsKept.default },
     tools: { chatApprovalWaitMinutes: CHAT_APPROVAL_WAIT_MINUTES.default },
     mcp: { servers: [] },
     agents: { agents: [] },
@@ -1072,26 +1085,10 @@ export class ConfigStore {
 
   private save(): void {
     mkdirSync(dirname(this.filePath), { recursive: true })
-    // A tmp file of this process's own. A process that loads the config can save it (load()
-    // persists its migration), so a refused second start can write the RUNNING daemon's
-    // config.json too; with one shared `config.json.tmp`, a Settings save interleaving with that
-    // had its tmp overwritten with the other process's older snapshot (which then became
-    // config.json), or found it already renamed away and threw ENOENT.
-    const tmp = `${this.filePath}.${process.pid}.tmp`
-    // Owner-only (CONFIG_FILE_MODE): the rename keeps the tmp's mode, so config.json is 0600 after
-    // every save (load() tightens an existing install's 0644 file in place). A mode applies only
-    // to a file the write creates, so one left under this pid (pid reuse after a kill, one the
-    // load's best-effort sweep did not remove) is removed first rather than written through with
-    // its old mode.
-    rmSync(tmp, { force: true })
-    writeFileSync(tmp, JSON.stringify(this.data, null, 2), { mode: CONFIG_FILE_MODE })
-    try {
-      renameSync(tmp, this.filePath) // libuv MoveFileEx replaces on Windows
-    } catch (e) {
-      // Per-process names are never overwritten by a later save: don't leave this one behind.
-      try { rmSync(tmp, { force: true }) } catch { /* best-effort */ }
-      throw e
-    }
+    // Owner-only (CONFIG_FILE_MODE): the rename keeps the tmp's mode, so config.json is 0600 after every save
+    // (load() tightens an existing install's 0644 file in place). The tmp file is per-process: a process that
+    // loads the config can save it too, and a shared tmp name let two saves overwrite each other's.
+    writeFileAtomicSync(this.filePath, JSON.stringify(this.data, null, 2), { mode: CONFIG_FILE_MODE })
   }
 }
 
@@ -1304,6 +1301,15 @@ function normalize(c: Config): void {
     captureBodies: rl.captureBodies === true,
     maxEntries: typeof rl.maxEntries === 'number' && rl.maxEntries >= 50 ? Math.min(Math.floor(rl.maxEntries), 5000) : 500,
   }
+  // Data retention (scalability review 2.4): absent in configs written before it → on, with the defaults. A value out of
+  // range (hand-edited) loads as its default, never a throw; a fraction is floored.
+  const rt = (c.retention ?? {}) as Partial<RetentionConfig>
+  const bounded = (field: RetentionBoundedField): number => {
+    const v = rt[field]
+    const b = RETENTION_BOUNDS[field]
+    return typeof v === 'number' && Number.isFinite(v) && v >= b.min && v <= b.max ? Math.floor(v) : b.default
+  }
+  c.retention = { enabled: rt.enabled !== false, apiUsageRawDays: bounded('apiUsageRawDays'), routineRunsKept: bounded('routineRunsKept') }
   // Built-in tools (v0.7.0): absent in pre-v0.7.0 configs → empty defaults.
   const tl = (c.tools ?? {}) as Partial<ToolsConfig>
   c.tools = {}

@@ -560,3 +560,10 @@ test('resolveKey: finds the presented key without cloning the config (read(), ne
   assert.equal(key?.id, 'k1')
   assert.equal(resolveKey(fakeContext({ 'x-turbollm-auth': 'tllm-nope' }), d), undefined)
 })
+
+test('requiredCapability: a chat image is read with what reads the chat (models:use); nothing writes one through it', () => {
+  assert.equal(requiredCapability('GET', '/api/v1/attachments/abc.png'), 'models:use')
+  assert.equal(requiredCapability('HEAD', '/api/v1/attachments/abc.png'), 'models:use')
+  assert.equal(requiredCapability('DELETE', '/api/v1/attachments/abc.png'), null)
+  assert.equal(requiredCapability('GET', '/api/v1/attachmentsX'), null)
+})

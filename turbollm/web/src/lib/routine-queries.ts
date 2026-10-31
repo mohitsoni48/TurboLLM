@@ -1,16 +1,21 @@
-import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from '../components/ui/sonner'
 import {
   approveRoutineRun, confirmRoutine, createRoutine, deleteRoutine, denyRoutineRun,
-  describeRoutineError, getRoutine, listRoutineRuns, listRoutines, pauseRoutine, resumeRoutine,
+  describeRoutineError, getRoutine, listRoutineRuns, listRoutineRunsPage, listRoutines, pauseRoutine, resumeRoutine,
   runRoutineNow, updateRoutine,
 } from './routine-api'
 import type { Routine, RoutineInput, RoutineRun } from './routine-types'
+import { FIRST_PAGE, flattenPages, nextCursorOf } from './paging'
 
 export const routineKeys = {
   list: ['routines'] as const,
   detail: (id: string) => ['routine', id] as const,
+  /** Newest run only (the list screen's summary column). Every run write invalidates this prefix, which
+   *  also covers {@link routineKeys.history}. */
   runs: (id: string) => ['routine-runs', id] as const,
+  /** The paged run history on the detail page. */
+  history: (id: string) => ['routine-runs', id, 'history'] as const,
 }
 
 /** @param enabled Default true. Pass false while Routines is experimental and turned off
@@ -44,10 +49,16 @@ export function useRoutine(id: string | undefined) {
   })
 }
 
+/** A routine's run history, newest first, a page at a time (the daemon's first page is the 50 newest runs):
+ *  `data` is one flat array, `fetchNextPage` loads older runs. The poll refetches every page already
+ *  loaded, in order, so runs the user paged back to are neither dropped nor duplicated. */
 export function useRoutineRuns(routineId: string | undefined) {
-  return useQuery({
-    queryKey: routineKeys.runs(routineId ?? ''),
-    queryFn: () => listRoutineRuns(routineId!),
+  return useInfiniteQuery({
+    queryKey: routineKeys.history(routineId ?? ''),
+    queryFn: ({ pageParam }) => listRoutineRunsPage(routineId!, pageParam),
+    initialPageParam: FIRST_PAGE,
+    getNextPageParam: nextCursorOf,
+    select: (data): RoutineRun[] => flattenPages<RoutineRun>({ ...data, pages: data.pages.map((p) => ({ items: p.runs })) }),
     enabled: !!routineId,
     refetchInterval: 10000,
     refetchIntervalInBackground: false,
@@ -62,8 +73,8 @@ export interface RoutineWithLatestRun {
 /** One routine + its most recent run, for the list screen's last-run summary column and the
  *  nav badge's needs-approval count (Shell.tsx). SPEC-GAP (00-conventions.md §8): the backend
  *  has no aggregate "routines with their latest run" endpoint, so this fetches every routine's
- *  run history (routine-routes.ts serves db.listRoutineRuns, `ORDER BY started_at DESC`, so
- *  index 0 really is the newest) — an N+1 query pattern, acceptable at the expected routine
+ *  run history (routine-routes.ts serves db.listRoutineRunsPage, `ORDER BY started_at DESC`, so
+ *  index 0 really is the newest; `limit=1` asks for just that one) — an N+1 query pattern, acceptable at the expected routine
  *  count (dozens, not thousands). Worth a real backend aggregate endpoint later; not built here
  *  since scope forbids adding backend code. */
 export function useRoutinesWithLatestRun(enabled = true) {
@@ -72,7 +83,7 @@ export function useRoutinesWithLatestRun(enabled = true) {
   const runsQ = useQueries({
     queries: routines.map((r) => ({
       queryKey: routineKeys.runs(r.id),
-      queryFn: () => listRoutineRuns(r.id),
+      queryFn: () => listRoutineRuns(r.id, 1),
       enabled: enabled && routinesQ.isSuccess,
       refetchInterval: 15000,
       refetchIntervalInBackground: false,

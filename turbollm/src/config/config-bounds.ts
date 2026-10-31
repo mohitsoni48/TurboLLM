@@ -147,6 +147,34 @@ export const CHAT_APPROVAL_WAIT_MINUTES = {
   message: 'chatApprovalWaitMinutes must be a whole number of minutes, 0–1440 (0 waits until answered).',
 } as const
 
+/** Data retention (Config.retention, chat/retention.ts): how many days of raw gateway usage rows to keep before they
+ *  fold into daily totals, and how many runs to keep per routine. Local only, like chatApprovalWaitMinutes: the
+ *  settings route refuses a value outside them with `message`, and normalize loads one outside them as `default`.
+ *  31 days at least, so the dashboards' widest range (30d) never reaches folded rows; 10 runs at least, so a routine's
+ *  recent history is never pruned to nothing. */
+export const RETENTION_BOUNDS = {
+  apiUsageRawDays: {
+    min: 31,
+    max: 3650,
+    default: 90,
+    message: 'retention.apiUsageRawDays must be a whole number of days, 31–3650.',
+  },
+  routineRunsKept: {
+    min: 10,
+    max: 100_000,
+    default: 200,
+    message: 'retention.routineRunsKept must be a whole number, 10–100000.',
+  },
+} as const
+
+export type RetentionBoundedField = keyof typeof RETENTION_BOUNDS
+
+/** Whether `v` is a value the settings route takes for retention `field`: a whole JSON number in range. */
+export function isRetentionValue(field: RetentionBoundedField, v: unknown): v is number {
+  const b = RETENTION_BOUNDS[field]
+  return typeof v === 'number' && Number.isInteger(v) && v >= b.min && v <= b.max
+}
+
 /** Whether `v` is a chatApprovalWaitMinutes the settings route takes: a whole JSON number in range. */
 export function isChatApprovalWaitMinutes(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= CHAT_APPROVAL_WAIT_MINUTES.min && v <= CHAT_APPROVAL_WAIT_MINUTES.max

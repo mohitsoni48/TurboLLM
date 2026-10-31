@@ -33,6 +33,7 @@ import { ExperimentalSection } from './settings/ExperimentalSection'
 import { TurboLinkSection } from './settings/TurboLinkSection'
 import { RemoteAccessSection } from './settings/RemoteAccessSection'
 import { HardwareSection } from './settings/HardwareSection'
+import { RetentionSection } from './settings/RetentionSection'
 
 import { ApiError, authHeaders, getAuthToken, track, type DaemonSettings, type DaemonSettingsPatch, type TelemetryLevel } from '../lib/api'
 import { TELEMETRY_UI_ENABLED } from '../lib/flags'
@@ -838,6 +839,9 @@ export function SettingsScreen() {
             <>
               {/* Hardware: static specs + live gauges with ~60 s sparklines (ADR-383). */}
               <HardwareSection />
+
+              {/* Data retention: the daemon's daily sweep of old usage rows and routine runs. */}
+              <RetentionSection />
 
               {/* Privacy & telemetry (spec 09 §5) — hidden for MVP launch (ADR-041);
                   no telemetry uploader ships yet. Re-enable via flags.ts when it does. */}
