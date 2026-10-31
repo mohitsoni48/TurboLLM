@@ -1041,6 +1041,7 @@ async function waitForDesktopAssets(tag, timeoutMs) {
 const ANDROID_DIR = () => join(REPO, 'TurboLLM Android');
 const GRADLEW = WIN ? 'gradlew.bat' : './gradlew';
 const VULKAN_ENGINE_REL = join('composeApp', 'src', 'androidMain', 'jniLibs', 'arm64-v8a', 'libllama_server_vk.so');
+const LLAMA_SUBMODULE = 'third_party/llama.cpp';
 
 // ADR-432: `build-vulkan-engine.sh`/`stage-vulkan-engine.sh` build the
 // dynamic-backend engine, which killed the CPU engine on a real device and
@@ -1056,6 +1057,30 @@ export function androidEngineProblem({ vulkanRequested, enginePresent, enginePat
     + `(it builds the engine and copies it to ${enginePath} itself), then re-run this phase.\n`
     + 'To ship CPU-only on purpose, pass --skip-vulkan-engine.'
   );
+}
+
+// ADR-411/432: the SDK's CPU engine is built from the llama.cpp submodule, and
+// its pin is the gitlink. A plain `git pull` leaves that tree empty (CMake
+// fails deep in the build) or at an old commit (a stale engine ships). Reads
+// one line of `git submodule status third_party/llama.cpp`; null means git
+// does not know the path as a submodule.
+export function androidSubmoduleProblem(statusLine) {
+  const fix = `run \`git submodule update --init ${LLAMA_SUBMODULE}\` in TurboLLM Android, then re-run this phase.`;
+  if (statusLine === null) return `${LLAMA_SUBMODULE} is not a submodule here — ${fix}`;
+  const state = statusLine[0];
+  if (state === ' ') return null;
+  if (state === '-') return `${LLAMA_SUBMODULE} is not initialised — ${fix}`;
+  if (state === '+') return `${LLAMA_SUBMODULE} is checked out at ${checkedOutSha(statusLine)}, not the pinned gitlink — ${fix}`;
+  return `${LLAMA_SUBMODULE} is in a merge conflict (${statusLine.trim()}) — resolve the gitlink, then ${fix}`;
+}
+
+const checkedOutSha = (statusLine) => statusLine.slice(1).split(' ')[0];
+
+function androidSubmoduleStatusLine(dir) {
+  // spawnSync, not run(): run() trims, and the leading space is the in-sync marker.
+  const r = spawnSync('git', ['submodule', 'status', LLAMA_SUBMODULE], { cwd: dir, encoding: 'utf8' });
+  const line = r.status === 0 ? (r.stdout || '').split(/\r?\n/)[0] : '';
+  return line || null;
 }
 
 async function phaseAndroid(state, flags) {
@@ -1087,6 +1112,15 @@ async function phaseAndroid(state, flags) {
     ? `Vulkan engine staged: ${enginePath.replace(REPO, '.')}`
     : '--skip-vulkan-engine passed — building CPU-only on purpose');
 
+  // 2. llama.cpp submodule at its pinned gitlink, unless this checkout predates the SDK.
+  if (existsSync(join(dir, '.gitmodules'))) {
+    const submoduleProblem = androidSubmoduleProblem(androidSubmoduleStatusLine(dir));
+    if (submoduleProblem) fail(submoduleProblem);
+    note(`llama.cpp submodule at the pinned gitlink: ${LLAMA_SUBMODULE}`);
+  } else {
+    note('llama.cpp submodule check skipped: no .gitmodules (this checkout predates the SDK)');
+  }
+
   if (!flags['dry-run']) {
     requireApproval(flags, 'publishing the Android app to Play Console (internal + alpha + beta, real users)');
   }
@@ -1095,13 +1129,13 @@ async function phaseAndroid(state, flags) {
     return `${out.join('\n')}\n[dry-run] would: bundleRelease, publishReleaseBundle → internal, promote → alpha + beta, publishReleaseListing`;
   }
 
-  // 2. Signed release bundle (signing + service-account creds already wired
+  // 3. Signed release bundle (signing + service-account creds already wired
   //    through the gitignored local.properties — no extra setup here).
   step('building the signed release bundle…');
   mustRun(GRADLEW, ['bundleRelease', ...vulkanFlag], { cwd: dir });
   note('release bundle built (composeApp-release.aab)');
 
-  // 3. Upload once to internal (cheapest, always accepts a fresh version
+  // 4. Upload once to internal (cheapest, always accepts a fresh version
   //    code), then PROMOTE that same version code — never re-run
   //    publishReleaseBundle per track (Play's version code is strictly
   //    increasing across every track combined, not per-track; ADR-412).
@@ -1115,7 +1149,7 @@ async function phaseAndroid(state, flags) {
     note(`promoted to ${track}`);
   }
 
-  // 4. Store listing — fully automated (ADR-413), reads play-store-assets/
+  // 5. Store listing — fully automated (ADR-413), reads play-store-assets/
   //    every run, so it always matches whatever that currently says.
   step('syncing the store listing (publishReleaseListing)…');
   mustRun(GRADLEW, ['publishReleaseListing'], { cwd: dir });
