@@ -178,7 +178,13 @@ test('commitGitChanges: default (no files given) stages and commits everything',
 // 14,000 files is slow on a Windows CI runner (every file is scanned, and with Git for Windows' default autocrlf each
 // one also prints a line-ending warning), so this repo converts nothing and the test gets headroom: what it pins is the
 // size of the list, not the speed of the runner.
-test('REGRESSION: committing everything works when the staged file list is over 1 MiB', { timeout: 300_000 }, async () => {
+// Not on a hosted Windows runner: there `git add` of 14,000 files took over 2 minutes, which says nothing about the
+// 1 MiB output limit this pins (execFile's maxBuffer, the same on every platform). It runs on Linux CI and on a
+// Windows dev machine.
+test('REGRESSION: committing everything works when the staged file list is over 1 MiB', {
+  timeout: 300_000,
+  skip: process.platform === 'win32' && process.env.CI === 'true' && '14,000 files is too slow on a hosted Windows runner',
+}, async () => {
   const dir = initRepo()
   gitSync(['config', 'core.autocrlf', 'false'], dir)
   mkdirSync(join(dir, 'gen'))

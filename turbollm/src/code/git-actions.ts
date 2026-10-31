@@ -39,8 +39,9 @@ const execFileAsync = tetheredExecFile({ kind: 'git', end: 'term-then-kill', hol
 const GIT_TIMEOUT_MS = 15_000
 // `git add` is the one local call whose time grows with the tree: staging a new folder of generated files (a build
 // output, a vendored tree) took longer than GIT_TIMEOUT_MS on Windows, where every file is also scanned by antivirus,
-// and the commit failed with "git add timed out". It gets headroom; a hung add is still bounded.
-const GIT_STAGE_TIMEOUT_MS = 120_000
+// and the commit failed with "git add timed out" (14,000 files took over 2 minutes on a hosted Windows runner). It is
+// only a backstop against a hung add, so it is generous: failing a user's commit on a slow disk is the worse outcome.
+const GIT_STAGE_TIMEOUT_MS = 600_000
 // Push touches the network — more headroom, but still bounded so a hung credential prompt can't
 // wedge a daemon request forever. GIT_TERMINAL_PROMPT=0 (set on every call below) is the real fix
 // for that case; this timeout is only the backstop if it doesn't work for the remote's exact auth
