@@ -178,6 +178,24 @@ const tailOf = (s, lines = 40) => String(s || '').split(/\r?\n/).slice(-lines).j
 // A `--dry-run` is recorded like any other phase, so without this a preview
 // satisfies the ordering guard and short-circuits the real run — which is how an
 // `announce` preview once ended a release having posted nothing.
+// GitHub's closing keywords (ADR-416). A commit already on main whose message merely quotes the syntax cannot be
+// reworded, so one that was checked and found harmless is acknowledged here by its FULL sha: a different commit with
+// the same words still blocks. b387a903 quotes `closes #12` while describing this very scan; #12 is a PR, so it closed
+// nothing.
+export const MAGIC_CLOSE = /\b(closes|fixes|resolves)\s+#\d+/i;
+export const MAGIC_CLOSE_ACKNOWLEDGED = new Set(['b387a90331e094858dcbaafd06faa0fdf15c0e7a']);
+
+/** The short shas of commits in `log` (entries of `%H\x1f%B\x1e`) whose message has a closing keyword, minus the
+ *  acknowledged ones. */
+export function magicCloseCommits(log, acknowledged = MAGIC_CLOSE_ACKNOWLEDGED) {
+  const flagged = [];
+  for (const entry of log.split('\x1e')) {
+    const [sha, message] = entry.trim().split('\x1f');
+    if (sha && message && !acknowledged.has(sha) && MAGIC_CLOSE.test(message)) flagged.push(sha.slice(0, 8));
+  }
+  return flagged;
+}
+
 export const isRealOk = (rec) => rec?.status === 'ok' && !rec.dryRun;
 export const alreadyRecordedOk = (rec, flags = {}) => isRealOk(rec) && !flags.resume;
 
@@ -350,17 +368,16 @@ async function phasePreflight(state, flags) {
   }
 
   // 5. no GitHub magic-close syntax anywhere (ADR-416)
-  const magic = /\b(closes|fixes|resolves)\s+#\d+/i;
   const range = tag ? `${tag}..HEAD` : 'HEAD';
-  const msgs = git('log', '--format=%B', range).stdout;
-  if (magic.test(msgs)) {
-    problems.push(`a commit message in ${range} contains \`Closes/Fixes/Resolves #NNN\` — GitHub executes that on merge and silently closes the reporter's issue. Reword it (\`(#NNN)\`, \`addresses #NNN\`).`);
+  const flagged = magicCloseCommits(git('log', '--format=%H%x1f%B%x1e', range).stdout);
+  if (flagged.length > 0) {
+    problems.push(`a commit message in ${range} (${flagged.join(', ')}) contains \`Closes/Fixes/Resolves #NNN\` — GitHub executes that on merge and silently closes the reporter's issue. Reword it (\`(#NNN)\`, \`addresses #NNN\`).`);
   } else note(`no magic-close syntax in commit messages (${range})`);
 
   const pr = findPr(state, flags, { optional: true });
   if (pr) {
     const body = gh('pr', 'view', String(pr), '--json', 'body', '-q', '.body').stdout;
-    if (magic.test(body)) {
+    if (MAGIC_CLOSE.test(body)) {
       problems.push(`PR #${pr}'s body contains \`Closes/Fixes/Resolves #NNN\` — edit it out before merging (\`gh pr edit ${pr} --body ...\`).`);
     } else note(`PR #${pr} body is free of magic-close syntax`);
   } else {
