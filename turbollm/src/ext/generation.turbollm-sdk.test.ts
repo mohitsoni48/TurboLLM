@@ -55,3 +55,49 @@ test('an extension run to the SDK engine carries its bearer; llama.cpp gets no a
   assert.equal(await authorizationSentTo('turbollm-sdk'), 'Bearer sdk-process-token')
   assert.equal(await authorizationSentTo('llama-server'), null)
 })
+
+const TOOLS = [{ type: 'function', function: { name: 'run_code', description: 'd', parameters: { type: 'object', properties: {} } } }]
+
+/** Runs one extension turn on an engine of `engineKind` with one tool offered, and returns the body the engine got. */
+async function bodySentTo(engineKind: string): Promise<Record<string, unknown>> {
+  const conv = new ConversationStore(IN_MEMORY_DATA_DIR)
+  const chatStore = new ChatStoreRouter(conv.chatStore, conv.chatStore)
+  const realFetch = globalThis.fetch
+  let sent: Record<string, unknown> | undefined
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    sent = JSON.parse(String(init?.body)) as Record<string, unknown>
+    return new Response(null, { status: 400, statusText: 'refused' })
+  }) as typeof fetch
+  try {
+    const d = {
+      chatStore,
+      manager: {
+        status: () => ({ state: 'running', model: { key: 'm', name: 'M', ctx: 8192 } }),
+        target: () => 'http://engine.invalid',
+        currentOpts: () => undefined,
+        generationStart: () => {},
+        generationEnd: () => {},
+      },
+      registry: { active: () => ({ id: 'e', kind: engineKind }) },
+      tools: { buildToolDefinitions: async () => TOOLS },
+      store: { snapshot: () => ({ tools: { toolPolicies: {}, autoAllowAll: false }, modelDefaults: {} }), dir: () => IN_MEMORY_DATA_DIR },
+    } as unknown as Deps
+    const chat = await chatStore.createChat(SCOPE, { title: 't' })
+    await chatStore.addMessage(SCOPE, chat.id, { role: 'user', content: 'go' })
+    const placeholder = await chatStore.addMessage(SCOPE, chat.id, { role: 'assistant', content: '', status: 'streaming' })
+    await createMakeBody(d)({ chatId: chat.id, messageId: placeholder.id, scope: SCOPE })({ emit: () => {}, signal: new AbortController().signal })
+      .catch(() => {})
+  } finally {
+    globalThis.fetch = realFetch
+    conv.close()
+  }
+  assert.ok(sent, 'the engine was called')
+  return sent
+}
+
+// The in-app SDK engine refuses a request's tools with a 400 (plan D-4, ADR-447 point 7), so an extension run there
+// goes without them rather than fail.
+test('an extension run to the SDK engine is sent no tools; llama.cpp keeps them', async () => {
+  assert.equal((await bodySentTo('turbollm-sdk')).tools, undefined)
+  assert.deepEqual((await bodySentTo('llama-server')).tools, TOOLS)
+})

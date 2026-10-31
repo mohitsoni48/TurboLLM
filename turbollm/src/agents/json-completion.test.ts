@@ -147,3 +147,16 @@ test('the JSON request to the SDK engine carries its bearer; llama.cpp gets no a
   await jsonCompletion(deps('llama-server'), 'http://engine.invalid', { messages: [] }, 5000)
   assert.deepEqual(seen, ['Bearer sdk-process-token', null])
 })
+
+// The in-app SDK engine refuses response_format and tools with a 400 (plan D-4, ADR-447 point 7), so the distiller and
+// the reviewer never send it either; the callers already find the object in whatever the model writes.
+test('the SDK engine is sent no response_format and no tools; llama.cpp keeps both', async (t) => {
+  const sent = engine(t, [ok(SKILL)])
+  const body = { messages: [], response_format: { type: 'json_object' }, tools: [{ type: 'function', function: { name: 'x' } }] }
+  await jsonCompletion(deps('turbollm-sdk'), 'http://engine.invalid', body, 5000)
+  await jsonCompletion(deps('llama-server'), 'http://engine.invalid', body, 5000)
+  assert.equal('response_format' in sent[0], false)
+  assert.equal('tools' in sent[0], false)
+  assert.deepEqual(sent[1].response_format, { type: 'json_object' })
+  assert.deepEqual(sent[1].tools, body.tools)
+})

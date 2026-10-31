@@ -53,7 +53,7 @@ import type { ChatStore } from '../chat/store/chat-store.js'
 import type { Chat, ChatMessage, Scope } from '../chat/store/types.js'
 import type { RunDeps } from './routes.runs.js'
 import { withCurrentDate } from '../chat/chat-compaction.js'
-import { engineModelAlias, shapeForEngine } from '../engines/compat.js'
+import { engineModelAlias, engineWithholdsTools, shapeForEngine } from '../engines/compat.js'
 import { litertLmIgnoredFieldsNote, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request.js'
 import { engineErrorReason, engineErrorText } from '../engines/engine-error.js'
 import { clampMaxTokens } from '../config/config.js'
@@ -287,7 +287,8 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
   // A LiteRT-LM model gets them when it calls tools and they fit, as in chat (litertLmToolsFor); they
   // were withheld from every LiteRT-LM model. What it is not sent is logged: this API has no note event.
   const toolDefs = d.tools ? await d.tools.buildToolDefinitions() : []
-  const toolsSupported = engineKind !== 'vllm' && engineKind !== 'sglang' && toolDefs.length > 0
+  // The in-app SDK engine refuses a request's tools (ADR-447 point 7); an extension run there goes without them.
+  const toolsSupported = engineKind !== 'vllm' && engineKind !== 'sglang' && !engineWithholdsTools(engineKind) && toolDefs.length > 0
   const litertModel = engineKind === 'litert-lm' ? d.scanner?.get?.(loadedModel.key) : undefined
   let toolsNoted = false
 

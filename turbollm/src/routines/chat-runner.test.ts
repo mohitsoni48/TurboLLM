@@ -576,3 +576,28 @@ test('a routine turn to the SDK engine carries its bearer; llama.cpp gets no aut
   }
   assert.deepEqual(seen, ['Bearer sdk-process-token', null])
 })
+
+// The in-app SDK engine refuses a request's tools with a 400 (plan D-4, ADR-447 point 7): the routine runs without them,
+// and its log says so once, not on every round.
+test('a routine on the SDK engine is sent no tools, and the log says so once; llama-server keeps them', async (t) => {
+  const logged: string[] = []
+  t.mock.method(console, 'log', (line: string) => { logged.push(line) })
+  const sdk = fakeDeps({ engineKind: 'turbollm-sdk' })
+  const r = routine(sdk.db)
+  const run = sdk.db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  const toolRound = { choices: [{ message: { content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'run_code', arguments: '{"code":"1"}' } }] } }] }
+  const fetchStub = stubFetch([toolRound, { choices: [{ message: { content: 'done' } }] }])
+  try {
+    await runChatRoutine(sdk.d, r, run, new AbortController().signal)
+    assert.ok(fetchStub.calls.length >= 2, 'more than one round, so a once-only log is tested')
+    for (const call of fetchStub.calls) assert.equal(call.tools, undefined)
+    assert.equal(logged.filter((l) => l.includes(`[routines] run ${run.id}:`) && l.includes('tools')).length, 1)
+  } finally { fetchStub.restore() }
+  const llama = fakeDeps({ engineKind: 'llama-server' })
+  const r2 = routine(llama.db)
+  const llamaStub = stubFetch([{ choices: [{ message: { content: 'done' } }] }])
+  try {
+    await runChatRoutine(llama.d, r2, llama.db.createRoutineRun({ routineId: r2.id, configSnapshot: JSON.stringify(r2) }), new AbortController().signal)
+    assert.ok(Array.isArray(llamaStub.calls[0].tools))
+  } finally { llamaStub.restore() }
+})

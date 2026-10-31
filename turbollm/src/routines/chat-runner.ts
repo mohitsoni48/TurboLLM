@@ -22,7 +22,7 @@ import type { CustomChatAgent } from '../config/config'
 import type { Routine, RoutineRun } from './schema'
 import type { Conversation, Message } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
-import { engineModelAlias, shapeForEngine } from '../engines/compat'
+import { engineModelAlias, engineWithholdsTools, shapeForEngine } from '../engines/compat'
 import { litertLmIgnoredFieldsNote, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request'
 import { engineErrorReason, engineErrorText } from '../engines/engine-error'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval'
@@ -175,6 +175,8 @@ export async function resumeChatRoutine(
   return runChatRoundLoop(d, run, agent, pending.convId, signal, { messages, toolLoop: new ToolLoopTracker(), iter: 0 }, routine.modelKey, route)
 }
 
+const SDK_TOOLS_WITHHELD_NOTE = "The in-app engine does not run tools, so the agent's tools were not sent."
+
 /** Every turn goes to `route`, where the routine's swap loaded its model, shaped for the engine serving it there as the
  *  gateway shapes a request from its route. With keep-N 2 or more the swap loads the routine's model into a pool slot
  *  and leaves the user's in the primary. The turns went to the primary with the primary's model all the same, so the
@@ -216,7 +218,10 @@ async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent
     // The agent's tools. A LiteRT-LM model gets them when it calls tools and they fit, as in chat
     // (litertLmToolsFor); they were withheld from every LiteRT-LM model, so a routine agent's tools never
     // ran there. What it is not sent is logged. vLLM/SGLang were already ungated on this path; that stays.
-    if (baseToolDefs.length && engineKind === 'litert-lm') {
+    // The in-app SDK engine refuses a request's tools (ADR-447 point 7): the agent runs without them, and the log says so.
+    if (baseToolDefs.length && engineWithholdsTools(engineKind)) {
+      if (!toolsNoted) { toolsNoted = true; console.log(`[routines] run ${run.id}: ${SDK_TOOLS_WITHHELD_NOTE}`) }
+    } else if (baseToolDefs.length && engineKind === 'litert-lm') {
       const pick = litertLmToolsFor(litertModel, baseToolDefs, state.messages, litertCtx)
       if (pick.tools.length) reqBody.tools = pick.tools
       if (pick.note && !toolsNoted) { toolsNoted = true; console.log(`[routines] run ${run.id}: ${pick.note}`) }

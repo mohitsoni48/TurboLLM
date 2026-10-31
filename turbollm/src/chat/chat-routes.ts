@@ -33,6 +33,7 @@ import type { ModelInfo } from '../engines/manager'
 import { litertLmPrefillStats } from '../engines/litert-lm'
 import { engineErrorReason, engineErrorText, streamChunkError } from '../engines/engine-error'
 import { LITERT_LM_RESEARCH_NOTE, litertLmIgnoredFieldsNote, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request'
+import { engineWithholdsTools } from '../engines/compat'
 import { getModelProfile } from '../config/config'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { noteLocalActivity } from '../link/host-idle'
@@ -1755,7 +1756,10 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
         roundTools = pick.tools
         if (pick.note) await noteOnce(pick.note)
       }
-      const toolsSupported = engineKind !== 'vllm' && engineKind !== 'sglang' && roundTools.length > 0
+      // The in-app SDK engine refuses a request's tools (ADR-447 point 7), so a local turn there goes without them. A
+      // turn to a Turbo Link host keeps them: the host's engine runs them, whatever this machine's engine is (G-6).
+      const localWithholdsTools = engineWithholdsTools(engineKind) && !upstream.remote
+      const toolsSupported = engineKind !== 'vllm' && engineKind !== 'sglang' && !localWithholdsTools && roundTools.length > 0
       if (toolsSupported) reqBody.tools = roundTools
       // Force web_search on the first two iterations when the conversation has a
       // force_web_search policy (e.g. Research persona). This guarantees at least
