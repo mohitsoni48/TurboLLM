@@ -17,7 +17,15 @@ import { slotCacheDir } from './slot-cache'
 import { rememberLitertLmModel, type LitertLmRequestInfo } from './litert-lm-request'
 import { litertlmHeaderFromFile } from '../models/litertlm'
 import { isTetheredGroupLeader, spawnTethered } from '../util/tether'
-import { exitedWithin, SpawnedTransport, type EngineTransport } from './transport'
+import {
+  AttachedTransport,
+  exitedWithin,
+  SDK_ENGINE_UNAVAILABLE,
+  SdkEngineError,
+  SpawnedTransport,
+  type EngineTransport,
+  type SdkLoadRequest,
+} from './transport'
 import { START_TIME_TOLERANCE_MS, processStartTimes } from '../util/process-start-time'
 import { hostUname, vllmModelRunnerEnv, vllmServerCommand, vllmServeBlocker } from './vllm'
 import { sglangServerCommand, sgLangServeBlocker } from './sglang'
@@ -249,8 +257,12 @@ export class Manager {
 
   /** `poolSlot`: this Manager runs a gateway pool slot (ModelRouter) beside the primary, often on the same
    *  engine, so its engine log gets a file of its own (see startInternal). */
-  constructor(private store: ConfigStore, options: { poolSlot?: boolean } = {}) {
+  /** How the in-app SDK engine is reached (AttachedTransport); a test injects a fake SDK here. */
+  private readonly sdkFetch: typeof globalThis.fetch
+
+  constructor(private store: ConfigStore, options: { poolSlot?: boolean; fetch?: typeof globalThis.fetch } = {}) {
     this.poolSlot = options.poolSlot ?? false
+    this.sdkFetch = options.fetch ?? globalThis.fetch
   }
 
   /** Load a model, freeing any currently-loaded one first — the single atomic
@@ -391,6 +403,7 @@ export class Manager {
     // previous model's.
     this.opts = opts
     this.lastCommand = null
+    if (opts.engine.kind === TURBOLLM_SDK) return this.startAttached(opts)
     if (!opts.engine.binPath) throw new Error('no_active_engine')
     if (!opts.modelPath) throw new Error('no_such_model')
 
@@ -551,6 +564,82 @@ export class Manager {
     void this.readiness(child, port)
   }
 
+  /** The in-app SDK engine (kind 'turbollm-sdk', architecture §6.3): the app runs it, so nothing is spawned and no pid,
+   *  pidfile, tether or command line is kept. Its load is asked for over HTTP and awaited in the background inside the
+   *  same readiness budget, as readiness() awaits a spawned engine. No token (the app did not start the SDK this
+   *  session) fails at once. */
+  private startAttached(opts: StartOpts): void {
+    if (!opts.modelPath) throw new Error('no_such_model')
+    if (!opts.engine.baseUrl || !sdkToken()) {
+      this.state = 'error'
+      this.errInfo = { code: 'engine_unavailable', message: SDK_ENGINE_UNAVAILABLE, exitCode: -1, logTail: [] }
+      return
+    }
+    const transport = new AttachedTransport(opts.engine.baseUrl, sdkToken, this.sdkFetch)
+    this.beginAttachedSession(transport, opts)
+    void this.attachedReadiness(transport, opts)
+  }
+
+  private beginAttachedSession(transport: AttachedTransport, opts: StartOpts): void {
+    this.state = 'starting'
+    this.session = freshSession()
+    this.port = 0
+    this.pid = 0
+    this.startedAt = Date.now()
+    this.errInfo = null
+    this.lastActivity = Date.now()
+    this.logPathStr = this.writeAttachedEngineLog(opts)
+    if (!this.watchdog) {
+      this.watchdog = setInterval(() => this.watchdogTick(), 60_000)
+      this.watchdog.unref()
+    }
+    this.transport = transport
+    this.exited = transport.ended.then(() => this.onDetached(transport))
+  }
+
+  /** Ready: the running model takes the context the SDK really loaded (E-51), so the chat's context meter and its
+   *  compaction count against it rather than the daemon's default. A failure is the engine's error, and the SDK is
+   *  asked to unload what it holds. */
+  private async attachedReadiness(transport: AttachedTransport, opts: StartOpts): Promise<void> {
+    try {
+      const loaded = await transport.start(sdkLoadRequest(opts), READINESS_TIMEOUT_MS)
+      if (this.transport !== transport || this.state !== 'starting') return
+      this.opts = withLoadedContext(opts, loaded.contextSize)
+      this.state = 'running'
+      this.lastActivity = Date.now()
+    } catch (e) {
+      if (this.transport !== transport || this.state !== 'starting') return
+      this.state = 'error'
+      const code = e instanceof SdkEngineError ? e.code : 'model_load_failed'
+      this.errInfo = { code, message: e instanceof Error ? e.message : String(e), exitCode: -1, logTail: [] }
+      transport.kill()
+    }
+  }
+
+  /** The attached engine's unload has settled (onTerminated's counterpart): a stop ends 'stopped', a failed load
+   *  keeps its error. */
+  private onDetached(transport: AttachedTransport): void {
+    if (this.transport !== transport) return
+    if (this.state === 'stopping') this.state = 'stopped'
+    this.transport = null
+    if (this.watchdog) clearInterval(this.watchdog)
+    this.watchdog = null
+    this.session = freshSession()
+  }
+
+  /** The engine log the logs route reads: there is no engine output to show, so it says so, and names the launch
+   *  settings the SDK does not apply (§6.6). Best-effort, as the spawned engine's log is. */
+  private writeAttachedEngineLog(opts: StartOpts): string {
+    const logPath = join(this.store.dir(), 'logs', `engine-${opts.engine.id}.log`)
+    try {
+      mkdirSync(dirname(logPath), { recursive: true })
+      writeFileSync(logPath, `${[SDK_ENGINE_LOG_LINE, ...ignoredLaunchSettings(opts)].join('\n')}\n`)
+    } catch (e) {
+      console.warn(`[engine] log write failed: ${e instanceof Error ? e.message : String(e)}`)
+    }
+    return logPath
+  }
+
   stop(): void {
     if (this.state === 'error') {
       this.state = 'stopped'
@@ -682,6 +771,8 @@ export class Manager {
    *  prompt-cache reuse; it is not free. */
   parallelSlots(): number | null {
     if (this.state !== 'running' && this.state !== 'starting') return null
+    // The SDK serves one generation at a time (its own gate queues 8, then answers 429): the daemon queues instead.
+    if (this.opts?.engine.kind === TURBOLLM_SDK) return 1
     const args = this.lastCommand?.args
     if (!args) return null
     const i = args.indexOf('--parallel')
@@ -1014,6 +1105,35 @@ export function engineCommand(opts: StartOpts, port: number, slotSavePath?: stri
  *  Strix Halo APU still hadn't finished loading at 120s). Flat-bumped to 600s for every
  *  kind rather than trying to model disk throughput. */
 const READINESS_TIMEOUT_MS = 600_000
+
+const TURBOLLM_SDK = 'turbollm-sdk'
+const SDK_ENGINE_LOG_LINE = 'Engine is managed in-app by the TurboLLM SDK; there is no engine log.'
+
+/** The app mints a new SDK token per process and hands it over in the environment: read on every call, never kept. */
+function sdkToken(): string | undefined {
+  return process.env.TURBOLLM_ANDROID_SDK_TOKEN
+}
+
+/** The profile as the SDK's load takes it (architecture §6.6). An unset (0) ctx or threads is left to the SDK; ngl and
+ *  the llama-server flags in extraArgs have no SDK equivalent (ignoredLaunchSettings). */
+function sdkLoadRequest(opts: StartOpts): SdkLoadRequest {
+  return {
+    path: opts.modelPath,
+    contextSize: opts.profile?.ctx || undefined,
+    threads: opts.profile?.threads || undefined,
+    backend: opts.litertLmConfig?.default.backend ?? 'auto',
+  }
+}
+
+function ignoredLaunchSettings(opts: StartOpts): string[] {
+  if (opts.extraArgs.length === 0) return []
+  return [`[turbollm] The in-app engine ignores these launch settings: ${opts.extraArgs.join(' ')}`]
+}
+
+function withLoadedContext(opts: StartOpts, contextSize: number | undefined): StartOpts {
+  if (!Number.isInteger(contextSize) || !contextSize || contextSize <= 0) return opts
+  return { ...opts, model: { ...opts.model, ctx: contextSize } }
+}
 
 /** Environment for a spawned engine. For native engines (llama.cpp, koboldcpp, llamafile) on
  *  Linux and Android, points `LD_LIBRARY_PATH` at the binary's own directory: a source build

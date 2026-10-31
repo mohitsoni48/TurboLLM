@@ -43,6 +43,130 @@ export class SpawnedTransport implements EngineTransport {
   }
 }
 
+export const SDK_ENGINE_UNAVAILABLE = 'The TurboLLM SDK engine is not running in this app session.'
+const SDK_TOKEN_REFUSED = "The app's SDK engine refused the daemon's token (the app was probably restarted)."
+const SDK_STATUS_POLL_MS = 500
+
+/** The body of the SDK's `POST /sdk/v1/load` (architecture §4.3): a model file by path, plus what the profile sets. */
+export interface SdkLoadRequest {
+  path: string
+  contextSize?: number
+  threads?: number
+  backend: 'auto' | 'cpu' | 'gpu'
+}
+
+/** What the SDK's status reports about the model it has loaded. */
+export interface SdkLoadedModel {
+  contextSize?: number
+}
+
+interface SdkStatus {
+  state: 'idle' | 'loading' | 'ready' | 'error'
+  model?: SdkLoadedModel
+  error?: { message?: string }
+}
+
+interface SdkErrorBody {
+  error?: { message?: string }
+}
+
+/** The SDK engine refused or failed a request; `code` is the Manager's error code for it. */
+export class SdkEngineError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'SdkEngineError'
+  }
+}
+
+/** The in-app TurboLLM SDK engine (kind 'turbollm-sdk'), which the app runs and the daemon reaches over loopback HTTP
+ *  with the app's per-process bearer (architecture §6.3). It has no pid, no pidfile, no tether and no log file: a load
+ *  is `POST /sdk/v1/load` plus status polling, and a stop is an unload. `token` is read on every request, never kept. */
+export class AttachedTransport implements EngineTransport {
+  /** Resolves once the unload has settled, however it ended: the engine's model is gone as far as the daemon goes. */
+  readonly ended: Promise<void>
+  private markEnded: () => void = () => {}
+  private unloading: Promise<void> | null = null
+
+  constructor(
+    private readonly baseUrl: string,
+    private readonly token: () => string | undefined,
+    private readonly fetchFn: typeof globalThis.fetch = globalThis.fetch,
+  ) {
+    this.ended = new Promise<void>((resolve) => { this.markEnded = resolve })
+  }
+
+  target(): string {
+    return this.baseUrl
+  }
+
+  headers(): Record<string, string> {
+    const token = this.token()
+    return token ? { Authorization: `Bearer ${token}` } : {}
+  }
+
+  /** Asks the SDK to load the model and waits for it to be ready within `budgetMs`. Rejects with an
+   *  {@link SdkEngineError}; nothing is retried. */
+  async start(request: SdkLoadRequest, budgetMs: number): Promise<SdkLoadedModel> {
+    const deadline = Date.now() + budgetMs
+    await this.answer(await this.send('POST', '/sdk/v1/load', request))
+    for (;;) {
+      await sleep(SDK_STATUS_POLL_MS)
+      if (this.unloading) throw new SdkEngineError('load_abandoned', 'The load was stopped.')
+      const status = (await this.answer(await this.send('GET', '/sdk/v1/status'))) as SdkStatus
+      if (status.state === 'ready') return status.model ?? {}
+      if (status.state === 'error') throw new SdkEngineError('model_load_failed', sdkMessage(status, 'The model did not load.'))
+      if (Date.now() > deadline) {
+        throw new SdkEngineError('readiness_timeout', `The model did not become ready within ${Math.round(budgetMs / 1000)} seconds.`)
+      }
+    }
+  }
+
+  stop(): Promise<void> {
+    return this.unload()
+  }
+
+  kill(): void {
+    void this.unload()
+  }
+
+  private unload(): Promise<void> {
+    this.unloading ??= this.send('POST', '/sdk/v1/unload', {}).then(
+      () => this.markEnded(),
+      () => this.markEnded(),
+    )
+    return this.unloading
+  }
+
+  private async send(method: 'GET' | 'POST', path: string, body?: object): Promise<Response> {
+    const headers = { ...this.headers(), ...(body ? { 'Content-Type': 'application/json' } : {}) }
+    try {
+      return await this.fetchFn(`${this.baseUrl}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined })
+    } catch {
+      throw new SdkEngineError('engine_unavailable', SDK_ENGINE_UNAVAILABLE)
+    }
+  }
+
+  /** The reply's JSON body, or the refusal as an {@link SdkEngineError}. Typed load errors all map onto
+   *  `model_load_failed` (architecture §6.3), except a 401: the app no longer holds the daemon's token. */
+  private async answer(res: Response): Promise<unknown> {
+    const body: unknown = await res.json().catch(() => ({}))
+    if (res.ok) return body
+    if (res.status === 401) throw new SdkEngineError('engine_auth_failed', SDK_TOKEN_REFUSED)
+    throw new SdkEngineError('model_load_failed', sdkMessage(body as SdkErrorBody, `The TurboLLM SDK engine answered HTTP ${res.status}.`))
+  }
+}
+
+function sdkMessage(body: SdkErrorBody, fallback: string): string {
+  return body?.error?.message || fallback
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 async function gracefulStop(child: ChildProcess, exited: Promise<void>): Promise<void> {
   signalTerm(child)
   const result = await exitedWithin(exited, 8000)
