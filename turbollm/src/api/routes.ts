@@ -81,7 +81,7 @@ import { gcAbandonedZipInstalls, installZipEngine, MAX_ZIP_BYTES, packagedAndroi
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
-import { modelIncompatibility } from '../engines/compat'
+import { engineWithholdsVision, modelIncompatibility } from '../engines/compat'
 import { ScannerError, type ModelEntry } from '../models/scanner'
 import { automaticProfile, configuredCtx, estimateVram, legacySeedProfile, type LoadProfile, resolveProfile, userSetProfile } from '../models/profile'
 import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
@@ -4046,8 +4046,11 @@ function overlayModel(
   const configuredCtxNow = configuredCtx(snap, e, engine?.id ?? '', getSysInfo())
   // Hidden by hand (Models → Library "Hide", config.ts hiddenModels): the web UI leaves it out of its lists and pickers.
   const hidden = isModelHidden(snap, e.key)
+  // An engine that reads no images (the in-app SDK engine, G-2) is not offered a model's vision; the scanned entry
+  // keeps it, for when another engine is selected.
+  const vision = e.vision && !engineWithholdsVision(engine?.kind ?? '')
   return {
-    ...e, loaded, hasProfile, configuredCtx: configuredCtxNow, lastTps, liveTps, benchTps,
+    ...e, vision, loaded, hasProfile, configuredCtx: configuredCtxNow, lastTps, liveTps, benchTps,
     compatibleWithActiveEngine, incompatibleReason, sourceRepo, hidden,
   }
 }

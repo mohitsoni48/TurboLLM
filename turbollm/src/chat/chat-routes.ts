@@ -33,7 +33,7 @@ import type { ModelInfo } from '../engines/manager'
 import { litertLmPrefillStats } from '../engines/litert-lm'
 import { engineErrorReason, engineErrorText, streamChunkError } from '../engines/engine-error'
 import { LITERT_LM_RESEARCH_NOTE, litertLmIgnoredFieldsNote, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request'
-import { engineWithholdsTools } from '../engines/compat'
+import { engineWithholdsTools, engineWithholdsVision } from '../engines/compat'
 import { getModelProfile } from '../config/config'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { noteLocalActivity } from '../link/host-idle'
@@ -339,6 +339,9 @@ const DENIED_TOOL_CHAT_ALLOW_REFUSED = 'This tool is set to Deny in Tool Permiss
 /** A change to an MCP-running chat routine's run conversation, to a caller the routine routes
  *  refuse that routine (see registerChatRoutes's conversationGate). */
 const MCP_ROUTINE_CONVERSATION_REFUSED = 'Changing the conversation of a routine whose agent uses an MCP server tool requires a valid API key from a non-host device.'
+
+/** An image sent to this machine's engine when it reads none (localEngineWithholdsVision, G-2). */
+const VISION_UNAVAILABLE = 'The in-app engine can\'t read images in this version. Switch to the bundled llama.cpp engine in Engines to use images.'
 
 /** Messages as the chat routes return them: without `docContext`, the attached documents' full
  *  text. It is stored so a Regenerate or a Save & Resend can send the turn again with its
@@ -694,6 +697,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const resolved = resolveChatUpstream(d, b.model)
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
     const upstream = resolved.upstream
+    // Refused before anything is stored: the engine would refuse the image part, and no reply could be generated.
+    if (images.length && localEngineWithholdsVision(d, upstream)) return err(c, 400, 'vision_unavailable', VISION_UNAVAILABLE)
 
     const busy = inflightRefusal(c, convId, 'A generation is already running for this conversation.')
     if (busy) return busy
@@ -852,7 +857,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // `lastUser` is the turn being answered: it goes out with its images and documents, as
       // POST /messages first sent it — the text alone is not what the user asked about.
       const allMsgs = (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id)
-      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id, { reasoningField: reasoningAsField(d, upstream) })
+      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id, {
+        reasoningField: reasoningAsField(d, upstream), withholdImages: localEngineWithholdsVision(d, upstream),
+      })
 
       await runGeneration(d, sink, { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), replacedId: replaced?.role === 'assistant' ? replaced.id : undefined, edited, isCodeAuthorized })
     })
@@ -1402,6 +1409,12 @@ export class EngineStreamError extends Error {}
  *  sees. A linked host's engine is not this machine's to judge: it keeps the fold. */
 function reasoningAsField(d: Deps, upstream: ChatUpstream): boolean {
   return !upstream.remote && servingEngineKind(d) === 'litert-lm'
+}
+
+/** Whether this turn's images must not reach the engine: this machine's engine reads none (the in-app SDK engine,
+ *  G-2). A linked host's engine is its own (ADR-376), so a remote turn keeps its images. */
+function localEngineWithholdsVision(d: Deps, upstream: ChatUpstream): boolean {
+  return !upstream.remote && engineWithholdsVision(servingEngineKind(d))
 }
 
 // The engine's error, read and shown as every path shows it (engines/engine-error.ts).

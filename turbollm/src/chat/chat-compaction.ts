@@ -171,6 +171,9 @@ export function userTurnContent(text: string, docContext: string | undefined, im
  *  templates read it there (see `reasoningField`). */
 export type EngineMessage = { role: string; content: unknown; reasoning_content?: string }
 
+/** What an image part becomes for an engine that reads no images (`withholdImages`, G-2). */
+const IMAGE_OMITTED_PART = { type: 'text', text: '[image omitted: this engine cannot read images]' }
+
 /** `answeringUserMessageId` — the user turn this generation answers, when it is already in
  *  `activeMessages` (/continue): it is rebuilt with its images and documents, as POST
  *  /messages sends a new turn. Every other turn is resent as text, as POST /messages does.
@@ -184,9 +187,13 @@ export type EngineMessage = { role: string; content: unknown; reasoning_content?
  *  Qwen3-0.6B) a folded block of about 100 tokens of reasoning added about 100 prompt tokens on Qwen3-0.6B,
  *  gemma-3-270m-it and LFM2.5-VL-450M, and as reasoning_content none. LFM2.5's template reads reasoning_content and
  *  applies its own preserve_thinking (the chat's preserve_thinking kwarg, which the Android app's server passes to the
- *  template). */
+ *  template).
+ *
+ *  `withholdImages` (this machine's engine reads no images, G-2): the answered turn's images go as a text placeholder
+ *  each, so a question asked with an image under another engine can still be answered. Older turns carry no images. */
 export function buildEngineMessages(
-  conv: Conversation, activeMessages: Message[], answeringUserMessageId?: string, opts: { reasoningField?: boolean } = {},
+  conv: Conversation, activeMessages: Message[], answeringUserMessageId?: string,
+  opts: { reasoningField?: boolean; withholdImages?: boolean } = {},
 ): EngineMessage[] {
   const { summary, rest } = resolveCompactionCut(conv, activeMessages)
   const out: EngineMessage[] = []
@@ -207,11 +214,20 @@ export function buildEngineMessages(
     out.push({
       role: m.role,
       content: m.id === answeringUserMessageId
-        ? userTurnContent(m.content, m.docContext, m.attachments)
+        ? answeredTurnContent(m, opts)
         : effectiveTailText(!!conv.preserveThinking, m),
     })
   }
   return out
+}
+
+function answeredTurnContent(m: Message, { withholdImages }: { withholdImages?: boolean }): unknown {
+  const content = userTurnContent(m.content, m.docContext, m.attachments)
+  return withholdImages && Array.isArray(content) ? content.map(omitImagePart) : content
+}
+
+function omitImagePart(part: { type: string }): unknown {
+  return part.type === 'image_url' ? IMAGE_OMITTED_PART : part
 }
 
 // ── tail sizing ──────────────────────────────────────────────────────────────────────

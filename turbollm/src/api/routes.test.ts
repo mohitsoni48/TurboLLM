@@ -41,7 +41,7 @@ const JEV_MODEL = entry({
 const GGUF_MODEL = entry({})
 const LITERT_MODEL = entry({ key: 'gemma-litert', format: 'litertlm', path: 'D:\\models\\gemma.litertlm' } as Partial<ModelEntry>)
 
-type ModelRow = { key: string; compatibleWithActiveEngine: boolean; incompatibleReason: string | null; jev?: JevInfo }
+type ModelRow = { key: string; compatibleWithActiveEngine: boolean; incompatibleReason: string | null; jev?: JevInfo; vision?: boolean }
 
 function appWithActiveEngine(engineKind: string | null, models: ModelEntry[], registry: Record<string, unknown> = {}) {
   const cfg: Record<string, unknown> = {
@@ -120,6 +120,21 @@ test('with no active engine every model is compatible, with no reason', async ()
     { compatibleWithActiveEngine: true, incompatibleReason: null },
     { compatibleWithActiveEngine: true, incompatibleReason: null },
   ])
+})
+
+const VISION_MODEL = entry({ key: 'gemma-vision', vision: true, mmprojPath: '/models/mmproj.gguf' } as Partial<ModelEntry>)
+
+test('while the SDK engine is active a vision model is listed without vision, and the scanned entry keeps it (G-2)', async () => {
+  const [row] = await listModels('turbollm-sdk', [VISION_MODEL])
+
+  assert.equal(row.vision, false)
+  assert.equal(VISION_MODEL.vision, true)
+})
+
+test('under llama.cpp a vision model is listed with vision', async () => {
+  const [row] = await listModels('llama-server', [VISION_MODEL])
+
+  assert.equal(row.vision, true)
 })
 
 test('GET /models takes the config snapshot and registry lookups once per request, not once per model', async () => {
