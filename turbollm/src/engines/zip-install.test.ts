@@ -608,7 +608,7 @@ test('installZipEngine: writes the marker and reports the FINAL path with a name
 test('installZipEngine: a zip named like a staging dir installs where the sweep leaves a registered engine alone', async () => {
   const root = tmpDir('tllm-zip-')
   try {
-    const res = await installZipEngine(root, '.my-build.stage.zip', buildZipArchive([member('llama-server', 'elf')]), { probeFn: STUB_PROBE })
+    const res = await installZipEngine(root, '.my-build.stage.zip', buildZipArchive([member(BIN, 'elf')]), { probeFn: STUB_PROBE })
     assert.ok(res.found)
     const dir = dirname(res.binPath)
     const old = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000)

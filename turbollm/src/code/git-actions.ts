@@ -37,6 +37,11 @@ const execFileAsync = tetheredExecFile({ kind: 'git', end: 'term-then-kill', hol
 // Local, read-only/local-mutation ops (status, add, commit) — bounded short since nothing here
 // touches the network.
 const GIT_TIMEOUT_MS = 15_000
+// `git add` is the one local call whose time grows with the tree: staging a new folder of generated files (a build
+// output, a vendored tree) took longer than GIT_TIMEOUT_MS on Windows, where every file is also scanned by antivirus,
+// and the commit failed with "git add timed out" (14,000 files took over 2 minutes on a hosted Windows runner). It is
+// only a backstop against a hung add, so it is generous: failing a user's commit on a slow disk is the worse outcome.
+const GIT_STAGE_TIMEOUT_MS = 600_000
 // Push touches the network — more headroom, but still bounded so a hung credential prompt can't
 // wedge a daemon request forever. GIT_TERMINAL_PROMPT=0 (set on every call below) is the real fix
 // for that case; this timeout is only the backstop if it doesn't work for the remote's exact auth
@@ -282,18 +287,18 @@ export async function commitGitChanges(repoRoot: string, message: string, files?
     let size = 0
     for (const f of files) {
       if (group.length > 0 && size + f.length + 3 > GIT_ADD_PATHS_BUDGET) {
-        await git(['--literal-pathspecs', 'add', '--', ...group], repoRoot)
+        await git(['--literal-pathspecs', 'add', '--', ...group], repoRoot, GIT_STAGE_TIMEOUT_MS)
         group = []
         size = 0
       }
       group.push(f)
       size += f.length + 3
     }
-    await git(['--literal-pathspecs', 'add', '--', ...group], repoRoot)
+    await git(['--literal-pathspecs', 'add', '--', ...group], repoRoot, GIT_STAGE_TIMEOUT_MS)
   } else {
     // `-- .`: without a pathspec `git add -A` stages the whole working tree, which for a session
     // opened at a repo subfolder includes changes outside the folder (getGitStatus lists only it).
-    await git(['add', '-A', '--', '.'], repoRoot)
+    await git(['add', '-A', '--', '.'], repoRoot, GIT_STAGE_TIMEOUT_MS)
   }
 
   // Re-check what's actually staged rather than trusting `status.files` was non-empty for the
