@@ -284,7 +284,24 @@ export function engineModelAlias(engineKind: string, modelPath?: string | null):
 export function shapeForEngine<T extends Record<string, unknown>>(engineKind: string, body: T): T {
   applyEngineTokenLimit(engineKind, body)
   if (engineKind === 'litert-lm') shapeLitertLmRequest(body)
+  if (engineKind === TURBOLLM_SDK) capSdkStopList(body)
   return body
+}
+
+/** The most stop strings the SDK accepts (OpenAI's own limit). It answers more with a 400, so a thread with five
+ *  would fail every turn. */
+const SDK_MAX_STOP_STRINGS = 4
+let sdkStopDropLogged = false
+
+/** Keeps the first SDK_MAX_STOP_STRINGS of an array `stop` and logs, the first time per process, what was dropped.
+ *  A string `stop` is one entry and stays as it is. Mutates `body`. */
+function capSdkStopList(body: Record<string, unknown>): void {
+  if (!Array.isArray(body.stop) || body.stop.length <= SDK_MAX_STOP_STRINGS) return
+  const dropped = body.stop.slice(SDK_MAX_STOP_STRINGS)
+  body.stop = body.stop.slice(0, SDK_MAX_STOP_STRINGS)
+  if (sdkStopDropLogged) return
+  sdkStopDropLogged = true
+  console.warn(`[engine] TurboLLM SDK takes at most ${SDK_MAX_STOP_STRINGS} stop strings; not sent: ${JSON.stringify(dropped)}`)
 }
 
 export function applyEngineTokenLimit<T extends Record<string, unknown>>(engineKind: string, body: T): T {
