@@ -550,10 +550,7 @@ export class Manager {
     this.errInfo = null
     this.lastActivity = Date.now()
     this.logPathStr = logPath
-    if (!this.watchdog) {
-      this.watchdog = setInterval(() => this.watchdogTick(), 60_000)
-      this.watchdog.unref()
-    }
+    this.armWatchdog()
     this.exited = new Promise<void>((res) => {
       this.resolveExited = res
     })
@@ -589,10 +586,7 @@ export class Manager {
     this.errInfo = null
     this.lastActivity = Date.now()
     this.logPathStr = this.writeAttachedEngineLog(opts)
-    if (!this.watchdog) {
-      this.watchdog = setInterval(() => this.watchdogTick(), 60_000)
-      this.watchdog.unref()
-    }
+    this.armWatchdog()
     this.transport = transport
     this.exited = transport.ended.then(() => this.onDetached(transport))
   }
@@ -1025,6 +1019,13 @@ export class Manager {
         return
       }
     }
+  }
+
+  /** One idle watchdog per Manager, armed when an engine (spawned or attached) starts. */
+  private armWatchdog(): void {
+    if (this.watchdog) return
+    this.watchdog = setInterval(() => this.watchdogTick(), 60_000)
+    this.watchdog.unref()
   }
 
   private watchdogTick(): void {
