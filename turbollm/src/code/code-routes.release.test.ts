@@ -8,6 +8,8 @@ import { Hono } from 'hono'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { registerCodeRoutes } from './code-routes'
 import { spawnHeld } from '../util/tether'
+import { lspPool } from './lsp-pool'
+import { lspSpecForLanguage } from './lsp-registry'
 import type { Deps } from '../deps'
 import { isGone, killRecorded, record, waitGone } from '../test-support/stand-in-daemon'
 
@@ -76,5 +78,27 @@ test('deleting a session ends its background jobs before its worktree is removed
     assert.equal(isGone(job), true)
   } finally {
     killRecorded()
+  }
+})
+
+// An LSP client (a 150-500 MB language server) is held per conversation; a closed session must not keep one. The pool's
+// client is built but never started here (the call below only touches it), so no language server is spawned.
+test('archiving a session disposes its LSP clients; unarchiving and other sessions are untouched', async () => {
+  const { app, db } = makeApp()
+  const spec = lspSpecForLanguage('python')!
+  const a = session(db)
+  const b = session(db)
+  await lspPool.use(db.getAgentRun(a)!.convId, spec, '/work/repo', async () => {})
+  await lspPool.use(db.getAgentRun(b)!.convId, spec, '/work/repo', async () => {})
+  const before = lspPool.size
+  const post = (id: string, json: string) => app.request(`/api/v1/code/sessions/${id}/archive`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: json })
+  try {
+    assert.equal((await post(b, '{"archived":false}')).status, 200)
+    assert.equal(lspPool.size, before, 'unarchiving disposes nothing')
+    assert.equal((await post(a, '{}')).status, 200)
+    assert.equal(lspPool.size, before - 1, "only the archived session's client is gone")
+  } finally {
+    lspPool.disposeConv(db.getAgentRun(a)!.convId)
+    lspPool.disposeConv(db.getAgentRun(b)!.convId)
   }
 })

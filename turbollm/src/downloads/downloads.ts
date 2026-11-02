@@ -122,6 +122,11 @@ export function setDownloadGetForTests(get: DownloadGet): void {
  *  same set {@link DownloadManager.liveAt} treats as live. */
 const LIVE: DownloadStatus[] = ['queued', 'downloading', 'paused']
 
+/** How many finished rows (done, cancelled) the manager keeps for the Downloads panel. Past it the oldest
+ *  go when the next row is created; a daemon up for weeks otherwise held every download it ever ran, and
+ *  list()/pump() walked them all on every poll. Queued, downloading and paused rows are never dropped. */
+export const MAX_TERMINAL_RECORDS = 200
+
 /** The most files a whole-folder download's `folder` may list. The web sends a model folder's
  *  own files (a repo's root components, or one checkpoint's): tens, or a few hundred for the
  *  most heavily sharded models. Any caller that may write downloads chooses the list, so it is
@@ -175,7 +180,14 @@ export class DownloadError extends Error {
 }
 
 export class DownloadManager {
+  /** Every row, in creation order (a Map iterates in insertion order and rows are only ever added at the end, so
+   *  list() needs no sort). */
   private records = new Map<string, DownloadRecord>()
+  /** The rows that are or were live (queued/downloading/paused) at each dest, keyed by {@link destKey}: liveAt's
+   *  lookup, which a 4096-file folder download made once per file against every row. A dest can have several (an
+   *  errored row resumed next to a paused one), so each is a set. Rows are added where they become live (commit,
+   *  resume, restore) and removed by {@link forget}; one that stopped being live is checked for at lookup. */
+  private liveByDest = new Map<string, Set<DownloadRecord>>()
   private controllers = new Map<string, AbortController>()
   /** Each row's run() until it has returned, which is after its write stream has closed the
    *  .part (pipeline() settles only once every stream has): what {@link dropPart} waits on. */
@@ -248,7 +260,7 @@ export class DownloadManager {
         r.bytesPerSec = 0
       }
     }
-    return [...this.records.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    return [...this.records.values()]
   }
 
   /** Enqueue a download. Validates the target + disk space, persists, then kicks the
@@ -412,10 +424,33 @@ export class DownloadManager {
    *  system compares names, {@link sameDest}), if any — the guard against two concurrent writers
    *  corrupting one file. Terminal records (done/cancelled/error) don't block a fresh attempt. */
   private liveAt(dest: string): DownloadRecord | undefined {
-    for (const r of this.records.values()) {
-      if (sameDest(r.dest, dest) && (r.status === 'queued' || r.status === 'downloading' || r.status === 'paused')) return r
+    for (const r of this.liveByDest.get(destKey(dest)) ?? []) {
+      if (LIVE.includes(r.status) && sameDest(r.dest, dest)) return r
     }
     return undefined
+  }
+
+  /** Record `rec` as holding its dest (see {@link liveByDest}). */
+  private indexLive(rec: DownloadRecord): void {
+    const key = destKey(rec.dest)
+    const rows = this.liveByDest.get(key)
+    if (rows) rows.add(rec)
+    else this.liveByDest.set(key, new Set([rec]))
+  }
+
+  /** Drop the oldest done and cancelled rows beyond {@link MAX_TERMINAL_RECORDS}. An errored row stays: it still
+   *  owns a .part that resume() can continue and that forget() would orphan on disk. */
+  private trimTerminal(): void {
+    const droppable = (r: DownloadRecord) => r.status === 'done' || r.status === 'cancelled'
+    let excess = -MAX_TERMINAL_RECORDS
+    for (const r of this.records.values()) if (droppable(r)) excess++
+    if (excess <= 0) return
+    for (const r of this.records.values()) {
+      if (excess === 0) break
+      if (!droppable(r)) continue
+      this.forget(r)
+      excess--
+    }
   }
 
   /** What is left to fetch of the whole-folder download `folder` names: the total of its files
@@ -488,8 +523,10 @@ export class DownloadManager {
         createdAt: new Date().toISOString(),
       }
       this.records.set(id, rec)
+      this.indexLive(rec)
       created.push(rec)
     }
+    this.trimTerminal()
     this.persist()
     this.pump()
     return created
@@ -634,6 +671,7 @@ export class DownloadManager {
     }
     rec.status = 'queued'
     rec.error = null
+    this.indexLive(rec)
     this.persist()
     this.pump()
     return true
@@ -646,10 +684,19 @@ export class DownloadManager {
     this.controllers.get(id)?.abort()
     this.controllers.delete(id)
     if (rec.status !== 'done') this.dropPart(rec)
-    this.records.delete(id)
+    this.forget(rec)
     this.persist()
     this.pump()
     return true
+  }
+
+  /** Drop a row and what indexes it. */
+  private forget(rec: DownloadRecord): void {
+    this.records.delete(rec.id)
+    this.lastDataAt.delete(rec.id)
+    const key = destKey(rec.dest)
+    const rows = this.liveByDest.get(key)
+    if (rows?.delete(rec) && rows.size === 0) this.liveByDest.delete(key)
   }
 
   /** Delete the .part of a row being cancelled or removed, unless another live row holds the
@@ -712,7 +759,7 @@ export class DownloadManager {
   /** Start queued jobs up to the concurrency cap. */
   private pump(): void {
     if (this.activeCount() >= MAX_CONCURRENT) return
-    for (const rec of this.list()) {
+    for (const rec of this.records.values()) {
       if (this.activeCount() >= MAX_CONCURRENT) break
       // Not while a run of this row is still ending (paused, then resumed before its aborted
       // stream closed the .part): two runs would append to one file. That run's own pump()
@@ -1088,7 +1135,9 @@ export class DownloadManager {
     } catch {
       return
     }
-    for (const e of parsed.entries ?? []) {
+    // The manifest is written in creation order; sorted once here so a hand-edited or old one still lists oldest first.
+    const entries = [...(parsed.entries ?? [])].sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    for (const e of entries) {
       let received = 0
       try {
         const p = `${e.dest}.part`
@@ -1096,7 +1145,7 @@ export class DownloadManager {
       } catch {
         /* ignore */
       }
-      this.records.set(e.id, {
+      const rec: DownloadRecord = {
         id: e.id,
         name: e.name,
         repo: e.repo,
@@ -1111,9 +1160,16 @@ export class DownloadManager {
         validator: e.validator,
         fileVersion: e.fileVersion,
         createdAt: e.createdAt,
-      })
+      }
+      this.records.set(e.id, rec)
+      this.indexLive(rec)
     }
   }
+}
+
+/** The key {@link DownloadManager.liveAt}'s index holds a dest under: the name as {@link sameDest} compares it. */
+function destKey(dest: string): string {
+  return foldsCase(dest) ? dest.toLowerCase() : dest
 }
 
 /** True when two destinations name one file on this platform's file system. Windows and

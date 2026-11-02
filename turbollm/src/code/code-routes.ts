@@ -539,8 +539,8 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (archived && runs.isActive(id)) return err(c, 409, 'run_active', 'Stop the current run before archiving this session.')
     db.setAgentRunArchived(id, archived)
     // An archived session's background jobs end (SIGTERM, then the group kill after 3 s): it is closed, as a
-    // deleted one is, and nothing would ever end them otherwise but TurboLLM's own stop.
-    if (archived) void releaseCodeSessionProcesses(id)
+    // deleted one is, and nothing would ever end them otherwise but TurboLLM's own stop. Likewise its language servers.
+    if (archived) { disposeLspClientsForConv(run.convId); void releaseCodeSessionProcesses(id) }
     return c.json({ ok: true, archived })
   })
 

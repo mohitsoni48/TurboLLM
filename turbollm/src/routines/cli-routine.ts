@@ -65,7 +65,7 @@ import type { GenerationGate } from '../agents/gate'
 import type { Routine, RoutineRun } from './schema'
 import { decideModelAction } from './model-conflict'
 import { CLI_ROUTINE_TIMEOUT_MS, type CliProcessResult } from './cli-process'
-import { parseClaudeCliStreamJson } from './cli-output'
+import { CliStreamJsonCollector } from './cli-output'
 import { inheritedEnv } from '../cli-launch'
 import { localDaemonOrigin } from '../daemon-pid'
 import { sessionAuth } from '../code/session-auth'
@@ -111,7 +111,7 @@ export interface CliRoutineDeps {
    *  `opts.stdin`; it must never be threaded into `args` (see this module's security note). */
   runProcess: (
     args: string[],
-    opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number; signal?: AbortSignal },
+    opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number; signal?: AbortSignal; onStdout?: (chunk: string) => void },
   ) => Promise<CliProcessResult>
   /** An already-created run row to write into, instead of creating one here.
    *
@@ -234,12 +234,15 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
     // the run is abandoned (the swap above can outlast execute.ts's bound); an abort after the
     // spawn kills the CLI.
     if (abandoned()) return
+    // Folded as it arrives: the CLI streams for up to ten minutes and only the final event matters.
+    const output = new CliStreamJsonCollector()
     const result = await deps.runProcess(buildCliArgs(permissionMode), {
       cwd: routine.workspacePath ?? process.cwd(),
       env,
       stdin: routine.prompt,
       timeoutMs: CLI_ROUTINE_TIMEOUT_MS,
       signal: deps.runSignal,
+      onStdout: (chunk) => output.push(chunk),
     })
 
     if (result.timedOut) {
@@ -253,7 +256,8 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
 
     // 5. Parse the CLI's own output — a clean exit code is NOT the same thing as task success
     // (spec 20 §7).
-    const parsed = parseClaudeCliStreamJson(result.stdout)
+    output.push(result.stdout) // whatever the runner returned instead of streaming (empty for the real one)
+    const parsed = output.result()
     finish(parsed.success ? { status: 'ok', result: parsed.resultText } : { status: 'errored', error: parsed.resultText })
   } catch (e) {
     // Every step above lands here: `isAvailable()`, `getLoadedModelKey()`, `gate.stats()`,

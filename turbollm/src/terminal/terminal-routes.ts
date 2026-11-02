@@ -564,6 +564,8 @@ export function registerTerminalRoutes(app: Hono, d: Deps): void {
 /** Internal interface for the ws library WebSocket instance. */
 interface WS {
   readyState: number
+  /** Bytes queued by send() and not yet written to the socket. */
+  bufferedAmount: number
   send(data: string): void
   close(code?: number, reason?: string): void
   terminate(): void
@@ -572,6 +574,26 @@ interface WS {
 
 /** OPEN constant from ws library */
 const WS_OPEN = 1
+
+/** How much output may sit unsent in one viewer's socket buffer. Past it the viewer (a tunnel, a phone on a bad
+ *  link) is not keeping up and the daemon would otherwise buffer without limit. */
+export const MAX_VIEWER_BUFFERED_BYTES = 8 * 1024 * 1024
+
+/** The buffer size at which a viewer already being closed is cut loose: close() waits on the peer's handshake, which a
+ *  stalled peer never answers, so its buffer would keep growing in the meantime. */
+const TERMINATE_VIEWER_BUFFERED_BYTES = MAX_VIEWER_BUFFERED_BYTES * 2
+
+const WS_CLOSING = 2
+
+/** Send PTY output to one viewer, or cut it loose if it has fallen too far behind: close 1013 (try again later) makes
+ *  the web client reconnect (any non-1000 close does) and get the scrollback replay, the current screen. A viewer that
+ *  is CLOSING and still past twice the limit is terminated, which frees its buffer immediately. */
+export function sendToViewer(ws: { readyState: number; bufferedAmount: number; send(data: string): void; close(code: number, reason: string): void; terminate(): void }, data: string): void {
+  if (ws.readyState === WS_CLOSING && ws.bufferedAmount > TERMINATE_VIEWER_BUFFERED_BYTES) { ws.terminate(); return }
+  if (ws.readyState !== WS_OPEN) return
+  if (ws.bufferedAmount > MAX_VIEWER_BUFFERED_BYTES) { ws.close(1013, 'Too slow, reconnect'); return }
+  ws.send(data)
+}
 
 /** What let an open terminal WebSocket in, recorded at its handshake: the key and address checks
  *  run only then, so dropStaleTerminalSockets re-checks these when one of them may have gone. */
@@ -689,7 +711,7 @@ export function registerTerminalWs(server: import('http').Server, _d: Deps): voi
     // listener apart from any other tab's listener attached to the same terminal id.
     const handler = {
       onData(data: string) {
-        if (ws.readyState === WS_OPEN) { ws.send(data) }
+        sendToViewer(ws, data)
       },
       onClose() {
         if (ws.readyState === WS_OPEN) { ws.close(1001, 'Terminal exited') }

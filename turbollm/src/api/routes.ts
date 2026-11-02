@@ -7,6 +7,7 @@ import { rm } from 'node:fs/promises'
 import { execFileSync } from 'node:child_process'
 import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
+import { readTail } from '../engines/engine-log'
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, isModelHidden, setModelHidden, isUnsafeMapKey, ownEntry, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Config, type DeepReadonly, type Engine, type McpServer } from '../config/config'
@@ -4671,16 +4672,6 @@ function resumeLogCursor(path: string, size: number, cursor: string): { at: numb
   if (at >= floor) return { at, before, midLine: false }
   before = readLogBytes(path, floor)
   return { at: floor, before, midLine: before.length > 0 && before[before.length - 1] !== 0x0a }
-}
-
-function readTail(path: string, n: number): string[] {
-  if (!path || !existsSync(path)) return []
-  try {
-    const lines = readFileSync(path, 'utf8').replace(/[\r\n]+$/, '').split('\n').map((l) => l.replace(/\r$/, ''))
-    return lines.length > n ? lines.slice(-n) : lines
-  } catch {
-    return []
-  }
 }
 
 // ── API key helpers ────────────────────────────────────────────────────────

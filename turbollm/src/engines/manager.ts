@@ -2,12 +2,13 @@
 // → stopping → stopped, plus error. Owns the single running engine process.
 // Ports the verified Go manager to node:child_process.
 import { type ChildProcess, execFile, spawnSync } from 'node:child_process'
-import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createConnection, createServer } from 'node:net'
 import { dirname, join } from 'node:path'
 import type { ConfigStore, Engine } from '../config/config'
 import type { LoadProfile } from '../models/profile'
 import { mlxServerCommand } from './mlx'
+import { RotatingLogStream, readTail } from './engine-log'
 import { rapidMlxServerCommand } from './rapid-mlx'
 import { layaServerCommand } from './laya'
 import { mlxVlmServerCommand } from './mlx-vlm'
@@ -453,7 +454,7 @@ export class Manager {
     const logName = this.poolSlot ? `engine-${opts.engine.id}-${port}.log` : `engine-${opts.engine.id}.log`
     const logPath = join(this.store.dir(), 'logs', logName)
     mkdirSync(dirname(logPath), { recursive: true })
-    const logStream = createWriteStream(logPath) // truncates
+    const logStream = new RotatingLogStream(logPath) // truncates; rotates to .1 past 50 MB
     // The log is best-effort: without a listener, a failed write (disk full) is an unhandled 'error' event,
     // which takes the whole daemon down.
     logStream.on('error', (e) => console.warn(`[engine] log write failed: ${e.message}`))
@@ -1486,16 +1487,6 @@ export function mmprojFallbackNote(err: ErrInfo): string {
     `bugs (e.g. github.com/ggml-org/llama.cpp/issues/20899 for Qwen3.6-35B-A3B) — not ` +
     `necessarily a wrong or corrupt file on your end. Vision won't be available this session.\n\n`
   )
-}
-
-function readTail(path: string, n: number): string[] {
-  if (!path || !existsSync(path)) return []
-  try {
-    const lines = readFileSync(path, 'utf8').replace(/[\r\n]+$/, '').split('\n').map((l) => l.replace(/\r$/, ''))
-    return lines.length > n ? lines.slice(-n) : lines
-  } catch {
-    return []
-  }
 }
 
 function sleep(ms: number): Promise<void> {

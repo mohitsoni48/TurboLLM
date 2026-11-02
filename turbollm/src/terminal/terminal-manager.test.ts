@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { TerminalManager, reapStaleTerminals, killTrackedTerminalsSync } from './terminal-manager'
 import { tmpDir } from '../test-support/tmp'
+import { sessionAuth } from '../code/session-auth'
 
 type Handler = { onData?: (data: string) => void; onClose?: () => void }
 
@@ -54,6 +55,7 @@ type SeededManager = {
   registerWsListener: (id: string, h: Handler) => void
   unregisterWsListener: (id: string, h: Handler) => void
   cleanupIdle: (maxAgeMs?: number) => void
+  kill: (id: string) => void
   findByCodeSessionId: (codeSessionId: string) => string | null
   markAgentExited: (codeSessionId: string) => void
   isAgentExited: (terminalId: string) => boolean
@@ -474,4 +476,37 @@ test('markAgentExited on a session with no terminal is a no-op, not a throw', ()
   const m = seededManager()
   assert.doesNotThrow(() => m.markAgentExited('nobody'))
   assert.equal(m.isAgentExited('nobody'), false)
+})
+
+// ── kill() and a natural exit end a terminal the same way ────────────────────────────
+// kill() disposes the session, which removes its listeners before node-pty's exit fires, so the cleanup that
+// create() hooked to the exit never ran on a kill: an idle-reaped terminal kept its `tllm-cs-*` token valid, and a
+// relaunch (kill of the dead-end terminal) never told its attached sockets.
+
+test('kill: revokes the terminal\'s Code-session token and closes its attached viewers', () => {
+  const m = seededManager()
+  seedTerminal(m, 'k1', 'code-session-k1')
+  const token = sessionAuth.mint('code-session-k1')
+  let closed = 0
+  m.registerWsListener('k1', { onData: () => {}, onClose: () => { closed++ } })
+
+  m.kill('k1')
+
+  assert.equal(sessionAuth.resolve(token), null, 'a killed terminal must not leave its token valid')
+  assert.equal(closed, 1, 'an attached viewer must be told the terminal ended')
+  assert.equal(m.sessions.has('k1'), false)
+})
+
+test('the exit path and kill() share one cleanup that runs once', () => {
+  const m = seededManager()
+  seedTerminal(m, 'k2', 'code-session-k2')
+  let closed = 0
+  m.registerWsListener('k2', { onData: () => {}, onClose: () => { closed++ } })
+
+  const finish = (m as unknown as { finishTerminal(id: string): void }).finishTerminal.bind(m)
+  finish('k2') // the PTY's exit
+  m.kill('k2') // then a kill of the already-finished terminal
+  finish('k2')
+
+  assert.equal(closed, 1, 'viewers are closed exactly once')
 })

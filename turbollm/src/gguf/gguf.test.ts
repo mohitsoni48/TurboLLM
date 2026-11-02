@@ -2,11 +2,12 @@
 // project's own VRAM estimator assumed a flat 128 for every model until a real-hardware
 // report showed it silently mis-sizing the KV cache for a GQA model whose real per-head
 // dim is 256; see profile.ts's estimateVram).
-import { test } from 'node:test'
+import { mock, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { rmSync, writeFileSync } from 'node:fs'
+import { open } from 'node:fs/promises'
 import { join } from 'node:path'
-import { ggufCutShort, parseGguf, quantFromName } from './gguf'
+import { GgufError, ggufCutShort, parseGguf, parseGgufAsync, quantFromName } from './gguf'
 import { ggufFile, ggufVocabOnly } from '../test-support/gguf-file'
 import { tmpDir } from '../test-support/tmp'
 
@@ -501,4 +502,143 @@ test('a GGUF with no tensors (vocab-only) needs only its header: it is not cut s
   // Cut inside its KV pairs, it is still cut short.
   const cut = bytes.subarray(0, bytes.length - 3)
   withFile(cut, (path) => assert.equal(ggufCutShort(path, cut.length), true))
+})
+
+// ── parseGgufAsync (scalability review 3.10): same answer as parseGguf, without blocking the event loop ──
+
+const T_FLOAT32 = 6
+
+/** A GGUF shaped like a real tokenizer-carrying one: scalar and per-layer array metadata, a chat template, and
+ *  string arrays (vocab, merges) and a float array (scores) that dwarf everything else, then tensor infos. */
+function bigVocabGguf(tokens = 60_000, merges = 90_000): Buffer {
+  const u32 = (n: number) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b }
+  const u64 = (n: number) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b }
+  const str = (s: string) => { const body = Buffer.from(s, 'utf8'); return Buffer.concat([u64(body.length), body]) }
+  const strArray = (n: number, mk: (i: number) => string) => {
+    const items: Buffer[] = [u32(T_ARRAY), u32(T_STRING), u64(n)]
+    for (let i = 0; i < n; i++) items.push(str(mk(i)))
+    return Buffer.concat(items)
+  }
+  const kvs: Array<[string, Buffer]> = [
+    ['general.architecture', Buffer.concat([u32(T_STRING), str('gemma4')])],
+    ['general.name', Buffer.concat([u32(T_STRING), str('Big Vocab')])],
+    ['general.file_type', u32Value(15)],
+    ['gemma4.block_count', u32Value(30)],
+    ['gemma4.attention.head_count_kv', Buffer.concat([u32(T_ARRAY), u32(T_UINT32), u64(3), u32(8), u32(2), u32(8)])],
+    ['gemma4.attention.sliding_window_pattern', Buffer.concat([u32(T_ARRAY), u32(T_BOOL), u64(3), Buffer.from([1, 0, 1])])],
+    ['tokenizer.chat_template', Buffer.concat([u32(T_STRING), str('{% if reasoning_effort %}x{% endif %}')])],
+    ['tokenizer.ggml.tokens', strArray(tokens, (i) => `▁tok${i}é`)],
+    ['tokenizer.ggml.scores', Buffer.concat([u32(T_ARRAY), u32(T_FLOAT32), u64(tokens), Buffer.alloc(tokens * 4)])],
+    ['tokenizer.ggml.merges', strArray(merges, (i) => `a${i} b${i}`)],
+    ['gemma4.embedding_length', u32Value(2048)],
+  ]
+  function u32Value(n: number): Buffer { return Buffer.concat([u32(T_UINT32), u32(n)]) }
+  const parts: Buffer[] = [u32(0x46554747), u32(3), u64(2), u64(kvs.length)]
+  for (const [k, v] of kvs) parts.push(str(k), v)
+  parts.push(str('token_embd.weight'), u32(2), u64(2048), u64(64), u32(0), u64(0))
+  parts.push(str('output.weight'), u32(1), u64(100), u32(0), u64(524288))
+  return Buffer.concat(parts, parts.reduce((n, p) => n + p.length, 0) + 1_000_000) // zero padding stands in for tensor data
+}
+
+test('parseGgufAsync gives exactly what parseGguf gives, on a vocab-heavy GGUF larger than its first read', async () => {
+  const bytes = bigVocabGguf()
+  assert.ok(bytes.length > 2 * 1024 * 1024, 'bigger than the first 1 MB read, so the reader must fetch more')
+  const dir = tmpDir('gguf-async-')
+  const path = join(dir, 'model.gguf')
+  writeFileSync(path, bytes)
+  const sync = parseGguf(path)
+  assert.deepEqual(await parseGgufAsync(path), sync)
+  assert.equal(sync.arch, 'gemma4')
+  assert.deepEqual(sync.headCountKvPerLayer, [8, 2, 8])
+  assert.equal(sync.reasoningEffort, true)
+})
+
+test('parseGgufAsync matches parseGguf on the small fixtures, tensors and alignment included', async () => {
+  const fixtures: Buffer[] = [
+    buildGguf([['general.architecture', 'qwen3'], ['qwen3.block_count', 65], ['qwen3.attention.key_length', 256]]),
+    buildGguf([['general.architecture', 'gemma3'], ['gemma3.attention.sliding_window_pattern', [true, false, true]], ['gemma3.attention.head_count_kv', [8, 2, 8]]]),
+    ggufFile([{ name: 'a', dims: [10], type: 0 }, { name: 'b', dims: [32, 2], type: 8 }], [['general.architecture', 'llama']]),
+    ggufFile([{ name: 'a', dims: [10], type: 0 }], [['general.alignment', 256]], 256),
+    ggufVocabOnly([['general.architecture', 'llama'], ['tokenizer.ggml.model', 'gpt2']]),
+  ]
+  const dir = tmpDir('gguf-async-')
+  for (const [i, bytes] of fixtures.entries()) {
+    const path = join(dir, `m${i}.gguf`)
+    writeFileSync(path, bytes)
+    assert.deepEqual(await parseGgufAsync(path), parseGguf(path), `fixture ${i}`)
+  }
+})
+
+test('parseGgufAsync fails with the same GgufError codes as parseGguf', async () => {
+  const dir = tmpDir('gguf-async-')
+  const big = bigVocabGguf(2000, 2000)
+  const cases: Array<[string, Buffer]> = [
+    ['not_gguf', Buffer.from('<html>not found</html>, long enough to read a header from')],
+    ['truncated', big.subarray(0, 40_000)], // cut inside the vocab
+    ['bad_version', Buffer.concat([Buffer.from('GGUF'), Buffer.from([9, 0, 0, 0]), Buffer.alloc(32)])],
+  ]
+  for (const [code, bytes] of cases) {
+    const path = join(dir, `${code}.gguf`)
+    writeFileSync(path, bytes)
+    const want = (e: unknown) => e instanceof GgufError && e.code === code
+    assert.throws(() => parseGguf(path), want)
+    await assert.rejects(parseGgufAsync(path), want)
+  }
+})
+
+/** Runs `fn` and returns how many bytes parseGgufAsync's file reads asked the OS for, counting through the file handle's read. */
+async function bytesReadDuring(path: string, fn: () => Promise<unknown>): Promise<{ asked: number; settled: PromiseSettledResult<unknown> }> {
+  const probe = await open(path, 'r')
+  const proto = Object.getPrototypeOf(probe) as { read: (...a: unknown[]) => Promise<{ bytesRead: number }> }
+  await probe.close()
+  let asked = 0
+  const original = proto.read
+  const spy = mock.method(proto, 'read', function (this: unknown, ...args: unknown[]) {
+    asked += (args[2] as number) ?? 0
+    return original.apply(this, args)
+  })
+  try {
+    const [settled] = await Promise.allSettled([fn()])
+    return { asked, settled }
+  } finally {
+    spy.mock.restore()
+  }
+}
+
+test('parseGgufAsync skips a huge string value by seeking, as parseGguf does, instead of reading it', async () => {
+  const dir = tmpDir('gguf-async-')
+  const path = join(dir, 'description.gguf')
+  const description = 'x'.repeat(40 * 1024 * 1024)
+  writeFileSync(path, ggufFile([{ name: 'a', dims: [10], type: 0 }], [['general.architecture', 'llama'], ['general.description', description], ['llama.block_count', 7]]))
+  const { asked, settled } = await bytesReadDuring(path, () => parseGgufAsync(path))
+  assert.equal(settled.status, 'fulfilled')
+  assert.deepEqual((settled as PromiseFulfilledResult<unknown>).value, parseGguf(path))
+  assert.ok(asked <= 16 * 1024 * 1024, `read ${asked} bytes of a header that is 40 MB only by skipping`)
+})
+
+test('parseGgufAsync refuses a header that needs more bytes than its read cap, with too_large, and reads no more than the cap', async () => {
+  const dir = tmpDir('gguf-async-')
+  const path = join(dir, 'long-name.gguf')
+  // general.name is materialized by the parser, so a 3 MB one needs 3 MB read.
+  writeFileSync(path, ggufVocabOnly([['general.architecture', 'llama'], ['general.name', 'n'.repeat(3 * 1024 * 1024)]]))
+  const cap = 1024 * 1024
+  const { asked, settled } = await bytesReadDuring(path, () => parseGgufAsync(path, cap))
+  assert.equal(settled.status, 'rejected')
+  const e = (settled as PromiseRejectedResult).reason
+  assert.ok(e instanceof GgufError && e.code === 'too_large', String(e))
+  assert.ok(asked <= cap, `read ${asked} bytes under a ${cap} cap`)
+})
+
+test('parseGgufAsync does not allocate a declared 20 GB string in a file that is short: truncated, after reading the file', async () => {
+  const dir = tmpDir('gguf-async-')
+  const path = join(dir, 'declared-huge.gguf')
+  const u32 = (n: number) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b }
+  const u64 = (n: number) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b }
+  const key = Buffer.from('general.name')
+  writeFileSync(path, Buffer.concat([u32(0x46554747), u32(3), u64(0), u64(1), u64(key.length), key, u32(T_STRING), u64(20 * 1024 ** 3), Buffer.alloc(64)]))
+  const { asked, settled } = await bytesReadDuring(path, () => parseGgufAsync(path))
+  assert.equal(settled.status, 'rejected')
+  const e = (settled as PromiseRejectedResult).reason
+  assert.ok(e instanceof GgufError && (e.code === 'truncated' || e.code === 'too_large'), String(e))
+  assert.ok(asked <= 16 * 1024 * 1024, `read ${asked} bytes`)
 })

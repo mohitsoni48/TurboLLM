@@ -8,7 +8,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, statfsSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { DownloadManager, DownloadError, MAX_FOLDER_FILES, setDownloadGetForTests, type DownloadRecord } from './downloads'
+import { DownloadManager, DownloadError, MAX_FOLDER_FILES, MAX_TERMINAL_RECORDS, setDownloadGetForTests, type DownloadRecord } from './downloads'
 import { Hono } from 'hono'
 import type { HfModelFiles } from '../hf/hf'
 import { registerApi } from '../api/routes'
@@ -856,6 +856,117 @@ test("enqueue: the expander's dir is sanitised, so it can never place files outs
     const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), hostile)
     const [rec] = await dm.enqueue({ repo: 'owner/repo', rfilename: 'evil.gguf' })
     assert.equal(rec.dest, join(modelDir, 'owner', 'repo', 'escaped', 'evil.gguf'))
+  } finally {
+    restore()
+  }
+})
+
+// ── uptime growth (scalability review 3.7) ───────────────────────────────────
+
+test('terminal records are kept only up to a cap (newest first kept), in-flight and queued ones never dropped', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const first = await dm.enqueue({ repo: 'o/r', rfilename: 'f0.gguf' })
+    dm.cancel(first[0].id)
+    for (let i = 1; i < MAX_TERMINAL_RECORDS + 50; i++) {
+      const [rec] = await dm.enqueue({ repo: 'o/r', rfilename: `f${i}.gguf` })
+      dm.cancel(rec.id)
+    }
+    const [live] = await dm.enqueue({ repo: 'o/r', rfilename: 'live.gguf' }) // enqueue trims
+    const rows = dm.list()
+    const terminal = rows.filter((r) => r.status === 'cancelled')
+    assert.equal(terminal.length, MAX_TERMINAL_RECORDS)
+    assert.ok(!rows.some((r) => r.id === first[0].id), 'the oldest terminal record went first')
+    assert.ok(rows.some((r) => r.id === live.id), 'the live record stays')
+    assert.equal(rows.at(-1)!.id, live.id, 'list stays in creation order')
+  } finally {
+    restore()
+  }
+})
+
+test('the live-dest index dedups a live file, frees it once cancelled, and holds it again after a resume', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const [a] = await dm.enqueue({ repo: 'o/r', rfilename: 'same.gguf' })
+    const dup = await dm.enqueue({ repo: 'o/r', rfilename: 'same.gguf' })
+    assert.deepEqual(dup, [], 'a live file is not enqueued twice')
+    dm.cancel(a.id)
+    const [b] = await dm.enqueue({ repo: 'o/r', rfilename: 'same.gguf' })
+    assert.notEqual(b.id, a.id, 'a cancelled row does not block a fresh attempt')
+    dm.pause(b.id)
+    assert.deepEqual(await dm.enqueue({ repo: 'o/r', rfilename: 'same.gguf' }), [], 'a paused row still holds the file')
+    dm.remove(b.id)
+    const [c] = await dm.enqueue({ repo: 'o/r', rfilename: 'same.gguf' })
+    assert.ok(c, 'a removed row frees the file')
+  } finally {
+    restore()
+  }
+})
+
+test('trimming keeps an errored row, which still owns a resumable .part, however many finished rows follow it', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const rows = (dm as unknown as { records: Map<string, { status: string }> }).records
+    const [failed] = await dm.enqueue({ repo: 'o/r', rfilename: 'failed.gguf' })
+    writeFileSync(`${failed.dest}.part`, Buffer.alloc(16, 1))
+    rows.get(failed.id)!.status = 'error'
+    for (let i = 0; i < MAX_TERMINAL_RECORDS + 20; i++) {
+      const [rec] = await dm.enqueue({ repo: 'o/r', rfilename: `done${i}.gguf` })
+      rows.get(rec.id)!.status = i % 2 ? 'done' : 'cancelled'
+    }
+    await dm.enqueue({ repo: 'o/r', rfilename: 'last.gguf' }) // enqueue trims
+    const kept = dm.list()
+    assert.ok(kept.some((r) => r.id === failed.id), 'the errored row is not trimmed')
+    assert.ok(existsSync(`${failed.dest}.part`), 'and its .part is not orphaned')
+    assert.equal(kept.filter((r) => r.status === 'done' || r.status === 'cancelled').length, MAX_TERMINAL_RECORDS, 'done and cancelled rows stay capped')
+    assert.equal(dm.resume(failed.id), true, 'the errored row can still be resumed')
+  } finally {
+    restore()
+  }
+})
+
+test('a live paused row keeps holding its file after an errored row for it is resumed and finishes', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const rows = (dm as unknown as { records: Map<string, { status: string }> }).records
+    const [e] = await dm.enqueue({ repo: 'o/r', rfilename: 'x.gguf' })
+    rows.get(e.id)!.status = 'error'
+    const [p] = await dm.enqueue({ repo: 'o/r', rfilename: 'x.gguf' })
+    assert.ok(p, 'an errored row does not block a fresh attempt')
+    dm.pause(p.id)
+    assert.equal(dm.resume(e.id), true, 'a paused row is not a writer, so the errored one may resume')
+    rows.get(e.id)!.status = 'done'
+    assert.deepEqual(await dm.enqueue({ repo: 'o/r', rfilename: 'x.gguf' }), [], 'the paused row still owns the file')
+  } finally {
+    restore()
+  }
+})
+
+test('restore brings back two paused rows for one file: removing one leaves the other holding it', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dest = join(modelDir, 'o', 'r', 'y.gguf')
+    const entry = (id: string, createdAt: string) => ({
+      id, name: 'y.gguf', repo: 'o/r', url: 'https://huggingface.co/o/r/resolve/main/y.gguf', dest, total: 100, received: 0, status: 'error', error: null, createdAt,
+    })
+    mkdirSync(join(stateDir, 'downloads'), { recursive: true })
+    writeFileSync(
+      join(stateDir, 'downloads', 'manifest.json'),
+      JSON.stringify({ version: 1, entries: [entry('dl-a', '2026-01-01T00:00:00.000Z'), entry('dl-b', '2026-01-02T00:00:00.000Z')] }),
+    )
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    assert.deepEqual(dm.list().map((r) => r.id), ['dl-a', 'dl-b'])
+    assert.equal(dm.remove('dl-b'), true)
+    assert.deepEqual(await dm.enqueue({ repo: 'o/r', rfilename: 'y.gguf' }), [], 'the other restored paused row still holds the file')
   } finally {
     restore()
   }

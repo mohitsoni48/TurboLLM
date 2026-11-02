@@ -1756,6 +1756,18 @@ const pendingCodeToolCalls = new Map<string, Map<string, ToolCallRecord>>()
  *  later calls is never going to be. */
 const MAX_PENDING_PER_SESSION = 256
 
+/** A session's CLI is gone (token revoked), so no later request can confirm what it left pending. */
+function forgetPendingCodeToolCalls(codeSessionId: string): void {
+  pendingCodeToolCalls.delete(codeSessionId)
+}
+sessionAuth.onRevoke(forgetPendingCodeToolCalls)
+
+/** How many Code sessions currently hold pending calls — for tests asserting the map does not grow
+ *  with the number of sessions the daemon has ever seen. */
+export function pendingCodeToolCallSessionCount(): number {
+  return pendingCodeToolCalls.size
+}
+
 /** Observe a turn a Code session's terminal-launched CLI just took: stash its file-touching tool
  *  calls as PENDING (see pendingCodeToolCalls — they are committed only once a later request
  *  confirms the CLI really applied them) and mark the run shipped.
@@ -1779,6 +1791,9 @@ function observeCodeSessionTurn(d: Deps, codeSessionId: string, calls: StreamToo
     const run = d.db.getAgentRun(codeSessionId)
     if (!run) return
 
+    // A request still streaming when its session's token was revoked ends after forgetPendingCodeToolCalls ran: its
+    // calls can never be confirmed, and recording them would re-create the entry that revoke just released.
+    if (!sessionAuth.hasToken(codeSessionId)) return
     let pending = pendingCodeToolCalls.get(codeSessionId)
     for (const call of calls) {
       const name = call.name.toLowerCase()
@@ -1874,6 +1889,7 @@ function commitConfirmedCodeToolCalls(d: Deps, codeSessionId: string, req: Anthr
         if (block.is_error !== true) confirmed.push(record)
       }
     }
+    if (pending.size === 0) pendingCodeToolCalls.delete(codeSessionId)
     if (confirmed.length === 0) return
 
     // Looked up only now, not on entry: a request that confirms nothing must cost this session

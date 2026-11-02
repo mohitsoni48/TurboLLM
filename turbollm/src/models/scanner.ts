@@ -4,7 +4,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync 
 import { readdir, realpath, stat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { migrateModelKey, type ConfigStore } from '../config/config'
-import { GgufError, type GgufMeta, parseGguf, quantFromName } from '../gguf/gguf'
+import { GgufError, type GgufMeta, parseGgufAsync, quantFromName } from '../gguf/gguf'
 import { writeFileAtomicSync } from '../util/atomic-write'
 import { CoalescedRunner } from '../util/coalesced-runner'
 import { detectJev, type JevInfo } from './jev'
@@ -519,7 +519,7 @@ export class Scanner {
       meta = cached.meta
     } else {
       try {
-        meta = parseGguf(path)
+        meta = await parseGgufAsync(path)
         this.cache.set(path, { size: sizeBytes, mtime: mtimeMs, meta })
       } catch (e) {
         parseError = e instanceof GgufError ? e.message : (e as Error).message

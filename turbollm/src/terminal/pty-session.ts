@@ -20,6 +20,7 @@ import { execFileSync } from 'node:child_process'
 import { withForegroundGitGc } from '../util/git-gc'
 import { tetherTerminal } from '../util/tether'
 import { ensurePtySpawnHelper } from './pty-spawn-helper'
+import { ScrollbackBuffer } from './pty-scrollback'
 
 const require = createRequire(import.meta.url)
 
@@ -66,7 +67,7 @@ export class PTYSession {
   // screen until the next byte happens to arrive. xterm.js replaying the same escape
   // sequences that produced the original screen reconstructs it correctly, the same way
   // `tmux attach`/`screen -r` catch a reconnecting client up.
-  private scrollback = ''
+  private scrollback = new ScrollbackBuffer(SCROLLBACK_CAP)
 
   /** Spawn a new PTY session. When `launchCommand` is given, the shell runs it as its
    *  own startup command (never typed into stdin — see the module header comment). */
@@ -111,10 +112,7 @@ export class PTYSession {
 
     // termPty is non-null here (captured from `this.pty!` above).
     termPty.onData((data: string) => {
-      this.scrollback += data
-      if (this.scrollback.length > SCROLLBACK_CAP) {
-        this.scrollback = this.scrollback.slice(this.scrollback.length - SCROLLBACK_CAP)
-      }
+      this.scrollback.append(data)
       this.emitter.emit('data', data)
     })
 
@@ -155,7 +153,7 @@ export class PTYSession {
   getPid(): number | null { return this.processId }
   /** Everything written so far (capped, oldest trimmed) — replay this to a newly-attached
    *  client before it starts receiving live `onData` output. */
-  getScrollback(): string { return this.scrollback }
+  getScrollback(): string { return this.scrollback.toString() }
 
   onData(cb: (data: string) => void): void { this.emitter.on('data', cb) }
   onExit(cb: (info: { exitCode: number | null; signal?: number }) => void): void { this.emitter.on('exit', cb) }

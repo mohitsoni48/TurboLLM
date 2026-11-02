@@ -43,6 +43,13 @@ const SEVERITY_NAMES: Record<number, LspDiagnostic['severity']> = { 1: 'error', 
 const INITIALIZE_TIMEOUT_MS = 60_000
 const DIAGNOSTICS_WAIT_MS = 5_000
 const TSSERVER_RESOLVE_TIMEOUT_MS = 30_000
+// A failed start (npx offline, package fetch hiccup) is reported as-is for this long, then the next call retries — so a
+// transient failure doesn't disable diagnostics for the session's lifetime, and a persistently broken one isn't re-spawned per edit.
+const START_ERROR_COOLDOWN_MS = 60_000
+
+/** The spawn seam: util/tether.ts's spawnTethered in production, a fake server process in tests. */
+export type LspSpawn = typeof spawnTethered
+export interface LspClientDeps { spawn?: LspSpawn; now?: () => number }
 
 function npxSpawnOptions(cwd?: string): SpawnOptionsWithStdioTuple<'pipe', 'pipe', 'pipe'> {
   // Windows' `npx.cmd` is a batch file, not a real executable — node's spawn() throws `EINVAL`
@@ -87,17 +94,39 @@ function resolveFallbackTsserverPath(): Promise<string | null> {
   return cachedTsserverPath
 }
 
+/** `promise`'s result, or `onTimeout` after `ms` � with the timer cleared (and unref'd) once either settles, so a fast
+ *  answer does not leave a 60 s timer pinned to the event loop. */
+async function raceWithTimeout<T, U>(promise: Promise<T>, ms: number, onTimeout: U): Promise<T | U> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<U>((resolve) => {
+    timer = setTimeout(() => resolve(onTimeout), ms)
+    timer.unref()
+  })
+  try {
+    return await Promise.race([promise, timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export class LspClient {
   private proc: ChildProcessWithoutNullStreams | null = null
   private conn: MessageConnection | null = null
   private ready = false
   private startError: string | null = null
+  private startErrorAt = 0
   private startPromise: Promise<{ ok: true } | { ok: false; error: string }> | null = null
   private readonly diagnosticsByUri = new Map<string, LspDiagnostic[]>()
   private readonly waitersByUri = new Map<string, Array<() => void>>()
   private readonly docVersionByUri = new Map<string, number>()
 
-  constructor(private readonly spec: LspServerSpec, private readonly rootDir: string) {}
+  private readonly spawn: LspSpawn
+  private readonly now: () => number
+
+  constructor(private readonly spec: LspServerSpec, private readonly rootDir: string, deps: LspClientDeps = {}) {
+    this.spawn = deps.spawn ?? spawnTethered
+    this.now = deps.now ?? Date.now
+  }
 
   /** Starts the server process and completes the initialize/initialized handshake, once. Safe to
    *  call repeatedly (idempotent) — concurrent callers share the same in-flight start. Never
@@ -105,7 +134,11 @@ export class LspClient {
    *  gracefully instead of blocking or crashing the agent turn. */
   async ensureStarted(): Promise<{ ok: true } | { ok: false; error: string }> {
     if (this.ready) return { ok: true }
-    if (this.startError) return { ok: false, error: this.startError }
+    if (this.startError) {
+      if (this.now() - this.startErrorAt < START_ERROR_COOLDOWN_MS) return { ok: false, error: this.startError }
+      this.startError = null
+      this.startPromise = null // the failed attempt's promise must not be served again
+    }
     if (this.startPromise) return this.startPromise
     this.startPromise = this.doStart()
     return this.startPromise
@@ -122,8 +155,19 @@ export class LspClient {
       // Tied to the daemon (util/tether.ts): npx and the server it runs as its child ended only when dispose() or
       // the daemon's teardown killed npx, so a daemon that died without one left them running, parented to init,
       // and a dispose() reached npx alone. Now the group ends with the daemon, and with npx.
-      const proc = spawnTethered(npxCmd, this.spec.npxArgs, npxSpawnOptions(this.rootDir), { kind: 'lsp' }) as ChildProcessWithoutNullStreams
+      const proc = this.spawn(npxCmd, this.spec.npxArgs, npxSpawnOptions(this.rootDir), { kind: 'lsp' }) as ChildProcessWithoutNullStreams
       this.proc = proc
+      // A server that dies AFTER the handshake (OOM, a crash, killed from outside) leaves nothing to answer: without this,
+      // ready stayed true and every later edit waited DIAGNOSTICS_WAIT_MS for a push that never came. Reset so the next call
+      // restarts it, but only after the same cooldown as a failed start: a server that keeps crashing was otherwise respawned
+      // on every edit, each respawn costing up to INITIALIZE_TIMEOUT_MS of turn latency. (Before ready, the spawnFailure race
+      // below reports it; a dispose() has already cleared this.proc.)
+      proc.once('exit', (code) => {
+        if (!this.ready || this.proc !== proc) return
+        this.dispose()
+        this.startError = `${this.spec.language} language server exited (code ${code})`
+        this.startErrorAt = this.now()
+      })
       // A missing `npx` on PATH (or a killed process before it fully starts) fires 'error'
       // asynchronously — without this, a broken environment would just hang initialize forever.
       const spawnFailure = new Promise<string>((resolve) => {
@@ -158,8 +202,11 @@ export class LspClient {
         // repo doesn't have typescript installed yet, e.g. a brand-new project.
         ...(fallbackTsserverPath ? { initializationOptions: { tsserver: { path: fallbackTsserverPath } } } : {}),
       })
-      const timeout = new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), INITIALIZE_TIMEOUT_MS))
-      const result = await Promise.race([initialize.then(() => 'ok' as const), spawnFailure.then((e) => `error:${e}` as const), timeout])
+      const result = await raceWithTimeout(
+        Promise.race([initialize.then(() => 'ok' as const), spawnFailure.then((e) => `error:${e}` as const)]),
+        INITIALIZE_TIMEOUT_MS,
+        'timeout' as const,
+      )
       if (result === 'timeout') throw new Error(`${this.spec.language} language server did not initialize within ${INITIALIZE_TIMEOUT_MS}ms`)
       if (result.startsWith('error:')) throw new Error(result.slice('error:'.length))
       // sendNotification returns a Promise that can reject ASYNCHRONOUSLY (e.g. ERR_STREAM_DESTROYED
@@ -172,6 +219,7 @@ export class LspClient {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       this.startError = msg
+      this.startErrorAt = this.now()
       this.dispose()
       return { ok: false, error: msg }
     }
@@ -200,12 +248,19 @@ export class LspClient {
       this.conn.sendNotification('textDocument/didChange', { textDocument: { uri, version }, contentChanges: [{ text }] }).catch(() => {})
     }
 
-    await Promise.race([waitForPush, new Promise<void>((resolve) => setTimeout(resolve, DIAGNOSTICS_WAIT_MS))])
+    await raceWithTimeout(waitForPush, DIAGNOSTICS_WAIT_MS, undefined)
     return this.diagnosticsByUri.get(uri) ?? []
   }
 
   dispose(): void {
     this.ready = false
+    // Back to never-started, so the next ensureStarted() spawns afresh; a new server knows none of the documents the old
+    // one had open, so their versions restart at 1 (didOpen). A failed start keeps startError (its cooldown) on its own.
+    this.startPromise = null
+    this.docVersionByUri.clear()
+    this.diagnosticsByUri.clear()
+    for (const waiters of this.waitersByUri.values()) for (const w of waiters) w()
+    this.waitersByUri.clear()
     // sendNotification returns a Promise, and it can reject ASYNCHRONOUSLY — after this
     // synchronous try/catch has already exited — when the server process's stdin is already
     // closed (ERR_STREAM_DESTROYED: "Cannot call write after a stream was destroyed"). Without

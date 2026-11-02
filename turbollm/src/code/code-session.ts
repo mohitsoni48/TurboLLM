@@ -60,7 +60,8 @@ import {
   DELETE_ROUTINE_TOOL,
   RUN_ROUTINE_NOW_TOOL,
 } from '../routines/routine-tools'
-import { LspClient, type LspDiagnostic } from './lsp-client'
+import type { LspClient, LspDiagnostic } from './lsp-client'
+import { lspPool } from './lsp-pool'
 import { lspSpecForPath, lspSpecForLanguage, SUPPORTED_LSP_LANGUAGES, type LspServerSpec } from './lsp-registry'
 
 /** How long any engine-gate acquire may sit QUEUED before giving up.
@@ -466,24 +467,13 @@ export {
 } from './agent-loop-rules'
 
 
-// LSP integration (item 3) — MODULE-level, keyed by convId (not per-runCodeSession-call): a code
-// session is one function call PER TURN (see code-run-manager.ts's own comment, "the one function
-// the manager drives per turn"), so a per-turn-scoped client would pay the npx cold-start cost
-// (up to LspClient's own ~60s ceiling) on EVERY turn instead of once per session — defeating the
-// entire point of keeping a warm, already-initialized language-server process. Persists for the
-// life of the daemon process; disposed explicitly on session delete (see
-// disposeLspClientsForConv, called from code-routes.ts's DELETE route) rather than an idle
-// timeout — simpler, and bounded by "one entry per code session that actually used an LSP, until
-// that session is deleted," which is a small, self-limiting number in practice.
-const lspClientsByConv = new Map<string, Map<string, LspClient>>()
-
-/** Disposes and forgets every LSP client running for `convId` (all languages). Called on session
- *  delete so a deleted session's language-server child processes don't outlive it. */
+// LSP integration (item 3): the language-server clients live in lsp-pool.ts — MODULE-level, keyed by convId, because a
+// session function runs once PER TURN (a per-turn client would pay the npx cold start every turn). Freed by
+// disposeLspClientsForConv (session delete / archive / the end of a routine run), by an idle TTL, and by an LRU cap.
+/** Disposes and forgets every LSP client running for the conversation (all languages), so a closed session's language-server
+ *  child processes don't outlive it. One mid-call is disposed the moment its call ends. */
 export function disposeLspClientsForConv(convId: string): void {
-  const clients = lspClientsByConv.get(convId)
-  if (!clients) return
-  for (const c of clients.values()) c.dispose()
-  lspClientsByConv.delete(convId)
+  lspPool.disposeConv(convId)
 }
 
 /** Extract the plain text out of a pi tool `partialResult` (tool_execution_update) — pi's bash
@@ -825,21 +815,11 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // between the very repeats it needs to catch (see the no-turn_start-reset note below).
   const toolLoop = new ToolLoopTracker()
 
-  // LSP integration (item 3): one running language-server process per `language`, cached at
-  // MODULE scope keyed by convId so it survives across turns — see lspClientsByConv's own
-  // comment for why (this function runs once PER TURN, not once per whole session). TS/JS share
-  // one typescript-language-server process (lsp-registry.ts). Lazily started on first use (an
-  // explicit install_lsp call OR the first edit/write to a matching file).
-  const getLspClient = (spec: LspServerSpec): LspClient => {
-    let clients = lspClientsByConv.get(convId)
-    if (!clients) { clients = new Map(); lspClientsByConv.set(convId, clients) }
-    let client = clients.get(spec.language)
-    if (!client) {
-      client = new LspClient(spec, repoRoot)
-      clients.set(spec.language, client)
-    }
-    return client
-  }
+  // LSP integration (item 3): one running language-server process per language, from the module-level pool (lsp-pool.ts,
+  // which see for why it outlives this per-turn function). TS/JS share one typescript-language-server process
+  // (lsp-registry.ts). Lazily started on first use (an explicit install_lsp call OR the first edit/write to a matching
+  // file); the pool holds the client against disposal for the duration of the call.
+  const withLspClient = <R>(spec: LspServerSpec, fn: (client: LspClient) => Promise<R>): Promise<R> => lspPool.use(convId, spec, repoRoot, fn)
 
   // A delegate_task/invoke_skill sub-agent's tool frames go through the parent's sink so the UI
   // shows them, tagged `subagent` so code-run-manager.ts can keep them out of the parent model's
@@ -1558,7 +1538,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           try {
             const absPath = resolve(repoRoot, relPath)
             const content = await readFile(absPath, 'utf8')
-            const diagnostics: LspDiagnostic[] = await getLspClient(spec).getDiagnostics(absPath, content)
+            const diagnostics: LspDiagnostic[] = await withLspClient(spec, (c) => c.getDiagnostics(absPath, content))
             if (diagnostics.length > 0) {
               const shown = diagnostics.slice(0, 20)
               const lines = shown.map((d) => `  ${d.severity} ${d.line}:${d.character} ${d.message}${d.source ? ` (${d.source})` : ''}`)
@@ -1977,7 +1957,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         if (!spec) {
           return { content: [{ type: 'text', text: `No LSP available for "${params.language}" yet. Supported: ${SUPPORTED_LSP_LANGUAGES.join(', ')}.` }], details: {} }
         }
-        const result = await getLspClient(spec).ensureStarted()
+        const result = await withLspClient(spec, (c) => c.ensureStarted())
         const text = result.ok
           ? `${spec.language} language server is installed and running.`
           : `Failed to start the ${spec.language} language server: ${result.error}`

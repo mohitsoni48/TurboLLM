@@ -6,6 +6,8 @@ import { runCodeRoutine, resumeCodeRoutine } from './code-runner'
 import type { Routine } from './schema'
 import { parsePendingToolCall, type PendingRoutineToolCall } from './approval'
 import type { Deps } from '../deps'
+import { lspPool } from '../code/lsp-pool'
+import { lspSpecForLanguage } from '../code/lsp-registry'
 import type { CodeSessionRunner } from '../code/code-run-manager'
 import { waitForToolApproval } from '../tools/approval-gate'
 import { releaseTetherScope, spawnHeld } from '../util/tether'
@@ -364,5 +366,50 @@ test('a routine run denied at its approval ends what its stalled turn\'s command
     assert.deepEqual(await waitGone(jobs, 2000), [], 'a Deny ends the run, and its session\'s held job with it')
   } finally {
     killRecorded()
+  }
+})
+
+// A routine creates a session per fire that nothing deletes for a long while, so the language server its edits started
+// (150-500 MB) is freed with the run, like its background jobs. The fake runner touches the pool's client for its own
+// conversation without starting it, so no language server is spawned.
+function runnerTouchingLsp(): CodeSessionRunner {
+  const spec = lspSpecForLanguage('python')!
+  return (async (params) => {
+    await lspPool.use(params.convId, spec, '/repo', async () => {})
+    return { finalText: 'done', contextUsed: 0, contextMax: 0, aborted: false }
+  }) as CodeSessionRunner
+}
+
+test('a routine run that ends disposes the LSP clients its session started', async () => {
+  const store = freshStore()
+  const routine = codeRoutine(store)
+  const run = store.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const d = depsWith(store, runnerTouchingLsp())
+  const before = lspPool.size
+  assert.equal((await runCodeRoutine(d, routine, run, new AbortController().signal)).status, 'ok')
+  assert.equal(lspPool.size, before)
+})
+
+test('a routine run parked for an approval keeps its LSP clients for the resume, and the denied resume frees them', async () => {
+  const store = freshStore()
+  const routine = codeRoutine(store, { permissionMode: 'ask' })
+  const run = store.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const spec = lspSpecForLanguage('python')!
+  const stall = [{ event: 'tool_call', data: { id: 'c1', name: 'bash', args: { command: 'ls' }, status: 'awaiting_approval' } }]
+  const d = depsWith(store, (async (params) => {
+    await lspPool.use(params.convId, spec, '/repo', async () => {})
+    for (const ev of stall) await params.sink(ev)
+    await new Promise<void>((resolve) => params.signal.addEventListener('abort', () => resolve(), { once: true }))
+    return { finalText: '', contextUsed: 0, contextMax: 0, aborted: true }
+  }) as CodeSessionRunner)
+  const before = lspPool.size
+  try {
+    assert.deepEqual(await runCodeRoutine(d, routine, run, new AbortController().signal), { status: 'needs_approval' })
+    assert.equal(lspPool.size, before + 1, 'kept while parked')
+    const pending = parsePendingToolCall(store.getRoutineRun(run.id)?.pendingToolCall) as PendingRoutineToolCall
+    await resumeCodeRoutine(d, routine, store.getRoutineRun(run.id)!, pending, 'deny', new AbortController().signal)
+    assert.equal(lspPool.size, before, 'freed when the resume ends the run')
+  } finally {
+    lspPool.disposeConv(parsePendingToolCall(store.getRoutineRun(run.id)?.pendingToolCall)?.convId ?? '')
   }
 })

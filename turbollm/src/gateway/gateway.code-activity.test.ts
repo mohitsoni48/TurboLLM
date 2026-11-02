@@ -21,7 +21,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
-import { registerGateway } from './gateway'
+import { registerGateway, pendingCodeToolCallSessionCount } from './gateway'
 import { sessionAuth } from '../code/session-auth'
 import type { Deps } from '../deps'
 import type { ToolCallRecord } from '../chat/db'
@@ -529,4 +529,68 @@ test('a DB failure while committing a confirmed call still returns a complete SS
   assert.ok(body.includes('event: message_start'), 'the stream still opens')
   assert.ok(body.includes('Done.'), 'the engine\'s text still reaches the client')
   assert.ok(body.includes('event: message_stop'), 'and it still terminates cleanly')
+})
+
+// Uptime growth (scalability review 3.8): the pending map is keyed by Code session and nothing used to
+// drop the OUTER key, so every Code session left one entry behind for the daemon's whole life.
+test('a session whose every pending call has been confirmed leaves no entry behind', async () => {
+  const { deps } = fakeDeps({ id: 'sess-leak-1', convId: 'conv-1' })
+  const app = new Hono()
+  registerGateway(app, deps)
+  const token = sessionAuth.mint('sess-leak-1')
+  const before = pendingCodeToolCallSessionCount()
+
+  const restore = stubStreamingEngine(EDIT_STREAM)
+  try { await postMessages(app, token, { stream: true }) } finally { restore() }
+  assert.equal(pendingCodeToolCallSessionCount(), before + 1, 'the unconfirmed call is held while pending')
+
+  await postToolResults(app, token, [{ id: 'toolu_01' }])
+  assert.equal(pendingCodeToolCallSessionCount(), before, 'confirming the last call releases the session\'s entry')
+})
+
+test('revoking a session\'s token drops calls that were never confirmed', async () => {
+  const { deps } = fakeDeps({ id: 'sess-leak-2', convId: 'conv-1' })
+  const app = new Hono()
+  registerGateway(app, deps)
+  const token = sessionAuth.mint('sess-leak-2')
+  const before = pendingCodeToolCallSessionCount()
+
+  const restore = stubStreamingEngine(EDIT_STREAM)
+  try { await postMessages(app, token, { stream: true }) } finally { restore() }
+  assert.equal(pendingCodeToolCallSessionCount(), before + 1)
+
+  sessionAuth.revoke('sess-leak-2') // what the terminal kill / exit path does when the CLI is gone
+  assert.equal(pendingCodeToolCallSessionCount(), before)
+})
+
+test('a stream still in flight when its session\'s token is revoked leaves no pending entry behind', async () => {
+  const { deps } = fakeDeps({ id: 'sess-leak-3', convId: 'conv-1' })
+  const app = new Hono()
+  registerGateway(app, deps)
+  const token = sessionAuth.mint('sess-leak-3')
+  const before = pendingCodeToolCallSessionCount()
+
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const original = globalThis.fetch
+  const enc = new TextEncoder()
+  globalThis.fetch = (async () => new Response(
+    new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        for (const l of EDIT_STREAM.slice(0, 2)) controller.enqueue(enc.encode(l + '\n'))
+        await gate // the CLI is killed while this turn is still streaming
+        for (const l of EDIT_STREAM.slice(2)) controller.enqueue(enc.encode(l + '\n'))
+        controller.close()
+      },
+    }),
+    { status: 200, headers: { 'content-type': 'text/event-stream' } },
+  )) as typeof fetch
+  try {
+    const turn = postMessages(app, token, { stream: true })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    sessionAuth.revoke('sess-leak-3')
+    release()
+    await turn
+  } finally { globalThis.fetch = original }
+  assert.equal(pendingCodeToolCallSessionCount(), before, 'nothing can ever confirm those calls, so none is held')
 })
