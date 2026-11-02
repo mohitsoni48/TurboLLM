@@ -212,7 +212,7 @@ export class Manager {
   private port = 0
   private pid = 0
   private child: ChildProcess | null = null
-  /** How the engine is reached and stopped; set exactly while `child` is. */
+  /** How the engine is reached and stopped; set while an engine, spawned (with `child`) or attached, is live. */
   private transport: EngineTransport | null = null
   private startedAt = 0
   private errInfo: ErrInfo | null = null
@@ -245,7 +245,7 @@ export class Manager {
   private generation = 0
   private liveGen: LiveGen | null = null
   private session: SessionAccumulator = freshSession()
-  /** The idle watchdog (watchdogTick), armed only while an engine process is alive. An interval armed for the
+  /** The idle watchdog (watchdogTick), armed only while an engine is live. An interval armed for the
    *  Manager's whole life kept every pool-slot Manager the gateway dropped (and its per-minute config clone) alive
    *  forever; armed this way, a stopped Manager holds no timer and is collected once nothing references it. */
   private watchdog: ReturnType<typeof setInterval> | null = null
@@ -255,11 +255,11 @@ export class Manager {
    *  guard's hooks refuse does not (LoadPausedError), and the guard reports the reload of it instead. */
   private reporting: { paused: boolean } | null = null
 
-  /** `poolSlot`: this Manager runs a gateway pool slot (ModelRouter) beside the primary, often on the same
-   *  engine, so its engine log gets a file of its own (see startInternal). */
   /** How the in-app SDK engine is reached (AttachedTransport); a test injects a fake SDK here. */
   private readonly sdkFetch: typeof globalThis.fetch
 
+  /** `poolSlot`: this Manager runs a gateway pool slot (ModelRouter) beside the primary, often on the same
+   *  engine, so its engine log gets a file of its own (see startInternal). */
   constructor(private store: ConfigStore, options: { poolSlot?: boolean; fetch?: typeof globalThis.fetch } = {}) {
     this.poolSlot = options.poolSlot ?? false
     this.sdkFetch = options.fetch ?? globalThis.fetch
