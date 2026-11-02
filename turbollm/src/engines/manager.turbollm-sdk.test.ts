@@ -37,8 +37,11 @@ function sdkEngineLoad(over: Partial<StartOpts> = {}): StartOpts {
   }
 }
 
-/** A Manager on a fresh data dir whose SDK is `routes`, with the app's token (null: none) in the environment for the test. */
-function attachedManager(t: TestContext, routes: Record<string, SdkReply[]>, token: string | null = 'tok') {
+type SdkFetch = typeof globalThis.fetch
+
+/** A Manager on a fresh data dir whose SDK is `routes` (as `answering` replies to it), with the app's token (null: none)
+ *  in the environment for the test. */
+function attachedManager(t: TestContext, routes: Record<string, SdkReply[]>, token: string | null = 'tok', answering = (sdk: SdkFetch) => sdk) {
   const previous = process.env[TOKEN_ENV]
   if (token === null) delete process.env[TOKEN_ENV]
   else process.env[TOKEN_ENV] = token
@@ -48,7 +51,7 @@ function attachedManager(t: TestContext, routes: Record<string, SdkReply[]>, tok
   })
   const dataDir = tmpDir('tllm-sdk-engine-')
   const sdk = fakeSdk(routes)
-  const manager = new Manager(ConfigStore.load(join(dataDir, 'config.json')), { fetch: sdk.fetch })
+  const manager = new Manager(ConfigStore.load(join(dataDir, 'config.json')), { fetch: answering(sdk.fetch) })
   return { manager, sdk, dataDir }
 }
 
@@ -248,4 +251,54 @@ test('launch flags the SDK cannot apply (ngl, llama-server args) are named as ig
   const log = readFileSync(manager.logPath(), 'utf8')
   assert.match(log, /ignores these launch settings: -ngl 99 --flash-attn on/)
   assert.ok(!JSON.stringify(sdk.sent[0].body).includes('ngl'), 'they are not sent')
+})
+
+// Review C-3: the SDK's unload waits for a native load in progress, so a Stop during a slow load can take longer than
+// the spawned engine's 10 s + kill + 5 s. Killing an attached engine is the same unload, so the next load must wait for
+// that unload (within the load budget) instead of finding the Manager still 'stopping' and failing with BusyError.
+const SLOW_UNLOAD_MS = 20_000
+
+/** An SDK whose model stays 'loading' until a second load is posted, and whose unload answers after SLOW_UNLOAD_MS. */
+function slowUnloadSdk(t: TestContext) {
+  let loadsPosted = 0
+  const slowly = (recorded: SdkFetch) => (async (input: string | URL | Request, init?: RequestInit) => {
+    const path = new URL(String(input)).pathname
+    if (path === '/sdk/v1/load') loadsPosted++
+    if (path === '/sdk/v1/unload') await new Promise((resolve) => setTimeout(resolve, SLOW_UNLOAD_MS))
+    if (path !== '/sdk/v1/status') return recorded(input, init)
+    await recorded(input, init)
+    return new Response(JSON.stringify(loadsPosted >= 2 ? { state: 'ready', model: {} } : { state: 'loading' }))
+  }) as SdkFetch
+  const routes = { 'POST /sdk/v1/load': [sdkAccepted], 'POST /sdk/v1/unload': [sdkStatus('idle')] }
+  const { manager } = attachedManager(t, routes, 'tok', slowly)
+  return { manager, loadsPosted: () => loadsPosted }
+}
+
+test('C-3: a Stop during a slow load, then a new load, waits for the SDK\'s unload and loads the new model', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const { manager, loadsPosted } = slowUnloadSdk(t)
+  const settle = async (done: () => boolean) => {
+    for (let ticks = 0; !done() && ticks < 200; ticks++) {
+      t.mock.timers.tick(500)
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+  }
+  let firstSettled = false
+  const first = manager.load(sdkEngineLoad()).finally(() => { firstSettled = true })
+  await settle(() => loadsPosted() === 1)
+
+  manager.stop()
+  await settle(() => firstSettled)
+  await first
+  let secondSettled = false
+  const second = manager.load(sdkEngineLoad({ model: { key: 'qwen-b', name: 'Qwen B', quant: 'Q4_K_M', ctx: DAEMON_DEFAULT_CTX, vision: false } }))
+    .catch(() => {})
+    .finally(() => { secondSettled = true })
+  await settle(() => secondSettled)
+  await second
+
+  assert.equal(loadsPosted(), 2, 'the second model\'s load was sent')
+  assert.notEqual(manager.status().err?.code, 'load_failed')
+  assert.equal(manager.status().state, 'running')
+  assert.equal(manager.status().model?.key, 'qwen-b')
 })

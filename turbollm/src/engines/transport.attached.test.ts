@@ -3,7 +3,8 @@
 // polled), and stopping is an unload. Every request here goes to an injected fake fetch: no socket is opened.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { AttachedTransport, SdkEngineError } from './transport'
+import type { ChildProcess } from 'node:child_process'
+import { AttachedTransport, SdkEngineError, SpawnedTransport } from './transport'
 import { fakeSdk, sdkAccepted, sdkStatus } from '../test-support/fake-sdk'
 
 const SDK_URL = 'http://127.0.0.1:6997'
@@ -150,4 +151,12 @@ test('a stop while the model is loading abandons the status polling', async () =
   const e = await refusal(started)
   assert.equal(e.code, 'load_abandoned')
   assert.ok(!sdk.routesCalled().includes('GET /sdk/v1/status'), 'no poll after the stop')
+})
+
+// Review C-3: how long a stop may take is the transport's to say. A spawned engine is forced after a grace; the SDK's
+// unload cannot be forced (its kill is the same unload), so the Manager waits for it within the load budget instead.
+test('a spawned engine is forced to stop after a grace; the SDK engine is not', () => {
+  const neverStarted = {} as ChildProcess
+  assert.equal(new SpawnedTransport(neverStarted, 1, Promise.resolve()).forcesStop(), true)
+  assert.equal(new AttachedTransport(SDK_URL, () => 'tok').forcesStop(), false)
 })
