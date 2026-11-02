@@ -31,6 +31,7 @@ function fakeDeps(routed: { model: string | null }): Deps {
     manager: {
       status: () => ({ state: 'stopped', model: null }),
       target: () => 'http://engine.local',
+      currentOpts: () => null,
       generationStart: () => {},
       generationEnd: () => {},
     },
