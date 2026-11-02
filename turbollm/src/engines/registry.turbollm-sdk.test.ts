@@ -7,7 +7,7 @@ import { ConfigStore, type Engine } from '../config/config'
 import { Registry } from './registry'
 import { tmpDir } from '../test-support/tmp'
 
-const SDK_URL = 'http://127.0.0.1:6997'
+const SDK_URL = 'http://sdk.invalid:1'
 
 function registryWithLlamaCpp(): { reg: Registry; store: ConfigStore } {
   const store = ConfigStore.load(join(tmpDir('tllm-sdk-registry-'), 'config.json'))
@@ -67,8 +67,8 @@ test('addTurbollmSdk stores no token in config', () => {
 test('addTurbollmSdk again keeps one SDK engine and adopts the new URL', () => {
   const { reg } = registryWithLlamaCpp()
   const first = reg.addTurbollmSdk('TurboLLM SDK', SDK_URL)
-  const again = reg.addTurbollmSdk('TurboLLM SDK', 'http://localhost:6997')
+  const again = reg.addTurbollmSdk('TurboLLM SDK', 'http://sdk-next.invalid:1')
   assert.equal(again.id, first.id)
   const sdkEngines = reg.list().engines.filter((e) => e.kind === 'turbollm-sdk')
-  assert.deepEqual(sdkEngines.map((e) => e.baseUrl), ['http://localhost:6997'])
+  assert.deepEqual(sdkEngines.map((e) => e.baseUrl), ['http://sdk-next.invalid:1'])
 })

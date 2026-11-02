@@ -108,7 +108,7 @@ test('a first run whose seed fails tries again at the next start', { skip: posix
 // offered that cannot run (ADR-239). These run on every platform: the bundled engines are registered in config.json
 // beforehand, so nothing is probed or executed.
 
-const SDK_URL = 'http://127.0.0.1:6997'
+const SDK_URL = 'http://sdk.invalid:1'
 const CPU_FILE = 'libllama_server.so'
 const LITERT_FILE = 'liblitertlm_server.so'
 const VULKAN_FILE = 'libllama_server_vk.so'
@@ -195,7 +195,7 @@ test('android second boot: the SDK engine keeps its id and takes the new URL', a
   const path = configWith([cpuEngine(lib)], 'cpu')
   const firstId = sdkEngineOf(await androidBoot(path))?.id
 
-  const nextUrl = 'http://localhost:6997'
+  const nextUrl = 'http://sdk-next.invalid:1'
   setEnv('TURBOLLM_ANDROID_SDK_URL', nextUrl)
   const registry = await androidBoot(path)
 

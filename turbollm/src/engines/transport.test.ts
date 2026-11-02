@@ -7,7 +7,7 @@ import { type ChildProcess, spawn } from 'node:child_process'
 import { test, type TestContext } from 'node:test'
 import { SpawnedTransport } from './transport'
 
-const ENGINE_PORT = 6997
+const ENGINE_PORT = 1
 
 /** A process that runs until it is ended, and the promise the Manager's `exited` is: resolved at its 'close'. */
 function idleProcess(t: TestContext): { child: ChildProcess; exited: Promise<void> } {

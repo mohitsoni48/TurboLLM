@@ -1350,7 +1350,7 @@ function runningPrimary(key: string) {
     }),
     currentOpts: () => null,
     restartOpts: () => null,
-    target: () => 'http://127.0.0.1:6997',
+    target: () => 'http://engine.invalid:1',
     touch: () => {},
     load: async (o: StartOpts) => { loads.push(o.model.key); modelKey = o.model.key },
   } as unknown as Manager

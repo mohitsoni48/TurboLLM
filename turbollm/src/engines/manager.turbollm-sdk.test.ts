@@ -13,7 +13,7 @@ import { Manager, type StartOpts } from './manager'
 import { fakeSdk, sdkAccepted, sdkStatus, type SdkReply } from '../test-support/fake-sdk'
 import { tmpDir } from '../test-support/tmp'
 
-const SDK_URL = 'http://127.0.0.1:6997'
+const SDK_URL = 'http://sdk.invalid:1'
 const TOKEN_ENV = 'TURBOLLM_ANDROID_SDK_TOKEN'
 const MODEL_PATH = '/data/user/0/dev.turbollm.android/files/models/qwen.gguf'
 const DAEMON_DEFAULT_CTX = 8192

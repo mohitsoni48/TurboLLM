@@ -7,7 +7,7 @@ import type { ChildProcess } from 'node:child_process'
 import { AttachedTransport, SdkEngineError, SpawnedTransport } from './transport'
 import { fakeSdk, sdkAccepted, sdkStatus } from '../test-support/fake-sdk'
 
-const SDK_URL = 'http://127.0.0.1:6997'
+const SDK_URL = 'http://sdk.invalid:1'
 const LOAD = { path: '/data/models/qwen.gguf', backend: 'auto' as const }
 
 async function refusal(promise: Promise<unknown>): Promise<SdkEngineError> {
