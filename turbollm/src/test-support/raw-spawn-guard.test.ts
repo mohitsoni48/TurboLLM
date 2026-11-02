@@ -55,7 +55,7 @@ const RAW_SPAWN_SITES: Record<string, string> = {
   'code/robust-bash.ts#killDescendantsViaWmi:spawn': WIN_KILL,
   'code/robust-bash.ts#killProcessTreeFast:spawn': WIN_KILL,
   'routines/cli-process.ts#killCliProcessTree:spawn': WIN_KILL,
-  'engines/manager.ts#forceKill:execFile': WIN_KILL,
+  'engines/transport.ts#forceKill:execFile': WIN_KILL,
   'engines/manager.ts#killPidTree:execFile': WIN_KILL,
   'engines/manager.ts#killTrackedEnginesSync:spawnSync': WIN_KILL,
   'engines/build-runner.ts#onAbort:execFile': WIN_KILL,
