@@ -53,3 +53,31 @@ test('a Turbo Link turn from a box running the SDK never carries the SDK bearer'
   await callChatUpstream(REMOTE_FROM_SDK_BOX, { model: 'm', messages: [] }, undefined, fetchImpl)
   assert.notEqual(sent[0].get('authorization'), `Bearer ${SDK_TOKEN}`)
 })
+
+// The stop-list cap (plan D-12, G-4; review C-2) is applied here, at the one outbound call, so the main turn, its
+// regenerate, the auto-title and memory all send the SDK at most 4 stop strings.
+const FIVE_STOPS = ['a', 'b', 'c', 'd', 'e']
+
+/** A fetch that records the JSON body it was sent and answers 200. */
+function bodyRecordingFetch(): { fetchImpl: typeof fetch; bodies: Array<Record<string, unknown>> } {
+  const bodies: Array<Record<string, unknown>> = []
+  const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+    return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+  }) as typeof fetch
+  return { fetchImpl, bodies }
+}
+
+test('a local turn to the SDK engine with 5 stop strings is sent the first 4', async (t) => {
+  t.mock.method(console, 'warn', () => {})
+  const { fetchImpl, bodies } = bodyRecordingFetch()
+  await callChatUpstream(LOCAL_SDK, { model: 'm', messages: [], stop: FIVE_STOPS }, undefined, fetchImpl)
+  assert.deepEqual(bodies[0].stop, FIVE_STOPS.slice(0, 4))
+})
+
+test('a local turn to llama.cpp with 5 stop strings is sent unchanged', async () => {
+  const { fetchImpl, bodies } = bodyRecordingFetch()
+  const body = { model: 'm', messages: [], stop: FIVE_STOPS, max_tokens: 64 }
+  await callChatUpstream({ ...LOCAL_SDK, engineKind: 'llama-server' }, body, undefined, fetchImpl)
+  assert.deepEqual(bodies[0], body)
+})

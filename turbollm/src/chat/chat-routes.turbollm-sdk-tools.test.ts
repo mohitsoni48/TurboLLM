@@ -165,3 +165,29 @@ test('answering again a question with a stored image on llama.cpp still sends th
   await answerStoredImageAgain(routes(t, 'llama-server'))
   assert.deepEqual(lastUserContent(sent[0]), [{ type: 'text', text: 'What is this?' }, { type: 'image_url', image_url: { url: IMAGE } }])
 })
+
+// Stop strings on the SDK engine (plan D-12, Revision 2 G-4; review C-2): it takes at most 4 and answers more with a
+// 400, so a thread with five is sent its first four. Other engines take the thread's stop list as it is.
+const FIVE_STOPS = ['<end>', '###', 'User:', 'Assistant:', '</s>']
+
+/** One turn in a chat whose Conversation settings carry FIVE_STOPS. */
+async function turnWithFiveStops(h: ReturnType<typeof routes>): Promise<void> {
+  const conv = h.store.createConversation({ sampling: { stop: FIVE_STOPS } })
+  const res = await h.app.request(`/api/v1/conversations/${conv.id}/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'Hi' }),
+  })
+  await res.text()
+}
+
+test('a local turn on the SDK engine in a thread with 5 stop strings is sent the first 4 (C-2)', async (t) => {
+  const sent = textEngine(t)
+  t.mock.method(console, 'warn', () => {})
+  await turnWithFiveStops(routes(t, 'turbollm-sdk'))
+  assert.deepEqual(sent[0].stop, FIVE_STOPS.slice(0, 4))
+})
+
+test('a local turn on llama.cpp in a thread with 5 stop strings is sent all 5', async (t) => {
+  const sent = textEngine(t)
+  await turnWithFiveStops(routes(t, 'llama-server'))
+  assert.deepEqual(sent[0].stop, FIVE_STOPS)
+})
