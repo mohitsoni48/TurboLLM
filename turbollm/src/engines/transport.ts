@@ -15,6 +15,8 @@ export interface EngineTransport {
   stop(): Promise<void>
   /** Ends the engine now, without the grace. */
   kill(): void
+  /** Whether a stop that outlasts its grace can be forced: kill() ends the engine sooner than stop() does. */
+  forcesStop(): boolean
 }
 
 /** An engine process the daemon spawned and owns, listening on its own loopback port. `exited` resolves at the
@@ -40,6 +42,10 @@ export class SpawnedTransport implements EngineTransport {
 
   kill(): void {
     forceKill(this.child)
+  }
+
+  forcesStop(): boolean {
+    return true
   }
 }
 
@@ -130,6 +136,11 @@ export class AttachedTransport implements EngineTransport {
 
   kill(): void {
     void this.unload()
+  }
+
+  /** No: the SDK's unload waits for a native load in progress, and kill() is that same unload. */
+  forcesStop(): boolean {
+    return false
   }
 
   private unload(): Promise<void> {

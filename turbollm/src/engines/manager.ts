@@ -687,13 +687,20 @@ export class Manager {
   }
 
   /** Wait for `exited` up to 10s; if it hasn't resolved by then, force-kill and wait
-   *  unconditionally. A bare timeout here previously let stopAndWait() return with the
+   *  unconditionally (an engine whose stop cannot be forced, the in-app SDK, is waited for within the load budget). A bare timeout here previously let stopAndWait() return with the
    *  process still alive and `state` stuck at 'stopping' (e.g. a slow Windows tree-kill) —
    *  the very next startInternal() would then throw BusyError, silently abandoning a model
    *  swap (the caller in routes.ts fires load() without awaiting and only logs the
    *  rejection). Bypasses forceStop()'s running/starting-only guard by killing through the
    *  transport directly, since by this point state is already 'stopping'. */
   private async waitForExit(exited: Promise<void>): Promise<void> {
+    // An engine whose stop cannot be forced (the SDK's unload waits out a native load in progress) is waited for
+    // within the budget a load gets: bounded, so the gate still cannot deadlock, and long enough that a Stop during a
+    // slow load does not leave the next load to BusyError (review C-3). The unload's own failure settles it sooner.
+    if (this.transport?.forcesStop() === false) {
+      await exitedWithin(exited, READINESS_TIMEOUT_MS)
+      return
+    }
     const result = await exitedWithin(exited, 10_000)
     if (result === 'timeout' && this.transport) {
       this.transport.kill()
