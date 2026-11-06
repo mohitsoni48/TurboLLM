@@ -30,6 +30,7 @@ export function ToolPermissionsSection() {
   const tools = toolsQ.data ?? []
   const policies = settingsQ.data?.toolPolicies ?? {}
   const autoAllowAll = settingsQ.data?.autoAllowAll ?? false
+  const pdfReading = settingsQ.data?.pdfReading ?? false
   const savedWait = settingsQ.data?.chatApprovalWaitMinutes ?? WAIT_DEFAULT
   // The field's text while it is edited; saved on blur or Enter, and put back to the saved value
   // whenever that changes (a save here, or one from another tab once the settings are read again).
@@ -49,6 +50,14 @@ export function ToolPermissionsSection() {
     save.mutate(
       { autoAllowAll: value },
       { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update tool permission.') },
+    )
+  }
+
+  const setPdfReading = (value: boolean) => {
+    track('settings', 'toggle_pdf_reading')
+    save.mutate(
+      { pdfReading: value },
+      { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update PDF reading.') },
     )
   }
 
@@ -90,6 +99,17 @@ export function ToolPermissionsSection() {
             </div>
           </div>
           <Switch checked={autoAllowAll} onCheckedChange={setAutoAllowAll} disabled={save.isPending} />
+        </div>
+
+        <div className="mb-3 flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2.5">
+          <div className="min-w-0">
+            <div className="text-[13px] font-medium text-ink">Read PDFs in fetch_url</div>
+            <div className="text-[11px] text-faint">
+              Let fetch_url read the text of PDF documents. Off, a PDF gets a fixed &quot;PDF reading is disabled&quot; note.
+              A PDF comes from an untrusted site and is opened by a PDF parser.
+            </div>
+          </div>
+          <Switch checked={pdfReading} onCheckedChange={setPdfReading} disabled={save.isPending} />
         </div>
 
         <div className="mb-3 flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2.5">
