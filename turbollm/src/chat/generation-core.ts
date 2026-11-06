@@ -67,6 +67,10 @@ export interface GenerationPersistence {
   /** The engine refused the turn before it produced anything: put back what this turn set aside, if anything. True
    *  when the turn's reply is gone with it, so there is nothing to finalize. Must not throw (a throw reads as false). */
   restoreUnproduced(): boolean
+  /** Persists a tool round once all its calls have settled, before the next request (a routine's run appends one
+   *  message per round). A round handed over is the caller's: the progress saves and the terminal write carry only
+   *  what came after it. Optional: the live chat keeps the whole reply in its one row. */
+  appendToolRound?(round: ToolRound): void | Promise<void>
   /** The one terminal write: persist the finished reply and return the message the 'done' event carries. */
   finalize(reply: FinalReply): unknown | Promise<unknown>
 }
@@ -94,11 +98,34 @@ export interface ApprovalPolicy {
 export type GenerationConversation = Pick<Conversation, 'id' | 'sampling'> &
   Partial<Pick<Conversation, 'skillIds' | 'allowedTools' | 'toolPolicy' | 'preserveThinking'>>
 
+/** A message of the turn's history; a prior round's tool calls and results keep their pairing fields. */
+export type GenerationMessage = EngineMessage & { tool_calls?: unknown; tool_call_id?: string }
+
+/** How a caller with nobody watching runs the loop (a routine's run). Every field unset is the live chat's behavior. */
+export interface LoopOptions {
+  /** 'json': one non-streaming completion per round, its text taken as the engine gives it (no <think> parsing, no
+   *  deltas, no progress). Unset: the streamed turn. */
+  transport?: 'json'
+  /** The most tool rounds the turn runs, each one's calls run; past it the turn ends `exceeded`. Unset: the live
+   *  chat's MAX_TOOL_ITER + 1 requests, the last one's calls ignored. */
+  toolRoundCeiling?: number
+  /** false: no BUG-001 extra pass for an empty answer; the answer is what it is. */
+  extraPass?: false
+  /** false: the turn writes nothing into this machine's ledgers: the owner's activity (Turbo Link's wake gate), the
+   *  engine's in-flight counter and live readout, its completion stats, the bench result or the request log. The
+   *  caller keeps its own accounting (a routine's gate hold and Manager.hold, routines/execute.ts). */
+  ledgers?: false
+  /** true: the tools go to vLLM and SGLang too, which the live chat withholds there. */
+  toolsOnEveryEngine?: true
+  /** false: a stop does not keep a round's remaining calls from running; the turn still ends before its next request. */
+  stopBetweenToolCalls?: false
+}
+
 /** One turn to generate. */
 export interface GenerationTurn {
   convId: string
   conv: GenerationConversation
-  engineMessages: EngineMessage[]
+  engineMessages: GenerationMessage[]
   /** Where this turn generates — the local engine, or a linked host (chat-upstream.ts). `upstream.remote` is the
    *  single test for "another machine did the work", which every local ledger below branches on. */
   upstream: ChatUpstream
@@ -106,23 +133,64 @@ export interface GenerationTurn {
   /** Reasoning token budget: -1 = unlimited, 0 = thinking off, N>0 = a sampler-enforced cap. */
   thinkingBudget: number
   reasoningEffort: ReasoningEffort | undefined
+  loop?: LoopOptions
 }
 
-export interface GenerationPorts {
+/** A tool call of the round, before it runs. */
+export interface PendingToolCall {
+  id: string
+  name: string
+  args: Record<string, unknown>
+}
+
+/** A tool call that has its result: the result string as the model reads it, an error included. */
+export interface SettledToolCall extends PendingToolCall {
+  result: string
+}
+
+/** A round's text and the calls of it settled so far. */
+export interface ToolRound {
+  content: string
+  calls: SettledToolCall[]
+}
+
+/** What the caller's beforeToolCall makes of a call: run it, answer it with `block` without running it, or end the
+ *  turn where it stands with `stop` (nothing more runs and nothing is finalized; the outcome carries it). */
+export type ToolCallVerdict<S> = 'run' | { block: string } | { stop: S }
+
+export interface GenerationPorts<S = never> {
   persistence: GenerationPersistence
   sink: EmitSink
   approval: ApprovalPolicy
   /** Runs once the engine is done with the turn, however it ended, before the terminal write (the chat route frees
    *  the conversation's in-flight slot here). */
   onSettled?(): void
+  /** The caller's say over each tool call before the approval policy's (a routine's loop breaker and its stall on a
+   *  tool its agent does not list). `round` is the call's round so far. Unset: every call goes to the approval policy.
+   *  Set, a round's calls reach it even with no tool registry (Deps.tools, absent in tests only), as a routine's stall
+   *  does not depend on one; a call it lets run is then answered "Error: no tool registry available.". */
+  beforeToolCall?(call: PendingToolCall, round: ToolRound): ToolCallVerdict<S>
 }
 
+/** Why a turn the engine did not finish failed: the engine refused it (`http`, with its reason when it gave one) or
+ *  reported an error (`engine`), or the request or its reading threw (`thrown`). */
+export type GenerationFailure =
+  | { kind: 'http'; status: number; reason: string | undefined }
+  | { kind: 'engine'; message: string }
+  | { kind: 'thrown'; message: string }
+
 /** How the turn ended, for what its caller does next (a chat turn's title and memory). */
-export interface GenerationOutcome {
+export interface GenerationOutcome<S = never> {
   /** The turn produced nothing and the persistence port put back what it set aside: nothing was finalized. */
   restored: boolean
   aborted: boolean
   content: string
+  /** Set only when the engine failed the turn. */
+  failure?: GenerationFailure
+  /** Set only when beforeToolCall stopped the turn: its `stop`. */
+  stopped?: S
+  /** Set only when the turn ran out of LoopOptions.toolRoundCeiling rounds without an answer. */
+  exceeded?: true
 }
 
 /**
@@ -131,9 +199,12 @@ export interface GenerationOutcome {
  * tags, executes tool calls and loops (up to MAX_TOOL_ITER rounds), and persists the final
  * message + stats through the persistence port. Shared by every caller of the generation loop.
  */
-export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: GenerationPorts): Promise<GenerationOutcome> {
+export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn, ports: GenerationPorts<S>): Promise<GenerationOutcome<S>> {
   const { persistence, approval } = ports
   const { convId, conv, upstream, ac, thinkingBudget, reasoningEffort } = turn
+  const loop = turn.loop ?? {}
+  const jsonTransport = loop.transport === 'json'
+  const ledgers = loop.ledgers !== false
   // GitHub #177: never let a write to a torn-down stream unwind past the persistence write
   // below. See resilientSink's doc comment — this is the invariant, not the individual
   // try/catch at the two emit sites that happened to have one.
@@ -143,11 +214,13 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
   // peer's engine card must not read "Generating…" for work its engine is not doing, and
   // `hostIdleState` reads sessionStats().activeRequests, so a false busy here would block a
   // third machine's legitimate wake.
-  const localAccounting = !upstream.remote
+  const localAccounting = ledgers && !upstream.remote
 
   // Map conversation sampling overrides (camelCase) to the engine's snake_case names.
   const convS = conv.sampling ?? {}
-  const engineKind = servingEngineKind(d)
+  // The engine serving THIS upstream: a routine's pool slot names its own, which is not the primary's. A remote
+  // upstream names none and reads the primary's, as it always has (the host shapes for its own engine).
+  const engineKind = upstream.engineKind ?? servingEngineKind(d)
   // BUG-006: vLLM and SGLang reject `repeat_penalty` (the llama.cpp name) and require
   // `repetition_penalty` — the OpenAI-spec name. mlx-vlm's request schema (server/schemas.py)
   // only declares `repetition_penalty` too — `repeat_penalty` isn't rejected (the schema
@@ -172,13 +245,18 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
   const stopStrings = convS.stop as string[] | undefined
 
   const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
-  const shaping: RequestShaping = { upstream, samplingOverride, stopStrings, maxLimit, thinkingBudget, reasoningEffort, preserveThinking: conv.preserveThinking }
+  const shaping: RequestShaping = { upstream, samplingOverride, stopStrings, maxLimit, thinkingBudget, reasoningEffort, preserveThinking: conv.preserveThinking, jsonTransport }
 
   // ── Agentic tool loop ──────────────────────────────────────────────────────
   // engineMessages is extended each round with tool results. Start from ctx copy
   // so the original array is never mutated (continue endpoint reuses it).
-  const iterMessages: { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string; reasoning_content?: string }[] =
-    turn.engineMessages.map((m) => ({ role: m.role, content: m.content, ...(m.reasoning_content ? { reasoning_content: m.reasoning_content } : {}) }))
+  // A prior round's tool calls and results keep their pairing (a resumed routine replays them).
+  const iterMessages: GenerationMessage[] = turn.engineMessages.map((m) => ({
+    role: m.role, content: m.content,
+    ...(m.reasoning_content ? { reasoning_content: m.reasoning_content } : {}),
+    ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+    ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+  }))
 
   // Skills enabled for this conversation (the shared SKILL.md library, picked via
   // Thread settings or the '/' picker): inject their instructions into the system
@@ -239,6 +317,14 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
   // a ceiling, not a target — ordinary chats still finish in 1–2 rounds and are unaffected.
   const MAX_TOOL_ITER = 16
   let toolIter = 0
+  /** LoopOptions.toolRoundCeiling: the caller's own ceiling, every round of it run. */
+  const roundCeiling = loop.toolRoundCeiling
+  /** The loop stopped asking because it had its answer (or nothing more to do), not because it ran out of rounds. */
+  let ended = false
+  /** beforeToolCall's stop, once it ended the turn. */
+  let stop: { value: S } | undefined
+  let failure: GenerationFailure | undefined
+  let exceeded = false
   /** The reply's wait for its tool-call approvals, shared by all its calls (ApprovalWaitBudget). */
   const approvalWait = newApprovalWaitBudget()
   /** Number of web_search tool calls made this turn (caps the confidence re-loop). */
@@ -309,7 +395,7 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
   // the terminal-agent paths; this is the only local path that never goes through it.
   // Still local activity even for a remote turn: the OWNER of this machine is at the
   // keyboard, which is exactly what the wake ledger records.
-  noteLocalActivity()
+  if (ledgers) noteLocalActivity()
   if (localAccounting) d.manager.generationStart()
   // The reply's text so far (and its reasoning and finished tool calls) is saved into its placeholder every
   // PARTIAL_SAVE_MS while the turn runs, when it changed. It was written only at the end of the turn, so a daemon
@@ -371,7 +457,7 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
     const toolDefs = skillTools && approval.isCodeAuthorized ? [...scopedBaseToolDefs, ...skillTools.defs] : scopedBaseToolDefs
     // This machine's LiteRT-LM engine and the model it serves (a Turbo Link host shapes for its own engine).
     const localLitert = engineKind === 'litert-lm' && !upstream.remote
-    const litertModel = localLitert ? d.scanner?.get?.(d.manager.status?.().model?.key ?? '') : undefined
+    const litertModel = localLitert ? d.scanner?.get?.(upstream.libraryKey ?? d.manager.status?.().model?.key ?? '') : undefined
     /** A note for the user about this turn, once per turn: the chat shows it (ChatScreen's 'notice'). */
     const notes = new Set<string>()
     const noteOnce = async (message: string): Promise<void> => {
@@ -380,8 +466,11 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
       await emit({ event: 'notice', data: { message } })
     }
 
-    while (toolIter <= MAX_TOOL_ITER) {
+    rounds: while (roundCeiling === undefined ? toolIter <= MAX_TOOL_ITER : toolIter < roundCeiling) {
       toolIter++
+      // A stop between rounds ends the turn before its next request, whether or not the round's calls heeded it
+      // (LoopOptions.stopBetweenToolCalls).
+      ac.signal.throwIfAborted()
 
       const reqBody = buildEngineRequest(shaping, iterMessages)
       // Attach tools only to engines whose OpenAI server accepts a `tools` array as
@@ -412,7 +501,7 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
         roundTools = pick.tools
         if (pick.note) await noteOnce(pick.note)
       }
-      const toolsSupported = engineKind !== 'vllm' && engineKind !== 'sglang' && roundTools.length > 0
+      const toolsSupported = (loop.toolsOnEveryEngine || (engineKind !== 'vllm' && engineKind !== 'sglang')) && roundTools.length > 0
       if (toolsSupported) reqBody.tools = roundTools
       // Force web_search on the first two iterations when the conversation has a
       // force_web_search policy (e.g. Research persona). This guarantees at least
@@ -430,7 +519,7 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
         else reqBody.tool_choice = { type: 'function', function: { name: 'web_search' } }
       }
 
-      const res = await callChatUpstream(upstream, reqBody, ac.signal, undefined, d)
+      const res = await callChatUpstream(upstream, reqBody, ac.signal, undefined, ledgers ? d : undefined)
 
       if (!res.ok || !res.body) {
         // The engine's own reason, from its body or (LiteRT-LM) its status line, says far more than the status code.
@@ -442,162 +531,172 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
         // round refused this way (its request past n_ctx with round 1's tool result in it, a 503
         // after a model swap, a linked host's host_busy) lost round 1's text, reasoning and tool
         // calls, all already streamed, and left the reply empty.
-        throw new EngineStreamError(reason ? `Engine returned ${res.status}: ${reason}` : `Engine returned ${res.status}`)
-      }
-
-      const reader = res.body.getReader()
-      const decoder = new TextDecoder()
-      let buf = ''
-
-      // `.catch()` is load-bearing (GitHub #177): on abort, the fetch layer ERRORS the body
-      // stream first (undici rejects the pending read with AbortError), and cancelling an
-      // already-errored stream returns a REJECTED promise. Bare `void reader.cancel()` left that
-      // floating — an unhandled rejection, i.e. a daemon crash mid-generation, which loses the
-      // turn's output the same way the unguarded emits did.
-      const cancelReader = () => { void reader.cancel().catch(() => {}) }
-      if (ac.signal.aborted) {
-        cancelReader()
-      } else {
-        ac.signal.addEventListener('abort', cancelReader, { once: true })
+        throw new EngineStreamError(reason ? `Engine returned ${res.status}: ${reason}` : `Engine returned ${res.status}`, { status: res.status, reason: reason || undefined })
       }
 
       // Per-round state
       let roundContent = ''
-      let parseState = initParseState()
-      pendingParse = parseState
       let finishReason = ''
       // Accumulate streaming tool_calls by index (OpenAI format: fragmented across chunks)
       const pendingToolCalls = new Map<number, { id: string; name: string; argsBuffer: string }>()
-      // Indices we've already told the UI about (so the long tool-arg generation that
-      // follows the model's text shows an inline "running…" step instead of looking frozen).
-      const announcedToolCalls = new Set<number>()
 
-      roundLoop: while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buf += decoder.decode(value, { stream: true })
-        const lines = buf.split('\n')
-        buf = lines.pop() ?? ''
+      if (jsonTransport) {
+        const completion = await readCompletion(res)
+        if (completion.usage) finalUsage = completion.usage
+        roundContent = completion.content
+        fullContent += completion.content
+        for (const [i, tc] of completion.toolCalls.entries()) pendingToolCalls.set(i, tc)
+      } else {
+        const reader = res.body.getReader()
+        const decoder = new TextDecoder()
+        let buf = ''
 
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          const raw = line.slice(6).trim()
-          if (raw === '[DONE]') break roundLoop
+        // `.catch()` is load-bearing (GitHub #177): on abort, the fetch layer ERRORS the body
+        // stream first (undici rejects the pending read with AbortError), and cancelling an
+        // already-errored stream returns a REJECTED promise. Bare `void reader.cancel()` left that
+        // floating — an unhandled rejection, i.e. a daemon crash mid-generation, which loses the
+        // turn's output the same way the unguarded emits did.
+        const cancelReader = () => { void reader.cancel().catch(() => {}) }
+        if (ac.signal.aborted) {
+          cancelReader()
+        } else {
+          ac.signal.addEventListener('abort', cancelReader, { once: true })
+        }
 
-          let chunk: Record<string, unknown>
-          try { chunk = JSON.parse(raw) as Record<string, unknown> } catch { continue }
-          const engineError = streamChunkError(chunk)
-          if (engineError) {
-            // Nothing more is read from this stream: hang up so the engine stops, and drop the abort hook with it.
-            ac.signal.removeEventListener('abort', cancelReader)
-            cancelReader()
-            throw new EngineStreamError(engineErrorText(d, engineKind, engineError))
-          }
+        let parseState = initParseState()
+        pendingParse = parseState
+        // Indices we've already told the UI about (so the long tool-arg generation that
+        // follows the model's text shows an inline "running…" step instead of looking frozen).
+        const announcedToolCalls = new Set<number>()
 
-          // Prompt progress
-          const pp = chunk.prompt_progress as { processed?: number; total?: number; tps?: number } | undefined
-          if (pp && pp.total) {
-            // #52 item 9: the only prompt-token number that exists before the round ends.
-            lastPromptTotal = pp.total
-            const pct = Math.round((pp.processed ?? 0) / pp.total * 100)
-            if (localAccounting) d.manager.setLiveGen({ phase: 'prompt', pct, outputTokens: 0 })
-            await emit({ event: 'progress', data: { phase: 'prompt', processed: pp.processed, total: pp.total, pct, tps: pp.tps ?? 0 } })
-            continue
-          }
+        roundLoop: while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += decoder.decode(value, { stream: true })
+          const lines = buf.split('\n')
+          buf = lines.pop() ?? ''
 
-          if (chunk.usage) finalUsage = chunk.usage as typeof finalUsage
-          if (chunk.timings) finalTimings = chunk.timings as typeof finalTimings
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue
+            const raw = line.slice(6).trim()
+            if (raw === '[DONE]') break roundLoop
 
-          const choices = chunk.choices as Array<{
-            delta?: { content?: string; reasoning_content?: string; reasoning?: string; tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> }
-            finish_reason?: string
-          }> | undefined
-          if (!choices?.length) continue
-
-          if (choices[0].finish_reason) finishReason = choices[0].finish_reason
-          const delta = choices[0].delta ?? {}
-
-          // Accumulate streaming tool_call fragments (OpenAI: id+name only in first chunk,
-          // arguments fragment across all chunks for that index).
-          if (delta.tool_calls?.length) {
-            for (const tc of delta.tool_calls) {
-              if (!pendingToolCalls.has(tc.index)) {
-                pendingToolCalls.set(tc.index, { id: '', name: '', argsBuffer: '' })
-              }
-              const entry = pendingToolCalls.get(tc.index)!
-              if (tc.id && !entry.id) entry.id = tc.id
-              if (tc.function?.name && !entry.name) entry.name = tc.function.name
-              if (tc.function?.arguments) entry.argsBuffer += tc.function.arguments
-              // The moment we know which tool this is, surface it as pending — the model
-              // may stream a long argument body next, and silence there reads as a freeze.
-              if (entry.id && entry.name && !announcedToolCalls.has(tc.index)) {
-                announcedToolCalls.add(tc.index)
-                await emit({ event: 'tool_call', data: { id: entry.id, name: entry.name, args: {}, status: 'pending' } })
-              }
+            let chunk: Record<string, unknown>
+            try { chunk = JSON.parse(raw) as Record<string, unknown> } catch { continue }
+            const engineError = streamChunkError(chunk)
+            if (engineError) {
+              // Nothing more is read from this stream: hang up so the engine stops, and drop the abort hook with it.
+              ac.signal.removeEventListener('abort', cancelReader)
+              cancelReader()
+              throw new EngineStreamError(engineErrorText(d, engineKind, engineError))
             }
-            continue
-          }
 
-          // Reasoning content — llama-server uses `reasoning_content`, mlx-lm uses `reasoning`.
-          const rc = (delta.reasoning_content ?? delta.reasoning) as string | undefined
-          if (rc) {
-            if (!thinkStart) thinkStart = Date.now()
-            thinkEnd = Date.now()
-            fullReasoning += rc
-            await emit({ event: 'reasoning', data: { delta: rc } })
-            continue
-          }
+            // Prompt progress
+            const pp = chunk.prompt_progress as { processed?: number; total?: number; tps?: number } | undefined
+            if (pp && pp.total) {
+              // #52 item 9: the only prompt-token number that exists before the round ends.
+              lastPromptTotal = pp.total
+              const pct = Math.round((pp.processed ?? 0) / pp.total * 100)
+              if (localAccounting) d.manager.setLiveGen({ phase: 'prompt', pct, outputTokens: 0 })
+              await emit({ event: 'progress', data: { phase: 'prompt', processed: pp.processed, total: pp.total, pct, tps: pp.tps ?? 0 } })
+              continue
+            }
 
-          const raw_content = delta.content ?? ''
-          if (!raw_content) continue
+            if (chunk.usage) finalUsage = chunk.usage as typeof finalUsage
+            if (chunk.timings) finalTimings = chunk.timings as typeof finalTimings
 
-          const { state: nextState, events: parseEvents } = feedChunk(parseState, raw_content)
-          parseState = nextState
-          pendingParse = parseState
-          for (const ev of parseEvents) {
-            if (ev.type === 'reasoning') {
+            const choices = chunk.choices as Array<{
+              delta?: { content?: string; reasoning_content?: string; reasoning?: string; tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> }
+              finish_reason?: string
+            }> | undefined
+            if (!choices?.length) continue
+
+            if (choices[0].finish_reason) finishReason = choices[0].finish_reason
+            const delta = choices[0].delta ?? {}
+
+            // Accumulate streaming tool_call fragments (OpenAI: id+name only in first chunk,
+            // arguments fragment across all chunks for that index).
+            if (delta.tool_calls?.length) {
+              for (const tc of delta.tool_calls) {
+                if (!pendingToolCalls.has(tc.index)) {
+                  pendingToolCalls.set(tc.index, { id: '', name: '', argsBuffer: '' })
+                }
+                const entry = pendingToolCalls.get(tc.index)!
+                if (tc.id && !entry.id) entry.id = tc.id
+                if (tc.function?.name && !entry.name) entry.name = tc.function.name
+                if (tc.function?.arguments) entry.argsBuffer += tc.function.arguments
+                // The moment we know which tool this is, surface it as pending — the model
+                // may stream a long argument body next, and silence there reads as a freeze.
+                if (entry.id && entry.name && !announcedToolCalls.has(tc.index)) {
+                  announcedToolCalls.add(tc.index)
+                  await emit({ event: 'tool_call', data: { id: entry.id, name: entry.name, args: {}, status: 'pending' } })
+                }
+              }
+              continue
+            }
+
+            // Reasoning content — llama-server uses `reasoning_content`, mlx-lm uses `reasoning`.
+            const rc = (delta.reasoning_content ?? delta.reasoning) as string | undefined
+            if (rc) {
               if (!thinkStart) thinkStart = Date.now()
               thinkEnd = Date.now()
-              fullReasoning += ev.text
-              await emit({ event: 'reasoning', data: { delta: ev.text } })
-            } else {
-              fullContent += ev.text
-              roundContent += ev.text
-              if (!ttftMs) ttftMs = Date.now() - requestStart
-              liveOut++
-              if (localAccounting) d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: liveOut })
-              await emit({ event: 'delta', data: { delta: ev.text } })
+              fullReasoning += rc
+              await emit({ event: 'reasoning', data: { delta: rc } })
+              continue
+            }
+
+            const raw_content = delta.content ?? ''
+            if (!raw_content) continue
+
+            const { state: nextState, events: parseEvents } = feedChunk(parseState, raw_content)
+            parseState = nextState
+            pendingParse = parseState
+            for (const ev of parseEvents) {
+              if (ev.type === 'reasoning') {
+                if (!thinkStart) thinkStart = Date.now()
+                thinkEnd = Date.now()
+                fullReasoning += ev.text
+                await emit({ event: 'reasoning', data: { delta: ev.text } })
+              } else {
+                fullContent += ev.text
+                roundContent += ev.text
+                if (!ttftMs) ttftMs = Date.now() - requestStart
+                liveOut++
+                if (localAccounting) d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: liveOut })
+                await emit({ event: 'delta', data: { delta: ev.text } })
+              }
             }
           }
         }
-      }
-      ac.signal.removeEventListener('abort', cancelReader)
-      // A Stop does not always reach this loop as an AbortError: with the request log on (the default)
-      // the turn reads one branch of a tee'd body (callChatUpstream), and cancelling it on abort ENDS the
-      // pending read (done: true) instead; Node 18's fetch body (the Android app's runtime) does the same
-      // with the log off. Read as the end of the round, a stopped reply was saved as finished (title,
-      // memory and bench result included) and a tool call it was streaming still ran, one set to Allow
-      // without asking. Thrown as the abort it is, before the flush below, so the catch and the drain
-      // after it handle it as they handle an AbortError.
-      ac.signal.throwIfAborted()
+        ac.signal.removeEventListener('abort', cancelReader)
+        // A Stop does not always reach this loop as an AbortError: with the request log on (the default)
+        // the turn reads one branch of a tee'd body (callChatUpstream), and cancelling it on abort ENDS the
+        // pending read (done: true) instead; Node 18's fetch body (the Android app's runtime) does the same
+        // with the log off. Read as the end of the round, a stopped reply was saved as finished (title,
+        // memory and bench result included) and a tool call it was streaming still ran, one set to Allow
+        // without asking. Thrown as the abort it is, before the flush below, so the catch and the drain
+        // after it handle it as they handle an AbortError.
+        ac.signal.throwIfAborted()
 
-      // Flush lookahead buffer at end-of-stream. Clearing `pendingParse` first is what stops the
-      // interrupted-turn drain after the try/catch from flushing this same buffer a SECOND time
-      // (flushState is pure — it does not consume the buffer it reads).
-      pendingParse = null
-      for (const ev of flushState(parseState)) {
-        if (ev.type === 'reasoning') {
-          fullReasoning += ev.text
-          await emit({ event: 'reasoning', data: { delta: ev.text } })
-        } else {
-          fullContent += ev.text
-          roundContent += ev.text
-          await emit({ event: 'delta', data: { delta: ev.text } })
+        // Flush lookahead buffer at end-of-stream. Clearing `pendingParse` first is what stops the
+        // interrupted-turn drain after the try/catch from flushing this same buffer a SECOND time
+        // (flushState is pure — it does not consume the buffer it reads).
+        pendingParse = null
+        for (const ev of flushState(parseState)) {
+          if (ev.type === 'reasoning') {
+            fullReasoning += ev.text
+            await emit({ event: 'reasoning', data: { delta: ev.text } })
+          } else {
+            fullContent += ev.text
+            roundContent += ev.text
+            await emit({ event: 'delta', data: { delta: ev.text } })
+          }
         }
       }
 
       // ── Tool call execution ──────────────────────────────────────────────
-      if ((finishReason === 'tool_calls' || pendingToolCalls.size > 0) && d.tools && toolIter <= MAX_TOOL_ITER) {
+      // A caller with a say over each call (beforeToolCall) gets every call, a registry or not (see there).
+      if ((finishReason === 'tool_calls' || pendingToolCalls.size > 0) && (d.tools || ports.beforeToolCall) && toolIter <= (roundCeiling ?? MAX_TOOL_ITER)) {
         const roundToolCalls = Array.from(pendingToolCalls.values())
 
         // Add the assistant message (with tool_calls) to iterMessages for the next round
@@ -611,14 +710,25 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
           })),
         })
 
+        /** The round's calls settled so far, as the model reads their results. */
+        const settled: SettledToolCall[] = []
         for (const tc of roundToolCalls) {
           // No call starts once the turn is stopped. A tool that does not honour the abort (fetch_url,
           // run_code, MCP) runs to its end when Stop comes during it, and the round's next call then
           // started after the Stop, a tool set to Allow included.
-          ac.signal.throwIfAborted()
+          if (loop.stopBetweenToolCalls !== false) ac.signal.throwIfAborted()
           let parsedArgs: Record<string, unknown>
           try { parsedArgs = JSON.parse(tc.argsBuffer || '{}') as Record<string, unknown> }
           catch { parsedArgs = {} }
+
+          // The caller's say comes first (GenerationPorts.beforeToolCall): a stop ends the turn here, a block
+          // answers the call without running it.
+          const verdict = ports.beforeToolCall?.({ id: tc.id, name: tc.name, args: parsedArgs }, { content: roundContent, calls: [...settled] }) ?? 'run'
+          if (verdict !== 'run' && 'stop' in verdict) {
+            stop = { value: verdict.stop }
+            break rounds
+          }
+          const blocked = verdict === 'run' ? undefined : verdict.block
 
           // save_skill (from the 'skill-creator' skill) is pre-authorized by the user
           // having enabled that skill for this chat, so it bypasses the approval gate
@@ -636,7 +746,13 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
           let result: string
           let callError: string | undefined
 
-          if (unlisted) {
+          if (blocked !== undefined) {
+            result = blocked
+            await emit({
+              event: 'tool_call',
+              data: { id: tc.id, name: tc.name, args: parsedArgs, status: 'done', result },
+            })
+          } else if (unlisted) {
             result = `Error: unknown tool "${tc.name}"`
             await emit({
               event: 'tool_call',
@@ -658,6 +774,9 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
               event: 'tool_call',
               data: { id: tc.id, name: tc.name, args: parsedArgs, status: callError ? 'error' : 'done', result },
             })
+          } else if (!d.tools) {
+            // Reached only with beforeToolCall: a call it lets run has nothing to run on.
+            result = 'Error: no tool registry available.'
           } else {
             // The approval policy port decides what an 'ask'-policy tool does. Live foreground chat is interactive:
             // it prompts the user via 'tool_call'/'awaiting_approval' and waits for POST
@@ -689,7 +808,7 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
           }
 
           // F-021: track web_search calls and accumulate research sources.
-          if (tc.name === 'web_search' && !callError && !unlisted) {
+          if (tc.name === 'web_search' && !callError && !unlisted && blocked === undefined) {
             searchCallCount++
             // The result string embeds the structured data; also ask the registry
             // for the raw ResearchResult[] via a direct research call on the same
@@ -720,8 +839,16 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
 
           // Inject tool result into iterMessages
           iterMessages.push({ role: 'tool', content: result, tool_call_id: tc.id })
+          settled.push({ id: tc.id, name: tc.name, args: parsedArgs, result })
         }
 
+        if (persistence.appendToolRound) {
+          await persistence.appendToolRound({ content: roundContent, calls: settled })
+          // The round is the caller's now (GenerationPersistence.appendToolRound): the reply is what follows it.
+          fullContent = ''
+          fullReasoning = ''
+          allToolCalls.length = 0
+        }
         // Continue to next round
         continue
       }
@@ -757,8 +884,10 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
       }
 
       // No tool calls (or tools not available) — done
+      ended = true
       break
     }
+    exceeded = roundCeiling !== undefined && !ended && !stop
 
     // ── BUG-001: Qwen3 empty-reply guard ──────────────────────────────────────
     // Thinking models sometimes produce ONLY <think>…</think> tokens in their
@@ -766,12 +895,13 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
     // and make one extra inference pass with tool_choice:'none' so the model is
     // forced to emit a text answer.
     console.log(`[chat] tool loop finished after ${toolIter} iteration(s); visible content length: ${fullContent.trim().length}`)
-    if (needsExtraPass(fullContent)) {
+    if (!stop && loop.extraPass !== false && needsExtraPass(fullContent)) {
       console.log('[chat] BUG-001: final content is empty after stripping think blocks — making extra pass with tool_choice:none')
       iterMessages.push({ role: 'user', content: 'Please now write your final answer based on what you found.' })
-      const reqBody = buildEngineRequest(shaping, iterMessages, 'none')
+      // Streamed whatever the turn's transport: this pass reads a stream.
+      const reqBody = buildEngineRequest({ ...shaping, jsonTransport: false }, iterMessages, 'none')
 
-      const res = await callChatUpstream(upstream, reqBody, ac.signal, undefined, d)
+      const res = await callChatUpstream(upstream, reqBody, ac.signal, undefined, ledgers ? d : undefined)
 
       if (res.ok && res.body) {
         const reader = res.body.getReader()
@@ -864,6 +994,7 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
     aborted = isAbort
     if (!isAbort) {
       engineFailed = true
+      failure = failureOf(e)
       restored = restoreReplaced() // a Stop (isAbort) keeps what it stopped
       // Belt and braces on top of resilientSink (GitHub #177): this emit is the one that used
       // to throw INSIDE the catch block, which no `finally` can contain — the rejection escaped
@@ -883,9 +1014,11 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
   // A Stop that came after the last read (while the round's last text was being sent on) is still a
   // Stop: the reply is saved and reported as stopped, and gets no title, memory or bench result.
   if (ac.signal.aborted && !engineFailed) aborted = true
+  // beforeToolCall ended the turn where it stood: nothing to finalize, title or count.
+  if (stop) return { restored: false, aborted, content: fullContent, stopped: stop.value }
   // The placeholder is gone and the old reply back (restoreReplaced): nothing to fill in, title or
   // count.
-  if (restored) return { restored: true, aborted, content: fullContent }
+  if (restored) return { restored: true, aborted, content: fullContent, ...(failure ? { failure } : {}) }
 
   // GitHub #177: drain whatever the parser was still holding when the round was cut short (see
   // `pendingParse`). Non-null ONLY on the interrupted paths — a round that reached its own
@@ -1019,7 +1152,7 @@ export async function runGenerationCore(d: Deps, turn: GenerationTurn, ports: Ge
     await emit({ event: 'done', data: { message: finalMsg } })
   } catch { /* a failing sink — nothing to flush to */ }
 
-  return { restored: false, aborted, content: fullContent }
+  return { restored: false, aborted, content: fullContent, ...(failure ? { failure } : {}), ...(exceeded ? { exceeded: true } : {}) }
 }
 
 /** How often a reply's text so far is saved into its placeholder while its turn runs, when it changed since the
@@ -1039,19 +1172,19 @@ interface RequestShaping {
   thinkingBudget: number
   reasoningEffort: ReasoningEffort | undefined
   preserveThinking: boolean | undefined
+  /** LoopOptions.transport 'json': a non-streaming request. */
+  jsonTransport: boolean
 }
 
-/** One streamed engine request: the round's messages under the thread's sampling, the Settings max-token cap
- *  (clampMaxTokens: the cap, or no max_tokens at all when neither sets one), stop strings and the thinking fields.
- *  `toolChoice` goes before the thread's sampling, which can override it, as it always has. */
+/** One engine request, streamed unless `jsonTransport`: the round's messages under the thread's sampling, the Settings
+ *  max-token cap (clampMaxTokens: the cap, or no max_tokens at all when neither sets one), stop strings and the
+ *  thinking fields. `toolChoice` goes before the thread's sampling, which can override it, as it always has. */
 export function buildEngineRequest(shaping: RequestShaping, messages: unknown[], toolChoice?: string): Record<string, unknown> {
   const { upstream, samplingOverride, stopStrings, maxLimit, thinkingBudget, reasoningEffort } = shaping
   const reqBody: Record<string, unknown> = {
     model: upstream.modelField,
     messages,
-    stream: true,
-    stream_options: { include_usage: true },
-    return_progress: true,
+    ...(shaping.jsonTransport ? { stream: false } : { stream: true, stream_options: { include_usage: true }, return_progress: true }),
     ...(toolChoice ? { tool_choice: toolChoice } : {}),
     ...samplingOverride,
   }
@@ -1173,5 +1306,33 @@ export function resilientSink(sink: EmitSink): EmitSink & { clientGone: () => bo
  *  request fails after streaming began, and LiteRT-LM does it for every runtime failure (a prompt longer than the
  *  bundle's context, for one). Such a chunk has no `choices`, so the round loop skipped it and the turn ended as an
  *  empty message with no reason given. Also thrown for a non-OK response, so that one is handled (and the turn's
- *  earlier rounds saved) by the same catch. */
-export class EngineStreamError extends Error {}
+ *  earlier rounds saved) by the same catch; `refusal` then carries its status and reason. */
+export class EngineStreamError extends Error {
+  constructor(message: string, readonly refusal?: { status: number; reason: string | undefined }) {
+    super(message)
+  }
+}
+
+/** What the catch makes of a thrown failure (GenerationOutcome.failure). */
+function failureOf(e: unknown): GenerationFailure {
+  if (e instanceof EngineStreamError) return e.refusal ? { kind: 'http', ...e.refusal } : { kind: 'engine', message: e.message }
+  return { kind: 'thrown', message: (e as Error)?.message ?? String(e) }
+}
+
+interface CompletionReply {
+  choices?: Array<{ message?: { content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }>
+  usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } }
+}
+
+/** A non-streaming completion's one message (LoopOptions.transport 'json'): its text as the engine gives it, and its
+ *  tool calls in the shape the streamed round collects them in. No message at all is the engine's failure. */
+async function readCompletion(res: Response): Promise<{ content: string; toolCalls: Array<{ id: string; name: string; argsBuffer: string }>; usage: CompletionReply['usage'] }> {
+  const data = await res.json() as CompletionReply
+  const message = data.choices?.[0]?.message
+  if (!message) throw new EngineStreamError('Engine returned no message.')
+  return {
+    content: message.content ?? '',
+    toolCalls: (message.tool_calls ?? []).map((tc) => ({ id: tc.id, name: tc.function.name, argsBuffer: tc.function.arguments })),
+    usage: data.usage,
+  }
+}

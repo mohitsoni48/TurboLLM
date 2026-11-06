@@ -227,3 +227,197 @@ test('engine shaping: max_tokens is clamped to the Settings cap, and moved to ma
     assert.equal('max_tokens' in engine.bodies[1], false)
   } finally { engine.restore() }
 })
+
+// ── The upstream's own engine, and the options a caller with nobody watching runs the loop with (a routine's run) ──
+
+const json = (message: Record<string, unknown>) => new Response(JSON.stringify({ choices: [{ message }] }), { status: 200 })
+const jsonCall = (id: string, args: Record<string, unknown>, text: string | null = null) =>
+  json({ content: text, tool_calls: [{ id, function: { name: 'lookup', arguments: JSON.stringify(args) } }] })
+const unattended = (over: Partial<GenerationTurn> = {}): GenerationTurn => turnFor({
+  loop: { transport: 'json', toolRoundCeiling: 3, extraPass: false, ledgers: false, toolsOnEveryEngine: true, stopBetweenToolCalls: false },
+  ...over,
+})
+
+test("engine shaping follows the upstream's own engine (a pool slot's), not the primary's; without one, the primary's", async () => {
+  const engine = fakeEngine(() => sse(content('ok'), stop))
+  const slot = (engineKind: string) => turnFor({
+    conv: { id: 'conv-1', sampling: { repeatPenalty: 1.1 } },
+    upstream: { modelField: 'm', modelName: 'Model', ctxMax: 4096, target: 'http://127.0.0.1:1', engineKind },
+  })
+  try {
+    await run(fakeDeps({ maxTokens: 256, engineKind: 'llama.cpp' }), fakePersistence(), approval(), () => {}, slot('litert-lm'))
+    assert.equal(engine.bodies[0].max_completion_tokens, 256)
+    await run(fakeDeps({ engineKind: 'llama.cpp' }), fakePersistence(), approval(), () => {}, slot('vllm'))
+    assert.equal(engine.bodies[1].repetition_penalty, 1.1)
+    await run(fakeDeps({ engineKind: 'vllm' }), fakePersistence(), approval(), () => {}, turnFor({ conv: { id: 'conv-1', sampling: { repeatPenalty: 1.1 } } }))
+    assert.equal(engine.bodies[2].repetition_penalty, 1.1)
+  } finally { engine.restore() }
+})
+
+test('json transport: one non-streaming completion per round, its text taken as the engine gives it', async () => {
+  const engine = fakeEngine((n) => n === 1 ? jsonCall('c1', { q: 'x' }) : json({ content: '<think>hm</think>The answer.' }))
+  try {
+    const outcome = await run(fakeDeps(), fakePersistence(), approval({ agentAllowedTools: ['lookup'] }), () => {}, unattended())
+    assert.deepEqual(Object.keys(engine.bodies[0]).sort(), ['messages', 'model', 'stream', 'tools'])
+    assert.equal(engine.bodies[0].stream, false)
+    assert.equal(outcome.content, '<think>hm</think>The answer.')
+    const round2 = engine.bodies[1].messages as Array<{ role: string; content: unknown; tool_calls?: unknown }>
+    assert.deepEqual(round2.slice(1), [
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'lookup', arguments: '{"q":"x"}' } }] },
+      { role: 'tool', content: 'found it', tool_call_id: 'c1' },
+    ])
+  } finally { engine.restore() }
+})
+
+test('json transport: a reply with no message is an engine failure, an HTTP refusal carries its status, a throw its message', async () => {
+  const cases: Array<[() => Response, unknown]> = [
+    [() => new Response('{}', { status: 200 }), { kind: 'engine', message: 'Engine returned no message.' }],
+    [() => new Response(null, { status: 500 }), { kind: 'http', status: 500, reason: undefined }],
+    [() => { throw new TypeError('fetch failed') }, { kind: 'thrown', message: 'fetch failed' }],
+  ]
+  for (const [reply, failure] of cases) {
+    const engine = fakeEngine(reply)
+    try {
+      const outcome = await run(fakeDeps(), fakePersistence(), approval(), () => {}, unattended())
+      assert.deepEqual(outcome.failure, failure)
+    } finally { engine.restore() }
+  }
+})
+
+test('toolRoundCeiling: the turn ends exceeded after that many tool rounds, every one run, with no extra pass', async () => {
+  const deps = fakeDeps()
+  const engine = fakeEngine((n) => jsonCall(`c${n}`, { q: n }))
+  try {
+    const outcome = await run(deps, fakePersistence(), approval({ agentAllowedTools: ['lookup'] }), () => {}, unattended())
+    assert.equal(outcome.exceeded, true)
+    assert.equal(engine.bodies.length, 3)
+    assert.equal(deps.toolRuns.length, 3)
+  } finally { engine.restore() }
+})
+
+test('extraPass false: an empty answer stays empty; the live chat makes its BUG-001 extra pass', async () => {
+  const engine = fakeEngine(() => sse(content('<think>only thinking</think>'), stop))
+  try {
+    await run(fakeDeps(), fakePersistence(), approval(), () => {}, turnFor({ loop: { extraPass: false } }))
+    assert.equal(engine.bodies.length, 1)
+    await run(fakeDeps(), fakePersistence(), approval(), () => {}, turnFor())
+    assert.equal(engine.bodies.length, 3)
+  } finally { engine.restore() }
+})
+
+test("ledgers false: nothing reaches the engine's counters, the completion stats or the request log", async () => {
+  const deps = fakeDeps()
+  const touched: string[] = []
+  const m = deps.d.manager as unknown as Record<string, () => void>
+  for (const k of ['generationStart', 'generationEnd', 'setLiveGen', 'recordCompletion']) m[k] = () => { touched.push(k) }
+  const cfg = { requestLog: { enabled: true, captureBodies: false, maxEntries: 5 } }
+  Object.assign(deps.d.store, { read: () => cfg })
+  Object.assign(deps.d, { requestLog: { start: () => { touched.push('requestLog'); return 'id' }, finalize: () => {} } })
+  const engine = fakeEngine(() => sse({ prompt_progress: { processed: 1, total: 2 } }, content('A reply long enough to stream.'), stop))
+  try {
+    await run(deps, fakePersistence(), approval(), () => {}, turnFor({ loop: { ledgers: false } }))
+    assert.deepEqual(touched, [])
+    await run(deps, fakePersistence(), approval(), () => {}, turnFor())
+    assert.deepEqual([...new Set(touched)].sort(), ['generationEnd', 'generationStart', 'recordCompletion', 'requestLog', 'setLiveGen'])
+  } finally { engine.restore() }
+})
+
+test('toolsOnEveryEngine: vLLM is offered the tools; the live chat withholds them there', async () => {
+  const engine = fakeEngine(() => sse(content('ok'), stop))
+  try {
+    await run(fakeDeps({ engineKind: 'vllm' }), fakePersistence(), approval(), () => {}, turnFor({ loop: { toolsOnEveryEngine: true } }))
+    assert.equal(Array.isArray(engine.bodies[0].tools), true)
+    await run(fakeDeps({ engineKind: 'vllm' }), fakePersistence(), approval(), () => {}, turnFor())
+    assert.equal('tools' in engine.bodies[1], false)
+  } finally { engine.restore() }
+})
+
+test("stopBetweenToolCalls false: a stop during a round's call lets its other calls run, and the next round is never asked", async () => {
+  const deps = fakeDeps()
+  const turn = unattended()
+  const tools = deps.d.tools as unknown as { executeTool: (call: { name: string }) => Promise<string> }
+  tools.executeTool = async (call) => { deps.toolRuns.push({ name: call.name, isCodeAuthorized: false }); turn.ac.abort(); return 'ran' }
+  const two = () => json({ content: null, tool_calls: [{ id: 'a', function: { name: 'lookup', arguments: '{}' } }, { id: 'b', function: { name: 'lookup', arguments: '{"n":2}' } }] })
+  const engine = fakeEngine(two)
+  try {
+    const outcome = await run(deps, fakePersistence(), approval({ agentAllowedTools: ['lookup'] }), () => {}, turn)
+    assert.equal(outcome.aborted, true)
+    assert.equal(deps.toolRuns.length, 2)
+    assert.equal(engine.bodies.length, 1)
+  } finally { engine.restore() }
+})
+
+test('appendToolRound: each settled round is handed over with its raw results, and the terminal write carries only what came after', async () => {
+  const rounds: unknown[] = []
+  const p = fakePersistence()
+  p.appendToolRound = (round) => { rounds.push(structuredClone(round)) }
+  const engine = fakeEngine((n) => n === 1 ? jsonCall('c1', { q: 'x' }, 'let me look') : json({ content: 'Done.' }))
+  try {
+    const outcome = await run(fakeDeps(), p, approval({ agentAllowedTools: ['lookup'] }), () => {}, unattended())
+    assert.deepEqual(rounds, [{ content: 'let me look', calls: [{ id: 'c1', name: 'lookup', args: { q: 'x' }, result: 'found it' }] }])
+    assert.equal(outcome.content, 'Done.')
+    assert.equal(p.finals[0].content, 'Done.')
+    assert.deepEqual(p.finals[0].toolCalls, [])
+  } finally { engine.restore() }
+})
+
+test('beforeToolCall: a block answers the call without running it; a stop ends the turn there, nothing finalized', async () => {
+  const deps = fakeDeps()
+  const p = fakePersistence()
+  const seen: unknown[] = []
+  const engine = fakeEngine((n) => n === 1 ? jsonCall('c1', { q: 1 }, 'first') : jsonCall('c2', { q: 2 }))
+  try {
+    const outcome = await runGenerationCore(deps.d, unattended(), {
+      persistence: p, sink: () => {}, approval: approval({ agentAllowedTools: ['lookup'] }),
+      beforeToolCall: (call, round) => {
+        seen.push([call.id, round.content, round.calls.length])
+        return call.id === 'c1' ? { block: 'not this one' } : { stop: 'stalled on c2' }
+      },
+    })
+    assert.equal(outcome.stopped, 'stalled on c2')
+    assert.equal(deps.toolRuns.length, 0)
+    assert.deepEqual(seen, [['c1', 'first', 0], ['c2', '', 0]])
+    assert.equal((engine.bodies[1].messages as Array<{ content: unknown }>).at(-1)?.content, 'not this one')
+    assert.equal(p.finals.length, 0)
+  } finally { engine.restore() }
+})
+
+test('beforeToolCall: with no tool registry its calls still reach it, and one it lets run is answered as having none', async () => {
+  const deps = fakeDeps()
+  Object.assign(deps.d, { tools: undefined })
+  const seen: string[] = []
+  const engine = fakeEngine((n) => n === 1 ? jsonCall('c1', { q: 1 }) : n === 2 ? jsonCall('c2', { q: 2 }) : json({ content: 'never' }))
+  try {
+    const outcome = await runGenerationCore(deps.d, unattended(), {
+      persistence: fakePersistence(), sink: () => {}, approval: approval(),
+      beforeToolCall: (call) => { seen.push(call.id); return call.id === 'c1' ? 'run' : { stop: 'stalled' } },
+    })
+    assert.equal(outcome.stopped, 'stalled')
+    assert.deepEqual(seen, ['c1', 'c2'])
+    assert.equal((engine.bodies[1].messages as Array<{ content: unknown }>).at(-1)?.content, 'Error: no tool registry available.')
+  } finally { engine.restore() }
+})
+
+test("a LiteRT-LM upstream's own library key picks the model whose tool support decides the round's tools", async () => {
+  const deps = fakeDeps({ engineKind: 'litert-lm' })
+  Object.assign(deps.d, { scanner: { get: (key: string) => (key === 'slot-model' ? { key, toolCalls: false } : undefined) } })
+  const engine = fakeEngine(() => sse(content('ok'), stop))
+  try {
+    const upstream = { modelField: 'slot-model', modelName: 'Slot', ctxMax: 4096, target: 'http://127.0.0.1:2', engineKind: 'litert-lm', libraryKey: 'slot-model' }
+    await run(deps, fakePersistence(), approval(), () => {}, turnFor({ upstream }))
+    assert.equal('tools' in engine.bodies[0], false)
+  } finally { engine.restore() }
+})
+
+test("engine messages keep a prior round's tool calls and results", async () => {
+  const engine = fakeEngine(() => sse(content('ok'), stop))
+  const history = [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c0', type: 'function', function: { name: 'lookup', arguments: '{}' } }] },
+    { role: 'tool', content: 'found it', tool_call_id: 'c0' },
+  ]
+  try {
+    await run(fakeDeps(), fakePersistence(), approval(), () => {}, turnFor({ engineMessages: history }))
+    assert.deepEqual(engine.bodies[0].messages, history)
+  } finally { engine.restore() }
+})
