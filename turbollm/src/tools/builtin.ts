@@ -2,6 +2,7 @@
 // Tools: web_search (Tavily), fetch_url, run_code (Node vm sandbox, isolated in a worker thread).
 import { Worker } from 'node:worker_threads'
 import { fetchWithSsrfCheck } from './security.js'
+import { extractPdfText, isPdfResponse } from './pdf-text.js'
 import { RUN_CODE_TIMEOUT_MS } from './run-code-sandbox.js'
 import type { SearchConfig } from './search-providers.js'
 import {
@@ -77,7 +78,7 @@ export const FETCH_URL_TOOL = {
   type: 'function' as const,
   function: {
     name: 'fetch_url',
-    description: 'Fetch the text content of a URL. Returns the main text of the page, stripped of HTML.',
+    description: 'Fetch the text content of a URL. Returns the main text of the page, stripped of HTML. PDF documents are read too: their text layer is extracted like page text.',
     parameters: {
       type: 'object',
       properties: {
@@ -514,12 +515,30 @@ export const FETCH_URL_MAX_CHARS = 20_000
  *  here gets the truncation marker below like any other over-long page. */
 const FETCH_URL_MAX_BYTES = 2 * 1024 * 1024
 
+/** Raw bytes read of a PDF body before fetch_url stops. PDFs need their own, higher bound than
+ *  HTML: a document's cross-reference table sits at its END, so a file cut at the HTML cap
+ *  would never parse, and a real reference PDF (a spec, a filing) is commonly a few MB. Still
+ *  a hard bound, on bytes in memory at once — the same phone-memory argument as
+ *  FETCH_URL_MAX_BYTES. A file cut here is reported as too large rather than half-parsed. */
+export const FETCH_URL_PDF_MAX_BYTES = 10 * 1024 * 1024
+
 /** Appended when a page is cut, so the model knows it is looking at a PREFIX and can decide
  *  to fetch a more specific URL rather than concluding the page did not contain the answer.
  *  Static text: no page content reaches it, so it cannot be spoofed into a different field. */
 const FETCH_URL_TRUNCATION_MARKER =
   '\n[truncated: this page was longer than the fetch limit and is cut off here. ' +
   'If the answer is not above, fetch a more specific URL on this site rather than assuming the page lacks it.]'
+
+
+/** Byte at absolute position `i` across a list of chunks (the magic-byte sniff reads a
+ *  signature that may arrive split across stream chunks). */
+function byteAt(chunks: Uint8Array[], i: number): number | undefined {
+  for (const c of chunks) {
+    if (i < c.length) return c[i]
+    i -= c.length
+  }
+  return undefined
+}
 
 export async function execFetchUrl(args: Record<string, unknown>): Promise<string> {
   const url = String(args.url ?? '').trim()
@@ -539,25 +558,94 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
   }
 
   const contentType = resp.headers.get('content-type') ?? ''
+  const asPdf = isPdfResponse(contentType, url)
   // Streamed up to FETCH_URL_MAX_BYTES instead of resp.text(), which would buffer a huge or
-  // endless body whole before any of it is cut.
+  // endless body whole before any of it is cut. A PDF body is collected as BYTES instead of
+  // decoded text: its text layer is extracted below, and a UTF-8 decode of raw PDF bytes was
+  // the garbage GitHub #52's PDF report came from.
   let text = ''
   let cut = false
+  let pdfBytes: Uint8Array | null = null
+  let pdfReadFailed = false
+  let sniffedPdf = false
   if (resp.body) {
     const reader = resp.body.getReader()
-    const decoder = new TextDecoder()
     let read = 0
+    // The first chunk is read up front so a MISLABELED PDF (a static host serving
+    // text/plain, or no type at all on a URL without a .pdf path) is caught by its magic
+    // bytes - the header check above alone still hands the model raw PDF syntax, the exact
+    // #52 complaint. An HTML page keeps its real type: a page *about* PDFs can contain the
+    // same bytes as text.
+    // Read far enough for the magic sniff: a stream may deliver the 5 signature bytes
+    // split across chunks (or after empty ones), so accumulate until 5 bytes or EOF.
+    const head: Uint8Array[] = []
+    let headFailed = false
     try {
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
-        read += value.byteLength
-        text += decoder.decode(value, { stream: true })
-        if (read >= FETCH_URL_MAX_BYTES) { cut = true; break }
+      while (read < 5) {
+        const r = await reader.read()
+        if (r.done) break
+        read += r.value.byteLength
+        head.push(r.value)
       }
-      text += decoder.decode()
     } catch {
-      text = ''
+      headFailed = true
+    }
+    sniffedPdf =
+      !asPdf &&
+      !contentType.toLowerCase().includes('html') &&
+      read >= 5 &&
+      byteAt(head, 0) === 0x25 && // %
+      byteAt(head, 1) === 0x50 && // P
+      byteAt(head, 2) === 0x44 && // D
+      byteAt(head, 3) === 0x46 && // F
+      byteAt(head, 4) === 0x2d // -
+    if (asPdf || sniffedPdf) {
+      const chunks: Uint8Array[] = head
+      if (headFailed) pdfReadFailed = true
+      if (read >= FETCH_URL_PDF_MAX_BYTES) cut = true
+      if (!cut && !pdfReadFailed) {
+        try {
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            read += value.byteLength
+            if (read >= FETCH_URL_PDF_MAX_BYTES) { cut = true; break }
+            chunks.push(value)
+          }
+        } catch {
+          // A mid-stream read failure leaves `read` counting bytes we never actually got:
+          // assembling `whole` anyway would hand the parser a zero-padded forgery that can
+          // "parse" misleadingly. A truncated download is an unreadable PDF, not a document.
+          pdfReadFailed = true
+        }
+      }
+      if (!cut && !pdfReadFailed) {
+        const whole = new Uint8Array(read)
+        let at = 0
+        for (const chunk of chunks) { whole.set(chunk, at); at += chunk.byteLength }
+        pdfBytes = whole
+      }
+    } else {
+      const decoder = new TextDecoder()
+      try {
+        if (headFailed) throw new Error('body read failed')
+        for (const chunk of head) {
+          text += decoder.decode(chunk, { stream: true })
+          if (read >= FETCH_URL_MAX_BYTES) { cut = true; break }
+        }
+        if (!cut) {
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            read += value.byteLength
+            text += decoder.decode(value, { stream: true })
+            if (read >= FETCH_URL_MAX_BYTES) { cut = true; break }
+          }
+        }
+        text += decoder.decode()
+      } catch {
+        text = ''
+      }
     }
     await reader.cancel().catch(() => {})
   }
@@ -565,7 +653,28 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
   let published: string | undefined
   let modified: string | undefined
 
-  if (contentType.includes('text/html')) {
+  if (asPdf || sniffedPdf) {
+    if (cut) {
+      // Static text, like the truncation marker's: no page bytes reach it. A cut PDF cannot
+      // be parsed (its xref table is at the end), so "too large" is the honest answer, not a
+      // half-document.
+      content = `(this PDF is larger than the ${Math.round(FETCH_URL_PDF_MAX_BYTES / 1024 / 1024)} MB fetch limit and was not read. Fetch a smaller document or a specific page instead.)`
+    } else if (pdfReadFailed || pdfBytes === null) {
+      content = '(this PDF could not be downloaded completely and was not read. Try again, or fetch a specific page instead.)'
+    } else {
+      const outcome = await extractPdfText(pdfBytes)
+      // Both failure notes are static text, like the truncation marker's: no document bytes
+      // reach them, so a hostile file cannot spoof the message. Scans are the common
+      // text-less case; a model told plainly will not invent the document's contents.
+      content = outcome.kind === 'text'
+        ? outcome.text
+        : outcome.kind === 'busy'
+          ? '(the document reader is busy with other PDFs right now and this one was queued too long. Try again shortly.)'
+          : outcome.kind === 'timeout'
+            ? '(this PDF took too long to read and was stopped. It may be unusually complex or damaged; its contents are not available.)'
+            : '(this PDF has no readable text layer — it may be a scan, encrypted, or corrupt. Its contents are not available.)'
+    }
+  } else if (contentType.includes('text/html')) {
     published = extractPublishedDate(text)
     modified = extractModifiedDate(text)
     // Strip HTML tags and collapse whitespace, in linear time and with the output the plain
