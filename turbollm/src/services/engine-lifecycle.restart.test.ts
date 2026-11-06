@@ -12,7 +12,7 @@ import { Hono } from 'hono'
 import type { Engine } from '../config/config'
 import type { Deps } from '../deps'
 import { freePort, realEngineSetUp } from '../test-support/stand-in-engine'
-import { registerApi } from './routes'
+import { registerApi } from '../api/routes'
 
 const skip = process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary'
 

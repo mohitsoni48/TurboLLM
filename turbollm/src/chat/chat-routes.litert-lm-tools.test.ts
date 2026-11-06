@@ -13,6 +13,7 @@ import { ConversationStore } from './db.js'
 import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
 import { LITERT_LM_NO_TOOL_CALLING_NOTE, LITERT_LM_RESEARCH_NOTE } from '../engines/litert-lm-request'
+import { chatRegistries } from '../test-support/chat-registries'
 
 const TOOLS = ['web_search', 'run_code'].map((name) => ({ type: 'function', function: { name, description: 'd', parameters: { type: 'object', properties: {} } } }))
 
@@ -40,6 +41,7 @@ function routes(t: TestContext, engineKind: string, toolCalls: boolean | undefin
     tools: { toolPolicies: {}, autoAllowAll: false },
   }
   const d = {
+    ...chatRegistries(),
     db: store,
     store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
     scanner: {

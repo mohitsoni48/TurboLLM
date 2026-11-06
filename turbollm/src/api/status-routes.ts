@@ -3,6 +3,7 @@ import type { Hono } from 'hono'
 import { GATE_VERSION } from '../comfyui/gate-template'
 import { createGateVersionReader } from '../comfyui/gate-version'
 import type { Deps } from '../deps'
+import type { EngineRuntime, Status, TunnelStatus } from '../contract/status'
 import { enabledFeatures } from '../features'
 import { isTerminalBackendAvailable } from '../terminal/terminal-routes'
 import { classifyLoadFailure } from '../telemetry/classify'
@@ -46,7 +47,7 @@ export function registerStatusRoutes(app: Hono, d: Deps, jobs: EngineJobs): void
     // advertises no slot count: "unknown" and "exactly one" are different answers, and a client
     // must not read the former as the latter.
     const launchCommand = d.manager.launchCommand()
-    const engine: Record<string, unknown> = { ...core.engine }
+    const engine: EngineRuntime = { ...core.engine }
     // `failReason` (ADR-338 Decision 4): the SAME `classifyLoadFailure` the telemetry
     // path already runs on this exact object, now also handed to the UI so a failed load
     // can offer a one-click recovery instead of dead-ending on "Copy log". Classified
@@ -62,7 +63,7 @@ export function registerStatusRoutes(app: Hono, d: Deps, jobs: EngineJobs): void
     // remedies suited a model the engine runs even for one it cannot.
     if (ms.err) engine.error = { ...ms.err, failReason: classifyLoadFailure(ms.err), ...failedLoadView(d) }
     if (launchCommand) engine.launchCommand = launchCommand
-    return c.json({
+    const payload = {
       version: d.version,
       engine,
       model: core.model,
@@ -129,7 +130,8 @@ export function registerStatusRoutes(app: Hono, d: Deps, jobs: EngineJobs): void
       // Local feature flags (TURBOLLM_FEATURES env var) — deliberately undocumented
       // in any user-facing README; see features.ts.
       features: enabledFeatures(),
-    })
+    } satisfies Status
+    return c.json(payload)
   })
 }
 
@@ -137,7 +139,7 @@ export function registerStatusRoutes(app: Hono, d: Deps, jobs: EngineJobs): void
  *  shape — { active, url, error } — is unchanged even though TunnelManager was replaced by
  *  RemoteAccessManager underneath it. External consumers and the deploy/ recipes read this
  *  field by its existing shape; do not rename or restructure it here. */
-function tunnelStatusSnapshot(d: Deps): { active: boolean; url: string | null; error: string | null } | null {
+function tunnelStatusSnapshot(d: Deps): TunnelStatus | null {
   if (!d.remote) return null
   const s = d.remote.state()
   const active = s.kind === 'connected' || s.kind === 'starting' || s.kind === 'reconnecting'

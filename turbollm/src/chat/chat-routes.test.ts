@@ -10,7 +10,9 @@ import { test } from 'node:test'
 import { readFileSync, rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { stripThinkingBlocks, needsExtraPass } from './think-utils.js'
-import { recentTitleTurns, abortAllInFlightChats, chatCodeAuthorization, inFlightChatIds, registerChatRoutes } from './chat-routes.js'
+import { recentTitleTurns, chatCodeAuthorization, registerChatRoutes } from './chat-routes.js'
+import { ChatTurns } from './chat-turns.js'
+import { ChatRuns } from './chat-runs.js'
 import { ConversationStore } from './db.js'
 import { attachmentRefId } from './attachments.js'
 import { hashKey, lanAuth } from '../auth.js'
@@ -219,7 +221,7 @@ test('C1 invariant: both chat generation entry points DERIVE isCodeAuthorized, n
 
 // ── inFlightChatIds (ADR-434 (i)(3)) ─────────────────────────────────────────────────────────
 // The Jev-load confirmation names the chats a load would interrupt: exactly the conversations
-// abortAllInFlightChats() would abort. Driven through the real POST /messages route with the
+// abortAll() would abort. Driven through the real POST /messages route with the
 // engine fetch held open, in the style of chat-routes.remote.test.ts (real store, no port).
 
 /** `tools`, when given, is the tool registry the chat loop calls, its tools allowed without asking. */
@@ -233,6 +235,7 @@ function inFlightHarness(tools?: unknown) {
     tools: { toolPolicies: {}, autoAllowAll: tools !== undefined },
   }
   const d = {
+    chatTurns: new ChatTurns(), chatRuns: new ChatRuns(),
     db: store,
     // `dir`: an engine's error text is path-redacted against it (engineErrorText).
     store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
@@ -277,7 +280,7 @@ test('inFlightChatIds lists a chat while its reply is generating, and drops it w
   const engine = holdEngineReply()
   try {
     const conv = h.store.createConversation()
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
 
     const res = await h.app.request(`/api/v1/conversations/${conv.id}/messages`, {
       method: 'POST',
@@ -285,11 +288,11 @@ test('inFlightChatIds lists a chat while its reply is generating, and drops it w
       body: JSON.stringify({ content: 'hi' }),
     })
     assert.equal(res.status, 200)
-    assert.deepEqual(inFlightChatIds(), [conv.id])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [conv.id])
 
     engine.finish()
     await res.text()
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
   } finally {
     engine.restore()
     h.cleanup()
@@ -434,7 +437,7 @@ test('a stale turn unwinding after Stop never removes the NEXT turn\'s in-flight
     // Stop (the page's only way to stop a reply): it aborts A and frees the chat at once.
     const stop = await (await h.app.request('/api/v1/chat/stop', json({ conversationId: conv.id, messageId: replyA }))).json()
     assert.deepEqual(stop, { ok: true, stopped: true })
-    assert.deepEqual(inFlightChatIds(), [], 'Stop drops A\'s entry')
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [], 'Stop drops A\'s entry')
     const resB = await send() // ...and the page immediately sends a follow-up
     assert.equal(resB.status, 200)
     toolDone() // turn A's tool returns; A sees its abort and unwinds through its finally
@@ -442,12 +445,12 @@ test('a stale turn unwinding after Stop never removes the NEXT turn\'s in-flight
     // its turn body, up to the second stale release, settles within the next macrotask.
     await waitFor(() => h.store.getMessage(replyA)?.stats.totalMs !== undefined, 'turn A to unwind and save its reply')
     await new Promise((r) => setImmediate(r))
-    assert.deepEqual(inFlightChatIds(), [conv.id], 'turn B is still generating and must stay tracked')
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [conv.id], 'turn B is still generating and must stay tracked')
     assert.equal((await send()).status, 409, 'a third send must still be refused while B runs')
 
     await h.app.request('/api/v1/chat/stop', json({ conversationId: conv.id })) // Stop reaches B
     await resB.text()
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
   } finally {
     toolDone()
     engine.restore()
@@ -478,7 +481,7 @@ test('a turn that throws before generating releases its in-flight entry (no stuc
     const text = await bad.text()
     assert.match(text, /event: error\ndata: \{"code":"turn_failed","message":"The reply could not be generated\."\}/)
     assert.ok(logged.some((args) => String(args[0]).startsWith('[chat] turn for')), 'logged')
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
     h.store.getConversation = getConversation
     const ok = await h.app.request(url, json({ content: 'hi again' }))
     assert.equal(ok.status, 200)
@@ -502,7 +505,7 @@ test('POST /messages refuses non-array images or textAttachments (and a non-stri
       assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'invalid_input')
     }
     assert.deepEqual(h.store.getMessages(conv.id), [], 'nothing stored')
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
     assert.equal(engine.bodies.length, 0)
     // Arrays of strings (and null for an absent field) still go through.
     const ok = await h.app.request(url, json({ content: 'hi', images: ['data:image/png;base64,AAAA'], textAttachments: null, docContext: null }))
@@ -593,7 +596,7 @@ test('a Regenerate the engine or linked host refuses once the turn has started k
       assert.deepEqual(active(), ['user:q1', 'assistant:a1'], code)
       const group = h.store.getMessage(a1)!.variantGroup!
       assert.deepEqual(h.store.getMessageVariants(group).map((m) => `${m.content}:${m.isActive}`), ['a1:true'], 'no empty version left on its switcher')
-      assert.deepEqual(inFlightChatIds(), [])
+      assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
     }
 
     await (await h.app.request(`${base}/continue`, json({ regenerate: true, messageId: a1 }))).text()
@@ -970,7 +973,7 @@ test('a Save & Resend the engine or linked host refuses once the turn has starte
       assert.match(sse, new RegExp(`"code":"${code}"`), 'the error still reaches the chat')
       assert.deepEqual(active(), ['user:q1', 'assistant:a1', 'user:q2', 'assistant:a2'], code)
       assert.deepEqual(versions(), ['q1:true'], 'no unanswered version left on its switcher')
-      assert.deepEqual(inFlightChatIds(), [])
+      assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
     }
 
     // A turn that streamed anything keeps the new version and its reply, as a Regenerate does.
@@ -1035,7 +1038,7 @@ test('a tool round the engine refuses with an HTTP error keeps what the earlier 
       assert.equal(reply.content, 'Let me look that up for you right now.', `${flow}: round 1's text is kept`)
       assert.equal(reply.reasoning, 'I should search.', `${flow}: round 1's reasoning is kept`)
       assert.deepEqual(reply.toolCalls.map((t) => [t.name, t.result]), [['web_search', 'a long page of results']], `${flow}: round 1's tool call is kept`)
-      assert.deepEqual(inFlightChatIds(), [])
+      assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
     }
     assert.equal(engine.bodies.length, script.length)
   } finally {
@@ -1130,7 +1133,7 @@ test('a manual compaction holds the in-flight slot: turns, edits and switches ar
 
     const compacting = h.app.request(`${base}/compact`, json({}))
     await waitFor(() => engine.bodies.length === 1, 'the summary call to start')
-    assert.deepEqual(inFlightChatIds(), [conv.id])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [conv.id])
     const put = (id: string, content: string) => h.app.request(`${base}/messages/${id}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content }) })
     const refused = {
       regenerate: await h.app.request(`${base}/continue`, json({ regenerate: true })),
@@ -1149,7 +1152,7 @@ test('a manual compaction holds the in-flight slot: turns, edits and switches ar
 
     finish()
     assert.equal((await compacting).status, 200)
-    assert.deepEqual(inFlightChatIds(), [], 'released when it ends')
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [], 'released when it ends')
     assert.equal(h.store.getConversation(conv.id)!.compactionSummary, 'The user asked twice about x.')
     assert.equal((await put(a2b.id, 'fixed reply')).status, 200, 'the chat takes edits again')
   } finally {
@@ -1177,10 +1180,10 @@ function slotViews(h: ReturnType<typeof inFlightHarness>) {
 
 /** Ends the turn or compaction a test still holds and waits until its slot is free, so a failed assertion does not
  *  leave an in-flight entry behind for the tests after it. */
-async function endHeldTurn(release: () => void): Promise<void> {
+async function endHeldTurn(turns: ChatTurns, release: () => void): Promise<void> {
   release()
-  abortAllInFlightChats()
-  await waitFor(() => inFlightChatIds().length === 0, 'the held turn to end').catch(() => {})
+  turns.abortAll()
+  await waitFor(() => turns.inFlightChatIds().length === 0, 'the held turn to end').catch(() => {})
 }
 
 test('a conversation names the reply its turn generates, and its list row says running, until the turn ends', async () => {
@@ -1200,7 +1203,7 @@ test('a conversation names the reply its turn generates, and its list row says r
     assert.deepEqual(await state(conv.id), { runningReplyId: null, compacting: false })
     assert.deepEqual(await listed(), { [conv.id]: false, [other.id]: false })
   } finally {
-    await endHeldTurn(engine.finish)
+    await endHeldTurn(h.d.chatTurns, engine.finish)
     engine.restore()
     h.cleanup()
   }
@@ -1227,7 +1230,7 @@ test('a conversation says it is compacting while a manual compaction holds it, w
     assert.equal((await compacting).status, 200)
     assert.deepEqual(await state(conv.id), { runningReplyId: null, compacting: false })
   } finally {
-    await endHeldTurn(finish)
+    await endHeldTurn(h.d.chatTurns, finish)
     engine.restore()
     h.cleanup()
   }
@@ -1258,7 +1261,7 @@ test('a Regenerate names its new reply as running, and a Stop clears it once the
     assert.deepEqual(await state(conv.id), { runningReplyId: null, compacting: false })
     assert.deepEqual(await listed(), { [conv.id]: false })
   } finally {
-    await endHeldTurn(() => {})
+    await endHeldTurn(h.d.chatTurns, () => {})
     engine.restore()
     h.cleanup()
   }
@@ -1339,7 +1342,7 @@ test('deleting a conversation aborts its in-flight generation', async () => {
     assert.equal((await h.app.request(`/api/v1/conversations/${conv.id}`, { method: 'DELETE' })).status, 200)
     assert.equal(engineSignal?.aborted, true)
     await res.text()
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
   } finally {
     engine.restore()
     h.cleanup()
@@ -1355,7 +1358,7 @@ test('share-url: advertises the port really bound, not daemon.port', async () =>
   const savedAdvertised = process.env.TURBOLLM_ADVERTISED_HOST
   delete process.env.TURBOLLM_ADVERTISED_HOST
   try {
-    const d = { db: store, store: { snapshot: () => ({ daemon: { port: 6996 } }), read: () => ({ daemon: { port: 6996 } }) }, bindPort: 7000 } as unknown as Deps
+    const d = { chatTurns: new ChatTurns(), chatRuns: new ChatRuns(), db: store, store: { snapshot: () => ({ daemon: { port: 6996 } }), read: () => ({ daemon: { port: 6996 } }) }, bindPort: 7000 } as unknown as Deps
     const app = new Hono()
     registerChatRoutes(app, d)
     const conv = store.createConversation()
@@ -1451,7 +1454,7 @@ test('the chat and folder routes refuse a text field that is not a string with 4
     assert.deepEqual(h.store.listFolders().map((f) => f.name), ['Work'])
     assert.deepEqual(h.store.getMessages(conv.id).map((m) => m.content), ['What is 2+2?'], 'nothing stored or edited')
     assert.equal(engine.bodies.length, 0, 'no turn ran')
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
     // Strings (and null for an absent field) still go through.
     assert.equal((await send('POST', '/api/v1/folders', { name: 'Home' })).status, 201)
     assert.equal((await send('PATCH', `/api/v1/folders/${folder.id}`, { name: 'Office' })).status, 200)

@@ -13,6 +13,7 @@ import { lanAuth, provisionRemoteApiKey } from '../auth'
 import { defaultConfig } from '../config/config'
 import type { LinkCapability } from '../link/types'
 import type { Deps } from '../deps'
+import { chatRegistries } from '../test-support/chat-registries'
 
 interface Library {
   conversations?: Record<string, { title: string }>
@@ -34,6 +35,7 @@ interface Running {
 
 function depsWith(library: Library, running: Running = {}, optional = { codeRuns: true, routineScheduler: true }): Deps {
   return {
+    ...chatRegistries(),
     db: {
       getConversation: (id: string) => library.conversations?.[id] ?? null,
       getAgentRun: (id: string) => library.agentRuns?.[id] ?? null,
@@ -120,8 +122,15 @@ test('without codeRuns or routineScheduler there are no code or routine items', 
   assert.deepEqual(activeWork(d, noChats), { items: [], waiting: [], engineGenerating: false })
 })
 
-test('the default chat source is the real in-flight chat list (nothing in flight here)', () => {
-  assert.deepEqual(activeWork(depsWith({})), { items: [], waiting: [], engineGenerating: false })
+test("the default chat source is the daemon's own chatTurns: nothing in flight here, then one chat parked on an approval", () => {
+  const d = depsWith({})
+  assert.deepEqual(activeWork(d), { items: [], waiting: [], engineGenerating: false })
+  const ac = new AbortController()
+  d.chatTurns.claim('conv-1', ac, 'reply-1')
+  assert.deepEqual(activeWork(d).items.map((i) => i.id), ['conv-1'])
+  d.chatTurns.setApprovalWait(ac, true, false)
+  const parked = activeWork(d)
+  assert.deepEqual([parked.items.length, parked.waiting.map((i) => i.id)], [0, ['conv-1']])
 })
 
 test('GET /api/v1/activity answers the active work as JSON', async () => {
@@ -165,6 +174,7 @@ function apiDeps(): Deps {
     'laya|q|1': { key: 'laya|q|1', name: 'Laya One', laya: { checkpoints: [] } },
   }
   return {
+    ...chatRegistries(),
     version: 'test',
     bindHost: '0.0.0.0',
     store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '/nonexistent' },

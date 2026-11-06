@@ -22,6 +22,7 @@ import assert from 'node:assert/strict'
 import { Hono } from 'hono'
 import { stopEngine, type EngineStopBody } from './engine-lifecycle'
 import type { Deps } from '../deps'
+import { chatRegistries } from '../test-support/chat-registries'
 
 function mkDeps(opts: {
   stopExplicitTargets?: Set<string>
@@ -47,6 +48,7 @@ function mkDeps(opts: {
     get: (key: string) => (key === primaryKey && primaryPath ? { path: primaryPath } : undefined),
   }
   const d = {
+    ...chatRegistries(),
     manager, modelRouter, scanner,
     bench: { cancel: () => { benchCancelCalls.push(1) } },
   } as unknown as Deps

@@ -2,8 +2,8 @@
 // restart (deps.requestRestart, forRestart) and for a signal shutdown (beginShutdown); before boot.ts, each path had
 // its own copy, and these were source scans that both copies made the same calls. Now there is one function, and the
 // tests watch it run: what it stops, what it waits for, and that the store closes and the listener releases the port
-// only after. The steps a test cannot watch from here (module functions, not methods: abortAllInFlightChats,
-// stopTethered, chatTurnsEnded) are boot.teardown-order.test.ts's source scan of the same function.
+// only after. The steps a test cannot watch from here (module functions, not methods: chatTurns.abortAll,
+// stopTethered, chatTurns.turnsEnded) are boot.teardown-order.test.ts's source scan of the same function.
 import assert from 'node:assert/strict'
 import { test, type TestContext } from 'node:test'
 import { AttachmentJanitor } from './chat/attachment-janitor'

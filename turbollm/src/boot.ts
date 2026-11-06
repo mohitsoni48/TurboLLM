@@ -25,7 +25,7 @@ import { AttachmentJanitor } from './chat/attachment-janitor'
 import { SearchIndexBackfill } from './chat/search-index-backfill'
 import { executeRoutine } from './routines/execute'
 import { sweepInteractiveCliRuns, terminalLookupsBySession, type CliInteractiveSweepDeps } from './routines/cli-interactive-runner'
-import { getTerminalManager } from './terminal/terminal-routes'
+import { getTerminalManager } from './terminal/terminal-service'
 import { AppUpdateChecker } from './app-update'
 import {
   AppUpdateProgressState,
@@ -47,7 +47,9 @@ import { configuredCtx, estimateVram } from './models/profile'
 import { getSysInfo } from './sysinfo/sysinfo'
 import { daemonTick } from './util/daemon-ticks'
 import { ConversationStore } from './chat/db'
-import { abortAllInFlightChats, chatHoldsEngine, chatTurnsEnded } from './chat/chat-routes'
+import { announceChatStoreChanges } from './events/chat-store-announcer'
+import { ChatTurns } from './chat/chat-turns'
+import { ChatRuns } from './chat/chat-runs'
 import { preloadSqlJs } from './chat/store/sqlite-adapter'
 import { buildChatStore } from './chat/store/startup'
 import { HfClient } from './hf/hf'
@@ -226,10 +228,12 @@ export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
     .then(() => seedDefaultEngines(registry, enginesDir, provision, store))
     .then(() => registry.ensureProbed())
   const manager = new Manager(store)
-  // The idle unload (Settings → Idle timeout) waits while a chat needs the model (chatHoldsEngine). The engine's
+  // The idle unload (Settings → Idle timeout) waits while a chat needs the model (chatTurns.holdsEngine). The engine's
   // generation count covers a turn's requests and approval waits, not the auto-compaction before them, a manual
   // compaction, or the reply's title and memory calls after it. The desktop daemon and the Android app both start here.
-  manager.holdsEngine = chatHoldsEngine
+  const chatTurns = new ChatTurns()
+  const chatRuns = new ChatRuns()
+  manager.holdsEngine = () => chatTurns.holdsEngine()
   const scanner = new Scanner(store)
   // First-run seed (ADR-092): if no model dirs are configured and the HF hub cache
   // exists, adopt it as the default so pre-existing HF models show up. One-time only;
@@ -242,7 +246,7 @@ export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
   // construction below — openSqlDb() (sqlite-adapter.ts) is synchronous and throws if this
   // hasn't resolved yet. A no-op on every other platform.
   await preloadSqlJs()
-  const db = new ConversationStore(store.dir())
+  const db = announceChatStoreChanges(new ConversationStore(store.dir()))
   const hf = new HfClient(() => store.snapshot().hf.token, version)
   // A completed download triggers a rescan so the new model shows up in the library.
   const downloads = new DownloadManager(
@@ -351,7 +355,7 @@ export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
     process.exit(1)
   }
   // `requestRestart` is attached after the server is created (it must close over it).
-  const deps: Deps = { store, registry, manager, scanner, hashes, db, chatStore, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, remoteCatalog, tools: toolRegistry, version, startedAt }
+  const deps: Deps = { store, registry, manager, scanner, hashes, db, chatStore, chatTurns, chatRuns, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, remoteCatalog, tools: toolRegistry, version, startedAt }
   // One gate per engine process (scalability review 1.1), each sized to ITS running engine's own slot
   // count, re-read on every admission (a model swap changes it). `Infinity` when the engine advertises
   // no `--parallel` — see Manager.parallelSlots() for why that is not 1. `deps.gate` is the primary's:
@@ -1207,7 +1211,7 @@ export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
   //      fallback, and an open Code terminal's WebSocket, which closeAllConnections() leaves, the same way), and the
   //      listener closes, releasing the port.
   function close({ forRestart = false, alsoWaitFor = () => Promise.resolve() }: TeardownOptions = {}): Promise<void> {
-    abortAllInFlightChats()
+    chatTurns.abortAll()
     if (forRestart) for (const id of deps.codeRuns?.activeSessionIds() ?? []) deps.codeRuns?.stop(id)
     updateScheduler.stop()
     routineScheduler.stop()
@@ -1217,7 +1221,7 @@ export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
     clearInterval(cliInteractiveSweepTimer)
     comfy.stop()
     toolRegistry.disconnectAll()
-    const stopping: Promise<unknown>[] = [manager.shutdown(), modelRouter.shutdownPool(), remote.disableAll(), stopTethered(), chatTurnsEnded()]
+    const stopping: Promise<unknown>[] = [manager.shutdown(), modelRouter.shutdownPool(), remote.disableAll(), stopTethered(), chatTurns.turnsEnded()]
     if (forRestart) stopping.push(downloads.pauseAll())
     stopping.push(alsoWaitFor())
     return new Promise((closed) => {

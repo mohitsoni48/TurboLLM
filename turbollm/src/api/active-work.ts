@@ -11,7 +11,6 @@
 import type { Hono } from 'hono'
 import type { Deps } from '../deps'
 import { mayAlsoRead } from '../auth'
-import { afterReplyChatIds, inFlightChatIds, parkedChatIds, parkedEngineTurns } from '../chat/chat-routes'
 import type { DownloadRecord } from '../downloads/downloads'
 import { jevStatus } from './jev-status'
 import { layaStatus } from './laya-status'
@@ -37,7 +36,7 @@ export interface ActiveWork {
   engineGenerating: boolean
 }
 
-/** Where the chats come from (chat-routes.ts). A test seam only — every caller takes the default. */
+/** Where the chats come from (d.chatTurns). A test seam only — every caller takes the default. */
 export interface ChatSources {
   /** Chats whose turn holds their in-flight slot (parked ones included). */
   inFlight: () => string[]
@@ -49,12 +48,16 @@ export interface ChatSources {
   parkedGenerations: () => number
 }
 
-const CHAT_SOURCES: ChatSources = { inFlight: inFlightChatIds, parked: parkedChatIds, afterReply: afterReplyChatIds, parkedGenerations: parkedEngineTurns }
-
 const UNTITLED = 'Untitled'
 
 export function activeWork(d: Deps, sources: Partial<ChatSources> = {}): ActiveWork {
-  const chats = { ...CHAT_SOURCES, ...sources }
+  const chats: ChatSources = {
+    inFlight: () => d.chatTurns.inFlightChatIds(),
+    parked: () => d.chatTurns.parkedChatIds(),
+    afterReply: () => d.chatTurns.afterReplyChatIds(),
+    parkedGenerations: () => d.chatTurns.parkedEngineTurns(),
+    ...sources,
+  }
   const parked = new Set(chats.parked())
   // A chat is listed once: running (a turn, or its title or memory call), else waiting.
   const running = [...new Set([...chats.inFlight().filter((id) => !parked.has(id)), ...chats.afterReply()])]

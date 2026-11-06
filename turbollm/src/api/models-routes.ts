@@ -2,6 +2,7 @@
 import type { Hono } from 'hono'
 import { getModelProfile, setModelProfile, deleteModelProfile, isModelHidden, setModelHidden, isUnsafeMapKey, ownEntry, type Config, type DeepReadonly } from '../config/config'
 import type { Deps } from '../deps'
+import type { ModelEntry as ModelEntryView, ModelsList } from '../contract/models'
 import { engineForModel, type Registry } from '../engines/registry'
 import { isLocalOrAuthenticated } from '../auth'
 import { modelIncompatibility } from '../engines/compat'
@@ -24,7 +25,7 @@ export function registerModelRoutes(app: Hono, d: Deps): void {
     // each is a structuredClone of the full config, which itself grows with the library
     // (profiles, presets, bench results are per model), and the UI polls this every few seconds.
     const shared = overlayShared(d)
-    return c.json({ models: models.map((m) => overlayModel(m, d, lastTps, shared)), scanning, lastScanAt })
+    return c.json({ models: models.map((m) => overlayModel(m, d, lastTps, shared)), scanning, lastScanAt } satisfies ModelsList)
   })
 
   app.post('/api/v1/models/rescan', (c) => {
@@ -206,7 +207,7 @@ function overlayShared(d: Deps): OverlayShared {
 function overlayModel(
   e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>,
   { snap, registry }: OverlayShared = { snap: d.store.read(), registry: d.registry },
-) {
+): ModelEntryView {
   const ms = d.manager.status()
   const loadedKey = ms.state === 'running' ? ms.model?.key : undefined
   const profiles = snap.modelProfiles

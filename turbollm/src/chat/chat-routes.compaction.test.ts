@@ -11,6 +11,7 @@ import { registerChatRoutes } from './chat-routes.js'
 import { ConversationStore } from './db.js'
 import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
+import { chatRegistries } from '../test-support/chat-registries'
 
 // Mirrors chat-routes.persist.test.ts's mkHarness() exactly — same field set, same
 // cast-through-unknown style, same "omit what's only reached via optional chaining".
@@ -25,6 +26,7 @@ function makeApp(): { app: Hono; store: ConversationStore; cleanup: () => void }
     requestLog: { enabled: false },
   }
   const d = {
+    ...chatRegistries(),
     db: store,
     store: { snapshot: () => cfg, read: () => cfg, dir: () => dir },
     scanner: { get: () => undefined },

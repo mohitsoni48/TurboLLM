@@ -9,6 +9,7 @@ import {
 } from '@tanstack/react-query'
 import { useEffect, useRef } from 'react'
 import { modelsRefetchInterval } from './models-poll'
+import { pollWhileLive } from './live-events'
 import {
   activateEngine,
   addEngine,
@@ -202,8 +203,15 @@ export function useAgentAvailability() {
   })
 }
 
-/** Status poll every 2s, paused when the tab is hidden (spec 00 §4). Polls at 1s
- *  while an auto-tune sweep runs so the inline progress stays live (spec 09 §1). */
+/** How often an idle status refetches while the invalidation stream is open (live-events.ts): the daemon
+ *  announces `status` on every engine state change and when a generation starts or ends, so this only
+ *  catches the fields nothing announces (a background task, remote access). */
+const STATUS_FALLBACK_POLL_MS = 15_000
+
+/** Status poll every 2s, paused when the tab is hidden (spec 00 §4), or every
+ *  {@link STATUS_FALLBACK_POLL_MS} while the invalidation stream is open. Polls at 1s while an auto-tune
+ *  sweep, an engine build or a generation runs: their progress is continuous and nothing announces it
+ *  step by step (spec 09 §1). */
 export function useStatus(): UseQueryResult<Status> {
   return useQuery({
     queryKey: queryKeys.status,
@@ -215,7 +223,7 @@ export function useStatus(): UseQueryResult<Status> {
       q.state.data?.engineBuild?.active ||
       (q.state.data?.engineStats?.activeRequests ?? 0) > 0
         ? 1000
-        : 2000,
+        : pollWhileLive(2000, STATUS_FALLBACK_POLL_MS),
     refetchIntervalInBackground: false,
     // Keep the prior value visible while a poll is in flight to avoid flicker.
     placeholderData: (prev) => prev,

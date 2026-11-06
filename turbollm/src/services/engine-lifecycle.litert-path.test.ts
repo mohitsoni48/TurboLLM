@@ -9,11 +9,13 @@ import { startEngine, type EngineStartBody } from './engine-lifecycle'
 import { type Config, type Engine, defaultConfig } from '../config/config'
 import type { Deps } from '../deps'
 import type { StartOpts } from '../engines/manager'
+import { chatRegistries } from '../test-support/chat-registries'
 
 function deps(engine: Engine): { d: Deps; loads: StartOpts[] } {
   const cfg: Config = defaultConfig()
   const loads: StartOpts[] = []
   const d = {
+    ...chatRegistries(),
     store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
     scanner: { get: () => undefined },
     manager: { load: (opts: StartOpts) => { loads.push(opts); return Promise.resolve() } },

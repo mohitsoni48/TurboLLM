@@ -15,6 +15,7 @@ import { mlxVlmServerCommand } from './mlx-vlm'
 import { koboldcppServerCommand } from './koboldcpp'
 import { llamafileServerCommand } from './llamafile'
 import { slotCacheDir } from './slot-cache'
+import { emitInvalidation } from '../events/bus'
 import { rememberLitertLmModel, type LitertLmRequestInfo } from './litert-lm-request'
 import { litertlmHeaderFromFile } from '../models/litertlm'
 import { isTetheredGroupLeader, killTetheredTree, spawnTethered } from '../util/tether'
@@ -203,7 +204,16 @@ export class Manager {
     }
   }
 
-  private state: State = 'stopped'
+  private engineState: State = 'stopped'
+  /** Every state change is announced: /status and the models list (its `loaded` flags) both read it. */
+  private get state(): State {
+    return this.engineState
+  }
+  private set state(next: State) {
+    if (next === this.engineState) return
+    this.engineState = next
+    announceEngineChange()
+  }
   private opts: StartOpts | null = null
   private port = 0
   private pid = 0
@@ -783,6 +793,7 @@ export class Manager {
    *  and unloaded a model in active chat use between two replies, once the timeout had passed since it was loaded. */
   generationStart(): void {
     this.generation++
+    if (this.generation === 1) announceEngineChange()
     this.lastActivity = Date.now()
   }
   /** Marks the engine in use until the returned release is called, for work that sends requests with gaps between them
@@ -810,8 +821,10 @@ export class Manager {
     return this.holds > 0
   }
   generationEnd(): void {
+    const wasGenerating = this.generation > 0
     this.generation = Math.max(0, this.generation - 1)
     if (this.generation === 0) this.liveGen = null
+    if (wasGenerating && this.generation === 0) announceEngineChange()
     this.lastActivity = Date.now()
   }
 
@@ -1651,4 +1664,11 @@ export function mmprojFallbackNote(err: ErrInfo): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
+}
+
+/** The engine card (/status: state, the "Generating…" indicator) and the models list (loaded flags, last t/s) both
+ *  change when an engine's state does or a generation starts or ends. */
+function announceEngineChange(): void {
+  emitInvalidation('status')
+  emitInvalidation('models')
 }

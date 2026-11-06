@@ -6,7 +6,7 @@ import {
   CLI_INTERACTIVE_ROUTINE_TIMEOUT_MS, runCliInteractiveRoutine, sweepInteractiveCliRuns, terminalLookupsBySession,
   type CliInteractiveDeps, type CliInteractiveSweepDeps,
 } from './cli-interactive-runner'
-import { buildTerminalLaunchCommand, type CreateAgentTerminalResult } from '../terminal/terminal-routes'
+import { buildTerminalLaunchCommand, type CreateAgentTerminalResult } from '../terminal/terminal-service'
 import { quotePtyShellArg } from '../util/shell-command'
 import type { Routine, RoutineRun } from './schema'
 import { realEngineSetUp } from '../test-support/stand-in-engine'

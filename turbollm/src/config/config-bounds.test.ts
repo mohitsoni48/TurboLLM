@@ -3,7 +3,10 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { DOWNLOAD_CONCURRENCY, ENGINE_LOAD_STALL_SECONDS, RETENTION_BOUNDS, isRetentionValue } from './config-bounds'
+import {
+  CHAT_APPROVAL_WAIT_MINUTES, DOWNLOAD_CONCURRENCY, ENGINE_LOAD_STALL_SECONDS, GATEWAY_MAX_BODY_MB, RETENTION_BOUNDS, isRetentionValue,
+  isWholeInBounds, loadBounded,
+} from './config-bounds'
 import { ConfigStore, defaultConfig } from './config'
 import { tmpDir } from '../test-support/tmp'
 
@@ -51,4 +54,26 @@ test('engineLoadStallSeconds: 120 by default, 0 (off) and any whole in-range val
   assert.equal(loaded(ENGINE_LOAD_STALL_SECONDS.max), ENGINE_LOAD_STALL_SECONDS.max)
   for (const bad of [-1, ENGINE_LOAD_STALL_SECONDS.max + 1, 90.5, '30', null, true]) assert.equal(loaded(bad), 120, String(bad))
   assert.equal(ConfigStore.load(join(dir, 'missing.json')).read().engineLoadStallSeconds, 120)
+})
+
+// Scalability item 5.3: one bound declares both how a hand-edited value loads (normalize) and what the settings route takes.
+test('loadBounded applies the load policy the bound declares: integer, floor or clamp', () => {
+  // integer: a whole in-range value, anything else the default (a fraction is not floored).
+  assert.equal(loadBounded(5, DOWNLOAD_CONCURRENCY), 5)
+  for (const bad of [3.5, 0, 9, '4', null, undefined]) assert.equal(loadBounded(bad, DOWNLOAD_CONCURRENCY), DOWNLOAD_CONCURRENCY.default, String(bad))
+  // floor: an in-range number floored, anything else the default.
+  assert.equal(loadBounded(90.9, RETENTION_BOUNDS.apiUsageRawDays), 90)
+  assert.equal(loadBounded(1440, CHAT_APPROVAL_WAIT_MINUTES), 1440)
+  for (const bad of [1441, -1, '30', null]) assert.equal(loadBounded(bad, CHAT_APPROVAL_WAIT_MINUTES), CHAT_APPROVAL_WAIT_MINUTES.default, String(bad))
+  // clamp: at least min is floored and capped at max; below min or not a number is the default.
+  assert.equal(loadBounded(9999, GATEWAY_MAX_BODY_MB), GATEWAY_MAX_BODY_MB.max)
+  assert.equal(loadBounded(64.7, GATEWAY_MAX_BODY_MB), 64)
+  for (const bad of [0.5, -3, '64', null]) assert.equal(loadBounded(bad, GATEWAY_MAX_BODY_MB), GATEWAY_MAX_BODY_MB.default, String(bad))
+})
+
+test('isWholeInBounds takes a whole JSON number inside the bound, nothing else', () => {
+  for (const b of [DOWNLOAD_CONCURRENCY, ENGINE_LOAD_STALL_SECONDS, GATEWAY_MAX_BODY_MB]) {
+    for (const ok of [b.min, b.default, b.max]) assert.equal(isWholeInBounds(ok, b), true, String(ok))
+    for (const bad of [b.min - 1, b.max + 1, b.min + 0.5, String(b.default), null, true]) assert.equal(isWholeInBounds(bad, b), false, String(bad))
+  }
 })

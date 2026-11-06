@@ -23,7 +23,7 @@ import { automaticProfile, deriveDefault, deriveTensorSplit, estimateVram, estim
 import { isSpilling, spillFloor, spillMb } from './spill'
 import { getSysInfo, unifiedMemoryOnly, type SysInfo } from '../sysinfo/sysinfo'
 import type { HfClient } from '../hf/hf'
-import { inferRepoFromPath } from '../api/path-utils'
+import { inferRepoFromPath } from '../util/path-utils'
 import { enqueue } from '../telemetry/queue'
 import { toSafeIdent, toSafeNameIdent } from '../telemetry/core/validate'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'

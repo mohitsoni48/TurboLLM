@@ -33,7 +33,7 @@ import { claudePermissionModeChoices } from '../terminal/agent-modes'
 import { engineIsIdle } from '../engines/update-scheduler'
 import type { GenerationGate } from '../agents/gate'
 import { runCliInteractiveRoutine, closeInteractiveRun, terminalLookupsBySession, agentLabel, CLI_INTERACTIVE_ROUTINE_TIMEOUT_MS, type CliInteractiveDeps } from './cli-interactive-runner'
-import { createAgentTerminal, getTerminalManager } from '../terminal/terminal-routes'
+import { createAgentTerminal, getTerminalManager } from '../terminal/terminal-service'
 
 /** The binary a terminal-harness routine needs installed. Falls back to `claude` for a routine with
  *  no terminal harness set, which is the only value that could reach here before this existed. */

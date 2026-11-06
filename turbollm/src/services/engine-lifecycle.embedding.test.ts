@@ -11,6 +11,7 @@ import { Hono } from 'hono'
 import { startEngine, type EngineStartBody } from './engine-lifecycle'
 import type { Deps } from '../deps'
 import type { ModelEntry } from '../models/scanner'
+import { chatRegistries } from '../test-support/chat-registries'
 
 function entry(overrides: Partial<ModelEntry>): ModelEntry {
   return {
@@ -54,6 +55,7 @@ function mkDeps(models: ModelEntry[], opts: { tuning?: boolean } = {}) {
     recordManualLoad: () => {},
   }
   const d = {
+    ...chatRegistries(),
     version: '1.12.0',
     store, scanner, manager, registry, modelRouter,
     bench: {

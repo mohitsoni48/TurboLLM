@@ -58,7 +58,7 @@ export function EngineLoadErrorBanner({ status }: { status: Status | undefined }
    *  asked for, which survives the failure. Returns whether it worked, so the recovery
    *  event can report a real `outcome` rather than assuming the click succeeded. */
   async function retryLoad(): Promise<boolean> {
-    const key = status?.lastLoaded
+    const key = status?.lastLoaded?.modelKey
     if (!key) return false
     try {
       await loadModel(key)

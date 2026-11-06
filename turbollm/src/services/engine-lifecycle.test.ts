@@ -12,6 +12,7 @@ import type { StartOpts } from '../engines/manager'
 import type { LoadExplicitOpts } from '../gateway/model-router'
 import type { ModelEntry } from '../models/scanner'
 import type { JevInfo } from '../models/jev'
+import { chatRegistries } from '../test-support/chat-registries'
 
 const OPENJEV: JevInfo = {
   labels: ['contradiction', 'entailment', 'neutral'],
@@ -56,6 +57,7 @@ function mkDeps(engineKind: string, models: ModelEntry[]) {
   }
   const cfg = { modelProfiles: {}, lastLoaded: {} }
   const d = {
+    ...chatRegistries(),
     store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     scanner: { get: (k: string) => models.find((m) => m.key === k) },
     registry: {

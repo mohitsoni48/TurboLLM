@@ -7,7 +7,7 @@ import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { Hono } from 'hono'
-import { startEngine, type EngineStartBody } from '../api/engine-lifecycle'
+import { startEngine, type EngineStartBody } from '../services/engine-lifecycle'
 import { ConfigStore, type Engine } from '../config/config'
 import type { Deps } from '../deps'
 import { ComfyGuard } from '../engines/comfy-guard'

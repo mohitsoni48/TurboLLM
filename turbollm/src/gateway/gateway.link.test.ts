@@ -16,6 +16,8 @@ import { lanAuth, provisionRemoteApiKey } from '../auth'
 import { defaultConfig, type ApiKey } from '../config/config'
 import { registerLinkApi } from '../link/link-routes'
 import { registerChatRoutes } from '../chat/chat-routes'
+import { ChatTurns } from '../chat/chat-turns'
+import { ChatRuns } from '../chat/chat-runs'
 import { ConversationStore } from '../chat/db'
 import { tmpDir } from '../test-support/tmp'
 import type { Deps } from '../deps'
@@ -633,6 +635,8 @@ for (const loaded of [false, true]) {
     cfg.daemon = { ...(cfg.daemon as object), autoGenerateTitles: false, experimental: { memory: false }, autoMemoryEnabled: false }
     const chatDeps = {
       ...d,
+      chatTurns: new ChatTurns(),
+      chatRuns: new ChatRuns(),
       db,
       remoteCatalog: { modelOn: () => ({ key: 'big-model', name: 'Big', quant: null, nativeCtx: 8192, vision: false, loaded }) },
     } as unknown as Deps

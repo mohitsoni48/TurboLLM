@@ -12,6 +12,7 @@ import type { Deps } from '../deps'
 import type { Manager, StartOpts, Status } from '../engines/manager'
 import type { ConfigStore } from '../config/config'
 import type { ModelEntry } from '../models/scanner'
+import { chatRegistries } from '../test-support/chat-registries'
 
 /** A Manager double running `modelKey` until stop() is called. */
 function managerRunning(modelKey: string) {
@@ -87,6 +88,7 @@ function app(slot?: Manager) {
     downloads: { activeCount: () => 0 },
     provision: { get: () => undefined },
     build: { get: () => undefined },
+    ...chatRegistries(),
   } as unknown as Deps
   const a = new Hono()
   registerApi(a, d)

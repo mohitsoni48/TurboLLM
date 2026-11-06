@@ -16,6 +16,7 @@ import { registerChatRoutes } from './chat-routes.js'
 import { ConversationStore } from './db.js'
 import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
+import { chatRegistries } from '../test-support/chat-registries'
 
 const REMOTE = {
   linkId: 'lnk1',
@@ -55,6 +56,7 @@ function mkApp(opts: { localRunning?: boolean } = {}): {
     tools: { toolPolicies: {}, autoAllowAll: false },
   }
   const d = {
+    ...chatRegistries(),
     db: store,
     store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },

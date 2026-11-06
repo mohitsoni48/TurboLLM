@@ -8,6 +8,7 @@ import type { Deps } from '../deps'
 import type { ApiKey } from '../config/config'
 import type { ModelEntry } from '../models/scanner'
 import { LinkClient } from './link-client'
+import { chatRegistries } from '../test-support/chat-registries'
 
 /** A model whose on-disk path is a WINDOWS absolute path on purpose: every response this
  *  suite touches is asserted not to contain it (see the "no host filesystem detail" tests). */
@@ -87,6 +88,7 @@ function mkDeps(
     store as never, registry as never, manager as never, scanner as never, undefined,
   )
   const d = {
+    ...chatRegistries(),
     version: '1.11.2',
     store, scanner, manager, registry, modelRouter,
     bench: { cancel: () => { benchCancels.n += 1 }, waitIdle: () => Promise.resolve() },

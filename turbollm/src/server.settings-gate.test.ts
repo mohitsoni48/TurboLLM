@@ -131,6 +131,11 @@ const HOST_ONLY: [string, (cfg: Config) => unknown][] = [
   ['retention.enabled', (cfg) => ({ retention: { enabled: !cfg.retention.enabled } })],
   ['retention.apiUsageRawDays', () => ({ retention: { apiUsageRawDays: 31 } })],
   ['retention.routineRunsKept', () => ({ retention: { routineRunsKept: 10 } })],
+  // Tier 4's runtime limits, exposed by scalability item 5.3: raising what the gateway buffers, how many files download
+  // at once, or switching the load stall watch off is the host's call.
+  ['gateway.maxBodyMb', () => ({ gateway: { maxBodyMb: 4096 } })],
+  ['downloadConcurrency', () => ({ downloadConcurrency: 8 })],
+  ['engineLoadStallSeconds', () => ({ engineLoadStallSeconds: 0 })],
 ]
 
 /** Every host-only change is refused (and nothing changes); a cosmetic one and an echo are not.

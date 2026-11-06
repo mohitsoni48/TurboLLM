@@ -14,6 +14,7 @@ import { UnreachableOverlay } from './components/UnreachableOverlay'
 import { AuthGate } from './components/AuthGate'
 import { JevLoadConfirmHost } from './components/JevLoadConfirmHost'
 import { useStatus, useSettings, useDownloads, useModels } from './lib/queries'
+import { useLiveInvalidation } from './lib/live-events'
 import {
   LEGACY_JEV_PATH,
   TEXT_CLASSIFICATION_PATH,
@@ -296,6 +297,9 @@ export function useKeyPrompt(statusQ: Pick<UseQueryResult<Status>, 'isError' | '
 }
 
 export function App() {
+  // The one invalidation stream (GET /api/v1/events): mounted here, for the app's lifetime, so the polls it
+  // turns into safety nets slow down on every screen (live-events.ts).
+  useLiveInvalidation()
   const statusQ = useStatus()
   // Turbo Link (ADR-382): the daemon owns which machine this install is pointed at, so mirror
   // its value into the UI store on every status poll. Mounted HERE, once for the app's lifetime,

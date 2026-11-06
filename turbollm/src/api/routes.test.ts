@@ -13,6 +13,7 @@ import type { Deps } from '../deps'
 import type { ModelEntry } from '../models/scanner'
 import type { JevInfo } from '../models/jev'
 import { tmpDir } from '../test-support/tmp'
+import { chatRegistries } from '../test-support/chat-registries'
 
 const OPENJEV: JevInfo = {
   labels: ['contradiction', 'entailment', 'neutral'],
@@ -239,6 +240,7 @@ test('registerApi registers GET /api/v1/activity', async () => {
     downloads: { list: () => [] },
     modelRouter: { aliveSlots: () => [], poolModelCount: () => 0 },
     scanner: { get: () => undefined },
+    ...chatRegistries(),
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)

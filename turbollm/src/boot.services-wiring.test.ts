@@ -3,7 +3,6 @@
 // cli.comfy-wiring, cli.daily-active-wiring): each one now calls the wired thing and watches where the call goes.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { chatHoldsEngine } from './chat/chat-routes'
 import { Emitter } from './telemetry/emit'
 import { bootTestDaemon } from './test-support/test-daemon'
 
@@ -13,7 +12,10 @@ import { bootTestDaemon } from './test-support/test-daemon'
 test("the primary Manager is given the chat's engine hold", async () => {
   const d = await bootTestDaemon()
   try {
-    assert.equal(d.deps.manager.holdsEngine, chatHoldsEngine)
+    const hold = d.deps.manager.holdsEngine!
+    assert.equal(hold(), false)
+    d.deps.chatTurns.claim('conv-1', new AbortController(), 'reply-1')
+    assert.equal(hold(), true, "the manager reads the daemon's own chatTurns")
   } finally {
     await d.stop()
   }
@@ -62,6 +64,23 @@ test('daily_active is re-checked on a recurring timer, not only at boot', async 
     assert.equal(daily.mock.callCount(), 2, 'and again on the 5-minute tick')
   } finally {
     t.mock.timers.reset()
+    await d.stop()
+  }
+})
+
+// The chat store the daemon builds announces its writes on the invalidation bus GET /api/v1/events streams
+// (review 4.14), so a reply finished by a detached turn or a routine reaches an open page without its poll.
+// The per-method keys are events/chat-store-announcer.test.ts's.
+test("the daemon's chat store announces its writes on the invalidation bus", async (t) => {
+  const { COALESCE_WINDOW_MS, eventBus } = await import('./events/bus')
+  const d = await bootTestDaemon()
+  try {
+    const heard = new Set<string>()
+    t.after(eventBus.subscribe((keys) => keys.forEach((k) => heard.add(k))))
+    const conv = d.deps.db.createConversation({ title: 'wired' })
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50))
+    assert.ok(heard.has(`conversation:${conv.id}`), `heard ${[...heard].join(', ')}`)
+  } finally {
     await d.stop()
   }
 })

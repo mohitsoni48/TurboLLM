@@ -12,6 +12,8 @@ import { test } from 'node:test'
 import { Hono } from 'hono'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from './db'
 import { registerChatRoutes } from './chat-routes'
+import { ChatTurns } from './chat-turns'
+import { ChatRuns } from './chat-runs'
 import { SearchIndexBackfill } from './search-index-backfill'
 import { openSqlDb, preloadSqlJs, type SqlDb } from './store/sqlite-adapter'
 import type { Deps } from '../deps'
@@ -341,7 +343,7 @@ test('GET /api/v1/conversations pages with ?limit and ?cursor, and adds nextCurs
   try {
     for (let i = 0; i < 3; i++) store.createConversation({ title: `c${i}` })
     const app = new Hono()
-    registerChatRoutes(app, { db: store, store: { snapshot: () => ({}), read: () => ({}), dir: () => IN_MEMORY_DATA_DIR } } as unknown as Deps)
+    registerChatRoutes(app, { chatTurns: new ChatTurns(), chatRuns: new ChatRuns(), db: store, store: { snapshot: () => ({}), read: () => ({}), dir: () => IN_MEMORY_DATA_DIR } } as unknown as Deps)
     const all = await (await app.request('/api/v1/conversations')).json() as { conversations: unknown[]; nextCursor: string | null }
     assert.equal(all.conversations.length, 3)
     assert.equal(all.nextCursor, null)
@@ -400,7 +402,7 @@ test('GET /api/v1/memory pages with ?limit and ?cursor and keeps the facts array
   try {
     for (let i = 0; i < 3; i++) store.addMemoryFact({ factText: `fact ${i}` })
     const app = new Hono()
-    registerChatRoutes(app, { db: store, store: { snapshot: () => ({}), read: () => ({}), dir: () => IN_MEMORY_DATA_DIR } } as unknown as Deps)
+    registerChatRoutes(app, { chatTurns: new ChatTurns(), chatRuns: new ChatRuns(), db: store, store: { snapshot: () => ({}), read: () => ({}), dir: () => IN_MEMORY_DATA_DIR } } as unknown as Deps)
     const all = await (await app.request('/api/v1/memory')).json() as { facts: unknown[]; nextCursor: string | null }
     assert.equal(all.facts.length, 3)
     assert.equal(all.nextCursor, null)

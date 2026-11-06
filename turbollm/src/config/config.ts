@@ -9,7 +9,7 @@ import { basename, dirname, join } from 'node:path'
 import type { LinkGrant, LinkRecord } from '../link/types'
 import type { ChatStoreConfig } from '../chat/store/load-adapter.js'
 import type { ReleaseProvenance } from '../engines/release-install'
-import { CHAT_APPROVAL_WAIT_MINUTES, DOWNLOAD_CONCURRENCY, ENGINE_LOAD_STALL_SECONDS, GATEWAY_MAX_BODY_MB, RETENTION_BOUNDS, type RetentionBoundedField } from './config-bounds'
+import { CHAT_APPROVAL_WAIT_MINUTES, DOWNLOAD_CONCURRENCY, ENGINE_LOAD_STALL_SECONDS, GATEWAY_MAX_BODY_MB, RETENTION_BOUNDS, loadBounded } from './config-bounds'
 import { writeFileAtomicSync } from '../util/atomic-write'
 
 export const SCHEMA_VERSION = 4
@@ -1213,16 +1213,8 @@ function normalize(c: Config): void {
   // default falls back to the first modelDir). Never throw on an old config.
   c.primaryModelDir ??= ''
   // Absent in older files, or hand-edited out of range / to a non-integer: the default, never a throw on load.
-  const dlc = c.downloadConcurrency as unknown
-  c.downloadConcurrency =
-    typeof dlc === 'number' && Number.isInteger(dlc) && dlc >= DOWNLOAD_CONCURRENCY.min && dlc <= DOWNLOAD_CONCURRENCY.max
-      ? dlc
-      : DOWNLOAD_CONCURRENCY.default
-  const els = c.engineLoadStallSeconds as unknown
-  c.engineLoadStallSeconds =
-    typeof els === 'number' && Number.isInteger(els) && els >= ENGINE_LOAD_STALL_SECONDS.min && els <= ENGINE_LOAD_STALL_SECONDS.max
-      ? els
-      : ENGINE_LOAD_STALL_SECONDS.default
+  c.downloadConcurrency = loadBounded(c.downloadConcurrency, DOWNLOAD_CONCURRENCY)
+  c.engineLoadStallSeconds = loadBounded(c.engineLoadStallSeconds, ENGINE_LOAD_STALL_SECONDS)
   // Per-engine model profiles (issue #35, schema v3): modelProfiles moved from a flat
   // { modelKey → profile } map to a nested { modelKey → { engineId → ProfileEntry } } map
   // so two installed engines keep independent tunes for the same model. Migrate in place,
@@ -1313,8 +1305,7 @@ function normalize(c: Config): void {
   c.gateway = {
     autoSwap: gw.autoSwap !== false,
     keepN: typeof gw.keepN === 'number' && gw.keepN >= 1 ? Math.min(Math.floor(gw.keepN), 4) : 1,
-    maxBodyMb: typeof gw.maxBodyMb === 'number' && gw.maxBodyMb >= GATEWAY_MAX_BODY_MB.min
-      ? Math.min(Math.floor(gw.maxBodyMb), GATEWAY_MAX_BODY_MB.max) : GATEWAY_MAX_BODY_MB.default,
+    maxBodyMb: loadBounded(gw.maxBodyMb, GATEWAY_MAX_BODY_MB),
   }
   // Developer request log (issue #211 follow-up): absent in pre-this-feature configs →
   // defaults (on, bodies off). `captureBodies` in particular must never silently flip on for
@@ -1329,12 +1320,11 @@ function normalize(c: Config): void {
   // Data retention (scalability review 2.4): absent in configs written before it → on, with the defaults. A value out of
   // range (hand-edited) loads as its default, never a throw; a fraction is floored.
   const rt = (c.retention ?? {}) as Partial<RetentionConfig>
-  const bounded = (field: RetentionBoundedField): number => {
-    const v = rt[field]
-    const b = RETENTION_BOUNDS[field]
-    return typeof v === 'number' && Number.isFinite(v) && v >= b.min && v <= b.max ? Math.floor(v) : b.default
+  c.retention = {
+    enabled: rt.enabled !== false,
+    apiUsageRawDays: loadBounded(rt.apiUsageRawDays, RETENTION_BOUNDS.apiUsageRawDays),
+    routineRunsKept: loadBounded(rt.routineRunsKept, RETENTION_BOUNDS.routineRunsKept),
   }
-  c.retention = { enabled: rt.enabled !== false, apiUsageRawDays: bounded('apiUsageRawDays'), routineRunsKept: bounded('routineRunsKept') }
   // Built-in tools (v0.7.0): absent in pre-v0.7.0 configs → empty defaults.
   const tl = (c.tools ?? {}) as Partial<ToolsConfig>
   c.tools = {}
@@ -1372,11 +1362,7 @@ function normalize(c: Config): void {
   c.tools.autoAllowAll = tl.autoAllowAll === true
   // Absent in configs written before the setting, or hand-edited out of range: the default (30
   // minutes), never a throw on load. A fraction is floored, as the minutes it stands for.
-  const wait = tl.chatApprovalWaitMinutes
-  c.tools.chatApprovalWaitMinutes =
-    typeof wait === 'number' && Number.isFinite(wait) && wait >= CHAT_APPROVAL_WAIT_MINUTES.min && wait <= CHAT_APPROVAL_WAIT_MINUTES.max
-      ? Math.floor(wait)
-      : CHAT_APPROVAL_WAIT_MINUTES.default
+  c.tools.chatApprovalWaitMinutes = loadBounded(tl.chatApprovalWaitMinutes, CHAT_APPROVAL_WAIT_MINUTES)
   // MCP host (v0.7.0): absent in pre-v0.7.0 configs → empty server list.
   const mc = (c.mcp ?? {}) as Partial<McpConfig>
   c.mcp = {

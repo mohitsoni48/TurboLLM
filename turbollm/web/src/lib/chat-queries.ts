@@ -8,6 +8,7 @@ import {
 import type { ConversationPage } from './chat-api'
 import type { Conversation, MemoryFact } from './chat-types'
 import { FIRST_PAGE, flattenPages, nextCursorOf } from './paging'
+import { pollWhileLive } from './live-events'
 
 export const chatKeys = {
   list: (q?: string) => ['conversations', q ?? ''] as const,
@@ -85,7 +86,7 @@ function useConversationListPoll(q?: string) {
     queryFn: () => listConversations(q, FIRST_PAGE),
     staleTime: 0,
     retry: false,
-    refetchInterval: 4000,
+    refetchInterval: () => pollWhileLive(4000),
     refetchIntervalInBackground: false,
   })
   // `head` keeps its identity while the server's answer is unchanged (structural sharing), so this runs on a change.
@@ -121,7 +122,7 @@ export function useConversation(id: string | null) {
     // (`runningReplyId`): ChatScreen then attaches to the reply's own run, which fans out to every
     // viewer (GET .../stream, chat-runs.ts), and follows it live. Matches the cadence Code's own
     // session list already uses (code-queries.ts, refetchInterval: 5000).
-    refetchInterval: 4000,
+    refetchInterval: () => pollWhileLive(4000),
     refetchIntervalInBackground: false,
   })
 }

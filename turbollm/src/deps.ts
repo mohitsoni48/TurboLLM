@@ -11,6 +11,8 @@ import type { Scanner } from './models/scanner'
 import type { HashStore } from './models/hashes'
 import type { ConversationStore } from './chat/db'
 import type { ChatStore } from './chat/store/chat-store.js'
+import type { ChatTurns } from './chat/chat-turns'
+import type { ChatRuns } from './chat/chat-runs'
 import type { HfClient } from './hf/hf'
 import type { DownloadManager } from './downloads/downloads'
 import type { BenchRunner } from './bench/bench'
@@ -42,6 +44,11 @@ export interface Deps {
    *  handle as `db`. Phase 2 replaces this with a tenant-dispatching router. The web UI
    *  does NOT go through this — it keeps using `db` directly (spec 27 §4.3). */
   chatStore: ChatStore
+  /** The chat turns running in this daemon: their in-flight slots, approval waits and pending saves. One instance,
+   *  built by bootDaemon; every reader (the active-work probe, the engine lifecycle, the idle watchdog) takes it from here. */
+  chatTurns: ChatTurns
+  /** The runs of those turns (their buffered frames and viewers). One instance, built by bootDaemon. */
+  chatRuns: ChatRuns
   provision: ProvisionState
   /** Live status of an in-app compile-from-source run (ADR-100). One build at a time;
    *  guarded alongside `provision` so a build and a download never run concurrently. */

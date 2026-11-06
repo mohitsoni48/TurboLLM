@@ -31,6 +31,8 @@ import type { CustomChatAgent } from './config/config'
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { registerChatRoutes } from './chat/chat-routes'
+import { ChatTurns } from './chat/chat-turns'
+import { ChatRuns } from './chat/chat-runs'
 import { registerChatAgentRoutes } from './chat/chat-agent-routes'
 import type { AgentToolsStore } from './chat/chat-agent-tools'
 import { registerRoutineRoutes } from './routines/routine-routes'
@@ -78,6 +80,7 @@ function makeDeps(mutate: (cfg: ReturnType<typeof defaultConfig>) => void): { d:
   const cfg = defaultConfig()
   mutate(cfg)
   const d = {
+    chatTurns: new ChatTurns(), chatRuns: new ChatRuns(),
     store: {
       snapshot: () => cfg, read: () => cfg,
       update: (fn: (c: typeof cfg) => void) => fn(cfg),

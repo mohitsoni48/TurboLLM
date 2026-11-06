@@ -115,11 +115,12 @@ function authTokenChanged(signal: AbortSignal): Promise<void> {
  *
  *  `onOpen` runs each time a stream's response arrives, before its first message (EventSource's
  *  `open` event), so a caller that also loads a snapshot loads it from there, the first time and
- *  after every reconnect. Returns the close function. */
+ *  after every reconnect. `onClose` runs when a stream that opened ends or drops (also on close()),
+ *  so a caller can tell an open stream from one that is reconnecting. Returns the close function. */
 export function subscribeSse(
   url: string,
   onMessage: (msg: SseMessage) => void,
-  opts: { onOpen?: () => void } = {},
+  opts: { onOpen?: () => void; onClose?: () => void } = {},
 ): () => void {
   const ac = new AbortController()
   const { signal } = ac
@@ -150,9 +151,13 @@ export function subscribeSse(
         if (!res.ok || !res.body || !/^text\/event-stream/i.test(res.headers.get('content-type') ?? '')) return
         failed = 0
         opts.onOpen?.()
-        for await (const msg of readSseStream(res.body)) {
-          if (msg.id !== undefined) lastEventId = msg.id
-          onMessage(msg)
+        try {
+          for await (const msg of readSseStream(res.body)) {
+            if (msg.id !== undefined) lastEventId = msg.id
+            onMessage(msg)
+          }
+        } finally {
+          opts.onClose?.()
         }
       } catch {
         /* network drop, daemon restart, a 5xx, or our own abort — the loop condition sorts out which */

@@ -26,6 +26,7 @@ const OWNED_INTERVALS: Record<string, { count: number; why: string }> = {
   'remote/manager.ts': { count: 1, why: 'a tunnel\'s health loop: cleared synchronously by remote.disable(), which the restart teardown calls' },
   'engines/manager.ts': { count: 1, why: 'an engine\'s idle watchdog, armed only while its process lives: the restart stops the engines, and the keeper\'s exit net kills what is left' },
   'chat/chat-routes.ts': { count: 2, why: 'a reply stream\'s keepalive and a turn\'s partial saves: each ends with its run, and the restart stops every run first (abortAllInFlightChats)' },
+  'events/events-routes.ts': { count: 1, why: 'a client\'s SSE heartbeat: armed per connection and cleared when it disconnects (onAbort); the restart closes every open connection with the listener' },
   'link/link-manager.ts': { count: 1, why: 'the Turbo Link poll: LinkManager.stop(), in becomeKeeper' },
   'sysinfo/usage.ts': { count: 1, why: 'the usage sampler: stopUsageMonitor(), in becomeKeeper (it also stops itself 6 s after its last reader)' },
   'util/tether.ts': { count: 1, why: 'the held-group re-count: it stops itself once nothing is held, and the keeper\'s closeAllLifelines closes every hold' },

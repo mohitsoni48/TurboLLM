@@ -1,179 +1,19 @@
-// Shared TS types mirroring the Go daemon API JSON (spec 02). Keep these in sync
-// with the daemon contract; the typed client in lib/api.ts returns these shapes.
+// Shared TS types for the daemon's API JSON; the typed client in lib/api.ts returns these shapes.
+// Types the daemon builds a response from live in src/contract/ (types only) and are re-exported below, so call
+// sites keep importing from here; the daemon `satisfies` those same declarations, so the two sides cannot drift.
+// The rest are still declared by hand in this file: move one into src/contract/ when its route gains a `satisfies`.
+import type {
+  AgentTask, BenchCandidate, BenchState, CardSampling, ComfyRuntime, EngineBuild, EngineError, EngineProvision,
+  EngineRuntime, EngineState, EngineStats, JevLabel, JevStatus, LastLoaded, LayaStatus, LiveGeneration, LoadedModel, LoadFailure,
+  ServingStatus, Status, TextClassificationRuntime, TextClassificationStatus, TunnelStatus,
+} from '@contract/status'
+import type { JevInfo, LayaInfo, LitertlmSampler, ModelEntry, ModelsList } from '@contract/models'
 
-/** Mirrors the daemon's `FAIL_REASONS` (src/telemetry/core/enums.ts), which is what
- *  `classifyLoadFailure` returns. Declared here because this file is the designated
- *  mirror of the daemon contract; `screens/onboarding/recovery.ts` checks its runtime
- *  array against this union rather than re-declaring it, so the two cannot drift. */
-export type LoadFailure =
-  | 'oom'
-  | 'no_engine'
-  | 'bad_gguf'
-  | 'unsupported_arch'
-  | 'timeout'
-  | 'cancelled'
-  | 'other'
-
-export type EngineState =
-  | 'stopped'
-  | 'starting'
-  | 'running'
-  | 'stopping'
-  | 'error'
-
-export type EngineError = {
-  code: string
-  message: string
-  exitCode?: number
-  logTail?: string[]
-  /** Server-side classification of this failure (`classifyLoadFailure`, ADR-338
-   *  Decision 4). Drives the one-click recovery offered in the error banner.
-   *  Optional because a daemon older than the field simply omits it — the UI
-   *  then falls back to `other`, which still offers a next action. */
-  failReason?: LoadFailure
-  /** Name of the engine the failed load ran on, and of the model it tried ('' when no load is recorded). Absent from an
-   *  older daemon: the banner then reads "Model load failed". */
-  engineName?: string
-  modelName?: string
-  /** False when that engine is not expected to load that model (the Models screen's compatibleWithActiveEngine for
-   *  it): a model "Show models for every engine" lists loads only on the selected engine, so the recovery offers no
-   *  engine advice and no re-download for it. Absent from an older daemon (read as true). */
-  expectedToLoad?: boolean
-}
-
-/** Active engine runtime state from GET /api/v1/status (spec 02 §1). */
-export type EngineRuntime = {
-  id: string
-  name: string
-  kind?: string
-  state: EngineState
-  error?: EngineError
-  port?: number
-  pid?: number
-  /** Id of the engine the loaded model actually runs on ('' when none). Not always `id` (the active engine): an engine
-   *  install or Enable activates another engine without stopping the model. Absent from older daemons. */
-  servingId?: string
-  /** Kind of the engine in `servingId` ('' when none). Absent from older daemons. */
-  servingKind?: string
-  /** Name of the engine in `servingId` ('' when none). Absent from older daemons. */
-  servingName?: string
-  /** The exact command last spawned, formatted for copy-paste into a terminal.
-   *  Present only while this engine is the one actually running/starting. */
-  launchCommand?: string
-}
-
-/** Loaded model from GET /api/v1/status (null when none). */
-export type LoadedModel = {
-  key: string
-  name: string
-  quant: string
-  ctx: number
-  vision: boolean
-  loadElapsedMs?: number
-}
-
-/** Default-engine provisioning progress (ADR-024), from GET /api/v1/status. */
-export type EngineProvision = {
-  active: boolean
-  phase: 'idle' | 'downloading' | 'extracting' | 'error'
-  backend: string
-  pct: number // 0..1 while downloading; -1 = indeterminate (extracting)
-  part?: number // 1-based current archive (multi-asset backends like CUDA)
-  parts?: number // total archives for this backend
-  error: string | null
-  /** False when POST /engines/backends/cancel can't stop this run (first-run seed, auto-update,
-   *  uv/pip runtime installs). Absent from daemons that predate it. */
-  cancellable?: boolean
-  /** When this run began (epoch ms), kept on its failure; 0 when idle. Identifies the run, so a dismissed failure
-   *  is told from a retry's. Absent from daemons that predate it. */
-  startedAt?: number
-}
-
-/** In-app compile-from-source status (ADR-100), from GET /api/v1/status. A build streams
- *  a phase + a log tail (clone/cmake output) rather than a byte percentage. */
-export type EngineBuild = {
-  active: boolean
-  phase: 'provisioning' | 'preparing' | 'cloning' | 'configuring' | 'compiling' | 'registering' | 'done' | 'error'
-  engine: string
-  log: string[]
-  error: string | null
-  /** The run installs a build tool (the CUDA Toolkit download, a build guide prerequisite) and builds no engine.
-   *  Absent from daemons that predate it: see isToolInstall. */
-  toolInstall?: boolean
-  /** The finished build ('done') is the selected engine: false after a rebuild of an engine the user had not selected,
-   *  which leaves the selection as it was. Absent from daemons that predate it, which made every build they registered
-   *  the selected engine. */
-  activated?: boolean
-}
-
-/** Live running-session stats (B4), from GET /api/v1/status. Null unless the
- *  engine is running; resets each time the engine starts/stops. */
-export type EngineStats = {
-  requests: number
-  inputTokens: number
-  outputTokens: number
-  avgPromptTps: number
-  avgGenTps: number
-  sinceMs: number
-  /** Completions streaming through the engine right now; >0 shows a live
-   *  "Generating…" indicator in the engine card. */
-  activeRequests: number
-}
-
-/** One candidate the auto-tune sweep evaluated (spec 09 §1). `outcome` is 'ok' on a
- *  measured run, else the failure mode — the sweep records it and continues. */
-export type BenchCandidate = {
-  label: string
-  params: { ctx: number; ngl: number; nglFit?: boolean; nCpuMoe: number; nCpuMoeFit?: boolean; parallel: number; kvTypeK: string; flashAttn: string }
-  outcome: 'ok' | 'timeout' | 'crash' | 'oom'
-  tps: number | null
-  ttftMs: number | null
-  vramMb: number | null
-}
-
-/** Live auto-tune state from GET /status `bench` (spec 09 §1). `done`/`error` linger
- *  after a finished run so the detail dialog can show the result. */
-export type BenchState = {
-  running: boolean
-  modelKey?: string
-  step?: string
-  bestTps?: number
-  candidates?: BenchCandidate[]
-  done?: boolean
-  error?: string
-  /** Winning candidate of a finished run — drives the Save/Cancel results dialog. The profile is
-   *  only persisted when the user clicks Save (POST /bench/save). */
-  result?: {
-    params: BenchCandidate['params']
-    tps: number
-    ttftMs: number
-    vramMb: number | null
-    /** The complete sampling the winning profile will be saved with (card values merged in) —
-     *  drives the full-config table in the results dialog. */
-    sampling?: CardSampling
-    /** The subset of `sampling` that came from the model's HF card (ADR-099) — marks those rows
-     *  "from model card". Absent when no card / nothing parsed. */
-    recommendedSampling?: CardSampling
-  }
-}
-
-/** Card-derived recommended sampling (ADR-099). Field names mirror the profile's `Sampling`
- *  block; only the knobs the card stated are present. */
-export type CardSampling = {
-  temp?: number
-  topP?: number
-  topK?: number
-  minP?: number
-}
-
-/** Live per-request progress for the engine card (spec 11), from GET /api/v1/status.
- *  Null unless a completion is actively streaming through the engine. */
-export type LiveGeneration = {
-  phase: 'prompt' | 'gen'
-  /** Prompt-processing percent (0–100) during the prefill phase; 0 in gen phase. */
-  pct: number
-  /** Output tokens produced so far (live, approximate) during the gen phase. */
-  outputTokens: number
+export type {
+  AgentTask, BenchCandidate, BenchState, CardSampling, ComfyRuntime, EngineBuild, EngineError, EngineProvision,
+  EngineRuntime, EngineState, EngineStats, JevLabel, JevStatus, LastLoaded, LayaStatus, LiveGeneration, LoadedModel, LoadFailure,
+  ServingStatus, Status, TextClassificationRuntime, TextClassificationStatus, TunnelStatus,
+  JevInfo, LayaInfo, LitertlmSampler, ModelEntry, ModelsList,
 }
 
 /** Live hardware usage (ADR-383) — the /api/v1/hwstats body. MUST stay structurally
@@ -221,66 +61,6 @@ export type HwUsage = {
   sampledAt: number
 }
 
-export type Status = {
-  version: string
-  engine: EngineRuntime
-  model: LoadedModel | null
-  /** Key of the last model the user loaded, config-tracked by the daemon and sent on
-   *  every status poll. Survives a FAILED load — `model` above is null then — which is
-   *  what makes a one-click retry of the thing that just broke possible at all. */
-  lastLoaded?: string
-  /** Turbo Link (ADR-382): the qualified `<machine>/<model>` id this INSTALL is pointed at,
-   *  or '' for this machine's own engine. Daemon-side so every surface agrees — this browser,
-   *  another device's browser, and `turbollm launch <cli>`, which has no access to any of
-   *  them. Absent from an older daemon, which is read as ''. */
-  selectedRemoteModel?: string
-  engineStats?: EngineStats | null
-  liveGeneration?: LiveGeneration | null
-  bench: BenchState
-  downloads: { active: number }
-  engineProvision?: EngineProvision
-  /** In-app compile-from-source status (ADR-100). */
-  engineBuild?: EngineBuild
-  /** Whether this install can spawn a PTY at all — `node-pty` is an optional native dependency,
-   *  so a healthy install may simply not have it. Gates whether terminal-only Code agents are
-   *  offered at all. Optional here so an older daemon (which never sends it) is treated as
-   *  unknown by the caller rather than as a hard "unavailable". */
-  terminalAvailable?: boolean
-  /** ComfyUI GPU coordination state (null when the feature is off / not wired). */
-  comfyui?: ComfyRuntime | null
-  /** Background agent tasks (reviewer + skill distill) — running + recently finished. */
-  agentTasks?: AgentTask[]
-  /** The loaded Jev model, or null when none is (ADR-434 (i)(1)). Absent from an older
-   *  daemon and over Turbo Link, which is read as "unknown", not as "none". */
-  jev?: JevStatus | null
-  /** The loaded Laya model, or null (ADR-443). It keeps the System One playground open but, unlike a Jev
-   *  model, never takes the Workspace over. Absent from an older daemon and over Turbo Link. */
-  laya?: LayaStatus | null
-  /** The alive text classification model, whichever runtime serves it, or null (ADR-444). The Jev one wins when
-   *  both are alive. Absent from an older daemon and over Turbo Link: read `jev`, `laya` and the catalog then. */
-  textClassification?: TextClassificationStatus | null
-  telemetryLevel: string
-  uptimeSec: number
-  /** Locally-enabled feature flags (TURBOLLM_FEATURES env var) — internal/dev only,
-   *  deliberately undocumented; see turbollm/src/features.ts. */
-  features?: string[]
-}
-
-/** One background agent task surfaced via GET /status `agentTasks`. */
-export type AgentTask = {
-  id: string
-  kind: 'review' | 'skill_from_conversation' | 'skill_from_folder'
-  convId?: string
-  agentId: string
-  label: string
-  status: 'running' | 'done' | 'failed'
-  steps: string[]
-  result?: string
-  error?: string
-  startedAt: number
-  endedAt?: number
-}
-
 /** App self-update check (F-006, GET /api/v1/app/update). Is a newer TurboLLM published
  *  on npm than the running version? `latest` is null + `error:'offline'` when the npm
  *  registry was unreachable (the UI then stays silent — never a false "up to date"). */
@@ -320,24 +100,6 @@ export type AppUpdateProgress = {
   method: AppUpdate['method'] | null
   error: string | null
   at: string
-}
-
-/** Live ComfyUI coordination state (GET /api/v1/status). Drives the "paused while
- *  ComfyUI renders" indicator and the reason a model load was refused. */
-export type ComfyRuntime = {
-  enabled: boolean
-  /** The gate node has been installed (a path is recorded). */
-  installed: boolean
-  /** Holding the GPU for ComfyUI right now (model unloaded, loads blocked). */
-  held: boolean
-  blocked: boolean
-  suspendedModelKey: string | null
-  /** ms since the last acquire/release signal from ComfyUI, or null if none yet. */
-  lastSignalAgoMs: number | null
-  /** Version number found in the installed __init__.py, or null if unreadable. */
-  installedVersion: number | null
-  /** Current gate version shipped with this TurboLLM build. */
-  currentVersion: number
 }
 
 export type FlagInfo = {
@@ -703,132 +465,7 @@ export type ChatCompletionResponse = {
   choices?: { message?: { content?: string } }[]
 }
 
-// ── Models (discovery, spec 04) ──────────────────────────────────────────────
-export type ModelEntry = {
-  key: string
-  name: string
-  path: string
-  dir: string
-  format: 'gguf' | 'mlx' | 'litertlm'
-  sizeBytes: number
-  sizeLabel: string
-  arch: string
-  quant: string
-  nativeCtx: number
-  /** LiteRT-LM only: nativeCtx is a dynamic export's maximum, not a size its caches hold (daemon models/litertlm.ts). */
-  ctxDynamic?: boolean
-  /** LiteRT-LM only: the bundle's own default context (LlmMetadata.max_num_tokens); absent when it declares none. */
-  defaultCtx?: number
-  blockCount: number
-  headCountKv: number
-  /** Attention/KV layout the daemon's scanner reads from the GGUF (twins of src/models/scanner.ts's
-   *  ModelEntry fields — see there for each one). The daemon always sends `headDim`; the rest only
-   *  when the GGUF declares them. Used only by vram.ts's live estimate, which mirrors the daemon's. */
-  headDim?: number
-  slidingWindow?: number
-  slidingWindowPattern?: boolean[]
-  headDimSwa?: number
-  headCountKvPerLayer?: number[]
-  fullAttentionInterval?: number
-  ssmInnerSize?: number
-  ssmStateSize?: number
-  ssmConvKernel?: number
-  moe: boolean
-  expertCount: number
-  /** >0 when the GGUF carries a built-in NextN multi-token-prediction head. */
-  nextnLayers: number
-  vision: boolean
-  /** True for MLX-format models whose config.json declares an audio_config (an audio
-   *  tower/encoder, e.g. gemma4's Conformer audio module). Always false for GGUF. */
-  audio: boolean
-  mmprojPath: string | null
-  /** On-disk size of the mmproj file, bytes (0 when `mmprojPath` is null) — sizes the projector's VRAM. */
-  mmprojSizeBytes?: number
-  hasChatTemplate: boolean
-  /** True when the model's chat template supports a `reasoning_effort` control
-   *  (low/medium/xhigh) — Qwen3.8's reasoning-depth control. Composers gate the
-   *  ReasoningEffortSelect vs ThinkingBudgetSlider choice on this flag. */
-  reasoningEffort: boolean
-  /** LiteRT-LM only: whether the bundle's chat template reads the model's past reasoning. false: the model sees none of
-   *  it, so a thread's "Preserve thinking" cannot apply (the thread settings say so). Absent when the bundle does not
-   *  say. */
-  reasoningHistory?: boolean
-  /** True when the model is an embedding model (BERT-family or embed filename pattern).
-   *  Activates --embeddings at startup so /v1/embeddings is available. */
-  embedding: boolean
-  incomplete: boolean
-  parseError: string | null
-  loaded: boolean
-  hasProfile: boolean
-  benchTps: number | null
-  /** Most-recent gen t/s recorded for this model in chat (spec 04 §5); null if
-   *  never chatted with. */
-  lastTps: number | null
-  /** Live gen t/s for the currently-loaded model; null unless this model is loaded
-   *  and a recent figure exists (best-effort until a full session accumulator lands). */
-  liveTps: number | null
-  /** Whether the currently-active engine can load this model's format (ADR-044).
-   *  Drives the model-list filter (GGUF under llama.cpp; safetensors under MLX/vLLM).
-   *  True when no engine is active. */
-  compatibleWithActiveEngine: boolean
-  /** Source HF repo — confirmed from download provenance, or inferred from the
-   *  on-disk layout (<root>/<owner>/<repo>/<file>) for imported files. Null when it
-   *  can't be determined. Lets the library open the model's HF page (card + quants). */
-  sourceRepo?: string | null
-  /** Set only for a Jev model — an NLI cross-encoder served through vLLM (ADR-434 (g)).
-   *  Absent means "not a Jev model"; the twin is `JevInfo` in src/models/jev.ts. */
-  jev?: JevInfo
-  /** Set only for a Laya model — a System One decision model served by its own 'laya' engine
-   *  (huggingface.co/convaiinnovations/laya). `checkpoints` names the folders it ships,
-   *  e.g. `['english', 'multilingual']`. Absent means "not a Laya model". */
-  laya?: { checkpoints: string[] }
-  /** Why the active engine cannot load this model, in the user's words ('Needs vLLM
-   *  (Linux or WSL2)'), or null when it can. The daemon owns the wording so every
-   *  surface says the same thing. */
-  incompatibleReason?: string | null
-  /** Hidden by the user (Models → Library, the model's "Hide"; the daemon keeps it per model key). The web UI leaves
-   *  it out of the Library list until "Show hidden models" is on, and out of every model picker but the draft-model
-   *  select in Load settings (a small draft is what one hides from the chat pickers), unless it is loaded
-   *  (lib/model-kind.ts hiddenByUser). Absent from an older daemon (read as shown). */
-  hidden?: boolean
-  mtime: string
-}
-
-export type ModelsList = {
-  models: ModelEntry[]
-  scanning: boolean
-  lastScanAt: string
-}
-
 // ── Jev — NLI cross-encoders (ADR-434) ───────────────────────────────────────
-/** The three NLI classes. Twin of src/models/jev.ts; a model declares them itself
- *  (config.json `id2label`), so probabilities are always read through the model's
- *  own label order rather than a hardcoded one. */
-export type JevLabel = 'contradiction' | 'entailment' | 'neutral'
-
-/** What makes a scanned model a Jev model (ADR-434 (g)). */
-export type JevInfo = {
-  /** Canonical label per class id, in `id2label` index order. */
-  labels: JevLabel[]
-  /** The model's own premise/hypothesis template, or null when it has none usable. */
-  nliTemplate: string | null
-  /** `architectures[0]` as declared, e.g. 'Qwen3_5ForSequenceClassification'. */
-  architecture: string
-  /** True when the architecture has a verified launch row; false → "Not verified". */
-  verified: boolean
-}
-
-/** The alive Jev model on GET /api/v1/status — local only, never part of the Turbo
- *  Link façade's status. Null when none is loaded, which is what puts Workspace back
- *  to Chat/Code/Routines (ADR-434 (i)(1)). */
-export type JevStatus = {
-  key: string
-  name: string
-  labels: JevLabel[]
-  state: 'starting' | 'running' | 'stopping'
-  slot: 'primary' | 'pool'
-}
-
 /** The loaded Jev model as a screen knows it. The daemon always names the slot, but a client
  *  that cannot read /status has to read the model off the catalog instead (ADR-422), and
  *  the catalog cannot tell which slot the engine took: `null` says so rather than guessing
@@ -836,31 +473,6 @@ export type JevStatus = {
 export type LoadedJev = Omit<JevStatus, 'slot'> & {
   slot: JevStatus['slot'] | null
   /** Set for a Laya model (ADR-443): the checkpoints it answers with. A Laya model has no labels of its own. */
-  checkpoints?: string[]
-}
-
-/** The alive Laya model, from /api/v1/status (ADR-443). Always in its own pool slot. */
-export type LayaStatus = {
-  key: string
-  name: string
-  checkpoints: string[]
-  state: 'starting' | 'running' | 'stopping'
-}
-
-/** The engine a text classification model runs on (ADR-444): vLLM for a Jev model, the Laya engine for a Laya
- *  one. Twin of `TextClassifierRuntime` in src/models/text-classifier.ts. */
-export type TextClassificationRuntime = 'vllm' | 'laya'
-
-/** Jev and Laya as one feature on /api/v1/status (ADR-444); twin of src/api/text-classification-status.ts.
- *  `runtime: 'vllm'` is a Jev model, which takes the Workspace over; `'laya'` never does. `labels` comes with a
- *  Jev model, `checkpoints` with a Laya one. */
-export type TextClassificationStatus = {
-  key: string
-  name: string
-  runtime: TextClassificationRuntime
-  state: 'starting' | 'running' | 'stopping'
-  slot: 'primary' | 'pool'
-  labels?: JevLabel[]
   checkpoints?: string[]
 }
 

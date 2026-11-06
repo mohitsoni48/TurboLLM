@@ -7,7 +7,9 @@ import assert from 'node:assert/strict'
 import { test, type TestContext } from 'node:test'
 import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
-import { inFlightChatIds, registerChatRoutes } from './chat-routes.js'
+import { registerChatRoutes } from './chat-routes.js'
+import { ChatRuns } from './chat-runs.js'
+import { ChatTurns } from './chat-turns.js'
 import { ConversationStore } from './db.js'
 import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
@@ -53,6 +55,7 @@ function routes(t: TestContext, waitMinutes: number | undefined) {
     tools: { toolPolicies: { run_code: 'ask' }, autoAllowAll: false, chatApprovalWaitMinutes: waitMinutes },
   }
   const d = {
+    chatTurns: new ChatTurns(), chatRuns: new ChatRuns(),
     db: store,
     store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
@@ -75,7 +78,7 @@ function routes(t: TestContext, waitMinutes: number | undefined) {
   const app = new Hono()
   registerChatRoutes(app, d)
   t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }) })
-  return { app, store, cfg }
+  return { app, store, cfg, d }
 }
 
 const json = (body: unknown) => ({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
@@ -138,7 +141,7 @@ test('a call nobody answers within the wait is not run, is saved with its own re
   t.mock.timers.tick(3 * MINUTE - 1)
   await settle()
   assert.ok(!page.frames.some(answered), 'still waiting a moment before the wait runs out')
-  assert.deepEqual(inFlightChatIds(), [conv.id])
+  assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [conv.id])
   t.mock.timers.tick(1)
   const text = 'No answer within 3 minutes; the call was not run.'
   const frame = await page.until(answered, 'the call answered')
@@ -151,7 +154,7 @@ test('a call nobody answers within the wait is not run, is saved with its own re
   assert.equal(r.toolCalls[0].result, text)
   assert.equal(r.content, 'I could not run it, so here is my best guess: 42.')
   assert.equal(r.stats.aborted, false)
-  assert.deepEqual(inFlightChatIds(), [])
+  assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
   const late = await h.app.request(`/api/v1/conversations/${conv.id}/tool-calls/call_1/approve`, json({ toolName: 'run_code', decision: 'allow' }))
   assert.equal(late.status, 404, 'an answer after the wait finds nothing to answer')
 })
@@ -243,7 +246,7 @@ test('a reply whose calls nobody answers waits once: its later calls are answere
   assert.deepEqual(executed, [], 'none of them ran')
   assert.equal(engine.sent.length, 4, 'the reply went on to its answer')
   assert.deepEqual(reply(h.store, conv.id).toolCalls.map((c) => c.result), [text, text, text])
-  assert.deepEqual(inFlightChatIds(), [])
+  assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
 })
 
 test('an answered call leaves the rest of the reply\'s wait for its next call', async (t) => {

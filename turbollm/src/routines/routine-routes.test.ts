@@ -11,6 +11,7 @@ import type { Deps } from '../deps'
 import type { Manager } from '../engines/manager'
 import type { ModelRouter } from '../gateway/model-router'
 import type { GenerationGate } from '../agents/gate'
+import { chatRegistries } from '../test-support/chat-registries'
 
 const JEV_KEY = 'jev-fake-v2'
 const LAYA_KEY = 'laya|laya|1455'
@@ -44,6 +45,7 @@ function testApp(opts: { lanBind?: boolean; hasKey?: boolean; routinesEnabled?: 
   // experimental gate itself, keeps working unchanged — the gate's own off-by-default behavior is
   // covered by a dedicated test that passes `routinesEnabled: false` explicitly.
   const d = {
+    ...chatRegistries(),
     db,
     store: {
       snapshot: () => ({
@@ -630,6 +632,7 @@ test('approve does NOT release the parked guard on a retryable resume failure (g
     },
   } as unknown as GenerationGate
   const d = {
+    ...chatRegistries(),
     db, manager, modelRouter, gate,
     registry: { active: () => ({ kind: 'llama-server' }) },
     store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), read: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
@@ -682,6 +685,7 @@ test('a parked run an Approve is resuming is listed as running until the resume 
   let holdGate: Promise<void> = Promise.resolve()
   const gate = { acquire: async () => { await holdGate; return () => {} } } as unknown as GenerationGate
   const d = {
+    ...chatRegistries(),
     db, manager, modelRouter, gate,
     registry: { active: () => ({ kind: 'llama-server' }) },
     store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), read: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
@@ -729,6 +733,7 @@ test('POST /api/v1/routines/:id/run-now on a code routine from a non-host device
   const app = new Hono()
   const apiKeys: unknown[] = []
   const d = {
+    ...chatRegistries(),
     db,
     store: {
       snapshot: () => ({ daemon: { lanBind: true, requireApiKey: false, experimental: { routines: true } }, apiKeys }), read: () => ({ daemon: { lanBind: true, requireApiKey: false, experimental: { routines: true } }, apiKeys }),
@@ -908,6 +913,7 @@ test('POST .../runs/:runId/approve returns a shaped 500 (not a raw crash) if res
   } as unknown as Manager
   const modelRouter = { loadExplicit: async () => ({ target: 'http://x' }) } as unknown as ModelRouter
   const d = {
+    ...chatRegistries(),
     db, manager: workingManager, modelRouter,
     registry: { active: () => ({ kind: 'llama-server' }) },
     store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), read: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
@@ -962,6 +968,7 @@ test('two concurrent approve calls on the same stalled run: only one executes, a
   const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
   const gate = { acquire: async () => () => {} } as unknown as GenerationGate
   const d = {
+    ...chatRegistries(),
     db, manager, modelRouter, gate,
     registry: { active: () => ({ kind: 'llama-server' }) },
     store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), read: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },

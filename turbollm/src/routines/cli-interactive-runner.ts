@@ -56,7 +56,7 @@ import { isTerminalCodingAgent, TERMINAL_CODE_AGENT } from './schema'
 import type { ModelRouter, RouteResult } from '../gateway/model-router'
 import { refusedAsBusy } from './model-swap'
 import { decideModelAction } from './model-conflict'
-import { firstMessageSeedProblem, type CreateAgentTerminalResult } from '../terminal/terminal-routes'
+import { firstMessageSeedProblem, type CreateAgentTerminalResult } from '../terminal/terminal-service'
 import type { TerminalManager } from '../terminal/terminal-manager'
 
 /** Generous relative to CLI_ROUTINE_TIMEOUT_MS/ROUTINE_RUN_TIMEOUT_MS's 10 minutes: those bound a

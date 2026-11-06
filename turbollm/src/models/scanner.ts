@@ -10,6 +10,7 @@ import { CoalescedRunner } from '../util/coalesced-runner'
 import { detectJev, type JevInfo } from './jev'
 import { isLayaModelDir, layaEntryFor, type LayaInfo } from './laya'
 import { hasLitertlmMagic, isLitertlmFileName, litertlmEntryFor, litertlmHeaderFromFile, type LitertlmSampler } from './litertlm'
+import { emitInvalidation } from '../events/bus'
 
 export interface ModelEntry {
   key: string
@@ -417,6 +418,7 @@ export class Scanner {
       const pairs = this.pendingKeyMigrations
       this.store.update((cfg) => { for (const [oldKey, newKey] of pairs) migrateModelKey(cfg, oldKey, newKey) })
     }
+    emitInvalidation('models')
   }
 
   /** Drop cache rows of files this scan did not see. A row under a root that was not walked (missing or

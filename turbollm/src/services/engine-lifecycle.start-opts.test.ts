@@ -19,6 +19,7 @@ import { mlxSamplingArgs } from '../engines/mlx'
 import { type LoadProfile, profileToArgs, resolveProfile, vllmProfileToArgs } from '../models/profile'
 import type { ModelEntry } from '../models/scanner'
 import { getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
+import { chatRegistries } from '../test-support/chat-registries'
 
 const GGUF_KEYS = ['engine', 'extraArgs', 'model', 'modelPath', 'preferredPort', 'profile', 'trigger']
 const NON_GGUF_KEYS = ['engine', 'extraArgs', 'model', 'modelPath', 'preferredPort', 'profile', 'tensorParallelSize', 'trigger']
@@ -231,6 +232,7 @@ function mkDeps(s: LoadScenario) {
     recordManualLoad: () => {},
   }
   const d = {
+    ...chatRegistries(),
     store, scanner, manager, registry, modelRouter,
     bench: { isRunning: () => false, cancel: () => {}, waitIdle: () => Promise.resolve() },
     comfy: undefined,

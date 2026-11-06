@@ -5,8 +5,7 @@ import { basename, join, resolve } from 'node:path'
 import { gateNodeSource } from '../comfyui/gate-template'
 import type { Deps } from '../deps'
 import { isLocalOrAuthenticated } from '../auth'
-import { restartEngine, startEngine, stopEngine, type EngineStartBody, type EngineStopBody } from './engine-lifecycle'
-import { saveRunningReplies } from '../chat/chat-routes'
+import { restartEngine, startEngine, stopEngine, type EngineStartBody, type EngineStopBody } from '../services/engine-lifecycle'
 import { err, body } from './http'
 
 /** Engine start/stop/restart, the ComfyUI GPU gate, and the daemon restart and flush. */
@@ -134,7 +133,7 @@ export function registerLifecycleRoutes(app: Hono, d: Deps): void {
   app.post('/api/v1/daemon/flush', (c) => {
     // A running reply's text first: it reaches its row only every 10 s while it streams (runGeneration's partial
     // saves), and the Android app ends the process right after this answers.
-    saveRunningReplies()
+    d.chatTurns.saveRunningReplies()
     const onDisk = d.db.flush()
     if (onDisk === null) return c.json({ ok: true, flushed: false })
     if (!onDisk) return err(c, 500, 'flush_failed', 'The chat database could not be written to disk.')

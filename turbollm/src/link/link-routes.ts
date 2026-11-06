@@ -9,8 +9,8 @@ import { ValueError } from '../config/config'
 import { linkAuth, requireCapability } from './link-auth'
 import { gatewayBodyLimit, gatewayV1Handler } from '../gateway/gateway'
 import { isJsonObject, NOT_A_JSON_OBJECT } from '../gateway/jev-serving'
-import { buildModelStatus } from '../api/status-view'
-import { startEngine, stopEngine } from '../api/engine-lifecycle'
+import { buildModelStatus } from '../services/status-view'
+import { startEngine, stopEngine } from '../services/engine-lifecycle'
 import type { Incompatibility } from '../engines/compat'
 import { unlistedForLoading } from '../engines/registry'
 import type { ModelEntry } from '../models/scanner'
@@ -19,7 +19,7 @@ import {
   listDownloads,
   removeDownload,
   type DownloadFailure,
-} from '../api/download-lifecycle'
+} from '../services/download-lifecycle'
 // The single-file model formats a repo-file download may produce — the SAME set the
 // download manager's own enqueue guards enforce, imported rather than restated so the
 // façade can never accept (or reject) a format the local route treats differently.

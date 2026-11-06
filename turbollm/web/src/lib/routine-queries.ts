@@ -7,6 +7,7 @@ import {
 } from './routine-api'
 import type { Routine, RoutineInput, RoutineRun } from './routine-types'
 import { FIRST_PAGE, flattenPages, nextCursorOf } from './paging'
+import { pollWhileLive } from './live-events'
 
 export const routineKeys = {
   list: ['routines'] as const,
@@ -23,7 +24,7 @@ export const routineKeys = {
  *  Shell.tsx's nav badge and the notification poller both mount unconditionally at the app-shell
  *  level and need to stop fetching, not just stop rendering, when the flag is off. */
 export function useRoutines(enabled = true) {
-  return useQuery({ queryKey: routineKeys.list, queryFn: listRoutines, enabled, refetchInterval: 15000, refetchIntervalInBackground: false })
+  return useQuery({ queryKey: routineKeys.list, queryFn: listRoutines, enabled, refetchInterval: () => pollWhileLive(15000), refetchIntervalInBackground: false })
 }
 
 /** Polls on the same 15s cadence as {@link useRoutines}.
@@ -44,7 +45,7 @@ export function useRoutine(id: string | undefined) {
     queryKey: routineKeys.detail(id ?? ''),
     queryFn: () => getRoutine(id!),
     enabled: !!id,
-    refetchInterval: 15000,
+    refetchInterval: () => pollWhileLive(15000),
     refetchIntervalInBackground: false,
   })
 }
@@ -60,7 +61,7 @@ export function useRoutineRuns(routineId: string | undefined) {
     getNextPageParam: nextCursorOf,
     select: (data): RoutineRun[] => flattenPages<RoutineRun>({ ...data, pages: data.pages.map((p) => ({ items: p.runs })) }),
     enabled: !!routineId,
-    refetchInterval: 10000,
+    refetchInterval: () => pollWhileLive(10000),
     refetchIntervalInBackground: false,
   })
 }
@@ -85,7 +86,7 @@ export function useRoutinesWithLatestRun(enabled = true) {
       queryKey: routineKeys.runs(r.id),
       queryFn: () => listRoutineRuns(r.id, 1),
       enabled: enabled && routinesQ.isSuccess,
-      refetchInterval: 15000,
+      refetchInterval: () => pollWhileLive(15000),
       refetchIntervalInBackground: false,
     })),
   })

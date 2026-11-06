@@ -804,6 +804,9 @@ export function requiredCapability(method: string, path: string): LinkCapability
   if (path.startsWith('/api/v1/downloads')) return read ? 'downloads:read' : 'downloads:write'
   if (path.startsWith('/api/v1/settings')) return read ? 'config:read' : 'config:write'
   if (path === '/api/v1/status') return 'config:read'
+  // The invalidation stream (events-routes.ts) carries keys only, but which conversations and models change
+  // when is activity on the host: held to what /status is. Read-only surface.
+  if (path === '/api/v1/events') return read ? 'config:read' : null
   // ADR-434 (i)(3): the work a model load would interrupt (chat titles, Code sessions, routine
   // names). Only a caller that may load models needs the confirmation this feeds, and routine
   // names are not a `models:use` read. Read-only surface: a write maps to nothing.

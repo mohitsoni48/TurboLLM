@@ -7,7 +7,7 @@ import { isLocalOrAuthenticated } from '../auth'
 import { HfError, type HfSearchItem, type HfSortOption } from '../hf/hf'
 import { TEXT_CLASSIFICATION_CATEGORY } from '../hf/text-classification-search'
 import type { EnqueueInput } from '../downloads/downloads'
-import { enqueueDownload, listDownloads, removeDownload, toDownloadFailure } from './download-lifecycle'
+import { enqueueDownload, listDownloads, removeDownload, toDownloadFailure } from '../services/download-lifecycle'
 import { annotateCheckpoint } from '../hf/checkpoints'
 import { err, body, regErr, type Status } from './http'
 

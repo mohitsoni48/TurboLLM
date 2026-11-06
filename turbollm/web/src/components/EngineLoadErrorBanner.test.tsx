@@ -1,9 +1,12 @@
 import { render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { EngineLoadErrorBanner } from './EngineLoadErrorBanner'
 import type { EngineError, Status } from '../lib/types'
+import { loadModel } from '../lib/api'
+
+vi.mock('../lib/api', async (orig) => ({ ...(await orig<typeof import('../lib/api')>()), loadModel: vi.fn().mockResolvedValue({ ok: true }) }))
 
 function statusWith(state: Status['engine']['state'], error?: EngineError): Status {
   return {
@@ -122,5 +125,12 @@ describe('EngineLoadErrorBanner', () => {
       expect(buttons).toContain('Choose a different model')
       expect(screen.getByText("The selected engine isn't expected to load this model.")).toBeTruthy()
     })
+  })
+
+  it('retries with the model key of the daemon lastLoaded record, not the record itself', async () => {
+    const status = { ...statusWith('error', { ...readinessTimeout, failReason: 'timeout' }), lastLoaded: { modelKey: 'qwen3-8b', engineId: 'e1' } }
+    renderBanner(status)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Retry' }))
+    expect(loadModel).toHaveBeenCalledWith('qwen3-8b')
   })
 })

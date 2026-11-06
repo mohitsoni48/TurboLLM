@@ -30,6 +30,7 @@ import { DOWNLOAD_CONCURRENCY } from '../config/config-bounds'
 import { ggufCutShort } from '../gguf/gguf'
 import type { HfModelFiles } from '../hf/hf'
 import { httpGet, type DownloadGet } from './http-get'
+import { emitInvalidation } from '../events/bus'
 
 export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'done' | 'error' | 'cancelled'
 
@@ -1213,8 +1214,10 @@ export class DownloadManager {
   }
 
   /** Write the in-flight/queued manifest so jobs survive a daemon restart. Done
-   *  rows are dropped from the manifest (the file is on disk and scanned). */
+   *  rows are dropped from the manifest (the file is on disk and scanned). Every record state change
+   *  persists, so this is also where the downloads list is announced as changed (review 4.14). */
   private persist(): void {
+    emitInvalidation('downloads')
     const entries: ManifestEntry[] = []
     for (const r of this.records.values()) {
       if (r.status === 'done' || r.status === 'cancelled') continue

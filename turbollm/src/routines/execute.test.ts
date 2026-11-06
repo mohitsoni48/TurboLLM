@@ -17,7 +17,7 @@ import type { RoutineRunStatus } from './schema'
 import { tmpDir } from '../test-support/tmp'
 import { realEngineSetUp } from '../test-support/stand-in-engine'
 import { TerminalManager } from '../terminal/terminal-manager'
-import { isTerminalBackendAvailable, getTerminalManager } from '../terminal/terminal-routes'
+import { isTerminalBackendAvailable, getTerminalManager } from '../terminal/terminal-service'
 import { PTYSession } from '../terminal/pty-session'
 
 const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
