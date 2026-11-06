@@ -33,7 +33,7 @@ import type { ModelInfo } from '../engines/manager'
 import { litertLmPrefillStats } from '../engines/litert-lm'
 import { engineErrorReason, engineErrorText, streamChunkError } from '../engines/engine-error'
 import { LITERT_LM_RESEARCH_NOTE, litertLmIgnoredFieldsNote, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request'
-import { engineWithholdsTools, engineWithholdsVision, VISION_UNAVAILABLE } from '../engines/compat'
+import { engineTakesReasoningAsField, engineWithholdsTools, engineWithholdsVision, VISION_UNAVAILABLE } from '../engines/compat'
 import { getModelProfile } from '../config/config'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { noteLocalActivity } from '../link/host-idle'
@@ -1402,10 +1402,10 @@ export function resilientSink(sink: EmitSink): EmitSink & { clientGone: () => bo
 export class EngineStreamError extends Error {}
 
 /** Whether this turn's past reasoning goes to the engine as each message's `reasoning_content` rather than folded into
- *  its text (buildEngineMessages): this machine's LiteRT-LM engine, whose bundle templates decide what of it the model
+ *  its text (buildEngineMessages): this machine's LiteRT-LM engine or in-app SDK engine, whose bundle templates decide what of it the model
  *  sees. A linked host's engine is not this machine's to judge: it keeps the fold. */
 function reasoningAsField(d: Deps, upstream: ChatUpstream): boolean {
-  return !upstream.remote && servingEngineKind(d) === 'litert-lm'
+  return !upstream.remote && engineTakesReasoningAsField(servingEngineKind(d))
 }
 
 /** Whether this turn's images must not reach the engine: this machine's engine reads none (the in-app SDK engine,

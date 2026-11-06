@@ -211,6 +211,14 @@ export function engineWithholdsTools(engineKind: string): boolean {
   return engineKind === TURBOLLM_SDK
 }
 
+/** True when `engineKind` takes a past turn's reasoning as the message's `reasoning_content` and not folded into its
+ *  text as <think>: the SDK serves LiteRT-LM bundles whose templates put the text in verbatim, so the fold derailed
+ *  Qwen3-0.6B's second turn (QA re-run R3). The SDK reads no such field and leaves the reasoning out, as a LiteRT-LM
+ *  conversation's own history does. */
+export function engineTakesReasoningAsField(engineKind: string): boolean {
+  return engineKind === 'litert-lm' || engineKind === TURBOLLM_SDK
+}
+
 /** True when `engineKind` cannot read image parts, so an image must be refused or replaced before it is sent. The
  *  SDK has no vision in this version. */
 export function engineWithholdsVision(engineKind: string): boolean {

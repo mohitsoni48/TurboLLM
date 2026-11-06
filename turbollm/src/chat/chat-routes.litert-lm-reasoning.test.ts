@@ -91,3 +91,13 @@ test('llama.cpp keeps the fold its templates parse (<think> in the answer\'s tex
     role: 'assistant', content: '<think>\nFrance is in western Europe; its capital is Paris.\n</think>\n\nParis.',
   })
 })
+
+// QA re-run R3: on the in-app SDK engine a .litertlm model's second turn came back with empty content, because the fold
+// put <think>…</think> into the assistant turn's text, which the Qwen3-0.6B template passes to the model verbatim.
+test('the in-app SDK engine gets past reasoning as reasoning_content too, never <think> text in the answer (R3)', async (t) => {
+  const history = await secondTurn(t, 'turbollm-sdk')
+  assert.deepEqual(history.find((m) => m.role === 'assistant'), {
+    role: 'assistant', content: 'Paris.', reasoning_content: 'France is in western Europe; its capital is Paris.',
+  })
+  assert.ok(!history.some((m) => String(m.content).includes('<think>')))
+})
