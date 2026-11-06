@@ -6,7 +6,7 @@
 //
 //  - PERSISTENCE (GenerationPersistence): where the reply lands. The core never touches `d.db`: the chat route's
 //    adapter writes the turn's placeholder row in the local ConversationStore; a caller with another store (the
-//    public API's chatStore) supplies its own port. ext/generation.ts's header, point 2, is the bug that prevents.
+//    public API's chatStore) supplies its own port. ext/generation.ts's header (PERSISTENCE) is the bug that prevents.
 //  - SINK (EmitSink, emit-sink.ts): where the events go, wrapped in resilientSink so a failing sink never costs output.
 //  - APPROVAL POLICY (ApprovalPolicy): what an 'ask'-policy tool does — wait for a human (interactive: a live chat
 //    turn) or be answered at once (a caller with nobody to ask, whose agentAllowedTools stand in for the approval) —
@@ -50,6 +50,9 @@ export interface ReplySnapshot {
   toolCalls: ToolCallRecord[]
 }
 
+/** What changed in the reply, for a progress save at every change (GenerationPersistence.progressCadence). */
+export type ReplyChange = 'text' | 'toolCall'
+
 /** The reply as the turn ends: the one terminal write. */
 export interface FinalReply extends ReplySnapshot {
   stats: Partial<MessageStats>
@@ -58,9 +61,14 @@ export interface FinalReply extends ReplySnapshot {
 
 /** Where the turn's reply lands. The core calls nothing else to persist, and never `d.db`. */
 export interface GenerationPersistence {
-  /** Saves the reply so far, every PARTIAL_SAVE_MS while it changes (and whenever trackProgressSave's caller asks).
-   *  Best-effort: a throw or rejection is swallowed, as the terminal write writes it all. */
-  saveProgress(reply: ReplySnapshot): void | Promise<void>
+  /** Saves the reply so far, every PARTIAL_SAVE_MS while it changes (and whenever trackProgressSave's caller asks), or
+   *  at every change with `progressCadence` 'everyChange', told then what changed. Best-effort: a throw or rejection is
+   *  swallowed, as the terminal write writes it all. */
+  saveProgress(reply: ReplySnapshot, change?: ReplyChange): void | Promise<void>
+  /** 'everyChange': saveProgress is called at each change to the reply as it happens (each streamed text or reasoning
+   *  piece, each settled tool call), for a caller that keeps its own cadence (the public API checkpoints every ~500 ms
+   *  or ~256 characters, and at once on a tool call); the PARTIAL_SAVE_MS timer does not run. Unset: the timer. */
+  progressCadence?: 'everyChange'
   /** Hands the turn's progress save to whoever must be able to run it before the process goes (a daemon stop's
    *  flush, ChatTurns.addReplySave); returns its removal, called once as the turn ends. Optional. */
   trackProgressSave?(save: () => void): () => void
@@ -119,6 +127,19 @@ export interface LoopOptions {
   toolsOnEveryEngine?: true
   /** false: a stop does not keep a round's remaining calls from running; the turn still ends before its next request. */
   stopBetweenToolCalls?: false
+  /** false: the streamed request does not ask for prompt progress (`return_progress`), as the public API's never has. */
+  returnProgress?: false
+  /** false: a tool call the model is still streaming is not announced as pending; the caller gets only the call's own
+   *  events as it runs (the public API's event stream). */
+  announceToolCalls?: false
+  /** 'ignore': an error chunk inside a 200 stream is read past rather than failing the turn (the public API's run,
+   *  which never read them). */
+  streamErrors?: 'ignore'
+  /** 'asStreamed': the reply is exactly what the sink was sent. A round its stop ends with a quiet end of the read
+   *  streams what the parser still held back before the turn ends; a round a throw cuts short (a stop's AbortError,
+   *  an engine that died) keeps none of it. Unset: what was held back is kept in the reply unsent (GitHub #177), which
+   *  the live chat's refetch reads. */
+  interruptedTail?: 'asStreamed'
 }
 
 /** One turn to generate. */
@@ -134,6 +155,11 @@ export interface GenerationTurn {
   thinkingBudget: number
   reasoningEffort: ReasoningEffort | undefined
   loop?: LoopOptions
+  /** The caller's sampling already in the engine's names, and its stop strings: the public API's (ext/generation.ts
+   *  mapSampling, which drops every key that steers the request). Sent UNDER the request's own fields, so no key of
+   *  it can replace the model, the messages or the stream fields. Unset: conv.sampling, mapped here and sent over
+   *  them, as the live chat always has. */
+  engineSampling?: { fields: Record<string, unknown>; stop: string[] | undefined }
 }
 
 /** A tool call of the round, before it runs. */
@@ -170,14 +196,17 @@ export interface GenerationPorts<S = never> {
    *  Set, a round's calls reach it even with no tool registry (Deps.tools, absent in tests only), as a routine's stall
    *  does not depend on one; a call it lets run is then answered "Error: no tool registry available.". */
   beforeToolCall?(call: PendingToolCall, round: ToolRound): ToolCallVerdict<S>
+  /** Told of every `usage` object the engine sends, as it sends it (the public API reports the last one raw). */
+  onUsage?(usage: unknown): void
 }
 
 /** Why a turn the engine did not finish failed: the engine refused it (`http`, with its reason when it gave one) or
- *  reported an error (`engine`), or the request or its reading threw (`thrown`). */
+ *  reported an error (`engine`), or the request or its reading threw (`thrown`; `request` when the request itself
+ *  threw, so the engine never answered). */
 export type GenerationFailure =
   | { kind: 'http'; status: number; reason: string | undefined }
   | { kind: 'engine'; message: string }
-  | { kind: 'thrown'; message: string }
+  | { kind: 'thrown'; message: string; request?: true }
 
 /** How the turn ended, for what its caller does next (a chat turn's title and memory). */
 export interface GenerationOutcome<S = never> {
@@ -216,36 +245,48 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
   // third machine's legitimate wake.
   const localAccounting = ledgers && !upstream.remote
 
-  // Map conversation sampling overrides (camelCase) to the engine's snake_case names.
-  const convS = conv.sampling ?? {}
   // The engine serving THIS upstream: a routine's pool slot names its own, which is not the primary's. A remote
   // upstream names none and reads the primary's, as it always has (the host shapes for its own engine).
   const engineKind = upstream.engineKind ?? servingEngineKind(d)
-  // BUG-006: vLLM and SGLang reject `repeat_penalty` (the llama.cpp name) and require
-  // `repetition_penalty` — the OpenAI-spec name. mlx-vlm's request schema (server/schemas.py)
-  // only declares `repetition_penalty` too — `repeat_penalty` isn't rejected (the schema
-  // allows extra fields) but is silently ignored, a no-op. Map per engine kind. LiteRT-LM keeps
-  // `repeat_penalty`: the Repeat penalty is llama.cpp's, and the Android app's server applies that
-  // name as llama.cpp does, over the last 64 tokens (`repetition_penalty` over the whole reply);
-  // `serve` reads neither, which litertLmIgnoredFieldsNote says.
-  const repeatPenaltyKey =
-    (engineKind === 'vllm' || engineKind === 'sglang' || engineKind === 'mlx-vlm') ? 'repetition_penalty' : 'repeat_penalty'
-  const SAMPLING_KEYS: Record<string, string> = {
-    temp: 'temperature', topP: 'top_p', topK: 'top_k', minP: 'min_p',
-    repeatPenalty: repeatPenaltyKey, presencePenalty: 'presence_penalty',
-    frequencyPenalty: 'frequency_penalty',
+  // The caller's own mapped sampling (GenerationTurn.engineSampling), or the conversation's, mapped here.
+  let samplingOverride: Record<string, unknown> = {}
+  let stopStrings: string[] | undefined
+  if (turn.engineSampling) {
+    samplingOverride = turn.engineSampling.fields
+    stopStrings = turn.engineSampling.stop
+  } else {
+    // Map conversation sampling overrides (camelCase) to the engine's snake_case names.
+    const convS = conv.sampling ?? {}
+    // BUG-006: vLLM and SGLang reject `repeat_penalty` (the llama.cpp name) and require
+    // `repetition_penalty` — the OpenAI-spec name. mlx-vlm's request schema (server/schemas.py)
+    // only declares `repetition_penalty` too — `repeat_penalty` isn't rejected (the schema
+    // allows extra fields) but is silently ignored, a no-op. Map per engine kind. LiteRT-LM keeps
+    // `repeat_penalty`: the Repeat penalty is llama.cpp's, and the Android app's server applies that
+    // name as llama.cpp does, over the last 64 tokens (`repetition_penalty` over the whole reply);
+    // `serve` reads neither, which litertLmIgnoredFieldsNote says.
+    const repeatPenaltyKey =
+      (engineKind === 'vllm' || engineKind === 'sglang' || engineKind === 'mlx-vlm') ? 'repetition_penalty' : 'repeat_penalty'
+    const SAMPLING_KEYS: Record<string, string> = {
+      temp: 'temperature', topP: 'top_p', topK: 'top_k', minP: 'min_p',
+      repeatPenalty: repeatPenaltyKey, presencePenalty: 'presence_penalty',
+      frequencyPenalty: 'frequency_penalty',
+    }
+    for (const [camel, snake] of Object.entries(SAMPLING_KEYS)) {
+      if (camel in convS) samplingOverride[snake] = convS[camel]
+    }
+    for (const [k, v] of Object.entries(convS)) {
+      if (!(k in SAMPLING_KEYS) && k !== 'stop') samplingOverride[k] = v
+    }
+    stopStrings = convS.stop as string[] | undefined
   }
-  const samplingOverride: Record<string, unknown> = {}
-  for (const [camel, snake] of Object.entries(SAMPLING_KEYS)) {
-    if (camel in convS) samplingOverride[snake] = convS[camel]
-  }
-  for (const [k, v] of Object.entries(convS)) {
-    if (!(k in SAMPLING_KEYS) && k !== 'stop') samplingOverride[k] = v
-  }
-  const stopStrings = convS.stop as string[] | undefined
 
   const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
-  const shaping: RequestShaping = { upstream, samplingOverride, stopStrings, maxLimit, thinkingBudget, reasoningEffort, preserveThinking: conv.preserveThinking, jsonTransport }
+  const shaping: RequestShaping = {
+    upstream, samplingOverride, stopStrings, maxLimit, thinkingBudget, reasoningEffort, preserveThinking: conv.preserveThinking, jsonTransport,
+    samplingUnder: turn.engineSampling !== undefined, returnProgress: loop.returnProgress !== false,
+  }
+  /** LoopOptions.interruptedTail 'asStreamed': the reply is what the sink was sent. */
+  const replyAsStreamed = loop.interruptedTail === 'asStreamed'
 
   // ── Agentic tool loop ──────────────────────────────────────────────────────
   // engineMessages is extended each round with tool results. Start from ctx copy
@@ -324,6 +365,8 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
   /** beforeToolCall's stop, once it ended the turn. */
   let stop: { value: S } | undefined
   let failure: GenerationFailure | undefined
+  /** An engine request is in flight, not yet answered: a throw now is the request's own (GenerationFailure.request). */
+  let requesting = false
   let exceeded = false
   /** The reply's wait for its tool-call approvals, shared by all its calls (ApprovalWaitBudget). */
   const approvalWait = newApprovalWaitBudget()
@@ -402,17 +445,23 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
   // or Android process killed mid-reply lost everything it had streamed, and the restart reconcile then marked an
   // empty reply stopped. The stats stay the placeholder's `{"aborted":false}` until the end-of-turn save below,
   // which is what tells that reconcile (db.ts abortUnfinishedReplies) the reply never finished.
+  const saveProgress = (change?: ReplyChange) => {
+    try {
+      const saved = persistence.saveProgress({ content: fullContent, reasoning: fullReasoning, toolCalls: allToolCalls }, change)
+      if (saved instanceof Promise) saved.catch(() => {})
+    } catch { /* best-effort: the end-of-turn save writes it all */ }
+  }
   let partial = { content: '', reasoning: '', toolCalls: 0 }
   const savePartial = () => {
     if (fullContent === partial.content && fullReasoning === partial.reasoning && allToolCalls.length === partial.toolCalls) return
     partial = { content: fullContent, reasoning: fullReasoning, toolCalls: allToolCalls.length }
-    try {
-      const saved = persistence.saveProgress({ content: fullContent, reasoning: fullReasoning, toolCalls: allToolCalls })
-      if (saved instanceof Promise) saved.catch(() => {})
-    } catch { /* best-effort: the end-of-turn save writes it all */ }
+    saveProgress()
   }
-  const partialSaves = setInterval(savePartial, PARTIAL_SAVE_MS)
-  partialSaves.unref?.()
+  // A caller with its own cadence (GenerationPersistence.progressCadence) is told of each change instead.
+  const everyChange = persistence.progressCadence === 'everyChange'
+  const replyChanged = (change: ReplyChange) => { if (everyChange) saveProgress(change) }
+  const partialSaves = everyChange ? undefined : setInterval(savePartial, PARTIAL_SAVE_MS)
+  partialSaves?.unref?.()
   const untrackPartialSave = persistence.trackProgressSave?.(savePartial)
   try {
     // Get tool definitions once (or empty for engines that don't support tools)
@@ -519,7 +568,9 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
         else reqBody.tool_choice = { type: 'function', function: { name: 'web_search' } }
       }
 
+      requesting = true
       const res = await callChatUpstream(upstream, reqBody, ac.signal, undefined, ledgers ? d : undefined)
+      requesting = false
 
       if (!res.ok || !res.body) {
         // The engine's own reason, from its body or (LiteRT-LM) its status line, says far more than the status code.
@@ -542,9 +593,13 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
 
       if (jsonTransport) {
         const completion = await readCompletion(res)
-        if (completion.usage) finalUsage = completion.usage
+        if (completion.usage) {
+          finalUsage = completion.usage
+          ports.onUsage?.(completion.usage)
+        }
         roundContent = completion.content
         fullContent += completion.content
+        replyChanged('text')
         for (const [i, tc] of completion.toolCalls.entries()) pendingToolCalls.set(i, tc)
       } else {
         const reader = res.body.getReader()
@@ -583,7 +638,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
 
             let chunk: Record<string, unknown>
             try { chunk = JSON.parse(raw) as Record<string, unknown> } catch { continue }
-            const engineError = streamChunkError(chunk)
+            const engineError = loop.streamErrors === 'ignore' ? undefined : streamChunkError(chunk)
             if (engineError) {
               // Nothing more is read from this stream: hang up so the engine stops, and drop the abort hook with it.
               ac.signal.removeEventListener('abort', cancelReader)
@@ -602,7 +657,10 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
               continue
             }
 
-            if (chunk.usage) finalUsage = chunk.usage as typeof finalUsage
+            if (chunk.usage) {
+              finalUsage = chunk.usage as typeof finalUsage
+              ports.onUsage?.(chunk.usage)
+            }
             if (chunk.timings) finalTimings = chunk.timings as typeof finalTimings
 
             const choices = chunk.choices as Array<{
@@ -627,7 +685,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
                 if (tc.function?.arguments) entry.argsBuffer += tc.function.arguments
                 // The moment we know which tool this is, surface it as pending — the model
                 // may stream a long argument body next, and silence there reads as a freeze.
-                if (entry.id && entry.name && !announcedToolCalls.has(tc.index)) {
+                if (loop.announceToolCalls !== false && entry.id && entry.name && !announcedToolCalls.has(tc.index)) {
                   announcedToolCalls.add(tc.index)
                   await emit({ event: 'tool_call', data: { id: entry.id, name: entry.name, args: {}, status: 'pending' } })
                 }
@@ -641,6 +699,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
               if (!thinkStart) thinkStart = Date.now()
               thinkEnd = Date.now()
               fullReasoning += rc
+              replyChanged('text')
               await emit({ event: 'reasoning', data: { delta: rc } })
               continue
             }
@@ -656,6 +715,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
                 if (!thinkStart) thinkStart = Date.now()
                 thinkEnd = Date.now()
                 fullReasoning += ev.text
+                replyChanged('text')
                 await emit({ event: 'reasoning', data: { delta: ev.text } })
               } else {
                 fullContent += ev.text
@@ -663,6 +723,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
                 if (!ttftMs) ttftMs = Date.now() - requestStart
                 liveOut++
                 if (localAccounting) d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: liveOut })
+                replyChanged('text')
                 await emit({ event: 'delta', data: { delta: ev.text } })
               }
             }
@@ -675,8 +736,9 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
         // with the log off. Read as the end of the round, a stopped reply was saved as finished (title,
         // memory and bench result included) and a tool call it was streaming still ran, one set to Allow
         // without asking. Thrown as the abort it is, before the flush below, so the catch and the drain
-        // after it handle it as they handle an AbortError.
-        ac.signal.throwIfAborted()
+        // after it handle it as they handle an AbortError — or, for a reply kept as streamed
+        // (LoopOptions.interruptedTail), right after the flush has streamed what the parser held back.
+        if (!replyAsStreamed) ac.signal.throwIfAborted()
 
         // Flush lookahead buffer at end-of-stream. Clearing `pendingParse` first is what stops the
         // interrupted-turn drain after the try/catch from flushing this same buffer a SECOND time
@@ -685,13 +747,16 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
         for (const ev of flushState(parseState)) {
           if (ev.type === 'reasoning') {
             fullReasoning += ev.text
+            replyChanged('text')
             await emit({ event: 'reasoning', data: { delta: ev.text } })
           } else {
             fullContent += ev.text
             roundContent += ev.text
+            replyChanged('text')
             await emit({ event: 'delta', data: { delta: ev.text } })
           }
         }
+        if (replyAsStreamed) ac.signal.throwIfAborted()
       }
 
       // ── Tool call execution ──────────────────────────────────────────────
@@ -836,6 +901,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
           }
 
           allToolCalls.push({ id: tc.id, name: tc.name, args: parsedArgs, result: callError ? undefined : result, error: callError })
+          replyChanged('toolCall')
 
           // Inject tool result into iterMessages
           iterMessages.push({ role: 'tool', content: result, tool_call_id: tc.id })
@@ -901,7 +967,9 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
       // Streamed whatever the turn's transport: this pass reads a stream.
       const reqBody = buildEngineRequest({ ...shaping, jsonTransport: false }, iterMessages, 'none')
 
+      requesting = true
       const res = await callChatUpstream(upstream, reqBody, ac.signal, undefined, ledgers ? d : undefined)
+      requesting = false
 
       if (res.ok && res.body) {
         const reader = res.body.getReader()
@@ -931,14 +999,17 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
             if (raw === '[DONE]') break roundLoop
             let chunk: Record<string, unknown>
             try { chunk = JSON.parse(raw) as Record<string, unknown> } catch { continue }
-            const engineError = streamChunkError(chunk)
+            const engineError = loop.streamErrors === 'ignore' ? undefined : streamChunkError(chunk)
             if (engineError) {
               // Nothing more is read from this stream: hang up so the engine stops, and drop the abort hook with it.
               ac.signal.removeEventListener('abort', cancelReader)
               cancelReader()
               throw new EngineStreamError(engineErrorText(d, engineKind, engineError))
             }
-            if (chunk.usage) finalUsage = chunk.usage as typeof finalUsage
+            if (chunk.usage) {
+              finalUsage = chunk.usage as typeof finalUsage
+              ports.onUsage?.(chunk.usage)
+            }
             if (chunk.timings) finalTimings = chunk.timings as typeof finalTimings
             // #52 item 9: the extra pass re-sends the whole conversation, so ITS prompt is the
             // one occupying context when it is interrupted. Captured (not emitted — this pass
@@ -951,6 +1022,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
             const rc = (delta.reasoning_content ?? delta.reasoning) as string | undefined
             if (rc) {
               fullReasoning += rc
+              replyChanged('text')
               await emit({ event: 'reasoning', data: { delta: rc } })
               continue
             }
@@ -962,29 +1034,34 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
             for (const ev of parseEvents) {
               if (ev.type === 'reasoning') {
                 fullReasoning += ev.text
+                replyChanged('text')
                 await emit({ event: 'reasoning', data: { delta: ev.text } })
               } else {
                 fullContent += ev.text
                 if (!ttftMs) ttftMs = Date.now() - requestStart
                 liveOut++
                 if (localAccounting) d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: liveOut })
+                replyChanged('text')
                 await emit({ event: 'delta', data: { delta: ev.text } })
               }
             }
           }
         }
         ac.signal.removeEventListener('abort', cancelReader)
-        ac.signal.throwIfAborted() // a quiet end on Stop, as in the round loop above
+        if (!replyAsStreamed) ac.signal.throwIfAborted() // a quiet end on Stop, as in the round loop above
         pendingParse = null
         for (const ev of flushState(parseState)) {
           if (ev.type === 'reasoning') {
             fullReasoning += ev.text
+            replyChanged('text')
             await emit({ event: 'reasoning', data: { delta: ev.text } })
           } else {
             fullContent += ev.text
+            replyChanged('text')
             await emit({ event: 'delta', data: { delta: ev.text } })
           }
         }
+        if (replyAsStreamed) ac.signal.throwIfAborted()
       }
     }
   } catch (e: unknown) {
@@ -994,7 +1071,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
     aborted = isAbort
     if (!isAbort) {
       engineFailed = true
-      failure = failureOf(e)
+      failure = failureOf(e, requesting)
       restored = restoreReplaced() // a Stop (isAbort) keeps what it stopped
       // Belt and braces on top of resilientSink (GitHub #177): this emit is the one that used
       // to throw INSIDE the catch block, which no `finally` can contain — the rejection escaped
@@ -1022,8 +1099,9 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
 
   // GitHub #177: drain whatever the parser was still holding when the round was cut short (see
   // `pendingParse`). Non-null ONLY on the interrupted paths — a round that reached its own
-  // end-of-stream flush nulls it first, so this can never double-count a normal turn.
-  if (pendingParse) {
+  // end-of-stream flush nulls it first, so this can never double-count a normal turn. A reply kept as streamed
+  // (LoopOptions.interruptedTail) keeps none of it: it was never sent.
+  if (pendingParse && !replyAsStreamed) {
     for (const ev of flushState(pendingParse)) {
       if (ev.type === 'reasoning') {
         fullReasoning += ev.text
@@ -1174,20 +1252,30 @@ interface RequestShaping {
   preserveThinking: boolean | undefined
   /** LoopOptions.transport 'json': a non-streaming request. */
   jsonTransport: boolean
+  /** GenerationTurn.engineSampling: the sampling goes under the request's own fields, not over them. */
+  samplingUnder: boolean
+  /** LoopOptions.returnProgress: a streamed request asks for prompt progress. */
+  returnProgress: boolean
 }
 
 /** One engine request, streamed unless `jsonTransport`: the round's messages under the thread's sampling, the Settings
  *  max-token cap (clampMaxTokens: the cap, or no max_tokens at all when neither sets one), stop strings and the
- *  thinking fields. `toolChoice` goes before the thread's sampling, which can override it, as it always has. */
+ *  thinking fields. `toolChoice` goes before the thread's sampling, which can override it, as it always has; a caller's
+ *  own mapped sampling (`samplingUnder`) goes under all of them instead. */
 export function buildEngineRequest(shaping: RequestShaping, messages: unknown[], toolChoice?: string): Record<string, unknown> {
   const { upstream, samplingOverride, stopStrings, maxLimit, thinkingBudget, reasoningEffort } = shaping
-  const reqBody: Record<string, unknown> = {
+  const streamFields = shaping.returnProgress
+    ? { stream: true, stream_options: { include_usage: true }, return_progress: true }
+    : { stream: true, stream_options: { include_usage: true } }
+  const requestFields: Record<string, unknown> = {
     model: upstream.modelField,
     messages,
-    ...(shaping.jsonTransport ? { stream: false } : { stream: true, stream_options: { include_usage: true }, return_progress: true }),
+    ...(shaping.jsonTransport ? { stream: false } : streamFields),
     ...(toolChoice ? { tool_choice: toolChoice } : {}),
-    ...samplingOverride,
   }
+  const reqBody: Record<string, unknown> = shaping.samplingUnder
+    ? { ...samplingOverride, ...requestFields }
+    : { ...requestFields, ...samplingOverride }
   if (stopStrings?.length) reqBody.stop = stopStrings
   const cappedMax = clampMaxTokens(reqBody.max_tokens as number | undefined, maxLimit)
   if (cappedMax != null) reqBody.max_tokens = cappedMax
@@ -1313,10 +1401,10 @@ export class EngineStreamError extends Error {
   }
 }
 
-/** What the catch makes of a thrown failure (GenerationOutcome.failure). */
-function failureOf(e: unknown): GenerationFailure {
+/** What the catch makes of a thrown failure (GenerationOutcome.failure); `requesting`: it came from the request itself. */
+function failureOf(e: unknown, requesting: boolean): GenerationFailure {
   if (e instanceof EngineStreamError) return e.refusal ? { kind: 'http', ...e.refusal } : { kind: 'engine', message: e.message }
-  return { kind: 'thrown', message: (e as Error)?.message ?? String(e) }
+  return { kind: 'thrown', message: (e as Error)?.message ?? String(e), ...(requesting ? { request: true as const } : {}) }
 }
 
 interface CompletionReply {

@@ -1,7 +1,7 @@
 // The generation core's three port contracts, driven with a fake persistence port and a fake
 // engine, and with NO `db` and NO `chatTurns` on Deps: any reach past the ports into the chat
 // database or the chat turn registry is a TypeError here, not a silent write to the wrong store
-// (ext/generation.ts's header, point 2, is that bug).
+// (ext/generation.ts's header, PERSISTENCE, is that bug).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { runGenerationCore, type ApprovalPolicy, type FinalReply, type GenerationPersistence, type GenerationTurn, type ReplySnapshot } from './generation-core.js'
@@ -273,7 +273,7 @@ test('json transport: a reply with no message is an engine failure, an HTTP refu
   const cases: Array<[() => Response, unknown]> = [
     [() => new Response('{}', { status: 200 }), { kind: 'engine', message: 'Engine returned no message.' }],
     [() => new Response(null, { status: 500 }), { kind: 'http', status: 500, reason: undefined }],
-    [() => { throw new TypeError('fetch failed') }, { kind: 'thrown', message: 'fetch failed' }],
+    [() => { throw new TypeError('fetch failed') }, { kind: 'thrown', message: 'fetch failed', request: true }],
   ]
   for (const [reply, failure] of cases) {
     const engine = fakeEngine(reply)
@@ -420,4 +420,144 @@ test("engine messages keep a prior round's tool calls and results", async () => 
     await run(fakeDeps(), fakePersistence(), approval(), () => {}, turnFor({ engineMessages: history }))
     assert.deepEqual(engine.bodies[0].messages, history)
   } finally { engine.restore() }
+})
+
+// ── What the public API's run needs of the loop (ext/generation.ts): each a defaulted-off option or port ──────────
+
+const usage = { prompt_tokens: 3, completion_tokens: 2 }
+/** A response whose body is `chunks` as SSE, then held open (`hold`) or broken off (`fail`) instead of ended. */
+function openStream(chunks: unknown[], end: 'hold' | 'fail'): Response {
+  const enc = new TextEncoder()
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const c of chunks) controller.enqueue(enc.encode(`data: ${JSON.stringify(c)}\n\n`))
+      if (end === 'fail') setTimeout(() => controller.error(new Error('terminated')), 10)
+    },
+  })
+  return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+}
+const deltas = (events: Array<{ event: string; data: unknown }>): string =>
+  events.filter((e) => e.event === 'delta').map((e) => (e.data as { delta: string }).delta).join('')
+
+test("engineSampling: the caller's mapped sampling goes UNDER the request's own fields, with its stop strings; conv.sampling is not read", async () => {
+  const engine = fakeEngine(() => sse(content('ok'), stop))
+  try {
+    await run(fakeDeps(), fakePersistence(), approval(), () => {}, turnFor({
+      conv: { id: 'conv-1', sampling: { temp: 0.9, stop: ['NO'] } },
+      engineSampling: { fields: { temperature: 0.2, model: 'evil', messages: [], stream: false, stream_options: {} }, stop: ['END'] },
+      loop: { returnProgress: false },
+    }))
+    const body = engine.bodies[0]
+    assert.deepEqual(Object.keys(body), ['temperature', 'model', 'messages', 'stream', 'stream_options', 'stop', 'tools'])
+    assert.equal(body.temperature, 0.2)
+    assert.equal(body.model, 'm')
+    assert.deepEqual(body.messages, [{ role: 'user', content: 'hi' }])
+    assert.equal(body.stream, true)
+    assert.deepEqual(body.stream_options, { include_usage: true })
+    assert.deepEqual(body.stop, ['END'])
+  } finally { engine.restore() }
+})
+
+test('returnProgress false: the streamed request does not ask for prompt progress; the live chat does', async () => {
+  const engine = fakeEngine(() => sse(content('ok'), stop))
+  try {
+    await run(fakeDeps(), fakePersistence(), approval(), () => {}, turnFor({ loop: { returnProgress: false } }))
+    assert.equal('return_progress' in engine.bodies[0], false)
+    await run(fakeDeps(), fakePersistence(), approval(), () => {}, turnFor())
+    assert.equal(engine.bodies[1].return_progress, true)
+  } finally { engine.restore() }
+})
+
+test("announceToolCalls false: a call the model streams is not announced as pending; the call's own events still come", async () => {
+  const toolCallEvents = async (loop: GenerationTurn['loop']) => {
+    const events: Array<{ event: string; data: unknown }> = []
+    const engine = fakeEngine((n) => n === 1 ? sse(lookupCall) : sse(content('The answer, long enough to stream.'), stop))
+    try {
+      await run(fakeDeps(), fakePersistence(), approval(), (ev) => { events.push(ev) }, turnFor({ loop }))
+    } finally { engine.restore() }
+    return events.filter((e) => e.event === 'tool_call').map((e) => (e.data as { status: string }).status)
+  }
+  assert.deepEqual(await toolCallEvents({ announceToolCalls: false }), ['done'])
+  assert.deepEqual(await toolCallEvents(undefined), ['pending', 'done'])
+})
+
+test('streamErrors ignore: an error chunk in the stream is read past; the live chat fails on it', async () => {
+  const engine = fakeEngine(() => sse({ error: { message: 'boom' } }, content('Read past the error chunk, long enough.'), stop))
+  try {
+    const p = fakePersistence()
+    const ignored = await run(fakeDeps(), p, approval(), () => {}, turnFor({ loop: { streamErrors: 'ignore' } }))
+    assert.equal(ignored.failure, undefined)
+    assert.equal(p.finals[0].content, 'Read past the error chunk, long enough.')
+    const failed = await run(fakeDeps(), fakePersistence(), approval(), () => {}, turnFor())
+    assert.equal(failed.failure?.kind, 'engine')
+  } finally { engine.restore() }
+})
+
+test('interruptedTail asStreamed: a broken-off reply keeps no text the parser held back; the live chat keeps it', async () => {
+  const cases: Array<[GenerationTurn['loop'], string]> = [[{ interruptedTail: 'asStreamed' }, ''], [undefined, 'short']]
+  for (const [loop, expected] of cases) {
+    const engine = fakeEngine(() => openStream([content('short')], 'fail'))
+    const events: Array<{ event: string; data: unknown }> = []
+    const p = fakePersistence()
+    try {
+      const outcome = await run(fakeDeps(), p, approval(), (ev) => { events.push(ev) }, turnFor({ loop }))
+      assert.deepEqual(outcome.failure, { kind: 'thrown', message: 'terminated' })
+      assert.equal(p.finals[0].content, expected)
+      assert.equal(deltas(events), '')
+    } finally { engine.restore() }
+  }
+})
+
+test('interruptedTail asStreamed: a stop that ends the read quietly streams the held-back text before it ends the turn', async () => {
+  for (const loop of [{ interruptedTail: 'asStreamed' as const }, undefined]) {
+    const turn = turnFor({ loop })
+    // A reply still shorter than the parser's opening lookahead when the stop comes: all of it held back.
+    const engine = fakeEngine(() => { setTimeout(() => turn.ac.abort(), 30); return openStream([content('short')], 'hold') })
+    const events: Array<{ event: string; data: unknown }> = []
+    const p = fakePersistence()
+    try {
+      const outcome = await run(fakeDeps(), p, approval(), (ev) => { events.push(ev) }, turn)
+      assert.equal(outcome.aborted, true)
+      assert.equal(p.finals[0].content, 'short')
+      // Streamed as stored for the public API; the live chat's refetch reads the stored reply.
+      assert.equal(deltas(events), loop ? 'short' : '')
+    } finally { engine.restore() }
+  }
+})
+
+test('progressCadence everyChange: saveProgress is told of every change as it happens, with what changed', async () => {
+  const saves: Array<{ content: string; toolCalls: number; cause: string | undefined }> = []
+  const p = fakePersistence()
+  p.progressCadence = 'everyChange'
+  p.saveProgress = (reply, cause) => { saves.push({ content: reply.content, toolCalls: reply.toolCalls.length, cause }) }
+  const engine = fakeEngine((n) => n === 1 ? sse(content('Looking that up for you, one moment.'), lookupCall) : sse(content('Found.'), stop))
+  try {
+    await run(fakeDeps(), p, approval(), () => {}, turnFor())
+    assert.equal(saves[0].cause, 'text')
+    assert.ok('Looking that up for you, one moment.'.startsWith(saves[0].content) && saves[0].content.length > 0)
+    assert.deepEqual(saves.find((s) => s.cause === 'toolCall'), { content: 'Looking that up for you, one moment.', toolCalls: 1, cause: 'toolCall' })
+    assert.deepEqual(saves.at(-1), { content: 'Looking that up for you, one moment.Found.', toolCalls: 1, cause: 'text' })
+  } finally { engine.restore() }
+})
+
+test('onUsage: told of each usage object the engine sends, as it sends it', async () => {
+  const seen: unknown[] = []
+  const engine = fakeEngine(() => sse(content('A reply long enough to stream here.'), stop, { choices: [], usage }))
+  try {
+    await runGenerationCore(fakeDeps().d, turnFor(), { persistence: fakePersistence(), sink: () => {}, approval: approval(), onUsage: (u) => { seen.push(u) } })
+    assert.deepEqual(seen, [usage])
+  } finally { engine.restore() }
+})
+
+test('a failure says whether the request itself threw, or the reading of its reply', async () => {
+  const cases: Array<[() => Response, unknown]> = [
+    [() => { throw new TypeError('fetch failed') }, { kind: 'thrown', message: 'fetch failed', request: true }],
+    [() => openStream([], 'fail'), { kind: 'thrown', message: 'terminated' }],
+  ]
+  for (const [reply, failure] of cases) {
+    const engine = fakeEngine(reply)
+    try {
+      assert.deepEqual((await run(fakeDeps(), fakePersistence(), approval(), () => {}, turnFor())).failure, failure)
+    } finally { engine.restore() }
+  }
 })
