@@ -51,6 +51,12 @@ const SPAWNING_DEPENDENCIES: Record<string, Pin> = {
   '@earendil-works/pi-coding-agent/node_modules/marked': {
     version: '18.0.5', reason: 'its command-line bin: never run', files: { 'bin/main.js': 1 },
   },
+  '@napi-rs/canvas': {
+    version: '1.1.0',
+    reason: 'its import-time libc probe only: js-binding.js runs execSync(\'ldd --version\') once at load to pick the musl ' +
+      'binding - a short-lived synchronous child. Loaded only inside the PDF text worker (pdfjs-dist), never by the daemon.',
+    files: { 'js-binding.js': 1 },
+  },
   '@puppeteer/browsers': {
     version: '3.2.4', reason: 'Chrome through launch(), which nothing in src calls (artifacts/screenshot.ts spawns Chrome ' +
       'through util/tether.ts and attaches with connect({ transport }); the test below keeps it so); its CLI and installer are not run',
