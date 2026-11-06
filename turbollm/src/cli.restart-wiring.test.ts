@@ -1,20 +1,20 @@
 // Source-level guard for the daemon's self-restart wiring (spec 08 §2, ADR-442).
 //
-// Why a source scan and not only a behavioural test: cli.ts is top-level module code. Importing it boots the real
-// daemon (config, engines, a listening port), so it cannot be loaded from a test. cli.keeper.test.ts runs the real
-// cli.ts as a process of its own and checks the keeper's behaviour end to end; these pin its wiring.
+// Why a source scan and not only a behavioural test: the restart's handler and the keeper are the CLI process's own
+// (they exit it, spawn its replacement, relay its signals), so they stay in cli.ts's top-level code, which cannot run
+// inside a test process. cli.keeper.test.ts runs the real cli.ts as a process of its own and checks the keeper's
+// behaviour end to end; these pin its wiring. The teardown the restart runs is boot.ts close, tested on a real test
+// daemon in boot.teardown-wiring.test.ts.
 //
 // The npm/CLI restart used to spawn a detached replacement that wrote to restart.log: it was beyond Ctrl+C, `docker
 // stop` and the closing of the terminal, and it lost process.execArgv, so under `npm start` it died at once. The old
 // process now becomes the keeper of its replacement (becomeKeeper), which is what these pin.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { daemonSourceInBootOrder } from './test-support/daemon-source'
 
-const HERE = dirname(fileURLToPath(import.meta.url))
-const CLI = readFileSync(join(HERE, 'cli.ts'), 'utf8').replace(/\r\n/g, '\n')
+// cli.ts with bootDaemon's body (boot.ts) in place of its call: the daemon's source in the order it runs.
+const CLI = daemonSourceInBootOrder()
 
 /** The text from `opening` through the first closing brace at column 0 after it. */
 function blockFrom(opening: string): string {
@@ -36,6 +36,7 @@ const DIRECT_RESTART_EXITS = ['process.exit(75)', 'exit(RESTART_REQUESTED_EXIT_C
 const SUPERVISION_GATE = 'const supervised = boot.desktop || boot.keeperPid !== null'
 const RESTART_PLAN_REQUEST = 'planRestartExit({ exitOnly: opts?.exitOnly === true, supervised })'
 const PLANNED_EXIT = 'process.exit(plan.exitCode)'
+const RESTART_TEARDOWN = 'void daemon.close({ forRestart: true, alsoWaitFor: testOnlyRestartStall })'
 
 test('the keeper runs the exit net, closes every lifeline, the listener, the store and the pidfile, then drops the daemon\'s own listeners, before the replacement starts', () => {
   const keeper = blockFrom(KEEPER_OPENING)
@@ -107,22 +108,24 @@ test('the keeper stops every recurring tick of the old daemon and its config sav
     assert.ok(i >= 0, `becomeKeeper must contain: ${step}`)
     assert.ok(i < replacement, `${step} before the replacement starts`)
   }
-  const restartHandler = blockFrom(RESTART_HANDLER_OPENING)
-  for (const stop of ['updateScheduler.stop()', 'routineScheduler.stop()', 'clearInterval(cliInteractiveSweepTimer)', 'comfy.stop()', 'remote.disableAll()']) {
-    assert.ok(restartHandler.includes(stop), `the restart handler stops the rest: ${stop} (util/daemon-ticks.test.ts lists them)`)
-  }
+  // The rest (the update and routine schedulers, the interactive-run sweep, ComfyUI's guard, a tunnel's health loop)
+  // is stopped by the teardown the restart runs: boot.teardown-wiring.test.ts watches it do so on a real daemon.
+  assert.ok(blockFrom(RESTART_HANDLER_OPENING).includes(RESTART_TEARDOWN), 'the restart runs the daemon\'s teardown')
 })
 
-// A shutdown that came while a remote-access Stop, a provider switch or a restart's teardown was still running
-// `tailscale serve|funnel … off`: its own remote.disable() found the provider taken and ended at once, the teardown
-// settled, and the exit (the 'exit' handler, or the keeper's exit net) killed that `off` mid-call, leaving Serve or the
-// public Funnel on after TurboLLM was gone. remote/child-process.tether.test.ts runs the manager's side.
-test('both teardowns wait for every remote-access stop still running, not only their own', () => {
-  const teardowns = [['the restart handler', blockFrom(RESTART_HANDLER_OPENING)], ['the signal shutdown', blockFrom('beginShutdown = (reason: string) => {')]] as const
-  for (const [name, block] of teardowns) {
-    assert.match(block, /void Promise\.all\(\[[^\]]*\bremote\.disableAll\(\)[^\]]*\]\)\.finally\(/, `${name}'s teardown waits for remote.disableAll()`)
-    assert.ok(!block.includes('remote.disable()'), `${name} does not wait for its own remote.disable() alone`)
-  }
+// Both teardowns were copies of each other, kept in step by scans like these: what each stopped and waited for (every
+// remote-access stop still running, the MCP servers, a restart's Code runs and downloads). They are now one function,
+// boot.ts close, run by both (boot.teardown-wiring.test.ts watches it on a real daemon); what is left to pin here is
+// that both run it, the restart in its restart form, each with its test-only stall.
+test('the restart and the signal shutdown both run the daemon\'s one teardown, the restart in its restart form', () => {
+  const restartHandler = blockFrom(RESTART_HANDLER_OPENING)
+  assert.ok(restartHandler.includes(RESTART_TEARDOWN), 'the restart: Code runs stopped and downloads paused too')
+  assert.ok(restartHandler.indexOf('const watchdog = setTimeout(finish, 14_000)') < restartHandler.indexOf(RESTART_TEARDOWN), 'under the watchdog')
+  assert.match(restartHandler, /\.then\(\(\) => \{\s*clearTimeout\(watchdog\)\s*finish\(\)\s*\}\)/, 'finished once the listener has closed')
+  const signals = blockFrom('beginShutdown = (reason: string) => {')
+  assert.ok(signals.includes('void daemon.close({ alsoWaitFor: testOnlySlowShutdown }).then(() => process.exit(0))'), 'the shutdown: exits once the listener has closed')
+  assert.ok(signals.indexOf('removeOwnPidfile(store.dir())') < signals.indexOf('daemon.close('), 'its pidfile goes first')
+  assert.ok(!/\b(remote\.disable|manager\.shutdown|db\.close)\(\)/.test(restartHandler + signals), 'no teardown step of their own beside it')
 })
 
 test('the restart watchdog is still 14 s, and it reaches the keeper too', () => {
@@ -172,24 +175,11 @@ test('the signal shutdown is one function, run by SIGINT, SIGTERM and SIGHUP, by
   assert.match(lifeline, /if \(beginShutdown\) beginShutdown\(reason\)\s*else process\.exit\(0\)/, 'before the handler exists it exits at once')
 })
 
-// The signal shutdown disconnects every MCP server before its teardown; a restart did not, so each stdio server was
-// left to notice its stdin's EOF after the exit, and one that ignores it ran on beside the replacement's own.
-test('a restart disconnects the MCP servers before its teardown, as the signal shutdown does', () => {
-  const restartHandler = blockFrom(RESTART_HANDLER_OPENING)
-  const disconnect = restartHandler.indexOf('toolRegistry.disconnectAll()')
-  assert.ok(disconnect > 0, 'the restart handler must call toolRegistry.disconnectAll()')
-  assert.ok(disconnect < restartHandler.indexOf('void Promise.all(['), 'before the teardown')
-})
-
 // The restart's exit used to cut off the old process's in-flight work. A restart from a terminal now keeps that
 // process alive as the keeper, where a Code turn would have gone on acting on its repository unseen, and a model
-// download gone on writing the .part the replacement shows paused and resumes (two writers on one file).
-test('a restart stops every Code run and pauses every download, and its teardown waits for their writers; the keeper starts nothing more', () => {
-  const restartHandler = blockFrom(RESTART_HANDLER_OPENING)
-  const stop = restartHandler.indexOf('for (const id of deps.codeRuns?.activeSessionIds() ?? []) deps.codeRuns?.stop(id)')
-  assert.ok(stop > 0, 'the restart handler stops every Code run')
-  assert.ok(stop < restartHandler.indexOf('void Promise.all(['), 'before the teardown, while the store is open')
-  assert.match(restartHandler, /void Promise\.all\(\[[^\]]*\bdownloads\.pauseAll\(\)[^\]]*\]\)\.finally\(/, 'the teardown waits for the paused downloads')
+// download gone on writing the .part the replacement shows paused and resumes (two writers on one file). The restart's
+// teardown stops and pauses them (boot.teardown-wiring.test.ts); the keeper then starts no tethered child.
+test('the keeper starts no tethered child once its lifelines are closed', () => {
   const keeper = blockFrom(KEEPER_OPENING)
   assert.ok(keeper.indexOf('refuseNewTetheredSpawns()') > keeper.indexOf('closeAllLifelines()'), 'after its lifelines are closed, the keeper starts no tethered child')
 })

@@ -7,15 +7,17 @@ on:
     branches: [main]
 
 # Every job that runs tests has a timeout-minutes well above its normal time, and every daemon test step passes node
-# --test-timeout=600000 (the unit step through package.json's "test" script): a test, or a test file whose process
-# does not exit, then fails after 10 minutes with its name. A pid namespace left by pid1.test.ts under sudo held the
-# unit job, and a hung file each tether job, for 2.5 hours until the run was cancelled, with no name in the log.
+# --test-timeout: a test, or a test file whose process does not exit, then fails after that long with its name. The
+# unit shards (and package.json's "test") use 60000: node's timeout is per TEST, so a test that needs longer carries
+# its own { timeout } (and a comment). The tether steps keep 600000: they run real process trees on macOS and Windows.
+# A pid namespace left by pid1.test.ts under sudo held the unit job, and a hung file each tether job, for 2.5 hours
+# until the run was cancelled, with no name in the log.
 jobs:
+  # Fast gate: the checks that need no test run.
   test:
-    name: Typecheck & Unit tests
+    name: Typecheck & Lint
     runs-on: ubuntu-latest
-    # About 6 minutes.
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v7
@@ -34,18 +36,70 @@ jobs:
         run: npm run typecheck
         working-directory: turbollm
 
+      - name: Lint
+        run: npm run lint
+        working-directory: turbollm
+
+  # The daemon's unit tests in 3 parallel shards, named by directory in src/test-support/test-shards.ts (a test there
+  # checks that the shards together are exactly `npm test`'s file set, each file once). `rest` takes every file the
+  # named shards do not, so a new directory is never dropped.
+  unit:
+    name: Unit tests (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    # Each shard takes a few minutes.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [engines, code, rest]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: turbollm/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: turbollm
+
       # code/search-tools.test.ts runs TurboLLM's grep and find against pi's own on real rg and fd (Debian names
       # it fdfind, which both look for); without them those cases are skipped. util/pid1.test.ts runs tini as PID 1
       # of a pid namespace (sudo -n unshare), as the Docker images do.
       - name: Install ripgrep, fd and tini
         run: sudo apt-get update && sudo apt-get install -y ripgrep fd-find tini
 
-      - name: Lint
-        run: npm run lint
+      - name: Unit tests (${{ matrix.shard }})
+        run: npx tsx --test --test-timeout=60000 $(npx tsx src/test-support/list-shard.ts ${{ matrix.shard }})
         working-directory: turbollm
 
-      - name: Unit tests
-        run: npm test
+  # A Windows smoke subset of the unit tests: the code that spawns through cmd.exe and the job sentinel, where a
+  # process-tree or exit regression shows up only on Windows (the MCP client left its server running under cmd.exe,
+  # and two test files never exited). Not the whole suite: build-runner, engine-error, manager.reap, zip-install,
+  # git-actions and engine-delete tests have known Windows-only failures (see docs/TODO.md) and are kept out of this
+  # list on purpose until those are fixed.
+  unit-windows:
+    name: Unit tests (Windows smoke)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: turbollm/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: turbollm
+
+      - name: Unit tests (Windows smoke)
+        run: npx tsx --test --test-timeout=60000 "src/tools/*.test.ts" src/auth.lanauth-composed.test.ts src/test-support/test-shards.test.ts
         working-directory: turbollm
 
   web:

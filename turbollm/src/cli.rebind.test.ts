@@ -1,38 +1,38 @@
-// Behaviour tests for the daemon's in-place LAN/port rebind (cli.ts: the listen address, listen()
+// Behaviour tests for the daemon's in-place LAN/port rebind (boot.ts bootDaemon: the listen address, listen()
 // and deps.rebind).
 //
-// cli.ts is top-level module code: importing it boots the real daemon (see
-// cli.lifecycle-wiring.test.ts), so these run cli.ts's own text instead. The source from
-// "Resolve listen address" through the end of `deps.rebind = () => {…}` is cut out, its types are
+// These run boot.ts's own text rather than a test daemon (boot.test.ts): they need what a booted daemon cannot give
+// them, its timers sped up, process.exit recorded instead of called, and a serve() that can be made to fail. The
+// source from "Resolve listen address" through the end of `deps.rebind = () => {…}` is cut out, its types are
 // stripped by esbuild, and it runs with the real @hono/node-server `serve` on real sockets. The
-// daemon pieces it names (config store, deps, argv, pidfile, banner inputs) are stand-ins (a test
+// daemon pieces it names (config store, deps, boot options, pidfile, banner inputs) are stand-ins (a test
 // can swap in the real ones), its own timers run SPEEDUP times faster, and process.exit is
 // recorded instead of called.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { connect, createServer, type AddressInfo, type Socket } from 'node:net'
 import type { Server } from 'node:http'
-import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 import { transformSync } from 'esbuild'
 import { serve } from '@hono/node-server'
 import { claimDataDir, daemonReachHost, findRunningDaemon, readPidfile, releaseDataDirClaim, writePidfile } from './daemon-pid'
 import { parseListenAddr } from './net'
 import { tmpDir } from './test-support/tmp'
+import { bootBody } from './test-support/daemon-source'
 
-const HERE = dirname(fileURLToPath(import.meta.url))
-const CLI = readFileSync(join(HERE, 'cli.ts'), 'utf8').replace(/\r\n/g, '\n')
+// bootDaemon's body, dedented to column 0.
+const BOOT = bootBody()
 const SPEEDUP = 20
 
-/** cli.ts from the listen address through deps.rebind, as JavaScript. */
+/** boot.ts from the listen address through deps.rebind, as JavaScript. */
 const SOURCE = (() => {
-  const start = CLI.indexOf('// ── Resolve listen address')
-  const rebind = CLI.indexOf('deps.rebind = () => {', start)
-  assert.ok(start >= 0 && rebind > start, 'cli.ts must resolve the listen address, then define deps.rebind')
-  const end = CLI.indexOf('\n}\n', rebind)
+  const start = BOOT.indexOf('// ── Resolve listen address')
+  const rebind = BOOT.indexOf('deps.rebind = () => {', start)
+  assert.ok(start >= 0 && rebind > start, 'boot.ts must resolve the listen address, then define deps.rebind')
+  const end = BOOT.indexOf('\n}\n', rebind)
   assert.ok(end > rebind, 'no column-0 closing brace after deps.rebind')
-  return transformSync(CLI.slice(start, end + 2), { loader: 'ts' }).code
+  return transformSync(BOOT.slice(start, end + 2), { loader: 'ts' }).code
 })()
 
 interface Config {
@@ -46,12 +46,18 @@ interface Daemon {
   deps: { rebind?: () => void; bindHost?: string; bindPort?: number }
   logs: string[]
   exits: number[]
-  /** The listener cli.ts's `server` points at. */
+  /** The listener boot.ts's `server` points at. */
   server(): Server
   /** Opens a connection to the bound port upgraded the way a Code terminal's WebSocket is:
    *  closeAllConnections() leaves it, so the listener's close() waits for it. */
   holdUpgrade(): Promise<void>
   stop(): Promise<void>
+}
+
+/** The value after `name` in `args`, as cli.ts's optionalArg reads it. */
+function argValue(args: string[], name: string): string | undefined {
+  const i = args.indexOf(name)
+  return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined
 }
 
 function bootDaemon(config: Config, args: string[], overrides: Record<string, unknown> = {}): Daemon {
@@ -71,11 +77,13 @@ function bootDaemon(config: Config, args: string[], overrides: Record<string, un
     app: { fetch: () => new Response('ok') },
     deps,
     store: { snapshot: () => structuredClone(config), read: () => structuredClone(config), dir: () => '' },
-    argValue: (name: string, fallback: string) => {
-      const i = args.indexOf(name)
-      return i >= 0 && i + 1 < args.length ? args[i + 1] : fallback
+    // BootOptions as cli.ts builds them from these argv.
+    opts: {
+      portFlag: argValue(args, '--port') ?? '',
+      addr: argValue(args, '--addr'),
+      openBrowser: !args.includes('--no-open'),
+      printToken: args.includes('--print-token'),
     },
-    hasFlag: (...names: string[]) => names.some((n) => args.includes(n)),
     parseListenAddr,
     daemonReachHost,
     provisionBootstrapApiKey: () => null,

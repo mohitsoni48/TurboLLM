@@ -1,9 +1,14 @@
 // Conversation + message persistence (spec 01 §4). Uses node:sqlite (Node 22+) on desktop;
 // Android uses a sql.js (WASM) fallback behind the same interface — see sqlite-adapter.ts.
-import { openSqlDb, type SqlDb, type SqlValue } from './store/sqlite-adapter.js'
+import { inTransaction, openSqlDb, type SqlDb, type SqlValue } from './store/sqlite-adapter.js'
+import { InvalidCursorError, keysetPage, safeJson, type Changes, type P, type PageOpts } from './db-support.js'
+import { UsageStatsQueries } from './usage-stats.js'
+import { RoutineRepo } from './routine-repo.js'
+import { AgentRunRepo } from './agent-run-repo.js'
+import { runMigrations, SEARCH_INDEX_BACKFILL_TABLE, UNFINISHED_REPLY, USABLE_TPS_ROW } from './db-migrations.js'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { Routine, RoutineRun, RoutineFlavor, RoutineStatus, RoutineRunStatus, CodingAgentChoice, ScheduleRule } from '../routines/schema'
+import type { Routine, RoutineRun, RoutineFlavor, CodingAgentChoice, ScheduleRule } from '../routines/schema'
 import { SqliteChatStore } from './store/sqlite-chat-store.js'
 import { AttachmentStore } from './attachments.js'
 import { LOCAL_SCOPE } from './store/chat-store.js'
@@ -315,18 +320,6 @@ export interface ApiUsageCursor {
   seq: number
 }
 
-interface ApiUsageRollupRow {
-  seq: number
-  id: string
-  created_at: string
-  source: string
-  model_key: string | null
-  harness: string | null
-  code_session_id: string | null
-  prompt_tokens: number
-  gen_tokens: number
-}
-
 /** A routine run the retention sweep may delete, with what it links to (v42). */
 export interface PrunableRoutineRun {
   id: string
@@ -334,22 +327,6 @@ export interface PrunableRoutineRun {
   conversationId: string | null
   codeSessionId: string | null
 }
-
-/** True (SQL, over `routine_runs r`) when someone went on with a routine run's chat or Code session after the run
- *  ended: either opens as a full interactive chat (RoutineEditPage), so the retention sweep must never delete it then.
- *  The signal is the messages, not conversations.updated_at, which renames, folder moves and auto-titles also touch.
- *  A user message after the end is the user's own (every prompt a run sends is written before it ends); any message
- *  more than a minute after the end is a regenerate or the like (a run's own reply may still be saved just after the
- *  end, so not every later message counts). A run with no end recorded is measured from its start, which its own
- *  prompt always follows: kept, when unsure. */
-const ROUTINE_RUN_CONTINUED = `EXISTS (
-  SELECT 1 FROM messages m
-  WHERE m.conv_id IN (r.conversation_id, (SELECT a.conv_id FROM agent_runs a WHERE a.id = r.code_session_id))
-    AND (
-      (m.role = 'user' AND m.created_at > COALESCE(r.ended_at, r.started_at))
-      OR m.created_at > strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(r.ended_at, r.started_at), '+60 seconds')
-    )
-)`
 
 export interface ApiModelUsage {
   modelKey: string
@@ -403,62 +380,6 @@ export interface CodeStatsResult {
   /** At least 180 days of boxes for 'all' (padded with empty cells for a new install), the real
    *  window for '30d'/'7d' — same convention as tokenUsageStats' heatmap. */
   heatmap: CodeStatsDay[]
-}
-
-const RANGE_WINDOW_DAYS: Record<'30d' | '7d', number> = { '30d': 30, '7d': 7 }
-
-const TOKEN_MILESTONES = [
-  1_000, 10_000, 100_000, 500_000, 1_000_000, 5_000_000,
-  10_000_000, 50_000_000, 100_000_000, 500_000_000, 1_000_000_000,
-]
-
-/** Where a lifetime token total sits on the milestone ladder. Shared by both branches of
- *  tokenUsageStats (empty-rows and the real computation) — as of 2026-07-22 the lifetime
- *  total fed in is the COMBINED chat+API figure, so this only ever computes, never decides
- *  which figure to use. */
-function milestoneFor(lifetimeTotalTokens: number): { achieved: number | null; next: number | null; progressPct: number | null } {
-  const achieved = [...TOKEN_MILESTONES].reverse().find((m) => m <= lifetimeTotalTokens) ?? null
-  const next = TOKEN_MILESTONES.find((m) => m > lifetimeTotalTokens) ?? null
-  const progressPct = next !== null
-    ? Math.round(((lifetimeTotalTokens - (achieved ?? 0)) / (next - (achieved ?? 0))) * 1000) / 10
-    : null
-  return { achieved, next, progressPct }
-}
-
-/** "gemma 4 e4b|Q6_K|6217256480" -> "Gemma 4 E4b". Good enough for a dashboard label —
- *  the model may since have been renamed/deleted, so this derives purely from the stored
- *  key rather than cross-referencing the live model list. */
-function titleCaseModelName(modelKey: string): string {
-  const raw = modelKey.split('|')[0] ?? modelKey
-  return raw.replace(/\b\w/g, (c) => c.toUpperCase())
-}
-
-/** Local calendar date key ("YYYY-MM-DD") for a timestamp — this daemon and its user are
- *  always the same machine, so local time (not UTC) is what "today"/"yesterday" means.
- *  Shared by tokenUsageStats and codeStats so both bucket days identically. */
-function dayKey(iso: string): string {
-  const d = new Date(iso)
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-}
-
-/** `key` shifted by `n` local calendar days (negative goes back). */
-function addDays(key: string, n: number): string {
-  const [y, m, d] = key.split('-').map(Number)
-  const dt = new Date(y, m - 1, d + n)
-  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`
-}
-
-/** Counts +/- lines in a unified diff (skips the +++/--- file-header lines, which start with
- *  the same characters but aren't real changes) — server-side twin of CodeTranscript.tsx's own
- *  diffStats, used to aggregate real "diff shipped" totals for the Code activity stats. */
-function countDiffLines(diff: string): { add: number; del: number } {
-  let add = 0, del = 0
-  for (const line of diff.split('\n')) {
-    if (line.startsWith('+++') || line.startsWith('---')) continue
-    if (line.startsWith('+')) add++
-    else if (line.startsWith('-')) del++
-  }
-  return { add, del }
 }
 
 export interface MessageStats {
@@ -574,26 +495,9 @@ export interface Message {
 }
 
 interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; compaction_applied_at: string | null; created_at: string; updated_at: string }
-interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; worktree_path: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; reverted_from_message_id: string | null; title_auto_synced: number | null; code_agent: string | null; terminal_launched_once: number | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface ExtRunRow { id: string; chat_id: string; message_id: string; tenant: string; owner: string; status: string; event_seq: number; error: string | null; created_at: string; ended_at: string | null }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number; doc_context: string | null }
-
-// Named-param objects need an explicit cast to Record<string, SqlValue>
-type P = Record<string, SqlValue>
-
-function safeJson(s: string): unknown { try { return JSON.parse(s) } catch { return {} } }
-
-/** A reply that recorded a usable generation speed — `typeof stats.tps === 'number' && tps > 0`,
- *  in SQL. It is both lastGenTpsByModel's filter and the WHERE of the partial index
- *  idx_messages_model_tps (v53): SQLite only uses a partial index when the query repeats its
- *  terms, so the two share this one string. The CASE keeps json_type/json_extract off malformed
- *  stats, where they would throw (and fail the write that stored them). */
-const USABLE_TPS_ROW = `role = 'assistant' AND model_key IS NOT NULL AND CASE WHEN json_valid(stats) THEN json_type(stats, '$.tps') IN ('integer', 'real') AND json_extract(stats, '$.tps') > 0 ELSE 0 END`
-
-/** A chat turn's reply still holding the placeholder stats its turn started with (see
- *  abortUnfinishedReplies). Shared with the partial index idx_messages_unfinished (v53), as above. */
-const UNFINISHED_REPLY = `role = 'assistant' AND stats = '{"aborted":false}' AND edited = 0`
 
 /** A column chat search indexes (v54), and its full-text table `<table>_fts`. */
 interface SearchIndexedColumn { table: 'messages' | 'conversations'; column: 'content' | 'title' }
@@ -602,10 +506,6 @@ const SEARCH_INDEXED: SearchIndexedColumn[] = [{ table: 'messages', column: 'con
 /** Every schema object of the search index: the FTS tables and their triggers. */
 const SEARCH_INDEX_TRIGGERS = SEARCH_INDEXED.flatMap(({ table }) => ['insert', 'delete', 'update'].map((op) => `${table}_fts_${op}`))
 const SEARCH_INDEX_TABLES = SEARCH_INDEXED.map(({ table }) => `${table}_fts`)
-
-/** The rowids of each indexed table still waiting for the background backfill (search-index-backfill.ts):
- *  [next_rowid, end_rowid]. A table's row goes once its last batch is indexed; no rows, the index is complete. */
-const SEARCH_INDEX_BACKFILL_TABLE = `CREATE TABLE IF NOT EXISTS search_index_backfill (tbl TEXT PRIMARY KEY, next_rowid INTEGER NOT NULL, end_rowid INTEGER NOT NULL)`
 
 /** Search needs at least one trigram: shorter queries take the LIKE path. */
 const TRIGRAM_CHARS = 3
@@ -637,9 +537,6 @@ function searchIndexSchema({ table, column }: SearchIndexedColumn): string {
   `
 }
 
-/** Above this many messages, the v53 index build is announced: it reads the whole table once. */
-const LARGE_HISTORY_ROWS = 100_000
-
 /** Conversations whose title or any message (inactive variants included, as before) matches. The
  *  FTS form computes each side's matches once; the LIKE form (sql.js, no FTS5, short queries, an
  *  index still being backfilled) stops at the first matching message per conversation. */
@@ -663,69 +560,12 @@ function likeSubstring(text: string): string {
   return `%${text.replace(/[\\%_]/g, '\\$&')}%`
 }
 
-/** `stats.<field>` when it is a JSON number, else 0: the dashboards' old
- *  `typeof s.field === 'number' ? s.field : 0` over safeJson, evaluated by SQLite so the rows
- *  never reach JavaScript. Malformed stats read as 0 (CASE checks validity first; json_type on
- *  malformed text throws). */
-function statsNumber(field: string): string {
-  return `CASE WHEN NOT json_valid(stats) THEN 0 WHEN json_type(stats, '$.${field}') IN ('integer', 'real') THEN json_extract(stats, '$.${field}') ELSE 0 END`
-}
-
-/** The UTC quarter hour an ISO `created_at` falls in, as `YYYY-MM-DDTHH:MM`. Every real time
- *  zone's offset is a whole number of quarter hours, so all instants in one quarter share a
- *  local day and a local hour: grouping by this in SQL keeps everything dayKey and getHours need
- *  while handing JavaScript one row per quarter instead of one per message. */
-function quarterHour(column: string): string {
-  return `substr(${column}, 1, 14) || printf('%02d', CAST(substr(${column}, 15, 2) AS INTEGER) / 15 * 15)`
-}
-
-/** A `quarterHour` key back as an ISO instant, for dayKey / getHours. */
-function quarterStartIso(quarter: string): string {
-  return `${quarter}:00.000Z`
-}
-
-/** Thrown for a list cursor this store did not issue; the list routes answer 400 invalid_cursor. */
-export class InvalidCursorError extends Error {
-  constructor() {
-    super('invalid_cursor: not a cursor this list issued')
-    this.name = 'InvalidCursorError'
-  }
-}
-
-/** One page request of a newest-first list. `cursor` is the previous page's `nextCursor`. */
-export interface PageOpts { limit?: number; cursor?: string }
-
-/** Keyset position (sort value, id) as opaque base64url JSON — the same shape
- *  sqlite-chat-store.ts's chat list uses. */
-function encodePageCursor(sortValue: string, id: string): string {
-  return Buffer.from(JSON.stringify({ u: sortValue, i: id }), 'utf8').toString('base64url')
-}
-
-function decodePageCursor(raw: string): { u: string; i: string } {
-  let parsed: { u?: unknown; i?: unknown } | null
-  try {
-    parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as { u?: unknown; i?: unknown } | null
-  } catch {
-    throw new InvalidCursorError()
-  }
-  if (typeof parsed?.u !== 'string' || typeof parsed?.i !== 'string') throw new InvalidCursorError()
-  return { u: parsed.u, i: parsed.i }
-}
-
-function clampPageLimit(limit: number | undefined, fallback: number, max: number): number {
-  if (!limit || !Number.isFinite(limit) || limit < 1) return fallback
-  return Math.min(Math.floor(limit), max)
-}
-
 /** Conversation list rows: every column but compaction_summary, which can run to thousands of
  *  words and only the opened conversation (getConversation) shows. */
 const CONV_LIST_COLUMNS = `id, title, system_prompt, model_key, sampling, expert_mode, tool_policy, kind, folder_id, tool_overrides, agent_id, completed_at, read_scope, agent_mode, skill_ids, allowed_tools, preserve_thinking, NULL AS compaction_summary, compaction_upto_message_id, compaction_tokens_before, compaction_applied_at, created_at, updated_at`
 
 /** Message rows for display: every column but doc_context (getMessagesForDisplay). */
 const MSG_DISPLAY_COLUMNS = `id, conv_id, seq, role, content, reasoning, attachments, text_attachments, tool_calls, timeline, stats, model_key, research_meta, created_at, variant_group, is_active, branch_of, edited, NULL AS doc_context`
-
-/** Agent-run list rows, slimmed the same way (getAgentRun has the summary). */
-const AGENT_RUN_LIST_COLUMNS = `id, conv_id, title, status, allowed_tools, agent_id, error, created_at, updated_at, started_at, ended_at, archived_at, completion, repo_root, repo_branch, use_worktree, worktree_branch, worktree_base, worktree_path, lines_added, lines_removed, NULL AS compaction_summary, compaction_upto_message_id, compaction_tokens_before, cleared_upto_message_id, reverted_from_message_id, title_auto_synced, code_agent, terminal_launched_once`
 
 function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
   if (!s) return {}
@@ -761,87 +601,6 @@ function rowToExtRun(r: ExtRunRow): ExtRunRecord {
   }
 }
 
-function rowToAgentRun(r: AgentRunRow): AgentRun {
-  return {
-    id: r.id, convId: r.conv_id, title: r.title,
-    status: r.status as AgentRun['status'],
-    allowedTools: safeJson(r.allowed_tools) as string[],
-    agentId: r.agent_id ?? undefined,
-    error: r.error ?? undefined,
-    createdAt: r.created_at, updatedAt: r.updated_at,
-    startedAt: r.started_at ?? undefined, endedAt: r.ended_at ?? undefined,
-    archivedAt: r.archived_at ?? undefined,
-    completion: (r.completion as AgentRun['completion']) ?? undefined,
-    repoRoot: r.repo_root ?? undefined,
-    repoBranch: r.repo_branch ?? undefined,
-    codeAgent: (r.code_agent as AgentRun['codeAgent']) ?? undefined,
-    useWorktree: r.use_worktree === null ? undefined : r.use_worktree === 1,
-    worktreeBranch: r.worktree_branch ?? undefined,
-    worktreeBase: r.worktree_base ?? undefined,
-    worktreePath: r.worktree_path ?? undefined,
-    linesAdded: r.lines_added ?? undefined,
-    linesRemoved: r.lines_removed ?? undefined,
-    compactionSummary: r.compaction_summary ?? undefined,
-    compactionUpToMessageId: r.compaction_upto_message_id ?? undefined,
-    compactionTokensBefore: r.compaction_tokens_before ?? undefined,
-    clearedUpToMessageId: r.cleared_upto_message_id ?? undefined,
-    revertedFromMessageId: r.reverted_from_message_id ?? undefined,
-    titleAutoSynced: r.title_auto_synced === 1,
-    terminalLaunchedOnce: r.terminal_launched_once === 1,
-  }
-}
-
-interface RoutineRow {
-  id: string; flavor: string; status: string; prompt: string
-  schedule_display: string; schedule_rule: string; next_fire_at: string | null
-  model_key: string; agent_id: string | null; workspace_path: string | null
-  coding_agent: string | null; permission_mode: string | null
-  created_at: string; updated_at: string
-}
-
-function rowToRoutine(r: RoutineRow): Routine {
-  return {
-    id: r.id,
-    flavor: r.flavor as RoutineFlavor,
-    status: r.status as RoutineStatus,
-    prompt: r.prompt,
-    scheduleDisplay: r.schedule_display,
-    scheduleRule: JSON.parse(r.schedule_rule) as ScheduleRule,
-    nextFireAt: r.next_fire_at,
-    modelKey: r.model_key,
-    agentId: r.agent_id ?? undefined,
-    workspacePath: r.workspace_path ?? undefined,
-    codingAgent: (r.coding_agent as CodingAgentChoice | null) ?? undefined,
-    permissionMode: (r.permission_mode as Routine['permissionMode']) ?? undefined,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
-  }
-}
-
-interface RoutineRunRow {
-  id: string; routine_id: string; status: string; skip_reason: string | null
-  config_snapshot: string; pending_tool_call: string | null
-  result: string | null; error: string | null; started_at: string; ended_at: string | null
-  conversation_id: string | null; code_session_id: string | null
-}
-
-function rowToRoutineRun(r: RoutineRunRow): RoutineRun {
-  return {
-    id: r.id,
-    routineId: r.routine_id,
-    status: r.status as RoutineRunStatus,
-    skipReason: r.skip_reason ?? undefined,
-    configSnapshot: r.config_snapshot,
-    pendingToolCall: r.pending_tool_call ?? undefined,
-    result: r.result ?? undefined,
-    error: r.error ?? undefined,
-    startedAt: r.started_at,
-    endedAt: r.ended_at ?? undefined,
-    conversationId: r.conversation_id ?? undefined,
-    codeSessionId: r.code_session_id ?? undefined,
-  }
-}
-
 function rowToMsg(r: MsgRow): Message {
   const msg: Message = { id: r.id, convId: r.conv_id, seq: r.seq, role: r.role, content: r.content, reasoning: r.reasoning, attachments: safeJson(r.attachments) as string[], textAttachments: r.text_attachments ? safeJson(r.text_attachments) as string[] : [], toolCalls: r.tool_calls ? safeJson(r.tool_calls) as ToolCallRecord[] : [], stats: safeJson(r.stats) as Partial<MessageStats>, createdAt: r.created_at, variantGroup: r.variant_group, isActive: r.is_active !== 0, branchOf: r.branch_of, edited: r.edited === 1 }
   if (r.research_meta) msg.researchMeta = safeJson(r.research_meta) as ResearchMeta
@@ -850,14 +609,19 @@ function rowToMsg(r: MsgRow): Message {
   return msg
 }
 
-interface Changes { changes: number }
-
 /** SQLite's own name for a database that lives only in RAM. Pass it as `dataDir` for a store
  *  that writes nothing to disk and is gone when closed. */
+export { InvalidCursorError, type PageOpts }
+
 export const IN_MEMORY_DATA_DIR = ':memory:'
 
 export class ConversationStore {
   private db: SqlDb
+
+  /** The usage, routine and agent-run query groups over this same handle (5.7). */
+  private readonly usage: UsageStatsQueries
+  private readonly routines: RoutineRepo
+  private readonly agentRuns: AgentRunRepo
 
   private _chatStore?: SqliteChatStore
 
@@ -884,9 +648,12 @@ export class ConversationStore {
 
   constructor(dataDir: string) {
     this.db = openSqlDb(dataDir === IN_MEMORY_DATA_DIR ? IN_MEMORY_DATA_DIR : join(dataDir, 'turbollm.db'))
+    this.usage = new UsageStatsQueries(this.db)
+    this.routines = new RoutineRepo(this.db)
+    this.agentRuns = new AgentRunRepo(this.db)
     this.attachments = new AttachmentStore(dataDir)
     try {
-      this.migrate()
+      runMigrations(this.db)
       this.reconcileSearchIndex()
     } catch (e) {
       this.db.close()
@@ -900,675 +667,8 @@ export class ConversationStore {
   /** Rows written before the index existed are not indexed yet: the backfill has work. */
   get searchIndexPending(): boolean { return this.searchIndexBuilt && this.searchIndexBackfillPending }
 
-  /** Whether `table` already has `column` — guards ADD COLUMN migrations that may have
-   *  already run under an earlier version number (this branch's migration ladder has
-   *  been renumbered more than once across its history; a stored user_version can lag
-   *  behind columns a prior run already added). */
-  private hasColumn(table: string, column: string): boolean {
-    const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
-    return rows.some((r) => r.name === column)
-  }
-
-  private migrate(): void {
-    this.db.exec(`PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;`)
-    const { user_version: v } = this.db.prepare('PRAGMA user_version').get() as { user_version: number }
-    this.migrationStep(v, 1, () => {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS conversations (
-          id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New chat',
-          system_prompt TEXT NOT NULL DEFAULT '', model_key TEXT NOT NULL DEFAULT '',
-          sampling TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS messages (
-          id TEXT PRIMARY KEY, conv_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-          seq INTEGER NOT NULL, role TEXT NOT NULL CHECK (role IN ('user','assistant')),
-          content TEXT NOT NULL, reasoning TEXT NOT NULL DEFAULT '',
-          attachments TEXT NOT NULL DEFAULT '[]', stats TEXT NOT NULL DEFAULT '{}',
-          created_at TEXT NOT NULL, UNIQUE (conv_id, seq)
-        );
-        CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conv_id, seq);
-      `)
-    })
-    // v2 (spec 04 §5): attribute each assistant reply to the model that produced it
-    // so the Models screen can show last-session gen t/s per model. Nullable — old
-    // rows stay NULL and are simply not counted (non-breaking).
-    this.migrationStep(v, 2, () => {
-      this.db.exec(`
-        ALTER TABLE messages ADD COLUMN model_key TEXT;
-        CREATE INDEX IF NOT EXISTS idx_messages_model ON messages(model_key, created_at);
-      `)
-    })
-    // v3 (spec 08 §2): mark the built-in TurboLLM Expert thread so its server-managed
-    // system prompt stays hidden from the UI. Additive — existing conversations get 0.
-    this.migrationStep(v, 3, () => {
-      this.db.exec(`
-        ALTER TABLE conversations ADD COLUMN expert_mode INTEGER NOT NULL DEFAULT 0;
-      `)
-    })
-    // v4 (spec 07 §9b): store text-file attachment filenames on user messages so the
-    // UI can render file chips in the sent bubble. Nullable — existing rows get NULL
-    // and are decoded as [] in rowToMsg (non-breaking).
-    this.migrationStep(v, 4, () => {
-      this.db.exec(`
-        ALTER TABLE messages ADD COLUMN text_attachments TEXT;
-      `)
-    })
-    // v5 (v0.7.0 agentic): store tool call records on assistant messages so the UI
-    // can render tool invocations + results inline. Nullable — existing rows get NULL
-    // and are decoded as [] in rowToMsg (non-breaking).
-    this.migrationStep(v, 5, () => {
-      this.db.exec(`
-        ALTER TABLE messages ADD COLUMN tool_calls TEXT;
-      `)
-    })
-    // v6 (v0.7.0 agentic): per-conversation tool policy. 'force_web_search' forces
-    // the model to call web_search on the first iteration. Nullable — existing rows
-    // get NULL and default to standard auto tool_choice (non-breaking).
-    this.migrationStep(v, 6, () => {
-      this.db.exec(`
-        ALTER TABLE conversations ADD COLUMN tool_policy TEXT;
-      `)
-    })
-    // v7 (F-021/F-022): research metadata — confidence score, ranked sources, and
-    // referee verdicts stored as JSON alongside the assistant message. Nullable —
-    // only set on Research-persona replies that use the retrieval service.
-    this.migrationStep(v, 7, () => {
-      this.db.exec(`
-        ALTER TABLE messages ADD COLUMN research_meta TEXT;
-      `)
-    })
-    // v8 (ADR-112): background agent runs table. Each run maps to a dedicated
-    // conversation of kind='agent'. Ring buffer events are in-memory only;
-    // this table stores the durable run record and status.
-    this.migrationStep(v, 8, () => {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS agent_runs (
-          id TEXT PRIMARY KEY,
-          conv_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-          title TEXT NOT NULL DEFAULT 'Agent run',
-          status TEXT NOT NULL DEFAULT 'queued',
-          allowed_tools TEXT NOT NULL DEFAULT '[]',
-          error TEXT,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL,
-          started_at TEXT,
-          ended_at TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status, created_at);
-      `)
-    })
-    // v9 (ADR-112): conversations.kind column — 'chat' (default) or 'agent'.
-    // Agent conversations are owned by a run and excluded from the chat sidebar.
-    this.migrationStep(v, 9, () => {
-      this.db.exec(`
-        ALTER TABLE conversations ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat';
-      `)
-    })
-    // v10: chat folders. Flat (no nesting) — conversations reference a folder via the
-    // nullable folder_id column. Deleting a folder UNASSIGNS its members (folder_id set
-    // to NULL in app code — see deleteFolder), it never cascade-deletes conversations,
-    // so no inline REFERENCES/ON DELETE constraint is added here. sort_order is reserved
-    // for a future drag-to-reorder; folders currently list in insertion order.
-    this.migrationStep(v, 10, () => {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS folders (
-          id TEXT PRIMARY KEY, name TEXT NOT NULL,
-          sort_order INTEGER NOT NULL DEFAULT 0,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        ALTER TABLE conversations ADD COLUMN folder_id TEXT;
-        CREATE INDEX IF NOT EXISTS idx_conversations_folder ON conversations(folder_id);
-      `)
-    })
-    // v11 (tool-call approval gate): per-conversation "Allow for this chat" overrides,
-    // persisted as JSON so they survive a restart. Nullable — existing rows get NULL
-    // and are decoded as {} in rowToConv (non-breaking).
-    this.migrationStep(v, 11, () => {
-      this.db.exec("ALTER TABLE conversations ADD COLUMN tool_overrides TEXT")
-    })
-    // v12: agent_runs.agent_id — link runs to the AgentType config.
-    // Additive column; existing rows get NULL (backwards-compatible with pre-agent-id runs).
-    this.migrationStep(v, 12, () => {
-      this.db.exec(`
-        ALTER TABLE agent_runs ADD COLUMN agent_id TEXT;
-      `)
-    })
-    // v13 (spec 13 §13): the durable working doc — one current doc per run. Survives
-    // /compact (it is NOT part of the compressible transcript). Cascades on run delete.
-    this.migrationStep(v, 13, () => {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS agent_run_docs (
-          run_id     TEXT PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE,
-          content    TEXT NOT NULL DEFAULT '',
-          updated_at TEXT NOT NULL
-        );
-      `)
-    })
-    // v14 (spec 13 §13): per-Hitman track record — one row per finished contract
-    // (incl. first-try successes). agent_id is a config id (not a DB FK); run_id cascades.
-    this.migrationStep(v, 14, () => {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS agent_track_record (
-          id          TEXT PRIMARY KEY,
-          agent_id    TEXT NOT NULL,
-          run_id      TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
-          model       TEXT NOT NULL,
-          outcome     TEXT NOT NULL,
-          feedback    TEXT,
-          ran_at      TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_track_agent ON agent_track_record(agent_id);
-      `)
-    })
-    // v15 (spec 13 §13): archive + completion outcome on the run row.
-    this.migrationStep(v, 15, () => {
-      this.db.exec(`
-        ALTER TABLE agent_runs ADD COLUMN archived_at TEXT;
-        ALTER TABLE agent_runs ADD COLUMN completion TEXT;
-      `)
-    })
-    // v16 (spec 13 redesign §1): bind a CHAT conversation to an Agent. Null = a plain
-    // chat (no agent, no FS/tools). Additive; existing chats get NULL = unchanged behavior.
-    this.migrationStep(v, 16, () => {
-      if (!this.hasColumn('conversations', 'agent_id')) this.db.exec(`ALTER TABLE conversations ADD COLUMN agent_id TEXT;`)
-    })
-    // v17 (spec 13 redesign §2/§3): completion marker on a conversation + the per-agent
-    // lessons store (Reflexion). completed_at null = in-progress. agent_lessons is keyed by
-    // the config agent id (not a DB FK); pruned when the agent is deleted.
-    this.migrationStep(v, 17, () => {
-      if (!this.hasColumn('conversations', 'completed_at')) this.db.exec(`ALTER TABLE conversations ADD COLUMN completed_at TEXT;`)
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS agent_lessons (
-          id         TEXT PRIMARY KEY,
-          agent_id   TEXT NOT NULL,
-          lesson     TEXT NOT NULL,
-          evidence   TEXT,
-          conv_id    TEXT,
-          created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_lessons_agent ON agent_lessons(agent_id, created_at);
-      `)
-    })
-    // v18 (spec 13 redesign §3.3): per-agent SKILLS grown from experience (Voyager) — a
-    // distilled name + description + procedure, injected on future runs. Keyed by config
-    // agent id (not a DB FK); pruned on agent delete.
-    this.migrationStep(v, 18, () => {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS agent_skills (
-          id          TEXT PRIMARY KEY,
-          agent_id    TEXT NOT NULL,
-          name        TEXT NOT NULL,
-          description TEXT NOT NULL DEFAULT '',
-          procedure   TEXT NOT NULL,
-          source      TEXT,
-          created_at  TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_skills_agent ON agent_skills(agent_id, created_at);
-      `)
-    })
-    // v19 (spec 13 redesign): per-conversation read scope — JSON array of file/folder paths
-    // the bound agent may read. Read access is chat-bound (attached via picker), not agent-bound.
-    this.migrationStep(v, 19, () => {
-      if (!this.hasColumn('conversations', 'read_scope')) this.db.exec(`ALTER TABLE conversations ADD COLUMN read_scope TEXT;`)
-    })
-    // v20: per-conversation pi permission mode ('ask'|'auto'|'bypass'|'read'). Null = 'auto'.
-    this.migrationStep(v, 20, () => {
-      if (!this.hasColumn('conversations', 'agent_mode')) this.db.exec(`ALTER TABLE conversations ADD COLUMN agent_mode TEXT;`)
-    })
-    // v21: skill ids enabled for a conversation (JSON string[]) — the shared SKILL.md
-    // library injected into chat directly, replacing the agent-bound tool/skill picker.
-    this.migrationStep(v, 21, () => {
-      if (!this.hasColumn('conversations', 'skill_ids')) this.db.exec(`ALTER TABLE conversations ADD COLUMN skill_ids TEXT;`)
-    })
-    // v22 (Customize → Agents): tool-name allow-list baked in from a custom chat
-    // Agent at conversation creation (JSON string[]). Null/absent = unrestricted —
-    // built-in personas never set this, preserving today's behavior byte-for-byte.
-    this.migrationStep(v, 22, () => {
-      if (!this.hasColumn('conversations', 'allowed_tools')) this.db.exec(`ALTER TABLE conversations ADD COLUMN allowed_tools TEXT;`)
-    })
-    // v23 (GitHub #52 item 2 — chat branching): regenerating a reply used to delete it
-    // outright. Now the old message is kept and deactivated instead — `variant_group`
-    // groups a message with its regenerated siblings (defaults to the group's own first
-    // message id), `is_active` marks which one is currently shown/sent as history.
-    // Existing rows default to is_active=1, variant_group=NULL (no branch UI for them).
-    this.migrationStep(v, 23, () => {
-      if (!this.hasColumn('messages', 'variant_group')) this.db.exec(`ALTER TABLE messages ADD COLUMN variant_group TEXT;`)
-      if (!this.hasColumn('messages', 'is_active')) this.db.exec(`ALTER TABLE messages ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1;`)
-      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_variant_group ON messages(conv_id, variant_group);`)
-    })
-    // v24 (GitHub #52 item 2, extended to user-message edits): editing an earlier user
-    // message used to hard-delete everything after it. Now that whole downstream tail is
-    // frozen (deactivated) instead, tagged with `branch_of` = the specific message version
-    // it was frozen under, so switching back to that version can restore exactly what was
-    // there — including whichever regenerate-sibling (variant_group) was active within it.
-    this.migrationStep(v, 24, () => {
-      if (!this.hasColumn('messages', 'branch_of')) this.db.exec(`ALTER TABLE messages ADD COLUMN branch_of TEXT;`)
-      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_branch_of ON messages(conv_id, branch_of);`)
-    })
-    // v25 (GitHub #52 item 1): per-conversation "preserve thinking across turns" toggle.
-    // Off by default — matches today's behavior, where only the final visible content of
-    // past turns is ever resent to the engine, never raw reasoning.
-    this.migrationStep(v, 25, () => {
-      if (!this.hasColumn('conversations', 'preserve_thinking')) this.db.exec(`ALTER TABLE conversations ADD COLUMN preserve_thinking INTEGER NOT NULL DEFAULT 0;`)
-    })
-    // v26: "Edited" tag — set only when a user explicitly edits an assistant reply's text
-    // in place (the PUT /messages/:msgId assistant-role path), never by the normal
-    // generation-completion save, so it means what it says.
-    this.migrationStep(v, 26, () => {
-      if (!this.hasColumn('messages', 'edited')) this.db.exec(`ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0;`)
-    })
-    // v27 (Release 3, auto-memory): durable facts extracted from the user's own chat
-    // messages, injected into future new conversations. No FK to conversations — deleting
-    // a source chat shouldn't delete the fact it produced (same provenance-column pattern
-    // as agent_lessons above).
-    this.migrationStep(v, 27, () => {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS memory_facts (
-          id             TEXT PRIMARY KEY,
-          fact_text      TEXT NOT NULL,
-          source_conv_id TEXT,
-          created_at     TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_memory_facts_created ON memory_facts(created_at);
-      `)
-    })
-    // v28 (Code, real pi-SDK agent): a 'code'-kind run stores the scratch/repo folder it
-    // runs against (the pi cwd + containment root), the sidebar branch label, and the
-    // composer's worktree intent (captured but NOT acted on in Phase 1). Diff stat columns
-    // default to 0 for Phase 1. All additive + nullable — existing agent_runs rows get NULL
-    // and are decoded as undefined in rowToAgentRun (non-breaking). hasColumn-guarded because
-    // this branch's migration ladder has been renumbered before (see hasColumn's comment).
-    this.migrationStep(v, 28, () => {
-      if (!this.hasColumn('agent_runs', 'repo_root'))       this.db.exec(`ALTER TABLE agent_runs ADD COLUMN repo_root TEXT;`)
-      if (!this.hasColumn('agent_runs', 'repo_branch'))     this.db.exec(`ALTER TABLE agent_runs ADD COLUMN repo_branch TEXT;`)
-      if (!this.hasColumn('agent_runs', 'use_worktree'))    this.db.exec(`ALTER TABLE agent_runs ADD COLUMN use_worktree INTEGER;`)
-      if (!this.hasColumn('agent_runs', 'worktree_branch')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN worktree_branch TEXT;`)
-      if (!this.hasColumn('agent_runs', 'worktree_base'))   this.db.exec(`ALTER TABLE agent_runs ADD COLUMN worktree_base TEXT;`)
-      if (!this.hasColumn('agent_runs', 'lines_added'))     this.db.exec(`ALTER TABLE agent_runs ADD COLUMN lines_added INTEGER;`)
-      if (!this.hasColumn('agent_runs', 'lines_removed'))   this.db.exec(`ALTER TABLE agent_runs ADD COLUMN lines_removed INTEGER;`)
-    })
-    // v29 (Code, manual /compact): one active compaction per session — a summary plus the last
-    // DB message id it covers. Not incremental (a second /compact re-summarizes everything up
-    // to that point again, replacing the old summary), which keeps seedPriorHistory's replay
-    // logic (code-session.ts) simple: at most one summary entry, then raw messages after it.
-    this.migrationStep(v, 29, () => {
-      if (!this.hasColumn('agent_runs', 'compaction_summary'))          this.db.exec(`ALTER TABLE agent_runs ADD COLUMN compaction_summary TEXT;`)
-      if (!this.hasColumn('agent_runs', 'compaction_upto_message_id'))  this.db.exec(`ALTER TABLE agent_runs ADD COLUMN compaction_upto_message_id TEXT;`)
-      if (!this.hasColumn('agent_runs', 'compaction_tokens_before'))    this.db.exec(`ALTER TABLE agent_runs ADD COLUMN compaction_tokens_before INTEGER;`)
-    })
-    // v30 (Code, /clear + /resume): a soft "clear chat" marker — the last DB message id
-    // covered by a clear, mirroring compaction_upto_message_id's shape but with no summary
-    // text (a clear is a blank slate, not a summarized carry-forward). Null = never cleared,
-    // or resumed back from one. resolveEffectiveHistory (code-session.ts) takes whichever of
-    // this and the compaction cut point is later in the message sequence.
-    this.migrationStep(v, 30, () => {
-      if (!this.hasColumn('agent_runs', 'cleared_upto_message_id')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN cleared_upto_message_id TEXT;`)
-    })
-    // v31 (Code, founder-reported gap 2026-07-13, item 6): an ordered text/tool-call timeline
-    // for assistant messages, so a completed Code turn can render in TRUE chronological order
-    // instead of today's fixed "reasoning → all tool calls grouped → final text" layout — the
-    // persisted `content`+`toolCalls` shape has no interleave-position marker to reconstruct from.
-    // JSON array of {type:'text',text} | {type:'tool',id} blocks (tool blocks reference an id in
-    // `toolCalls` rather than duplicating it). Nullable — existing rows get NULL and the UI falls
-    // back to the pre-fix grouped rendering for them (non-breaking, no backfill).
-    this.migrationStep(v, 31, () => {
-      if (!this.hasColumn('messages', 'timeline')) this.db.exec(`ALTER TABLE messages ADD COLUMN timeline TEXT;`)
-    })
-    // v32 (Code, founder-reported gap 2026-07-14): a manual session rename used to silently
-    // revert on the next completed turn — code-run-manager.ts's pump() unconditionally mirrored
-    // conversations.title onto agent_runs.title after EVERY successful turn (auto-title's own
-    // regeneration guard only stops conversations.title from changing again, not the mirror
-    // re-applying that now-frozen value over a manual rename). Fix (founder-decided): the mirror
-    // should only ever run ONCE, at the session's first successful turn, never again after,
-    // regardless of any rename in between. 0/NULL = not yet synced; existing rows default to
-    // NULL (their title may already have been mirrored under the old unconditional behavior —
-    // treated as "not yet synced" is harmless, it just allows exactly one more mirror before
-    // this fix's guard takes over for good).
-    this.migrationStep(v, 32, () => {
-      if (!this.hasColumn('agent_runs', 'title_auto_synced')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN title_auto_synced INTEGER;`)
-    })
-    // v33 (Code, founder-reported bug 2026-07-17, found live against a real 40-message session):
-    // revert-to-message previously reused clearedUpToMessageId (a movable prefix cursor), which
-    // can only hide "everything before X, show everything after" — backwards from what a revert
-    // needs (discard the reverted message and everything after it, keep everything before it),
-    // and structurally incapable of that for any message that isn't already at the tail. Real
-    // deactivation (is_active=0, the same mechanism Chat's branching already uses — getMessages()
-    // filters is_active=1 unconditionally) fixes both: it needs a marker of its own so /resume
-    // knows what to reactivate. Nullable — existing rows get NULL (never reverted).
-    this.migrationStep(v, 33, () => {
-      if (!this.hasColumn('agent_runs', 'reverted_from_message_id')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN reverted_from_message_id TEXT;`)
-    })
-    // v34 (GitHub #71): tokens hitting the gateway (/v1/messages, /v1/chat/completions) from
-    // external clients — Claude Code, other CLIs/extensions — never landed in `messages` (that
-    // table is chat-conversation rows only; gateway requests create no conversation). Usage was
-    // silently invisible to the Tokens dashboard. One row per completed gateway request, kept
-    // deliberately separate from `messages` (no conv_id/role — it isn't a chat turn) rather than
-    // merged into the existing streak/session semantics there, which are chat-specific concepts.
-    this.migrationStep(v, 34, () => {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS api_usage (
-          id             TEXT PRIMARY KEY,
-          created_at     TEXT NOT NULL,
-          source         TEXT NOT NULL,
-          model_key      TEXT,
-          prompt_tokens  INTEGER NOT NULL DEFAULT 0,
-          gen_tokens     INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_api_usage_created ON api_usage(created_at);
-      `)
-    })
-    // v35 (ADR-283, Code agent selector): which coding agent a session launches with
-    // (config.ts's code.defaultAgent, snapshotted at creation). Additive + nullable —
-    // existing rows get NULL, decoded as undefined (→ 'turbollm') in rowToAgentRun.
-    this.migrationStep(v, 35, () => {
-      if (!this.hasColumn('agent_runs', 'code_agent')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN code_agent TEXT;`)
-    })
-    // v36 (ADR-284, terminal-agent composer parity): api_usage rows gain a code_session_id
-    // (which Code session a gateway request belongs to, resolved from the session-scoped
-    // token — session-auth.ts) and duration_ms (elapsed wall-clock time of the request, so
-    // prompt/gen tokens-per-second can be computed the same way lastRealStats already is for
-    // chat sessions). Both additive + nullable — pre-existing rows (and any request whose
-    // token doesn't resolve to a Code session) simply have no session/timing to attribute.
-    this.migrationStep(v, 36, () => {
-      if (!this.hasColumn('api_usage', 'code_session_id')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN code_session_id TEXT;`)
-      if (!this.hasColumn('api_usage', 'duration_ms')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN duration_ms INTEGER;`)
-      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_api_usage_code_session ON api_usage(code_session_id, created_at);`)
-    })
-    // v37 (terminal-agent auto-resume across a daemon restart): whether a terminal has ever
-    // been created for this session — lets terminal-routes.ts tell a genuinely first-ever
-    // launch apart from a restart-reconnect (the in-memory PTY died with the daemon, the
-    // session didn't) and pass the CLI's own continue/resume flag on the latter. Additive +
-    // defaulted to 0 — every pre-existing row reads as "never launched", which just means its
-    // NEXT terminal open is treated as fresh (the same behavior as today), never wrongly
-    // resumed into a conversation that was never actually interrupted.
-    this.migrationStep(v, 37, () => {
-      if (!this.hasColumn('agent_runs', 'terminal_launched_once')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN terminal_launched_once INTEGER NOT NULL DEFAULT 0;`)
-    })
-    // v38 (one-time data fix, same day as v37): v37's terminal_launched_once meant "has a
-    // terminal been created before" and its next-launch flag was claude's --continue (resume
-    // the most recent conversation in this DIRECTORY). Found live within hours of shipping:
-    // --continue is ambiguous the moment two Code sessions share a repoRoot, so it was replaced
-    // with --session-id/--resume keyed on THIS session's own id — but any row already flagged
-    // true under the OLD scheme was never registered with the CLI under that exact id, so its
-    // next launch would send --resume <id-the-CLI-has-never-seen> and fail outright ("No
-    // conversation found with session ID: ..."). Reset unconditionally: every session's next
-    // terminal launch is treated as a fresh --session-id registration exactly once, then
-    // resumes correctly from then on — a strictly safe replay of v37's own default for rows
-    // that, in practice, only existed for a few hours before this fix landed.
-    this.migrationStep(v, 38, () => {
-      this.db.exec(`UPDATE agent_runs SET terminal_launched_once = 0;`)
-    })
-    // v39 (ADR-300): the engine's OWN per-phase rates, as llama.cpp measured them
-    // (`timings.prompt_per_second` / `timings.predicted_per_second`). v36 stored only a single
-    // `duration_ms` for the whole request and derived both rates from it, which cannot be right
-    // for either phase — prefill and decode run one after the other, so dividing each token count
-    // by the TOTAL duration understates both. Measured on a live claude session: 763 generated
-    // tokens over a 62 s request read as 12.3 tok/s while the engine's own decode rate was ~78.
-    // Additive + nullable: pre-existing rows keep the old derived approximation (below).
-    this.migrationStep(v, 39, () => {
-      if (!this.hasColumn('api_usage', 'prompt_tps')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN prompt_tps REAL;`)
-      if (!this.hasColumn('api_usage', 'gen_tps')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN gen_tps REAL;`)
-    })
-    // v40 (Code, real worktrees): the ABSOLUTE path of the git worktree a session actually runs
-    // in, when it was created with "Use worktree". Kept separate from `repo_root` rather than
-    // overwriting it: repo_root stays the base repository, which is what worktree removal has to
-    // run `git worktree remove` FROM, and what the UI should keep showing as the session's project.
-    // Null for every session that isn't using a worktree — including all existing rows, whose
-    // `use_worktree` intent was captured but never acted on (v28's comment), so they correctly
-    // decode as "no worktree" rather than claiming one that was never created.
-    this.migrationStep(v, 40, () => {
-      if (!this.hasColumn('agent_runs', 'worktree_path')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN worktree_path TEXT;`)
-    })
-    // v41 (Routines, Phase 1 foundation): scheduled tasks (chat or code) that fire on a
-    // cron-like schedule. routine_runs cascades on routine delete (FK + ON DELETE CASCADE,
-    // relying on the `PRAGMA foreign_keys = ON` set above) — unlike agent_runs' explicit
-    // multi-table delete, a routine's runs have no other referents to clean up.
-    this.migrationStep(v, 41, () => {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS routines (
-          id TEXT PRIMARY KEY,
-          flavor TEXT NOT NULL CHECK (flavor IN ('chat','code')),
-          status TEXT NOT NULL DEFAULT 'pending_confirmation' CHECK (status IN ('pending_confirmation','active','paused')),
-          prompt TEXT NOT NULL,
-          schedule_display TEXT NOT NULL,
-          schedule_rule TEXT NOT NULL,
-          next_fire_at TEXT,
-          model_key TEXT NOT NULL,
-          agent_id TEXT,
-          workspace_path TEXT,
-          coding_agent TEXT,
-          permission_mode TEXT,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_routines_status_next_fire ON routines(status, next_fire_at);
-        CREATE TABLE IF NOT EXISTS routine_runs (
-          id TEXT PRIMARY KEY,
-          routine_id TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
-          status TEXT NOT NULL CHECK (status IN ('running','ok','skipped','errored','needs_approval')),
-          skip_reason TEXT,
-          config_snapshot TEXT NOT NULL,
-          pending_tool_call TEXT,
-          result TEXT,
-          error TEXT,
-          started_at TEXT NOT NULL,
-          ended_at TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_routine_runs_routine ON routine_runs(routine_id, started_at);
-      `)
-    })
-    // v42 (Routines: open a run as a real chat/Code session): a chat-flavor run already creates a
-    // full conversation (chat-runner.ts) and a code-flavor run already creates a full Code session
-    // (code-runner.ts) — both were previously un-lookup-able from the run row itself, so the only
-    // way to see what a run actually did was the flattened `result` text. Nullable/additive: every
-    // pre-existing run correctly decodes as "no linked session" (it genuinely has none — the id was
-    // never persisted), falling back to `result`.
-    this.migrationStep(v, 42, () => {
-      if (!this.hasColumn('routine_runs', 'conversation_id')) this.db.exec(`ALTER TABLE routine_runs ADD COLUMN conversation_id TEXT;`)
-      if (!this.hasColumn('routine_runs', 'code_session_id')) this.db.exec(`ALTER TABLE routine_runs ADD COLUMN code_session_id TEXT;`)
-    })
-    // v43 (spec 23 §3.5, telemetry Phase 5): which coding-tool CLI made this gateway request,
-    // classified from its User-Agent header (classify.ts's classifyHarness) at the two gateway
-    // entry points (gateway.ts) — the gateway read zero request headers before this. Additive +
-    // nullable: every pre-existing row simply has no header to have classified, and reads as
-    // 'unknown' (gatewayDailyStats' own fallback), the same bucket a genuinely unrecognized
-    // client falls into going forward.
-    this.migrationStep(v, 43, () => {
-      if (!this.hasColumn('api_usage', 'harness')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN harness TEXT;`)
-    })
-    // v44 (founder-reported: a terminal-agent session's ctx-fill ring jumped between full and
-    // empty within the same session): getLastApiUsageForSession now picks the row with the
-    // MAX prompt_tokens for the session instead of literally the most-recently-inserted one —
-    // see that method's own doc comment for the full root cause (Task-tool sub-agent requests
-    // share the main turn's code_session_id, and a smaller sub-agent row finishing after the
-    // real turn used to silently win). This index serves that new query pattern the same way
-    // idx_api_usage_code_session (v36) served the old ORDER BY created_at.
-    this.migrationStep(v, 44, () => {
-      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_api_usage_code_session_tokens ON api_usage(code_session_id, prompt_tokens);`)
-    })
-    this.migrationStep(v, 45, () => {
-      // Spec 27 §9.1: tenancy for the public chat API. Every column is NOT NULL with a
-      // DEFAULT, so this is a metadata-only ALTER in SQLite and existing rows land in the
-      // local scope untouched. hasColumn guards each ADD because this branch's ladder has
-      // been renumbered before and a stored user_version can lag behind reality.
-      if (!this.hasColumn('conversations', 'tenant'))   this.db.exec(`ALTER TABLE conversations ADD COLUMN tenant TEXT NOT NULL DEFAULT 'local';`)
-      if (!this.hasColumn('conversations', 'owner'))    this.db.exec(`ALTER TABLE conversations ADD COLUMN owner TEXT NOT NULL DEFAULT 'default';`)
-      if (!this.hasColumn('conversations', 'version'))  this.db.exec(`ALTER TABLE conversations ADD COLUMN version INTEGER NOT NULL DEFAULT 1;`)
-      if (!this.hasColumn('conversations', 'metadata')) this.db.exec(`ALTER TABLE conversations ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';`)
-
-      if (!this.hasColumn('messages', 'tenant'))   this.db.exec(`ALTER TABLE messages ADD COLUMN tenant TEXT NOT NULL DEFAULT 'local';`)
-      if (!this.hasColumn('messages', 'owner'))    this.db.exec(`ALTER TABLE messages ADD COLUMN owner TEXT NOT NULL DEFAULT 'default';`)
-      if (!this.hasColumn('messages', 'status'))   this.db.exec(`ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'complete';`)
-      if (!this.hasColumn('messages', 'version'))  this.db.exec(`ALTER TABLE messages ADD COLUMN version INTEGER NOT NULL DEFAULT 1;`)
-      if (!this.hasColumn('messages', 'metadata')) this.db.exec(`ALTER TABLE messages ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';`)
-
-      // The three indexes spec 27 §4.1 requires of every adapter. Unlike the ADD COLUMNs
-      // these DO scan, so a large messages table takes a moment on first open after upgrade.
-      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_conv_scope_updated ON conversations(tenant, owner, updated_at DESC);`)
-      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_msg_scope_chat_seq ON messages(tenant, owner, conv_id, seq);`)
-      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_msg_variant ON messages(tenant, conv_id, variant_group);`)
-
-    })
-    this.migrationStep(v, 46, () => {
-      // Phase 2 Task 4: folder scoping for the FolderStore capability group (spec 27
-      // §4.2). Deliberately a NEW block rather than an extension of v45 above — v45 has
-      // already run (and bumped user_version to 45) on every database that has been
-      // opened since Task 1 landed, so an edit to that block would never execute again
-      // on any of those databases and the folders columns would silently never appear.
-      // hasColumn-guarded for the same reason as every other ALTER here: this ladder has
-      // been renumbered before and a stored user_version can lag behind reality.
-      if (!this.hasColumn('folders', 'tenant')) this.db.exec(`ALTER TABLE folders ADD COLUMN tenant TEXT NOT NULL DEFAULT 'local';`)
-      if (!this.hasColumn('folders', 'owner'))  this.db.exec(`ALTER TABLE folders ADD COLUMN owner TEXT NOT NULL DEFAULT 'default';`)
-      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_folders_scope ON folders(tenant, owner, sort_order);`)
-    })
-    this.migrationStep(v, 47, () => {
-      // Public API run records (spec 27 §6.4). Local-only: a run is node-local operational
-      // state (an abort controller, a cursor, an engine target), never integrator data, so it
-      // must NOT sit behind the pluggable store — that would force every adapter author to
-      // build a job table before streaming worked at all.
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS ext_runs (
-          id TEXT PRIMARY KEY,
-          chat_id TEXT NOT NULL,
-          message_id TEXT NOT NULL,
-          tenant TEXT NOT NULL,
-          owner TEXT NOT NULL,
-          status TEXT NOT NULL,
-          event_seq INTEGER NOT NULL DEFAULT 0,
-          error TEXT,
-          created_at TEXT NOT NULL,
-          ended_at TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_ext_runs_tenant ON ext_runs(tenant, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_ext_runs_status ON ext_runs(status);
-      `)
-    })
-    this.migrationStep(v, 48, () => {
-      // Audit trail for tenant-scoped mutations (spec 27 §10). There is deliberately NO
-      // content column: the log records THAT a chat or message changed, never what was said.
-      // A content-carrying audit log is a second, unscoped copy of every conversation.
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS ext_audit (
-          id TEXT PRIMARY KEY,
-          tenant TEXT NOT NULL,
-          owner TEXT NOT NULL,
-          action TEXT NOT NULL,
-          target_id TEXT,
-          request_id TEXT NOT NULL,
-          status INTEGER NOT NULL,
-          key_prefix TEXT NOT NULL,
-          at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_ext_audit_tenant_at ON ext_audit(tenant, at DESC);
-      `)
-    })
-    this.migrationStep(v, 49, () => {
-      // v49 (ADR-386, ctx-gauge-freeze fix): api_usage gains a `ctx_used` column that tracks the
-      // current context size, updated during /compact so the ring reflects post-compaction reality.
-      // `prompt_tokens` still carries the largest-request value (sub-agent safety net), but the
-      // ring now reads `ctx_used` — the actual context window fill — which compaction updates.
-      if (!this.hasColumn('api_usage', 'ctx_used')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN ctx_used INTEGER DEFAULT 0;`)
-    })
-    // v50 (ADR-420): chat compaction — mirrors agent_runs's compaction_summary /
-    // compaction_upto_message_id / compaction_tokens_before columns exactly (same names,
-    // same semantics), so the pattern reads as one system across Chat and Code.
-    this.migrationStep(v, 50, () => {
-      if (!this.hasColumn('conversations', 'compaction_summary'))         this.db.exec(`ALTER TABLE conversations ADD COLUMN compaction_summary TEXT;`)
-      if (!this.hasColumn('conversations', 'compaction_upto_message_id')) this.db.exec(`ALTER TABLE conversations ADD COLUMN compaction_upto_message_id TEXT;`)
-      if (!this.hasColumn('conversations', 'compaction_tokens_before'))   this.db.exec(`ALTER TABLE conversations ADD COLUMN compaction_tokens_before INTEGER;`)
-    })
-    // v51: when the compaction was applied. The chat header's context meter reads the LAST
-    // assistant message's recorded ctxUsed — a measurement of what THAT turn actually sent,
-    // which compaction deliberately never rewrites. So right after compacting, the meter
-    // still shows the pre-compaction number and the feature looks like it did nothing
-    // (founder-reported 2026-09-12). This timestamp is what lets the UI tell "that
-    // measurement predates the compaction, project the new size" apart from "a real turn has
-    // since run on the compacted prompt, trust the measurement" — the two cases are otherwise
-    // indistinguishable, and survive a reload only if it's persisted.
-    this.migrationStep(v, 51, () => {
-      if (!this.hasColumn('conversations', 'compaction_applied_at')) this.db.exec(`ALTER TABLE conversations ADD COLUMN compaction_applied_at TEXT;`)
-    })
-    // v52: a user turn's attached-document text (Message.docContext). It used to exist only in
-    // the request that first sent the turn, so a regenerate or edit-and-resend sent the turn
-    // again without its documents. Nullable, no default: most turns attach nothing.
-    this.migrationStep(v, 52, () => {
-      if (!this.hasColumn('messages', 'doc_context')) this.db.exec(`ALTER TABLE messages ADD COLUMN doc_context TEXT;`)
-    })
-    // v53 (scalability review Tier 2): indexes so the hot reads stop scanning whole history
-    // tables on the event loop. All CREATE INDEX IF NOT EXISTS, so a crash before the version
-    // bump just re-runs them.
-    //  - messages(created_at): the dashboards' and daily roll-ups' date ranges.
-    //  - idx_messages_model_tps: partial, only replies that recorded a usable t/s, in
-    //    (model_key, created_at, seq) order, so lastGenTpsByModel is one seek per model. Its
-    //    WHERE must stay word-for-word USABLE_TPS_ROW, or SQLite will not use it.
-    //  - idx_messages_unfinished: partial, only the turn placeholders the startup reconcile
-    //    looks for, which a finished turn's stats save removes from it — so it stays tiny.
-    //  - the list views' keyset orders: conversations by kind, agent runs, a routine's runs,
-    //    memory facts.
-    this.migrationStep(v, 53, () => {
-      const messages = this.maxRowid('messages')
-      if (messages > LARGE_HISTORY_ROWS) console.log(`[db] indexing ${messages} chat messages, once; this can take a while`)
-      this.db.exec(`
-        CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
-        CREATE INDEX IF NOT EXISTS idx_messages_model_tps ON messages(model_key, created_at, seq) WHERE ${USABLE_TPS_ROW};
-        CREATE INDEX IF NOT EXISTS idx_messages_unfinished ON messages(conv_id) WHERE ${UNFINISHED_REPLY};
-        CREATE INDEX IF NOT EXISTS idx_conversations_kind_updated ON conversations(kind, updated_at, id);
-        CREATE INDEX IF NOT EXISTS idx_agent_runs_updated ON agent_runs(updated_at, id);
-        CREATE INDEX IF NOT EXISTS idx_routine_runs_routine_started ON routine_runs(routine_id, started_at, id);
-        CREATE INDEX IF NOT EXISTS idx_memory_facts_created_id ON memory_facts(created_at, id);
-      `)
-    })
-    // v54 (scalability review 2.2): full-text indexes for chat search, which used to LIKE-scan
-    // every message body. The migration adds only the backfill's progress table, on every
-    // runtime; the index itself follows the runtime that opens the database (reconcileSearchIndex),
-    // since only some have FTS5: node:sqlite from Node 22.16, never the bundled sql.js (Android).
-    this.migrationStep(v, 54, () => {
-      this.db.exec(SEARCH_INDEX_BACKFILL_TABLE)
-    })
-    // v55 (scalability review 2.4, data retention): `api_usage` gains a row per gateway request
-    // forever. The retention sweep (chat/retention.ts) folds rows older than its cutoff into one
-    // row per local day and dashboard group here, then deletes them; every reader sums both.
-    // model_key/harness hold '' for api_usage's NULL, so the primary key can upsert them.
-    // first_at/first_seq carry the group's earliest created_at and rowid, which apiUsageStats
-    // orders its groups by. idx_api_usage_code_session_ctx finds a Code session's peak-context
-    // row (getLastApiUsageForSession's MAX), which the sweep keeps raw, in one seek.
-    this.migrationStep(v, 55, () => {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS api_usage_daily (
-          day           TEXT NOT NULL,
-          source        TEXT NOT NULL,
-          model_key     TEXT NOT NULL DEFAULT '',
-          harness       TEXT NOT NULL DEFAULT '',
-          requests      INTEGER NOT NULL,
-          prompt_tokens INTEGER NOT NULL,
-          gen_tokens    INTEGER NOT NULL,
-          first_at      TEXT NOT NULL,
-          first_seq     INTEGER NOT NULL,
-          PRIMARY KEY (day, source, model_key, harness)
-        );
-        CREATE INDEX IF NOT EXISTS idx_api_usage_code_session_ctx ON api_usage(code_session_id, ctx_used);
-      `)
-    })
-  }
-
-  /** Applies migration `version` when the database is older, as one transaction together with
-   *  its user_version bump: a step that throws (or a crash midway) leaves neither half of it,
-   *  and the next open runs it again. PRAGMAs that do nothing inside a transaction
-   *  (journal_mode, foreign_keys) stay in migrate()'s preamble, outside every step. */
-  private migrationStep(current: number, version: number, step: () => void): void {
-    if (current >= version) return
-    this.transaction(() => {
-      step()
-      this.db.exec(`PRAGMA user_version = ${version}`)
-    })
-  }
-
   private fts5Compiled(): boolean {
     return (this.db.prepare(`SELECT sqlite_compileoption_used('ENABLE_FTS5') AS yes`).get() as { yes: number }).yes === 1
-  }
-
-  private maxRowid(table: string): number {
-    return (this.db.prepare(`SELECT COALESCE(MAX(rowid), 0) AS n FROM ${table}`).get() as { n: number }).n
   }
 
   private schemaHas(name: string): boolean {
@@ -1657,36 +757,11 @@ export class ConversationStore {
   /** The sidebar list, most recently updated first, a keyset page at a time (200 by default
    *  and at most). Rows leave out the compaction summary (CONV_LIST_COLUMNS). */
   listConversationsPage(kind: 'chat' | 'agent' | 'all', page: PageOpts = {}): { conversations: Conversation[]; nextCursor: string | null } {
-    const { rows, nextCursor } = this.keysetPage<ConvRow>({
+    const { rows, nextCursor } = keysetPage<ConvRow>(this.db, {
       columns: CONV_LIST_COLUMNS, table: 'conversations', sortColumn: 'updated_at', sortValue: (r) => r.updated_at,
       where: kind === 'all' ? [] : ['kind = $kind'], params: kind === 'all' ? {} : { $kind: kind },
     }, page, 200, 200)
     return { conversations: rows.map(rowToConv), nextCursor }
-  }
-
-  /** One newest-first page of `table` in (sortColumn DESC, id DESC) order. Keyset, not OFFSET:
-   *  the cursor is the last row's position, so a deep page costs what the first one does, and a
-   *  row updated between pages can't shift the others into a duplicate or a gap. */
-  private keysetPage<R extends { id: string }>(
-    q: { columns: string; table: string; sortColumn: string; sortValue: (row: R) => string; where: string[]; params: P },
-    page: PageOpts, defaultLimit: number, maxLimit: number,
-  ): { rows: R[]; nextCursor: string | null } {
-    const limit = clampPageLimit(page.limit, defaultLimit, maxLimit)
-    const where = [...q.where]
-    const params: P = { ...q.params, $lim: limit + 1 }
-    if (page.cursor) {
-      const at = decodePageCursor(page.cursor)
-      where.push(`(${q.sortColumn}, id) < ($cu, $ci)`)
-      params.$cu = at.u
-      params.$ci = at.i
-    }
-    const whereSql = where.length ? ` WHERE ${where.join(' AND ')}` : ''
-    const rows = this.db.prepare(`SELECT ${q.columns} FROM ${q.table}${whereSql} ORDER BY ${q.sortColumn} DESC, id DESC LIMIT $lim`)
-      .all(params) as unknown as R[]
-    if (rows.length <= limit) return { rows, nextCursor: null }
-    const pageRows = rows.slice(0, limit)
-    const last = pageRows[limit - 1]
-    return { rows: pageRows, nextCursor: encodePageCursor(q.sortValue(last), last.id) }
   }
 
   createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'sampling' | 'expertMode' | 'toolPolicy' | 'kind' | 'folderId' | 'agentId' | 'skillIds' | 'allowedTools' | 'preserveThinking'>>): Conversation {
@@ -1922,731 +997,6 @@ export class ConversationStore {
     return out
   }
 
-  /** Token usage dashboard (Release 3): sessions/messages/tokens/active-days scoped to
-   *  `range`, lifetime streaks (a streak isn't a "last N days" concept), the local hour
-   *  with the most activity, a per-model breakdown, and the heatmap day buckets. Days are
-   *  bucketed by LOCAL calendar date (this daemon and its user are always the same machine),
-   *  not UTC, so a late-night session lands on the day the user actually thinks of as "today".
-   *
-   *  The lifetime streaks need every day ever active whatever `range` is, so SQLite sums the
-   *  whole history per (UTC quarter hour, model) — see quarterHour for why that keeps local days
-   *  and hours exact — and JavaScript gets one row per active quarter, not one per reply, with no
-   *  stats JSON to parse. Rows come in order of first appearance, so Map insertion order (which
-   *  breaks peak-hour and favorite-model ties) is what the per-reply pass it replaced had.
-   *  Still one aggregate pass over the table per call; a daily roll-up table would make it
-   *  O(days), but has to stay in step with every stats write, so it is left for later. */
-  tokenUsageStats(range: TokenUsageRange = 'all'): TokenUsageStats {
-    const quarters = (this.db.prepare(`
-      SELECT ${quarterHour('created_at')} AS quarter, model_key, COUNT(*) AS messages,
-        SUM(${statsNumber('promptTokens')}) AS prompt_tokens, SUM(${statsNumber('genTokens')}) AS gen_tokens
-      FROM messages WHERE role = 'assistant'
-      GROUP BY quarter, model_key
-      ORDER BY quarter, MIN(created_at), MIN(rowid)
-    `).all() as unknown as { quarter: string; model_key: string | null; messages: number; prompt_tokens: number; gen_tokens: number }[])
-      .map((q) => ({ at: quarterStartIso(q.quarter), modelKey: q.model_key, messages: q.messages, promptTokens: q.prompt_tokens, genTokens: q.gen_tokens }))
-
-    if (quarters.length === 0) {
-      // Computed independently — a user with zero in-app chats but real gateway (Claude
-      // Code / extension) traffic still has something to show here. "Total tokens" /
-      // "Lifetime tokens" (below and in the main branch) are the founder-directed
-      // combined figure (2026-07-22) — Overview must reflect ALL usage, not just chat,
-      // so a chat-less API-only user still gets a real milestone reading instead of a
-      // permanently-stuck-at-zero one.
-      const api = this.apiUsageStats(range)
-      const milestone = milestoneFor(api.lifetimeTotalTokens)
-      return {
-        range, sessions: 0, messages: 0, totalTokens: api.totalTokens, activeDays: 0,
-        currentStreak: 0, longestStreak: 0, peakHour: null, favoriteModel: null,
-        firstMessageAt: null, lifetimeTotalTokens: api.lifetimeTotalTokens, milestone,
-        activity: { granularityHours: 24, buckets: [] }, dailyByModel: [], byModel: [],
-        api,
-      }
-    }
-
-    // Per-local-day totals across the FULL history — needed for the lifetime streaks
-    // regardless of `range`, and reused below for the heatmap window.
-    const dayBuckets = new Map<string, { promptTokens: number; genTokens: number; messageCount: number }>()
-    for (const q of quarters) {
-      const key = dayKey(q.at)
-      const b = dayBuckets.get(key) ?? { promptTokens: 0, genTokens: 0, messageCount: 0 }
-      b.promptTokens += q.promptTokens
-      b.genTokens += q.genTokens
-      b.messageCount += q.messages
-      dayBuckets.set(key, b)
-    }
-    const firstMessageAt = (this.db.prepare(`SELECT MIN(created_at) AS at FROM messages WHERE role = 'assistant'`).get() as { at: string }).at
-
-    const todayKey = dayKey(new Date().toISOString())
-    const firstKey = dayKey(firstMessageAt)
-
-    let longestStreak = 0, run = 0
-    for (let key = firstKey; key <= todayKey; key = addDays(key, 1)) {
-      if (dayBuckets.has(key)) { run++; longestStreak = Math.max(longestStreak, run) } else { run = 0 }
-    }
-    let currentStreak = 0
-    {
-      // Grace period: if today has no activity yet, the streak isn't broken until
-      // tomorrow — check from yesterday instead of reporting 0 the moment you wake up.
-      let key = dayBuckets.has(todayKey) ? todayKey : addDays(todayKey, -1)
-      while (key >= firstKey && dayBuckets.has(key)) { currentStreak++; key = addDays(key, -1) }
-    }
-
-    // "all" always shows at least 180 days of boxes (GitHub-graph convention, scaled
-    // down) — a brand-new account pads out with empty cells before its first message
-    // instead of rendering a tiny, sparse-looking grid. An account older than that still
-    // shows its full real history (never truncated).
-    const minAllStart = addDays(todayKey, -179)
-    const heatStart = range === 'all'
-      ? (firstKey < minAllStart ? firstKey : minAllStart)
-      : addDays(todayKey, -(RANGE_WINDOW_DAYS[range] - 1))
-    // String comparison is safe and deliberately used over Date parsing here — both sides
-    // are zero-padded "YYYY-MM-DD" keys, and `new Date("YYYY-MM-DD")` parses as UTC
-    // midnight (not local), a classic footgun this sidesteps entirely.
-    const scoped = range === 'all' ? quarters : quarters.filter((q) => dayKey(q.at) >= heatStart)
-    const sessions = this.chatSessionsSince(range === 'all' ? null : this.dayWindow(heatStart).start)
-
-    const hourTally = new Map<number, number>()
-    const modelTally = new Map<string, { messageCount: number; promptTokens: number; genTokens: number }>()
-    const dayModelTally = new Map<string, Map<string, number>>()
-    let totalTokens = 0, messages = 0
-    for (const q of scoped) {
-      const tokens = q.promptTokens + q.genTokens
-      totalTokens += tokens
-      messages += q.messages
-      const hour = new Date(q.at).getHours()
-      hourTally.set(hour, (hourTally.get(hour) ?? 0) + q.messages)
-      if (q.modelKey) {
-        const m = modelTally.get(q.modelKey) ?? { messageCount: 0, promptTokens: 0, genTokens: 0 }
-        m.messageCount += q.messages; m.promptTokens += q.promptTokens; m.genTokens += q.genTokens
-        modelTally.set(q.modelKey, m)
-
-        const day = dayKey(q.at)
-        const dm = dayModelTally.get(day) ?? new Map<string, number>()
-        dm.set(q.modelKey, (dm.get(q.modelKey) ?? 0) + tokens)
-        dayModelTally.set(day, dm)
-      }
-    }
-
-    let peakHour: number | null = null, peakHourCount = -1
-    for (const [hour, count] of hourTally) if (count > peakHourCount) { peakHour = hour; peakHourCount = count }
-
-    const byModel: ModelUsage[] = [...modelTally.entries()]
-      .map(([modelKey, m]) => ({
-        modelKey, displayName: titleCaseModelName(modelKey),
-        messageCount: m.messageCount, promptTokens: m.promptTokens, genTokens: m.genTokens,
-        totalTokens: m.promptTokens + m.genTokens,
-      }))
-      .sort((a, b) => b.totalTokens - a.totalTokens)
-
-    const days: TokenUsageDay[] = []
-    const dailyByModel: DailyModelBreakdown[] = []
-    let activeDays = 0
-    for (let key = heatStart; key <= todayKey; key = addDays(key, 1)) {
-      const b = dayBuckets.get(key)
-      if (b && b.messageCount > 0) activeDays++
-      const dayTotalTokens = (b?.promptTokens ?? 0) + (b?.genTokens ?? 0)
-      days.push({
-        date: key,
-        promptTokens: b?.promptTokens ?? 0, genTokens: b?.genTokens ?? 0,
-        totalTokens: dayTotalTokens, messageCount: b?.messageCount ?? 0,
-      })
-      const dm = dayModelTally.get(key)
-      dailyByModel.push({
-        date: key, totalTokens: dayTotalTokens,
-        byModel: dm ? [...dm.entries()].map(([modelKey, tokens]) => ({ modelKey, tokens })) : [],
-      })
-    }
-
-    // Overview heatmap: box granularity zooms in as the range narrows so the grid stays
-    // visually dense (a 7-cell or 30-cell day-level grid looks broken/sparse) — 1h boxes
-    // for 7d, 12h boxes for 30d, 1-day boxes (the classic GitHub-style grid) for all.
-    let activity: TokenActivity
-    if (range === 'all') {
-      activity = {
-        granularityHours: 24,
-        buckets: days.map((d) => ({ start: d.date, totalTokens: d.totalTokens, messageCount: d.messageCount })),
-      }
-    } else {
-      const granularityHours = range === '7d' ? 1 : 12
-      const subTally = new Map<string, { totalTokens: number; messageCount: number }>()
-      for (const q of scoped) {
-        const d = new Date(q.at)
-        const day = dayKey(q.at)
-        const bucketKey = granularityHours === 1
-          ? `${day}T${String(d.getHours()).padStart(2, '0')}`
-          : `${day}-${d.getHours() < 12 ? 'AM' : 'PM'}`
-        const b = subTally.get(bucketKey) ?? { totalTokens: 0, messageCount: 0 }
-        b.totalTokens += q.promptTokens + q.genTokens; b.messageCount += q.messages
-        subTally.set(bucketKey, b)
-      }
-      const buckets: ActivityBucket[] = []
-      for (let key = heatStart; key <= todayKey; key = addDays(key, 1)) {
-        if (granularityHours === 1) {
-          for (let h = 0; h < 24; h++) {
-            const bucketKey = `${key}T${String(h).padStart(2, '0')}`
-            const b = subTally.get(bucketKey)
-            buckets.push({ start: bucketKey, totalTokens: b?.totalTokens ?? 0, messageCount: b?.messageCount ?? 0 })
-          }
-        } else {
-          for (const half of ['AM', 'PM'] as const) {
-            const bucketKey = `${key}-${half}`
-            const b = subTally.get(bucketKey)
-            buckets.push({ start: bucketKey, totalTokens: b?.totalTokens ?? 0, messageCount: b?.messageCount ?? 0 })
-          }
-        }
-      }
-      activity = { granularityHours, buckets }
-    }
-
-    let chatLifetimeTotalTokens = 0
-    for (const b of dayBuckets.values()) chatLifetimeTotalTokens += b.promptTokens + b.genTokens
-
-    // Founder-directed (2026-07-22): Overview's "Total tokens" / "Lifetime tokens" / milestone
-    // ladder must reflect ALL usage, not just in-app chat — a heavy Claude Code / extension user
-    // was seeing a headline total that silently excluded most of their real usage, with the API
-    // figures only visible by switching to a separate tab. `sessions`/`messages`/streak/peak-hour/
-    // favorite-model stay chat-only below: those are chat-conversation-shaped concepts (a gateway
-    // request has no conv_id, isn't a "session") with no clean 1:1 API equivalent, and the founder
-    // asked specifically about "usage" totals, not those. The isolated `api` breakdown (by source,
-    // by model) remains available in its own tab for anyone who wants the split.
-    const api = this.apiUsageStats(range)
-    const combinedTotalTokens = totalTokens + api.totalTokens
-    const combinedLifetimeTotalTokens = chatLifetimeTotalTokens + api.lifetimeTotalTokens
-    const milestone = milestoneFor(combinedLifetimeTotalTokens)
-
-    return {
-      range, sessions, messages, totalTokens: combinedTotalTokens, activeDays,
-      currentStreak, longestStreak, peakHour,
-      favoriteModel: byModel[0]?.displayName ?? null,
-      firstMessageAt, lifetimeTotalTokens: combinedLifetimeTotalTokens, milestone,
-      activity, dailyByModel, byModel,
-      api,
-    }
-  }
-
-  /** Conversations with an assistant reply at or after `since` (an ISO instant; null: ever). */
-  private chatSessionsSince(since: string | null): number {
-    // INDEXED BY: for a DISTINCT, SQLite's planner otherwise prefers walking idx_messages_conv
-    // (sorted conv_ids, no temp sort) over the whole table instead of seeking the date range.
-    const range = since === null ? '' : ' INDEXED BY idx_messages_created WHERE created_at >= $since AND'
-    return (this.db.prepare(`SELECT COUNT(DISTINCT conv_id) AS n FROM messages${range || ' WHERE'} role = 'assistant'`)
-      .get(since === null ? {} : { $since: since } as P) as { n: number }).n
-  }
-
-  /** Insert one completed gateway request (GitHub #71) — called from the two gateway entry
-   *  points (gateway.ts) right where in-app chat already records into `messages`. Fully
-   *  additive/fail-safe: callers wrap this the same way `recordCompletion` is wrapped.
-   *  `codeSessionId`/`durationMs` (ADR-284) are only populated for a terminal-agent session's
-   *  own token-identified traffic — undefined for every other gateway client, same as before. */
-  recordApiUsage(rec: { source: ApiUsageSource; modelKey: string | null; promptTokens: number; genTokens: number; codeSessionId?: string | null; durationMs?: number | null; promptTps?: number | null; genTps?: number | null; harness?: string | null }): void {
-    // `promptTps`/`genTps` (ADR-300) are the ENGINE's own measurements, straight from the
-    // llama.cpp response's `timings` — not anything computed here. Passing them through is the
-    // whole point: each phase gets its own real rate instead of both being divided by one
-    // wall-clock. Absent (an engine that reports no timings) → null, and the reader falls back.
-    const rate = (v: number | null | undefined) => (v != null && Number.isFinite(v) && v > 0 ? v : null)
-    this.db.prepare(`
-      INSERT INTO api_usage (id, created_at, source, model_key, prompt_tokens, gen_tokens, code_session_id, duration_ms, prompt_tps, gen_tps, harness, ctx_used)
-      VALUES ($id, $createdAt, $source, $modelKey, $promptTokens, $genTokens, $codeSessionId, $durationMs, $promptTps, $genTps, $harness, $ctxUsed)
-    `).run({
-      $id: randomUUID(),
-      $createdAt: new Date().toISOString(),
-      $source: rec.source,
-      $modelKey: rec.modelKey,
-      $promptTokens: Math.max(0, Math.floor(rec.promptTokens) || 0),
-      $genTokens: Math.max(0, Math.floor(rec.genTokens) || 0),
-      $codeSessionId: rec.codeSessionId ?? null,
-      $durationMs: rec.durationMs != null && Number.isFinite(rec.durationMs) ? Math.max(0, Math.floor(rec.durationMs)) : null,
-      $promptTps: rate(rec.promptTps),
-      $genTps: rate(rec.genTps),
-      $harness: rec.harness ?? null,
-      $ctxUsed: Math.max(0, Math.floor(rec.promptTokens) || 0),
-    } as P)
-  }
-
-  /** Lower the current context size for a Code session after /compact, so the ctx gauge
-   *  reflects post-compaction reality (ADR-386). Updates the row with the MAX ctx_used
-   *  to the new value — this is what allows /compact to lower the ring's frozen ceiling.
-   *  If no row exists yet (fresh session compacted before first gateway request), creates one. */
-  setCodeSessionCtxUsed(codeSessionId: string, ctxUsed: number): void {
-    // Try to update the row with the MAX ctx_used first
-    const maxRow = this.db.prepare(`
-      SELECT id FROM api_usage
-      WHERE code_session_id = $codeSessionId AND ctx_used = (
-        SELECT MAX(ctx_used) FROM api_usage WHERE code_session_id = $codeSessionId
-      )
-      LIMIT 1
-    `).get({ $codeSessionId: codeSessionId } as P) as { id: string } | undefined
-    if (maxRow) {
-      this.db.prepare(`
-        UPDATE api_usage SET ctx_used = $ctxUsed, prompt_tokens = $promptTokens, created_at = $createdAt
-        WHERE id = $id
-      `).run({ $ctxUsed: ctxUsed, $promptTokens: ctxUsed, $createdAt: new Date().toISOString(), $id: maxRow.id } as P)
-    } else {
-      // No row exists yet — create one (fresh session compacted before first gateway request)
-      this.db.prepare(`
-        INSERT INTO api_usage (id, created_at, source, prompt_tokens, gen_tokens, code_session_id, ctx_used)
-        VALUES ($id, $createdAt, 'compact', $promptTokens, 0, $codeSessionId, $ctxUsed)
-      `).run({
-        $id: randomUUID(),
-        $createdAt: new Date().toISOString(),
-        $promptTokens: ctxUsed,
-        $codeSessionId: codeSessionId,
-        $ctxUsed: ctxUsed,
-      } as P)
-    }
-  }
-
-  /** The session's own gateway-request stats (ADR-284, revised twice — founder-reported "ctx
-   *  fill jumps between full and empty in the same session", then a review pass on that same fix
-   *  catching that it had gone on to freeze the LAST-TURN stats too). Two different questions,
-   *  two different rows:
-   *
-   *  `ctxUsed` is the MAX prompt_tokens row, not literally the most-recently-INSERTED one. Every
-   *  request a real `claude` CLI process makes — the main conversation's own turn AND every
-   *  parallel Task-tool sub-agent it spawns — shares the SAME code_session_id: `resolveCodeSession`
-   *  (gateway.ts) derives it purely from the bearer token, and the CLI mints exactly one token
-   *  (ANTHROPIC_AUTH_TOKEN, set once at launch) for its whole process, sub-agents included. A
-   *  sub-agent's own prompt is a small, isolated sub-task — nothing like the full resent
-   *  conversation — so whichever of the two finishes last used to decide what the ring showed:
-   *  the real, large, ever-growing main-turn prompt one poll, a tiny sub-agent prompt the next,
-   *  with no change to the actual conversation in between. The MAX is the honest answer to "how
-   *  full has this session's context gotten" — a real Claude Code CLI resends the whole
-   *  conversation every turn, so its size only grows within one continuous conversation, and a
-   *  sub-agent (always smaller) can never legitimately raise that high-water mark. Trade-off,
-   *  accepted: after a real `/clear` inside the CLI (invisible to the daemon — a terminal-agent
-   *  session's turns are never persisted here, see ADR-297), this keeps reporting the pre-clear
-   *  high-water mark until the new conversation grows past it. A temporarily-stale-high ring
-   *  reading after a rare, deliberate user action beats an unpredictable full/empty flicker on
-   *  every ordinary agentic turn with sub-agents.
-   *
-   *  `promptTokens`/`genTokens`/`promptTps`/`genTps` are the temporally-LAST row instead — these
-   *  power TerminalToolbar.tsx's composer-parity stats row, which reads as "your last turn", not
-   *  "session high-water mark". Sharing the MAX row here (the original version of this fix) meant
-   *  a sub-agent call landing after the real turn hid its own genTokens/tps behind the earlier,
-   *  larger turn's numbers, and after a `/clear` these froze at the pre-clear turn's numbers
-   *  forever, same failure shape as the ctxUsed bug this method was written to fix in the first
-   *  place. null when the session has made no gateway requests yet (fresh session, or a
-   *  non-terminal-agent one). */
-  getLastApiUsageForSession(codeSessionId: string): { ctxUsed: number; promptTokens: number; genTokens: number; promptTps: number | null; genTps: number | null } | null {
-    const row = this.db.prepare(`
-      SELECT prompt_tokens, gen_tokens, duration_ms, prompt_tps, gen_tps, ctx_used FROM api_usage
-      WHERE code_session_id = $codeSessionId
-      ORDER BY created_at DESC, rowid DESC LIMIT 1
-    `).get({ $codeSessionId: codeSessionId } as P) as unknown as { prompt_tokens: number; gen_tokens: number; duration_ms: number | null; prompt_tps: number | null; gen_tps: number | null; ctx_used: number } | undefined
-    if (!row) return null
-    // ctx_used is the MAX across all rows — same high-water-mark semantics as the old
-    // MAX(prompt_tokens) approach, but now /compact can lower it via setCodeSessionCtxUsed.
-    // Sub-agent calls (smaller prompts) can't drag the ring down because MAX ignores them.
-    const ctxUsed = (this.db.prepare(`
-      SELECT MAX(ctx_used) as maxCtxUsed FROM api_usage WHERE code_session_id = $codeSessionId
-    `).get({ $codeSessionId: codeSessionId } as P) as unknown as { maxCtxUsed: number }).maxCtxUsed
-    const seconds = row.duration_ms != null && row.duration_ms > 0 ? row.duration_ms / 1000 : null
-    return {
-      ctxUsed,
-      promptTokens: row.prompt_tokens,
-      genTokens: row.gen_tokens,
-      promptTps: row.prompt_tps ?? (seconds ? row.prompt_tokens / seconds : null),
-      genTps: row.gen_tps ?? (seconds ? row.gen_tokens / seconds : null),
-    }
-  }
-
-  /** Gateway (external-client) token usage — see `ApiUsageStats`'s doc comment for why this
-   *  is a separate bucket from `tokenUsageStats`. Same local-day range scoping as the chat
-   *  stats above, but no streak/session concepts (a gateway request isn't a chat turn).
-   *  SQLite does the sums: the range is a WHERE on the indexed created_at, and JavaScript gets
-   *  one row per (source, model), in order of first appearance like the per-request pass it
-   *  replaced (Map order breaks byModel ties). */
-  apiUsageStats(range: TokenUsageRange = 'all'): ApiUsageStats {
-    const lifetimeTotalTokens = (this.db.prepare(`
-      SELECT (SELECT COALESCE(SUM(prompt_tokens + gen_tokens), 0) FROM api_usage)
-           + (SELECT COALESCE(SUM(prompt_tokens + gen_tokens), 0) FROM api_usage_daily) AS n
-    `).get() as { n: number }).n
-
-    const todayKey = dayKey(new Date().toISOString())
-    const sinceDay = range === 'all' ? null : addDays(todayKey, -(RANGE_WINDOW_DAYS[range] - 1))
-    const params = sinceDay === null ? {} : { $since: this.dayWindow(sinceDay).start, $sinceDay: sinceDay }
-    // Raw rows and the retention sweep's daily totals (v55) together: a row is in exactly one.
-    const groups = this.db.prepare(`
-      SELECT source, model_key, SUM(requests) AS requests, SUM(prompt_tokens) AS prompt_tokens, SUM(gen_tokens) AS gen_tokens
-      FROM (
-        SELECT source, model_key, 1 AS requests, prompt_tokens, gen_tokens, created_at AS first_at, rowid AS first_seq
-        FROM api_usage${sinceDay === null ? '' : ' WHERE created_at >= $since'}
-        UNION ALL
-        SELECT source, NULLIF(model_key, ''), requests, prompt_tokens, gen_tokens, first_at, first_seq
-        FROM api_usage_daily${sinceDay === null ? '' : ' WHERE day >= $sinceDay'}
-      )
-      GROUP BY source, model_key
-      ORDER BY MIN(first_at), MIN(first_seq)
-    `).all(params as P) as unknown as { source: ApiUsageSource; model_key: string | null; requests: number; prompt_tokens: number; gen_tokens: number }[]
-
-    const sourceTally = new Map<ApiUsageSource, { requests: number; totalTokens: number }>()
-    const modelTally = new Map<string, { requests: number; promptTokens: number; genTokens: number }>()
-    let totalTokens = 0, requests = 0
-    for (const g of groups) {
-      const tokens = g.prompt_tokens + g.gen_tokens
-      totalTokens += tokens
-      requests += g.requests
-      const st = sourceTally.get(g.source) ?? { requests: 0, totalTokens: 0 }
-      st.requests += g.requests; st.totalTokens += tokens
-      sourceTally.set(g.source, st)
-      if (g.model_key) {
-        const mt = modelTally.get(g.model_key) ?? { requests: 0, promptTokens: 0, genTokens: 0 }
-        mt.requests += g.requests; mt.promptTokens += g.prompt_tokens; mt.genTokens += g.gen_tokens
-        modelTally.set(g.model_key, mt)
-      }
-    }
-
-    const byModel: ApiModelUsage[] = [...modelTally.entries()]
-      .map(([modelKey, m]) => ({
-        modelKey, displayName: titleCaseModelName(modelKey),
-        requests: m.requests, promptTokens: m.promptTokens, genTokens: m.genTokens,
-        totalTokens: m.promptTokens + m.genTokens,
-      }))
-      .sort((a, b) => b.totalTokens - a.totalTokens)
-
-    return {
-      range, requests, totalTokens, lifetimeTotalTokens,
-      bySource: [...sourceTally.entries()].map(([source, s]) => ({ source, ...s })),
-      byModel,
-    }
-  }
-
-  /** Retention (scalability review 2.4): folds up to `limit` raw `api_usage` rows created before
-   *  `before` into `api_usage_daily` and deletes them, in one transaction. Walks in (created_at,
-   *  rowid) order from `after`; `next` is where the following batch starts, null once done.
-   *  A Code session's latest and peak-context rows stay raw: getLastApiUsageForSession reads
-   *  them, and the rows it skips are walked past, never revisited. */
-  rollUpApiUsageBatch(before: string, limit: number, after: ApiUsageCursor | null = null): { rolledUp: number; next: ApiUsageCursor | null } {
-    return this.transaction(() => {
-      const rows = this.db.prepare(`
-        SELECT rowid AS seq, id, created_at, source, model_key, harness, code_session_id, prompt_tokens, gen_tokens FROM api_usage
-        WHERE created_at < $before${after ? ' AND created_at >= $afterAt AND (created_at > $afterAt OR rowid > $afterSeq)' : ''}
-        ORDER BY created_at, rowid LIMIT $limit
-      `).all({ $before: before, $limit: limit, ...(after ? { $afterAt: after.createdAt, $afterSeq: after.seq } : {}) } as P) as unknown as ApiUsageRollupRow[]
-      const kept = this.codeSessionGaugeRowIds(rows)
-      const folded = rows.filter((r) => !kept.has(r.id))
-      this.addToDailyApiUsage(folded)
-      const del = this.db.prepare(`DELETE FROM api_usage WHERE rowid = $seq`)
-      for (const r of folded) del.run({ $seq: r.seq } as P)
-      const last = rows[rows.length - 1]
-      return { rolledUp: folded.length, next: rows.length < limit ? null : { createdAt: last.created_at, seq: last.seq } }
-    })
-  }
-
-  /** The ids of the rows getLastApiUsageForSession reads for each Code session among `rows`:
-   *  its newest, and one holding its peak ctx_used. */
-  private codeSessionGaugeRowIds(rows: ApiUsageRollupRow[]): Set<string> {
-    const sessions = new Set(rows.map((r) => r.code_session_id).filter((s): s is string => s !== null))
-    const latest = this.db.prepare(`SELECT id FROM api_usage WHERE code_session_id = $s ORDER BY created_at DESC, rowid DESC LIMIT 1`)
-    const peak = this.db.prepare(`SELECT id FROM api_usage WHERE code_session_id = $s ORDER BY ctx_used DESC LIMIT 1`)
-    const ids = new Set<string>()
-    for (const s of sessions) {
-      for (const stmt of [latest, peak]) ids.add((stmt.get({ $s: s } as P) as { id: string }).id)
-    }
-    return ids
-  }
-
-  private addToDailyApiUsage(rows: ApiUsageRollupRow[]): void {
-    const groups = new Map<string, { day: string; source: string; model: string; harness: string; requests: number; prompt: number; gen: number; firstAt: string; firstSeq: number }>()
-    for (const r of rows) {
-      const day = dayKey(r.created_at)
-      const key = [day, r.source, r.model_key ?? '', r.harness ?? ''].join('\x00')
-      const g = groups.get(key) ?? { day, source: r.source, model: r.model_key ?? '', harness: r.harness ?? '', requests: 0, prompt: 0, gen: 0, firstAt: r.created_at, firstSeq: r.seq }
-      g.requests++; g.prompt += r.prompt_tokens; g.gen += r.gen_tokens
-      if (r.created_at < g.firstAt) g.firstAt = r.created_at
-      if (r.seq < g.firstSeq) g.firstSeq = r.seq
-      groups.set(key, g)
-    }
-    const upsert = this.db.prepare(`
-      INSERT INTO api_usage_daily (day, source, model_key, harness, requests, prompt_tokens, gen_tokens, first_at, first_seq)
-      VALUES ($day, $source, $model, $harness, $requests, $prompt, $gen, $firstAt, $firstSeq)
-      ON CONFLICT (day, source, model_key, harness) DO UPDATE SET
-        requests = requests + excluded.requests,
-        prompt_tokens = prompt_tokens + excluded.prompt_tokens,
-        gen_tokens = gen_tokens + excluded.gen_tokens,
-        first_at = MIN(first_at, excluded.first_at),
-        first_seq = MIN(first_seq, excluded.first_seq)
-    `)
-    for (const g of groups.values()) {
-      upsert.run({
-        $day: g.day, $source: g.source, $model: g.model, $harness: g.harness, $requests: g.requests,
-        $prompt: g.prompt, $gen: g.gen, $firstAt: g.firstAt, $firstSeq: g.firstSeq,
-      } as P)
-    }
-  }
-
-  /**
-   * A single UTC-comparable `[start, end)` window for `chat_daily`/`gateway_daily`/
-   * `code_daily` (spec 23 §3.4/3.5/3.8, ADR-333) — read-only aggregations over
-   * tables that already durably record everything needed, computed once at
-   * day-rollover rather than accumulated in memory (unlike `feature_used_daily`,
-   * which has no backing table to query and genuinely needs `runtime/rollup.ts`'s
-   * accumulator). `dayIso` is a `YYYY-MM-DD` local-calendar-day key, matching
-   * `dayKey()`'s own convention above.
-   */
-  private dayWindow(dayIso: string): { start: string; end: string } {
-    const [y, m, d] = dayIso.split('-').map(Number)
-    return {
-      start: new Date(y, m - 1, d).toISOString(),
-      end: new Date(y, m - 1, d + 1).toISOString(),
-    }
-  }
-
-  /** `chat_daily`'s config block (spec 23 §3.4) for the local calendar day `dayIso`.
-   *  `toolCalls` sums `json_array_length(tool_calls)` rather than counting messages
-   *  that merely HAVE a tool call, so a message with 3 calls in one turn counts as 3.
-   *  `regenerates` counts deactivated variant-group siblings — each one is a message
-   *  a real regenerate action superseded (see the `variant_group`/`is_active`
-   *  migration note above). `stops` reads `stats.aborted`, the same flag the chat UI
-   *  itself uses to render a stopped reply. Median is computed in JS — SQLite has no
-   *  built-in median aggregate, and pulling one row per touched conversation is cheap
-   *  (a real day's conversation count is nowhere near enough to matter). */
-  chatDailyStats(dayIso: string): {
-    conversations: number; messages: number; maxMessagesInConversation: number
-    medianMessagesInConversation: number; distinctModels: number; toolCalls: number
-    regenerates: number; stops: number
-  } {
-    const { start, end } = this.dayWindow(dayIso)
-    const rows = this.db.prepare(`
-      SELECT conv_id, model_key, tool_calls, stats FROM messages
-      WHERE created_at >= ? AND created_at < ? AND is_active = 1
-    `).all(start, end) as unknown as { conv_id: string; model_key: string | null; tool_calls: string | null; stats: string }[]
-
-    const perConv = new Map<string, number>()
-    const models = new Set<string>()
-    let toolCalls = 0
-    let stops = 0
-    for (const r of rows) {
-      perConv.set(r.conv_id, (perConv.get(r.conv_id) ?? 0) + 1)
-      if (r.model_key) models.add(r.model_key)
-      if (r.tool_calls) {
-        try {
-          const parsed: unknown = JSON.parse(r.tool_calls)
-          if (Array.isArray(parsed)) toolCalls += parsed.length
-        } catch {
-          // malformed tool_calls JSON — skip rather than crash a periodic rollup
-        }
-      }
-      try {
-        const s: unknown = JSON.parse(r.stats)
-        if (typeof s === 'object' && s !== null && (s as { aborted?: unknown }).aborted === true) stops++
-      } catch {
-        // malformed stats JSON — same treatment
-      }
-    }
-
-    const counts = [...perConv.values()].sort((a, b) => a - b)
-    const median = counts.length === 0 ? 0
-      : counts.length % 2 === 1 ? counts[(counts.length - 1) / 2]
-      : (counts[counts.length / 2 - 1] + counts[counts.length / 2]) / 2
-
-    const regenerates = (this.db.prepare(`
-      SELECT COUNT(*) AS n FROM messages
-      WHERE created_at >= ? AND created_at < ? AND variant_group IS NOT NULL AND is_active = 0
-    `).get(start, end) as unknown as { n: number }).n
-
-    return {
-      conversations: perConv.size,
-      messages: rows.length,
-      maxMessagesInConversation: counts.length === 0 ? 0 : counts[counts.length - 1],
-      medianMessagesInConversation: median,
-      distinctModels: models.size,
-      toolCalls,
-      regenerates,
-      stops,
-    }
-  }
-
-  /** `gateway_daily`'s config block (spec 23 §3.5) for the local calendar day
-   *  `dayIso`, grouped by `source` (protocol) — a read-only aggregation over the
-   *  ALREADY-INDEXED `api_usage` table, so this adds no write to the gateway's own
-   *  hot request path. Grouped by harness too once Phase 5's client-detection
-   *  ships; until then every row reports `harness: 'unknown'` rather than waiting
-   *  on that phase to start collecting protocol-level volume at all. */
-  /** Grouped by (protocol, harness) — spec 23 §3.5, telemetry Phase 5. Pre-Phase-5 rows (and
-   *  any client the gateway didn't classify) have `harness IS NULL`, which reads as `'unknown'`
-   *  here rather than a distinct group of its own — that's the same bucket a genuinely
-   *  unrecognized live client falls into, so the two cases don't need telling apart downstream. */
-  gatewayDailyStats(dayIso: string): { protocol: ApiUsageSource; harness: string; requests: number; promptTokens: number; genTokens: number; distinctModels: number }[] {
-    const { start, end } = this.dayWindow(dayIso)
-    // Raw rows and the retention sweep's daily totals for the day (v55), which keep the same
-    // (source, model, harness) detail. In order of first appearance, so the groups come out in
-    // the same order whether or not the day has been rolled up.
-    const rows = this.db.prepare(`
-      SELECT source, model_key, harness, 1 AS requests, prompt_tokens, gen_tokens, created_at AS first_at, rowid AS first_seq FROM api_usage
-      WHERE created_at >= ? AND created_at < ?
-      UNION ALL
-      SELECT source, NULLIF(model_key, ''), NULLIF(harness, ''), requests, prompt_tokens, gen_tokens, first_at, first_seq FROM api_usage_daily
-      WHERE day = ?
-      ORDER BY first_at, first_seq
-    `).all(start, end, dayIso) as unknown as { source: ApiUsageSource; model_key: string | null; harness: string | null; requests: number; prompt_tokens: number; gen_tokens: number }[]
-
-    const byGroup = new Map<string, { protocol: ApiUsageSource; harness: string; requests: number; promptTokens: number; genTokens: number; models: Set<string> }>()
-    for (const r of rows) {
-      const harness = r.harness ?? 'unknown'
-      const key = `${r.source}\x00${harness}`
-      const t = byGroup.get(key) ?? { protocol: r.source, harness, requests: 0, promptTokens: 0, genTokens: 0, models: new Set<string>() }
-      t.requests += r.requests
-      t.promptTokens += r.prompt_tokens
-      t.genTokens += r.gen_tokens
-      if (r.model_key) t.models.add(r.model_key)
-      byGroup.set(key, t)
-    }
-
-    return [...byGroup.values()].map((t) => ({
-      protocol: t.protocol, harness: t.harness, requests: t.requests, promptTokens: t.promptTokens, genTokens: t.genTokens, distinctModels: t.models.size,
-    }))
-  }
-
-  /** `code_daily`'s config block (spec 23 §3.6) for the local calendar day `dayIso`
-   *  — `sessions`/`turns`/`toolCalls` only. `toolApprovals`/`toolDenials`/
-   *  `compactions`/`worktreeSessions` need new instrumentation inside
-   *  `code-session.ts` itself (no table records per-call approval decisions or
-   *  compaction events today) and are a deliberate, tracked follow-up (TODO.md)
-   *  rather than fabricated here. `agent_runs` is a Code session (`codeStats`'s own
-   *  precedent for this join); `turns` counts assistant replies within one, the same
-   *  unit `chatDailyStats` counts for regular chat. */
-  codeDailyStats(dayIso: string): { sessions: number; turns: number; toolCalls: number } {
-    const { start, end } = this.dayWindow(dayIso)
-    const sessions = (this.db.prepare(`
-      SELECT COUNT(*) AS n FROM agent_runs ar JOIN conversations c ON c.id = ar.conv_id
-      WHERE c.kind = 'code' AND ar.created_at >= ? AND ar.created_at < ?
-    `).get(start, end) as unknown as { n: number }).n
-
-    // CROSS JOIN keeps messages the outer loop, so the day is a seek on idx_messages_created
-    // (v53) rather than every code conversation's messages read and filtered.
-    const rows = this.db.prepare(`
-      SELECT m.tool_calls FROM messages m CROSS JOIN conversations c ON c.id = m.conv_id
-      WHERE c.kind = 'code' AND m.role = 'assistant' AND m.is_active = 1
-        AND m.created_at >= ? AND m.created_at < ?
-    `).all(start, end) as unknown as { tool_calls: string | null }[]
-
-    let toolCalls = 0
-    for (const r of rows) {
-      if (!r.tool_calls) continue
-      try {
-        const parsed: unknown = JSON.parse(r.tool_calls)
-        if (Array.isArray(parsed)) toolCalls += parsed.length
-      } catch {
-        // malformed tool_calls JSON — skip rather than crash a periodic rollup
-      }
-    }
-
-    return { sessions, turns: rows.length, toolCalls }
-  }
-
-  /** Code launchpad's "Coding activity" stats — real numbers, replacing code-mock.ts's
-   *  CODE_STATS/mockSessionDays (which were always fake). Mirrors tokenUsageStats' own
-   *  day-bucket/streak/range pattern closely (dayKey/addDays are the same shared helpers) —
-   *  everything computed fresh from agent_runs + messages on each call, not from a maintained
-   *  running counter, so it's always internally consistent with whatever data actually exists.
-   *  As in tokenUsageStats, SQLite does the counting: lifetime runs per quarter hour for the
-   *  streaks, the range's runs per model, and only the range's tool calls reach JavaScript. */
-  codeStats(range: CodeStatsRange = 'all'): CodeStatsResult {
-    const quarters = this.db.prepare(`
-      SELECT ${quarterHour('ar.created_at')} AS quarter, COUNT(*) AS runs
-      FROM agent_runs ar JOIN conversations c ON c.id = ar.conv_id
-      WHERE c.kind = 'code'
-      GROUP BY quarter ORDER BY quarter
-    `).all() as unknown as { quarter: string; runs: number }[]
-
-    if (quarters.length === 0) {
-      return {
-        range, sessions: 0, tasksShipped: 0, filesTouched: 0, diffAdded: 0, diffRemoved: 0,
-        activeDays: 0, currentStreak: 0, longestStreak: 0, favoriteModel: null, heatmap: [],
-      }
-    }
-
-    // Per-local-day run counts across the FULL history — needed for lifetime streaks
-    // regardless of `range`, and reused below for the heatmap window.
-    const dayBuckets = new Map<string, number>()
-    for (const q of quarters) {
-      const key = dayKey(quarterStartIso(q.quarter))
-      dayBuckets.set(key, (dayBuckets.get(key) ?? 0) + q.runs)
-    }
-    const firstKey = dayKey(quarterStartIso(quarters[0].quarter))
-    const todayKey = dayKey(new Date().toISOString())
-
-    let longestStreak = 0, run = 0
-    for (let key = firstKey; key <= todayKey; key = addDays(key, 1)) {
-      if (dayBuckets.has(key)) { run++; longestStreak = Math.max(longestStreak, run) } else { run = 0 }
-    }
-    let currentStreak = 0
-    {
-      // Grace period: if today has no session yet, the streak isn't broken until tomorrow.
-      let key = dayBuckets.has(todayKey) ? todayKey : addDays(todayKey, -1)
-      while (key >= firstKey && dayBuckets.has(key)) { currentStreak++; key = addDays(key, -1) }
-    }
-
-    const minAllStart = addDays(todayKey, -179)
-    const heatStart = range === 'all'
-      ? (firstKey < minAllStart ? firstKey : minAllStart)
-      : addDays(todayKey, -(RANGE_WINDOW_DAYS[range] - 1))
-
-    const since = range === 'all' ? null : this.dayWindow(heatStart).start
-    const sinceClause = since === null ? '' : ' AND ar.created_at >= $since'
-    const sinceParams = since === null ? {} : { $since: since } as P
-    // Per model in order of first appearance, so Map order breaks favorite-model ties as before.
-    const byModel = this.db.prepare(`
-      SELECT c.model_key, COUNT(*) AS runs, SUM(ar.status = 'done') AS done
-      FROM agent_runs ar JOIN conversations c ON c.id = ar.conv_id
-      WHERE c.kind = 'code'${sinceClause}
-      GROUP BY c.model_key ORDER BY MIN(ar.created_at), MIN(ar.rowid)
-    `).all(sinceParams) as unknown as { model_key: string; runs: number; done: number }[]
-
-    const modelTally = new Map<string, number>()
-    let sessions = 0, tasksShipped = 0
-    for (const m of byModel) {
-      sessions += m.runs
-      tasksShipped += m.done
-      if (m.model_key) modelTally.set(m.model_key, m.runs)
-    }
-    const activeDays = [...dayBuckets.keys()].filter((key) => key >= heatStart).length
-    let favoriteModelKey: string | null = null, favoriteCount = -1
-    for (const [k, n] of modelTally) if (n > favoriteCount) { favoriteModelKey = k; favoriteCount = n }
-
-    const heatmap: CodeStatsDay[] = []
-    for (let key = heatStart; key <= todayKey; key = addDays(key, 1)) {
-      heatmap.push({ date: key, sessions: dayBuckets.get(key) ?? 0 })
-    }
-
-    // filesTouched + diffAdded/diffRemoved: scoped by each MESSAGE's own created_at (when the
-    // tool call actually ran), not the owning run's — a long session's later turns land on a
-    // later day than its first message, so this is the more honest scoping of the two.
-    // With a range, CROSS JOIN pins messages as the outer loop (SQLite keeps the written join
-    // order for it), so the date range is an index seek rather than every code message read.
-    const msgRows = this.db.prepare(since === null ? `
-      SELECT m.tool_calls FROM messages m JOIN conversations c ON c.id = m.conv_id
-      WHERE c.kind = 'code' AND m.role = 'assistant' AND m.tool_calls IS NOT NULL
-    ` : `
-      SELECT m.tool_calls FROM messages m CROSS JOIN conversations c ON c.id = m.conv_id
-      WHERE c.kind = 'code' AND m.role = 'assistant' AND m.tool_calls IS NOT NULL AND m.created_at >= $since
-    `).all(sinceParams) as unknown as { tool_calls: string }[]
-
-    const filePaths = new Set<string>()
-    let diffAdded = 0, diffRemoved = 0
-    for (const r of msgRows) {
-      const calls = safeJson(r.tool_calls) as ToolCallRecord[] | undefined
-      if (!Array.isArray(calls)) continue
-      for (const tc of calls) {
-        const path = typeof tc.args?.path === 'string' ? tc.args.path : undefined
-        if (path && (tc.name === 'edit' || tc.name === 'write')) filePaths.add(path)
-        if (tc.name === 'edit' && tc.diff) {
-          const { add, del } = countDiffLines(tc.diff)
-          diffAdded += add
-          diffRemoved += del
-        }
-      }
-    }
-
-    return {
-      range, sessions, tasksShipped, filesTouched: filePaths.size,
-      diffAdded, diffRemoved, activeDays, currentStreak, longestStreak,
-      favoriteModel: favoriteModelKey ? titleCaseModelName(favoriteModelKey) : null,
-      heatmap,
-    }
-  }
-
   /** Active branch only — matches getMessages(). Used to find "the last thing the user
    *  currently sees" (e.g. to decide whether a fresh assistant placeholder follows it). */
   getLastMessage(convId: string): Message | null {
@@ -2724,17 +1074,7 @@ export class ConversationStore {
    *  BEGIN/COMMIT/ROLLBACK like node:sqlite, and its periodic flush is a timer, which cannot fire
    *  in the middle either. */
   transaction<T>(fn: () => T): T {
-    this.db.exec('BEGIN IMMEDIATE')
-    try {
-      const out = fn()
-      this.db.exec('COMMIT')
-      return out
-    } catch (e) {
-      // SQLite has already rolled back after some errors (SQLITE_FULL, SQLITE_IOERR); a second
-      // ROLLBACK would then throw and hide the error that failed the operation.
-      try { this.db.exec('ROLLBACK') } catch { /* already rolled back */ }
-      throw e
-    }
+    return inTransaction(this.db, fn)
   }
 
   // ── Folder methods (v10 migration) ────────────────────────────────────────
@@ -2820,294 +1160,6 @@ export class ConversationStore {
     return r.changes
   }
 
-  // ── Agent run methods (v8 migration) ──────────────────────────────────────
-
-  createAgentRun(params: { convId: string; title: string; allowedTools: string[]; agentId?: string; repoRoot?: string; repoBranch?: string; useWorktree?: boolean; worktreeBranch?: string; worktreeBase?: string; worktreePath?: string; codeAgent?: 'turbollm' | 'pi' | 'claude' | 'opencode' }): AgentRun {
-    const id = randomUUID()
-    const now = new Date().toISOString()
-    const agentId = params.agentId ?? null
-    // Code runs carry repo/worktree metadata (v28); background 'agent' runs pass none of it
-    // and every code column is written NULL (byte-identical to the pre-v28 insert for them).
-    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,agent_id,repo_root,repo_branch,use_worktree,worktree_branch,worktree_base,worktree_path,lines_added,lines_removed,code_agent,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$aid,$rr,$rb,$uw,$wb,$wbase,$wpath,$la,$lr,$ca,$now,$now)`)
-      .run({
-        $id: id, $cid: params.convId, $title: params.title, $at: JSON.stringify(params.allowedTools), $aid: agentId,
-        $rr: params.repoRoot ?? null,
-        $rb: params.repoBranch ?? null,
-        $uw: params.useWorktree === undefined ? null : (params.useWorktree ? 1 : 0),
-        $wb: params.worktreeBranch ?? null,
-        $wbase: params.worktreeBase ?? null,
-        $wpath: params.worktreePath ?? null,
-        // Phase 1: diff stats are not computed yet — seed a code run's counters at 0 so the
-        // sidebar shows +0/-0 rather than a blank; a background 'agent' run leaves them NULL.
-        $la: params.repoRoot !== undefined ? 0 : null,
-        $lr: params.repoRoot !== undefined ? 0 : null,
-        $ca: params.codeAgent ?? null,
-        $now: now,
-      } as P)
-    return this.getAgentRun(id)!
-  }
-
-  getAgentRun(id: string): AgentRun | null {
-    const row = this.db.prepare(`SELECT * FROM agent_runs WHERE id = $id`).get({ $id: id } as P) as unknown as AgentRunRow | undefined
-    return row ? rowToAgentRun(row) : null
-  }
-
-  listAgentRuns(opts?: { statuses?: string[] }): AgentRun[] {
-    return this.listAgentRunsPage(opts).runs
-  }
-
-  /** Agent runs, most recently updated first, a keyset page at a time (200 by default and at
-   *  most), optionally only those in `statuses`. Rows leave out the compaction summary
-   *  (AGENT_RUN_LIST_COLUMNS). */
-  listAgentRunsPage(opts: { statuses?: string[] } & PageOpts = {}): { runs: AgentRun[]; nextCursor: string | null } {
-    const params: P = {}
-    opts.statuses?.forEach((s, i) => { params[`$s${i}`] = s })
-    const where = opts.statuses?.length ? [`status IN (${opts.statuses.map((_, i) => `$s${i}`).join(',')})`] : []
-    const { rows, nextCursor } = this.keysetPage<AgentRunRow>({
-      columns: AGENT_RUN_LIST_COLUMNS, table: 'agent_runs', sortColumn: 'updated_at', sortValue: (r) => r.updated_at, where, params,
-    }, opts, 200, 200)
-    return { runs: rows.map(rowToAgentRun), nextCursor }
-  }
-
-  updateAgentRun(id: string, patch: Partial<Pick<AgentRun, 'status' | 'error' | 'startedAt' | 'endedAt' | 'title' | 'compactionSummary' | 'compactionUpToMessageId' | 'compactionTokensBefore' | 'titleAutoSynced' | 'terminalLaunchedOnce'>>): boolean {
-    const now = new Date().toISOString()
-    const sets: string[] = ['updated_at = $now']
-    const params: Record<string, SqlValue> = { $id: id, $now: now }
-    if (patch.status    !== undefined) { sets.push('status = $status');      params.$status  = patch.status }
-    if (patch.error     !== undefined) { sets.push('error = $error');        params.$error   = patch.error }
-    if (patch.startedAt !== undefined) { sets.push('started_at = $started'); params.$started = patch.startedAt }
-    if (patch.endedAt   !== undefined) { sets.push('ended_at = $ended');     params.$ended   = patch.endedAt }
-    if (patch.title     !== undefined) { sets.push('title = $title');       params.$title   = patch.title }
-    if (patch.compactionSummary        !== undefined) { sets.push('compaction_summary = $csum');    params.$csum = patch.compactionSummary }
-    if (patch.compactionUpToMessageId  !== undefined) { sets.push('compaction_upto_message_id = $cupto'); params.$cupto = patch.compactionUpToMessageId }
-    if (patch.compactionTokensBefore   !== undefined) { sets.push('compaction_tokens_before = $ctok'); params.$ctok = patch.compactionTokensBefore }
-    if (patch.titleAutoSynced          !== undefined) { sets.push('title_auto_synced = $tas'); params.$tas = patch.titleAutoSynced ? 1 : 0 }
-    if (patch.terminalLaunchedOnce     !== undefined) { sets.push('terminal_launched_once = $tlo'); params.$tlo = patch.terminalLaunchedOnce ? 1 : 0 }
-    return ((this.db.prepare(`UPDATE agent_runs SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
-  }
-
-  // ── Routine methods (v41 migration) ─────────────────────────────────────────
-
-  createRoutine(params: {
-    flavor: RoutineFlavor; prompt: string; scheduleDisplay: string; scheduleRule: ScheduleRule
-    modelKey: string; agentId?: string; workspacePath?: string; codingAgent?: CodingAgentChoice
-    permissionMode?: Routine['permissionMode']
-  }): Routine {
-    const id = randomUUID()
-    const now = new Date().toISOString()
-    this.db.prepare(`
-      INSERT INTO routines (id, flavor, status, prompt, schedule_display, schedule_rule, next_fire_at,
-        model_key, agent_id, workspace_path, coding_agent, permission_mode, created_at, updated_at)
-      VALUES ($id, $flavor, 'pending_confirmation', $prompt, $scheduleDisplay, $scheduleRule, NULL,
-        $modelKey, $agentId, $workspacePath, $codingAgent, $permissionMode, $now, $now)
-    `).run({
-      $id: id, $flavor: params.flavor, $prompt: params.prompt,
-      $scheduleDisplay: params.scheduleDisplay, $scheduleRule: JSON.stringify(params.scheduleRule),
-      $modelKey: params.modelKey, $agentId: params.agentId ?? null, $workspacePath: params.workspacePath ?? null,
-      $codingAgent: params.codingAgent ?? null, $permissionMode: params.permissionMode ?? null, $now: now,
-    } as P)
-    return this.getRoutine(id)!
-  }
-
-  getRoutine(id: string): Routine | null {
-    const row = this.db.prepare('SELECT * FROM routines WHERE id = $id').get({ $id: id } as P) as unknown as RoutineRow | undefined
-    return row ? rowToRoutine(row) : null
-  }
-
-  listRoutines(): Routine[] {
-    return (this.db.prepare('SELECT * FROM routines ORDER BY created_at DESC').all() as unknown as RoutineRow[]).map(rowToRoutine)
-  }
-
-  listDueRoutines(nowIso: string): Routine[] {
-    const rows = this.db.prepare(
-      `SELECT * FROM routines WHERE status = 'active' AND next_fire_at IS NOT NULL AND next_fire_at <= $now`,
-    ).all({ $now: nowIso } as P) as unknown as RoutineRow[]
-    return rows.map(rowToRoutine)
-  }
-
-  confirmRoutine(id: string, nextFireAtIso: string): Routine | null {
-    this.db.prepare(
-      `UPDATE routines SET status = 'active', next_fire_at = $nextFireAt, updated_at = $now
-       WHERE id = $id AND status = 'pending_confirmation'`,
-    ).run({ $id: id, $nextFireAt: nextFireAtIso, $now: new Date().toISOString() } as P)
-    return this.getRoutine(id)
-  }
-
-  updateRoutine(
-    id: string,
-    patch: Partial<Pick<Routine, 'prompt' | 'scheduleDisplay' | 'scheduleRule' | 'nextFireAt' | 'modelKey' | 'workspacePath' | 'codingAgent' | 'permissionMode' | 'status'>>,
-  ): Routine | null {
-    const sets: string[] = []
-    const params: P = { $id: id } as P
-    if (patch.prompt !== undefined) { sets.push('prompt = $prompt'); params.$prompt = patch.prompt }
-    if (patch.scheduleDisplay !== undefined) { sets.push('schedule_display = $scheduleDisplay'); params.$scheduleDisplay = patch.scheduleDisplay }
-    if (patch.scheduleRule !== undefined) { sets.push('schedule_rule = $scheduleRule'); params.$scheduleRule = JSON.stringify(patch.scheduleRule) }
-    if (patch.nextFireAt !== undefined) { sets.push('next_fire_at = $nextFireAt'); params.$nextFireAt = patch.nextFireAt }
-    if (patch.modelKey !== undefined) { sets.push('model_key = $modelKey'); params.$modelKey = patch.modelKey }
-    if (patch.workspacePath !== undefined) { sets.push('workspace_path = $workspacePath'); params.$workspacePath = patch.workspacePath }
-    if (patch.codingAgent !== undefined) { sets.push('coding_agent = $codingAgent'); params.$codingAgent = patch.codingAgent }
-    if (patch.permissionMode !== undefined) { sets.push('permission_mode = $permissionMode'); params.$permissionMode = patch.permissionMode }
-    if (patch.status !== undefined) { sets.push('status = $status'); params.$status = patch.status }
-    if (sets.length === 0) return this.getRoutine(id)
-    sets.push('updated_at = $now')
-    params.$now = new Date().toISOString()
-    this.db.prepare(`UPDATE routines SET ${sets.join(', ')} WHERE id = $id`).run(params)
-    return this.getRoutine(id)
-  }
-
-  deleteRoutine(id: string): boolean {
-    return ((this.db.prepare('DELETE FROM routines WHERE id = $id').run({ $id: id } as P) as unknown) as Changes).changes > 0
-  }
-
-  createRoutineRun(params: { routineId: string; configSnapshot: string }): RoutineRun {
-    const id = randomUUID()
-    const now = new Date().toISOString()
-    this.db.prepare(
-      `INSERT INTO routine_runs (id, routine_id, status, config_snapshot, started_at)
-       VALUES ($id, $routineId, 'running', $configSnapshot, $now)`,
-    ).run({ $id: id, $routineId: params.routineId, $configSnapshot: params.configSnapshot, $now: now } as P)
-    return this.getRoutineRun(id)!
-  }
-
-  getRoutineRun(id: string): RoutineRun | null {
-    const row = this.db.prepare('SELECT * FROM routine_runs WHERE id = $id').get({ $id: id } as P) as unknown as RoutineRunRow | undefined
-    return row ? rowToRoutineRun(row) : null
-  }
-
-  listRoutineRuns(routineId: string): RoutineRun[] {
-    const rows = this.db.prepare(
-      'SELECT * FROM routine_runs WHERE routine_id = $routineId ORDER BY started_at DESC',
-    ).all({ $routineId: routineId } as P) as unknown as RoutineRunRow[]
-    return rows.map(rowToRoutineRun)
-  }
-
-  /** A routine's runs, newest first, a keyset page at a time (50 by default, 200 at most) —
-   *  its history grows by a row per fire for good. Full rows: the run list shows `result`. */
-  listRoutineRunsPage(routineId: string, page: PageOpts = {}): { runs: RoutineRun[]; nextCursor: string | null } {
-    const { rows, nextCursor } = this.keysetPage<RoutineRunRow>({
-      columns: '*', table: 'routine_runs', sortColumn: 'started_at', sortValue: (r) => r.started_at,
-      where: ['routine_id = $routineId'], params: { $routineId: routineId },
-    }, page, 50, 200)
-    return { runs: rows.map(rowToRoutineRun), nextCursor }
-  }
-
-  countRoutineRuns(routineId: string): number {
-    return (this.db.prepare('SELECT COUNT(*) AS n FROM routine_runs WHERE routine_id = $routineId').get({ $routineId: routineId } as P) as { n: number }).n
-  }
-
-  /** Retention (scalability review 2.4): up to `limit` of a routine's runs older than its newest
-   *  `keep`, oldest first, after `after` — never one still running or parked for an approval, nor
-   *  one the user went on with (ROUTINE_RUN_CONTINUED). Those still count toward the newest `keep`.
-   *  Both seeks walk idx_routine_runs_routine_started. */
-  routineRunsBeyondNewest(routineId: string, keep: number, limit: number, after: Pick<PrunableRoutineRun, 'startedAt' | 'id'> | null = null): PrunableRoutineRun[] {
-    const oldestKept = this.db.prepare(`
-      SELECT started_at, id FROM routine_runs WHERE routine_id = $routineId
-      ORDER BY started_at DESC, id DESC LIMIT 1 OFFSET $offset
-    `).get({ $routineId: routineId, $offset: keep - 1 } as P) as { started_at: string; id: string } | undefined
-    if (!oldestKept) return []
-    const rows = this.db.prepare(`
-      SELECT id, started_at, conversation_id, code_session_id FROM routine_runs r
-      WHERE routine_id = $routineId
-        AND (started_at < $keptAt OR (started_at = $keptAt AND id < $keptId))
-        ${after ? 'AND (started_at > $afterAt OR (started_at = $afterAt AND id > $afterId))' : ''}
-        AND status NOT IN ('running', 'needs_approval')
-        AND NOT ${ROUTINE_RUN_CONTINUED}
-      ORDER BY started_at, id LIMIT $limit
-    `).all({
-      $routineId: routineId, $keptAt: oldestKept.started_at, $keptId: oldestKept.id, $limit: limit,
-      ...(after ? { $afterAt: after.startedAt, $afterId: after.id } : {}),
-    } as P) as unknown as { id: string; started_at: string; conversation_id: string | null; code_session_id: string | null }[]
-    return rows.map((r) => ({ id: r.id, startedAt: r.started_at, conversationId: r.conversation_id, codeSessionId: r.code_session_id }))
-  }
-
-  /** Deletes `runs` and each one's own chat conversation (chat-runner.ts creates a kind='agent'
-   *  one per run; its messages go with it, ON DELETE CASCADE), in one transaction. A linked
-   *  conversation of any other kind is left alone. A code run's session is not touched here: it
-   *  is deleted first, through the Code session delete's own cleanup (chat/retention.ts). A run
-   *  the user went on with since it was listed (ROUTINE_RUN_CONTINUED) is skipped, with its chat. */
-  deleteRoutineRuns(runs: PrunableRoutineRun[]): { runs: number; conversations: number } {
-    return this.transaction(() => {
-      const continued = this.db.prepare(`SELECT 1 AS yes FROM routine_runs r WHERE r.id = $id AND ${ROUTINE_RUN_CONTINUED}`)
-      const delRun = this.db.prepare(`DELETE FROM routine_runs WHERE id = $id`)
-      const delConv = this.db.prepare(`DELETE FROM conversations WHERE id = $id AND kind = 'agent'`)
-      let deletedRuns = 0, conversations = 0
-      for (const run of runs) {
-        if (continued.get({ $id: run.id } as P)) continue
-        deletedRuns += ((delRun.run({ $id: run.id } as P) as unknown) as Changes).changes
-        if (run.conversationId) conversations += ((delConv.run({ $id: run.conversationId } as P) as unknown) as Changes).changes
-      }
-      return { runs: deletedRuns, conversations }
-    })
-  }
-
-  /** Every run row currently parked awaiting an approval decision, across all routines.
-   *  RoutineScheduler's `inFlight`/`parked` guard (routines/scheduler.ts) is in-memory only, so
-   *  after a daemon restart it is silently empty even though these runs are still correctly
-   *  'needs_approval' in the DB — `RoutineScheduler.start()` calls this to repopulate its guard
-   *  BEFORE the first tick can fire a routine whose approval is still outstanding from before
-   *  the restart. Unindexed scan is fine here: 'needs_approval' rows are rare (one per routine
-   *  currently parked) and this only runs once, at startup. */
-  listParkedRoutineRuns(): RoutineRun[] {
-    const rows = this.db.prepare(
-      `SELECT * FROM routine_runs WHERE status = 'needs_approval'`,
-    ).all() as unknown as RoutineRunRow[]
-    return rows.map(rowToRoutineRun)
-  }
-
-  /** Every run row still at 'running', across all routines — read once by
-   *  `RoutineScheduler.start()` to close out runs a daemon restart cut off. Unindexed scan, for
-   *  the same reason as listParkedRoutineRuns above. */
-  listRunningRoutineRuns(): RoutineRun[] {
-    const rows = this.db.prepare(
-      `SELECT * FROM routine_runs WHERE status = 'running'`,
-    ).all() as unknown as RoutineRunRow[]
-    return rows.map(rowToRoutineRun)
-  }
-
-  updateRoutineRun(
-    id: string,
-    patch: Partial<Pick<RoutineRun, 'status' | 'skipReason' | 'pendingToolCall' | 'result' | 'error' | 'endedAt' | 'conversationId' | 'codeSessionId'>>,
-  ): RoutineRun | null {
-    const sets: string[] = []
-    const params: P = { $id: id } as P
-    if (patch.status !== undefined) { sets.push('status = $status'); params.$status = patch.status }
-    if (patch.skipReason !== undefined) { sets.push('skip_reason = $skipReason'); params.$skipReason = patch.skipReason }
-    if (patch.pendingToolCall !== undefined) { sets.push('pending_tool_call = $pendingToolCall'); params.$pendingToolCall = patch.pendingToolCall }
-    if (patch.result !== undefined) { sets.push('result = $result'); params.$result = patch.result }
-    if (patch.error !== undefined) { sets.push('error = $error'); params.$error = patch.error }
-    if (patch.endedAt !== undefined) { sets.push('ended_at = $endedAt'); params.$endedAt = patch.endedAt }
-    if (patch.conversationId !== undefined) { sets.push('conversation_id = $conversationId'); params.$conversationId = patch.conversationId }
-    if (patch.codeSessionId !== undefined) { sets.push('code_session_id = $codeSessionId'); params.$codeSessionId = patch.codeSessionId }
-    if (sets.length === 0) return this.getRoutineRun(id)
-    this.db.prepare(`UPDATE routine_runs SET ${sets.join(', ')} WHERE id = $id`).run(params)
-    return this.getRoutineRun(id)
-  }
-
-  // ── Code session lifecycle (archive/delete/clear) ───────────────────────────
-
-  /** Archive or unarchive a Code session — a separate, single-purpose setter (not folded into
-   *  updateAgentRun's patch) because `archivedAt` needs to be explicitly CLEARABLE (unarchive),
-   *  which updateAgentRun's `!== undefined` convention can't express for a nullable field. */
-  setAgentRunArchived(id: string, archived: boolean): boolean {
-    const now = new Date().toISOString()
-    return ((this.db.prepare(`UPDATE agent_runs SET archived_at = $at, updated_at = $now WHERE id = $id`)
-      .run({ $id: id, $at: archived ? now : null, $now: now } as P) as unknown) as Changes).changes > 0
-  }
-
-  /** Set or clear (`null`) a Code session's /clear cut point — see AgentRun.clearedUpToMessageId. */
-  setClearedUpToMessageId(id: string, messageId: string | null): boolean {
-    const now = new Date().toISOString()
-    return ((this.db.prepare(`UPDATE agent_runs SET cleared_upto_message_id = $mid, updated_at = $now WHERE id = $id`)
-      .run({ $id: id, $mid: messageId, $now: now } as P) as unknown) as Changes).changes > 0
-  }
-
-  /** Set or clear (`null`) a Code session's revert marker — see AgentRun.revertedFromMessageId. */
-  setRevertedFromMessageId(id: string, messageId: string | null): boolean {
-    const now = new Date().toISOString()
-    return ((this.db.prepare(`UPDATE agent_runs SET reverted_from_message_id = $mid, updated_at = $now WHERE id = $id`)
-      .run({ $id: id, $mid: messageId, $now: now } as P) as unknown) as Changes).changes > 0
-  }
-
   /** Revert-to-message (v33): deactivates `fromMessageId` and every message after it (by `seq`,
    *  within the same conversation) — is_active=0, same mechanism Chat's branching uses. Unlike
    *  clearedUpToMessageId's movable cursor, this correctly discards a range starting anywhere in
@@ -3158,88 +1210,6 @@ export class ConversationStore {
       .run({ $cid: convId, $seq: upto.seq } as P) as unknown) as Changes).changes
   }
 
-  /** Permanently delete a Code session: its messages, working doc, and the agent_run +
-   *  conversation rows. There is no FK cascade on these tables (each is deleted explicitly,
-   *  same as chat's own conversation delete never cascaded to messages) — miss one and it's
-   *  an orphaned row, not a crash, but still worth getting right. Returns false if the run
-   *  didn't exist. */
-  deleteCodeSession(runId: string): boolean {
-    const run = this.getAgentRun(runId)
-    if (!run) return false
-    this.db.prepare(`DELETE FROM messages WHERE conv_id = $cid`).run({ $cid: run.convId } as P)
-    this.db.prepare(`DELETE FROM agent_run_docs WHERE run_id = $id`).run({ $id: runId } as P)
-    this.db.prepare(`DELETE FROM agent_runs WHERE id = $id`).run({ $id: runId } as P)
-    this.db.prepare(`DELETE FROM conversations WHERE id = $cid`).run({ $cid: run.convId } as P)
-    return true
-  }
-
-  // ── Hitman layer (spec 13 §§12-15) ─────────────────────────────────────────
-
-  /** The durable working doc for a run (spec 13 §12.2). '' when none yet. */
-  getRunDoc(runId: string): string {
-    const row = this.db.prepare(`SELECT content FROM agent_run_docs WHERE run_id = $id`).get({ $id: runId } as P) as { content: string } | undefined
-    return row?.content ?? ''
-  }
-
-  upsertRunDoc(runId: string, content: string): void {
-    const now = new Date().toISOString()
-    this.db.prepare(`
-      INSERT INTO agent_run_docs (run_id, content, updated_at) VALUES ($id, $c, $now)
-      ON CONFLICT(run_id) DO UPDATE SET content = $c, updated_at = $now
-    `).run({ $id: runId, $c: content, $now: now } as P)
-  }
-
-  /** Record a finished contract's outcome for the per-Hitman track record (§12.3). */
-  addTrackRecord(row: Omit<TrackRecordRow, 'id' | 'ranAt'> & { ranAt?: string }): void {
-    const id = randomUUID()
-    const ranAt = row.ranAt ?? new Date().toISOString()
-    this.db.prepare(`INSERT INTO agent_track_record (id,agent_id,run_id,model,outcome,feedback,ran_at) VALUES ($id,$aid,$rid,$m,$o,$f,$t)`)
-      .run({ $id: id, $aid: row.agentId, $rid: row.runId, $m: row.model, $o: row.outcome, $f: row.feedback ?? null, $t: ranAt } as P)
-  }
-
-  trackRecordForAgent(agentId: string): TrackRecordRow[] {
-    const rows = this.db.prepare(`SELECT * FROM agent_track_record WHERE agent_id = $a ORDER BY ran_at DESC`).all({ $a: agentId } as P) as Array<{ id: string; agent_id: string; run_id: string; model: string; outcome: string; feedback: string | null; ran_at: string }>
-    return rows.map((r) => ({ id: r.id, agentId: r.agent_id, runId: r.run_id, model: r.model, outcome: r.outcome as 'complete' | 'miss', feedback: r.feedback ?? undefined, ranAt: r.ran_at }))
-  }
-
-  /** Per-model count + success rate for a Hitman (§12.3). Drives warn/suggest. */
-  modelStatsForAgent(agentId: string): ModelStat[] {
-    const rows = this.db.prepare(`
-      SELECT model,
-             COUNT(*) AS total,
-             SUM(CASE WHEN outcome = 'complete' THEN 1 ELSE 0 END) AS complete
-      FROM agent_track_record WHERE agent_id = $a GROUP BY model
-    `).all({ $a: agentId } as P) as Array<{ model: string; total: number; complete: number }>
-    return rows.map((r) => ({ model: r.model, total: r.total, complete: r.complete, successRate: r.total ? r.complete / r.total : 0 }))
-  }
-
-  /** Archive a contract + record its disposition outcome (§14). */
-  setRunDisposition(runId: string, completion: 'complete' | 'miss', archive: boolean): boolean {
-    const now = new Date().toISOString()
-    const sets = ['completion = $c', 'updated_at = $now']
-    const params: Record<string, SqlValue> = { $id: runId, $c: completion, $now: now }
-    if (archive) { sets.push('archived_at = $now') }
-    return ((this.db.prepare(`UPDATE agent_runs SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
-  }
-
-  /** Active (non-archived) runs, newest first. */
-  listActiveAgentRuns(): AgentRun[] {
-    return (this.db.prepare(`SELECT ${AGENT_RUN_LIST_COLUMNS} FROM agent_runs WHERE archived_at IS NULL ORDER BY created_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
-  }
-
-  /** Archived contracts, optionally filtered to one Hitman (§15). */
-  listArchivedAgentRuns(agentId?: string): AgentRun[] {
-    if (agentId) {
-      return (this.db.prepare(`SELECT ${AGENT_RUN_LIST_COLUMNS} FROM agent_runs WHERE archived_at IS NOT NULL AND agent_id = $a ORDER BY archived_at DESC LIMIT 200`).all({ $a: agentId } as P) as unknown as AgentRunRow[]).map(rowToAgentRun)
-    }
-    return (this.db.prepare(`SELECT ${AGENT_RUN_LIST_COLUMNS} FROM agent_runs WHERE archived_at IS NOT NULL ORDER BY archived_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
-  }
-
-  /** Prune a deleted Hitman's track-record rows (agent_id is a config id, not a DB FK). */
-  pruneTrackRecordForAgent(agentId: string): void {
-    this.db.prepare(`DELETE FROM agent_track_record WHERE agent_id = $a`).run({ $a: agentId } as P)
-  }
-
   // ── Self-improvement: completion marker + per-agent lessons (redesign §2/§3) ──
 
   /** Mark a conversation's task complete (archives it from the active agent view). */
@@ -3267,24 +1237,6 @@ export class ConversationStore {
       .run({ $id: id, $mode: mode } as P)
   }
 
-  addAgentLesson(row: { agentId: string; lesson: string; evidence?: string; convId?: string }): void {
-    const id = randomUUID()
-    const now = new Date().toISOString()
-    this.db.prepare(`INSERT INTO agent_lessons (id,agent_id,lesson,evidence,conv_id,created_at) VALUES ($id,$aid,$l,$e,$c,$now)`)
-      .run({ $id: id, $aid: row.agentId, $l: row.lesson, $e: row.evidence ?? null, $c: row.convId ?? null, $now: now } as P)
-  }
-
-  /** Most-recent lessons for an agent (for injection at run start; the loop limits to top-N). */
-  listAgentLessons(agentId: string, limit = 50): AgentLesson[] {
-    const rows = this.db.prepare(`SELECT * FROM agent_lessons WHERE agent_id = $a ORDER BY created_at DESC LIMIT $n`)
-      .all({ $a: agentId, $n: limit } as P) as Array<{ id: string; agent_id: string; lesson: string; evidence: string | null; conv_id: string | null; created_at: string }>
-    return rows.map((r) => ({ id: r.id, agentId: r.agent_id, lesson: r.lesson, evidence: r.evidence ?? undefined, convId: r.conv_id ?? undefined, createdAt: r.created_at }))
-  }
-
-  pruneAgentLessons(agentId: string): void {
-    this.db.prepare(`DELETE FROM agent_lessons WHERE agent_id = $a`).run({ $a: agentId } as P)
-  }
-
   // ── Auto-memory (Release 3) ───────────────────────────────────────────────────
   // Insert/list/delete only — no update. Facts are reviewed and removed, not hand-edited.
 
@@ -3303,7 +1255,7 @@ export class ConversationStore {
 
   /** Facts newest first, a keyset page at a time (200 by default and at most). */
   listMemoryFactsPage(page: PageOpts = {}): { facts: MemoryFact[]; nextCursor: string | null } {
-    const { rows, nextCursor } = this.keysetPage<MemoryFactRow>({
+    const { rows, nextCursor } = keysetPage<MemoryFactRow>(this.db, {
       columns: 'id, fact_text, source_conv_id, created_at', table: 'memory_facts', sortColumn: 'created_at', sortValue: (r) => r.created_at, where: [], params: {},
     }, page, 200, 200)
     return { facts: rows.map(rowToMemoryFact), nextCursor }
@@ -3319,38 +1271,239 @@ export class ConversationStore {
     return ((this.db.prepare(`DELETE FROM memory_facts WHERE id = $id`).run({ $id: id } as P) as unknown) as Changes).changes > 0
   }
 
-  // ── Skills grown from experience (redesign §3.3, Voyager) ─────────────────────
+  // ── Query groups pulled out of this class (5.7): same methods, same handle ──────────
+
+  // Usage dashboards and roll-ups: UsageStatsQueries
+  tokenUsageStats(range: TokenUsageRange = 'all'): TokenUsageStats {
+    return this.usage.tokenUsageStats(range)
+  }
+
+  recordApiUsage(rec: { source: ApiUsageSource; modelKey: string | null; promptTokens: number; genTokens: number; codeSessionId?: string | null; durationMs?: number | null; promptTps?: number | null; genTps?: number | null; harness?: string | null }): void {
+    this.usage.recordApiUsage(rec)
+  }
+
+  setCodeSessionCtxUsed(codeSessionId: string, ctxUsed: number): void {
+    this.usage.setCodeSessionCtxUsed(codeSessionId, ctxUsed)
+  }
+
+  getLastApiUsageForSession(codeSessionId: string): { ctxUsed: number; promptTokens: number; genTokens: number; promptTps: number | null; genTps: number | null } | null {
+    return this.usage.getLastApiUsageForSession(codeSessionId)
+  }
+
+  apiUsageStats(range: TokenUsageRange = 'all'): ApiUsageStats {
+    return this.usage.apiUsageStats(range)
+  }
+
+  rollUpApiUsageBatch(before: string, limit: number, after: ApiUsageCursor | null = null): { rolledUp: number; next: ApiUsageCursor | null } {
+    return this.usage.rollUpApiUsageBatch(before, limit, after)
+  }
+
+  chatDailyStats(dayIso: string): {
+    conversations: number; messages: number; maxMessagesInConversation: number
+    medianMessagesInConversation: number; distinctModels: number; toolCalls: number
+    regenerates: number; stops: number
+  } {
+    return this.usage.chatDailyStats(dayIso)
+  }
+
+  gatewayDailyStats(dayIso: string): { protocol: ApiUsageSource; harness: string; requests: number; promptTokens: number; genTokens: number; distinctModels: number }[] {
+    return this.usage.gatewayDailyStats(dayIso)
+  }
+
+  codeDailyStats(dayIso: string): { sessions: number; turns: number; toolCalls: number } {
+    return this.usage.codeDailyStats(dayIso)
+  }
+
+  codeStats(range: CodeStatsRange = 'all'): CodeStatsResult {
+    return this.usage.codeStats(range)
+  }
+
+  // Routines and their runs: RoutineRepo
+  createRoutine(params: {
+    flavor: RoutineFlavor; prompt: string; scheduleDisplay: string; scheduleRule: ScheduleRule
+    modelKey: string; agentId?: string; workspacePath?: string; codingAgent?: CodingAgentChoice
+    permissionMode?: Routine['permissionMode']
+  }): Routine {
+    return this.routines.createRoutine(params)
+  }
+
+  getRoutine(id: string): Routine | null {
+    return this.routines.getRoutine(id)
+  }
+
+  listRoutines(): Routine[] {
+    return this.routines.listRoutines()
+  }
+
+  listDueRoutines(nowIso: string): Routine[] {
+    return this.routines.listDueRoutines(nowIso)
+  }
+
+  confirmRoutine(id: string, nextFireAtIso: string): Routine | null {
+    return this.routines.confirmRoutine(id, nextFireAtIso)
+  }
+
+  updateRoutine(
+    id: string,
+    patch: Partial<Pick<Routine, 'prompt' | 'scheduleDisplay' | 'scheduleRule' | 'nextFireAt' | 'modelKey' | 'workspacePath' | 'codingAgent' | 'permissionMode' | 'status'>>,
+  ): Routine | null {
+    return this.routines.updateRoutine(id, patch)
+  }
+
+  deleteRoutine(id: string): boolean {
+    return this.routines.deleteRoutine(id)
+  }
+
+  createRoutineRun(params: { routineId: string; configSnapshot: string }): RoutineRun {
+    return this.routines.createRoutineRun(params)
+  }
+
+  getRoutineRun(id: string): RoutineRun | null {
+    return this.routines.getRoutineRun(id)
+  }
+
+  listRoutineRuns(routineId: string): RoutineRun[] {
+    return this.routines.listRoutineRuns(routineId)
+  }
+
+  listRoutineRunsPage(routineId: string, page: PageOpts = {}): { runs: RoutineRun[]; nextCursor: string | null } {
+    return this.routines.listRoutineRunsPage(routineId, page)
+  }
+
+  countRoutineRuns(routineId: string): number {
+    return this.routines.countRoutineRuns(routineId)
+  }
+
+  routineRunsBeyondNewest(routineId: string, keep: number, limit: number, after: Pick<PrunableRoutineRun, 'startedAt' | 'id'> | null = null): PrunableRoutineRun[] {
+    return this.routines.routineRunsBeyondNewest(routineId, keep, limit, after)
+  }
+
+  deleteRoutineRuns(runs: PrunableRoutineRun[]): { runs: number; conversations: number } {
+    return this.routines.deleteRoutineRuns(runs)
+  }
+
+  listParkedRoutineRuns(): RoutineRun[] {
+    return this.routines.listParkedRoutineRuns()
+  }
+
+  listRunningRoutineRuns(): RoutineRun[] {
+    return this.routines.listRunningRoutineRuns()
+  }
+
+  updateRoutineRun(
+    id: string,
+    patch: Partial<Pick<RoutineRun, 'status' | 'skipReason' | 'pendingToolCall' | 'result' | 'error' | 'endedAt' | 'conversationId' | 'codeSessionId'>>,
+  ): RoutineRun | null {
+    return this.routines.updateRoutineRun(id, patch)
+  }
+
+  // Agent / Code session runs, track records, lessons and skills: AgentRunRepo
+  createAgentRun(params: { convId: string; title: string; allowedTools: string[]; agentId?: string; repoRoot?: string; repoBranch?: string; useWorktree?: boolean; worktreeBranch?: string; worktreeBase?: string; worktreePath?: string; codeAgent?: 'turbollm' | 'pi' | 'claude' | 'opencode' }): AgentRun {
+    return this.agentRuns.createAgentRun(params)
+  }
+
+  getAgentRun(id: string): AgentRun | null {
+    return this.agentRuns.getAgentRun(id)
+  }
+
+  listAgentRuns(opts?: { statuses?: string[] }): AgentRun[] {
+    return this.agentRuns.listAgentRuns(opts)
+  }
+
+  listAgentRunsPage(opts: { statuses?: string[] } & PageOpts = {}): { runs: AgentRun[]; nextCursor: string | null } {
+    return this.agentRuns.listAgentRunsPage(opts)
+  }
+
+  updateAgentRun(id: string, patch: Partial<Pick<AgentRun, 'status' | 'error' | 'startedAt' | 'endedAt' | 'title' | 'compactionSummary' | 'compactionUpToMessageId' | 'compactionTokensBefore' | 'titleAutoSynced' | 'terminalLaunchedOnce'>>): boolean {
+    return this.agentRuns.updateAgentRun(id, patch)
+  }
+
+  setAgentRunArchived(id: string, archived: boolean): boolean {
+    return this.agentRuns.setAgentRunArchived(id, archived)
+  }
+
+  setClearedUpToMessageId(id: string, messageId: string | null): boolean {
+    return this.agentRuns.setClearedUpToMessageId(id, messageId)
+  }
+
+  setRevertedFromMessageId(id: string, messageId: string | null): boolean {
+    return this.agentRuns.setRevertedFromMessageId(id, messageId)
+  }
+
+  deleteCodeSession(runId: string): boolean {
+    return this.agentRuns.deleteCodeSession(runId)
+  }
+
+  getRunDoc(runId: string): string {
+    return this.agentRuns.getRunDoc(runId)
+  }
+
+  upsertRunDoc(runId: string, content: string): void {
+    this.agentRuns.upsertRunDoc(runId, content)
+  }
+
+  addTrackRecord(row: Omit<TrackRecordRow, 'id' | 'ranAt'> & { ranAt?: string }): void {
+    this.agentRuns.addTrackRecord(row)
+  }
+
+  trackRecordForAgent(agentId: string): TrackRecordRow[] {
+    return this.agentRuns.trackRecordForAgent(agentId)
+  }
+
+  modelStatsForAgent(agentId: string): ModelStat[] {
+    return this.agentRuns.modelStatsForAgent(agentId)
+  }
+
+  setRunDisposition(runId: string, completion: 'complete' | 'miss', archive: boolean): boolean {
+    return this.agentRuns.setRunDisposition(runId, completion, archive)
+  }
+
+  listActiveAgentRuns(): AgentRun[] {
+    return this.agentRuns.listActiveAgentRuns()
+  }
+
+  listArchivedAgentRuns(agentId?: string): AgentRun[] {
+    return this.agentRuns.listArchivedAgentRuns(agentId)
+  }
+
+  pruneTrackRecordForAgent(agentId: string): void {
+    this.agentRuns.pruneTrackRecordForAgent(agentId)
+  }
+
+  addAgentLesson(row: { agentId: string; lesson: string; evidence?: string; convId?: string }): void {
+    this.agentRuns.addAgentLesson(row)
+  }
+
+  listAgentLessons(agentId: string, limit = 50): AgentLesson[] {
+    return this.agentRuns.listAgentLessons(agentId, limit)
+  }
+
+  pruneAgentLessons(agentId: string): void {
+    this.agentRuns.pruneAgentLessons(agentId)
+  }
 
   addAgentSkill(row: { agentId: string; name: string; description?: string; procedure: string; source?: string }): void {
-    const id = randomUUID()
-    const now = new Date().toISOString()
-    this.db.prepare(`INSERT INTO agent_skills (id,agent_id,name,description,procedure,source,created_at) VALUES ($id,$aid,$n,$d,$p,$s,$now)`)
-      .run({ $id: id, $aid: row.agentId, $n: row.name, $d: row.description ?? '', $p: row.procedure, $s: row.source ?? null, $now: now } as P)
+    this.agentRuns.addAgentSkill(row)
   }
 
   listAgentSkills(agentId: string, limit = 50): AgentSkill[] {
-    const rows = this.db.prepare(`SELECT * FROM agent_skills WHERE agent_id = $a ORDER BY created_at DESC LIMIT $n`)
-      .all({ $a: agentId, $n: limit } as P) as Array<{ id: string; agent_id: string; name: string; description: string; procedure: string; source: string | null; created_at: string }>
-    return rows.map((r) => ({ id: r.id, agentId: r.agent_id, name: r.name, description: r.description, procedure: r.procedure, source: r.source ?? undefined, createdAt: r.created_at }))
+    return this.agentRuns.listAgentSkills(agentId, limit)
   }
 
-  /** True if a skill with this (case-insensitive) name already exists for the agent — the
-   *  Curator's dedupe check before inserting a new distilled skill. */
   hasAgentSkillNamed(agentId: string, name: string): boolean {
-    const r = this.db.prepare(`SELECT 1 FROM agent_skills WHERE agent_id = $a AND lower(name) = lower($n) LIMIT 1`).get({ $a: agentId, $n: name } as P)
-    return !!r
+    return this.agentRuns.hasAgentSkillNamed(agentId, name)
   }
 
   countAgentSkills(agentId: string): number {
-    return (this.db.prepare(`SELECT COUNT(*) n FROM agent_skills WHERE agent_id = $a`).get({ $a: agentId } as P) as { n: number }).n
+    return this.agentRuns.countAgentSkills(agentId)
   }
 
   deleteAgentSkill(id: string): void {
-    this.db.prepare(`DELETE FROM agent_skills WHERE id = $id`).run({ $id: id } as P)
+    this.agentRuns.deleteAgentSkill(id)
   }
 
   pruneAgentSkills(agentId: string): void {
-    this.db.prepare(`DELETE FROM agent_skills WHERE agent_id = $a`).run({ $a: agentId } as P)
+    this.agentRuns.pruneAgentSkills(agentId)
   }
 
   /** Writes the database to disk now, where the backend holds it in memory (sql.js, Android:

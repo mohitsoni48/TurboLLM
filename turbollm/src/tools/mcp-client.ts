@@ -1,7 +1,7 @@
 // MCP host/client. Implements stdio (subprocess JSON-RPC) and Streamable HTTP
 // (MCP 2025-03-26) transports. All modern hosted MCPs use Streamable HTTP.
 import type { ChildProcess } from 'node:child_process'
-import { spawnTethered } from '../util/tether'
+import { killTetheredTree, spawnTethered } from '../util/tether'
 
 // ── MCP protocol types ────────────────────────────────────────────────────
 
@@ -223,7 +223,8 @@ export class StdioMcpClient implements IMcpClient {
       p.resolve({ jsonrpc: '2.0', id: -1, error: { code: -1, message: 'MCP server disconnected' } })
     }
     this.pending.clear()
-    try { this.proc?.kill() } catch { /* ignore */ }
+    // The tree, not the pid: on Windows the pid is cmd.exe's, and killing it alone left the server under it running.
+    try { if (this.proc) killTetheredTree(this.proc, 'SIGTERM') } catch { /* ignore */ }
     this.proc = null
     this.initialized = false
   }

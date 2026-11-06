@@ -15,12 +15,12 @@ import { daemonTick, stopDaemonTicks } from './daemon-ticks'
 import { sourceFilesUnder } from '../test-support/raw-spawn-sites'
 
 const SRC_ROOT = fileURLToPath(new URL('..', import.meta.url))
-const RESTART = 'stopped by the restart handler (cli.ts deps.requestRestart) before the keeper starts its replacement'
+const RESTART = 'stopped by the daemon\'s teardown (boot.ts close), which the restart runs before the keeper starts its replacement'
 
 /** `<file>` → how many setInterval calls it has, and what stops each before the keeper's replacement starts. */
 const OWNED_INTERVALS: Record<string, { count: number; why: string }> = {
   'util/daemon-ticks.ts': { count: 1, why: 'daemonTick itself: stopDaemonTicks, in becomeKeeper' },
-  'cli.ts': { count: 1, why: `the interactive-run sweep (cliInteractiveSweepTimer): ${RESTART}` },
+  'boot.ts': { count: 1, why: `the interactive-run sweep (cliInteractiveSweepTimer): ${RESTART}` },
   'engines/update-scheduler.ts': { count: 1, why: `UpdateScheduler.stop(), which cancels its first pass too: ${RESTART}` },
   'routines/scheduler.ts': { count: 1, why: `RoutineScheduler.stop(): ${RESTART}` },
   'remote/manager.ts': { count: 1, why: 'a tunnel\'s health loop: cleared synchronously by remote.disable(), which the restart teardown calls' },
