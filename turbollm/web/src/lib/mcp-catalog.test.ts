@@ -8,6 +8,26 @@ import { LOCAL_MCPS } from './mcp-catalog'
 const CREDENTIALED_URL = /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/i
 
 describe('LOCAL_MCPS', () => {
+  it('MCP Web Engine has no accidental argument or blanket privacy/security claim', () => {
+    const engine = LOCAL_MCPS.find((e) => e.id === 'mcp-web-engine')!
+    expect(engine.argNote).toBeUndefined()
+    expect(engine.desc).toContain('running SearXNG')
+    expect(engine.desc).toContain('Markdown')
+    expect(engine.desc).not.toMatch(/SSRF-hardened|no query leaves|privacy-first/i)
+    expect(engine.cmd).not.toContain('==1.1.0')
+  })
+
+  it('MCP Web Engine explicitly configures search and optional fallback', () => {
+    const engine = LOCAL_MCPS.find((e) => e.id === 'mcp-web-engine')!
+    const search = engine.envs.find((e) => e.key === 'SEARXNG_URL')!
+    expect(search.required).toBe(true)
+    expect(search.desc).toContain('http://127.0.0.1:8080/search')
+    expect(search.desc).not.toMatch(/default:/i)
+    const fallback = engine.envs.find((e) => e.key === 'ALLOW_DDG_FALLBACK')!
+    expect(fallback.required).toBe(false)
+    expect(fallback.desc).toContain('false')
+  })
+
   it('the PostgreSQL entry takes its password in PGPASSWORD, not in the connection-string argument', () => {
     const pg = LOCAL_MCPS.find((e) => e.id === 'postgres')!
     expect(pg.argNote).toContain('postgresql://user@host/db')
