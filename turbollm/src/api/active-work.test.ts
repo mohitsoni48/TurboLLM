@@ -320,3 +320,12 @@ test('engineGenerating is true while a pool slot generates and the primary is id
 
   assert.equal(activeWork(d, noChats).engineGenerating, true)
 })
+
+// A one-shot CLI routine holds its engine between its own requests (Manager.hold, scalability review 4.13): a restart
+// in that gap would kill the CLI's next turn, so the hold is active work, though no request is in flight.
+test('engineGenerating is true while a routine holds the primary between its requests', () => {
+  const d = depsWith({}, { activeRequests: 0 })
+  ;(d.manager as unknown as { hasHolds: () => boolean }).hasHolds = () => true
+
+  assert.equal(activeWork(d, noChats).engineGenerating, true)
+})

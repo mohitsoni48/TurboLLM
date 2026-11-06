@@ -513,6 +513,8 @@ export type EngineBackends = {
 
 export type EngineLogs = {
   lines: string[]
+  /** Model keys of the loaded pool slots whose own log `?model=` can read (keep-N, embedding, Laya). */
+  slots?: string[]
 }
 
 // ── Honest engine update status (ADR-085, Phase 6) ────────────────────────────

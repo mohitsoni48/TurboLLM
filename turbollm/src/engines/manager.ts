@@ -2,7 +2,7 @@
 // → stopping → stopped, plus error. Owns the single running engine process.
 // Ports the verified Go manager to node:child_process.
 import { type ChildProcess, execFile, spawnSync } from 'node:child_process'
-import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createConnection, createServer } from 'node:net'
 import { dirname, join } from 'node:path'
 import type { ConfigStore, Engine } from '../config/config'
@@ -234,9 +234,14 @@ export class Manager {
   private lastCommand: { cmd: string; args: string[] } | null = null
   private lastActivity = 0
   private logPathStr = ''
+  /** The engine log's write stream errored during this run: the log no longer grows, so log growth proves nothing
+   *  about a load and the stall watch stands down (readiness). Reset at each spawn. */
+  private logStreamFailed = false
   private exited: Promise<void> = Promise.resolve()
   private resolveExited: (() => void) | null = null
   private generation = 0
+  /** Holds taken with hold(): work that needs the engine between its requests, which is not a generation. */
+  private holds = 0
   private liveGen: LiveGen | null = null
   private session: SessionAccumulator = freshSession()
   /** The idle watchdog (watchdogTick), armed only while an engine process is alive. An interval armed for the
@@ -382,8 +387,8 @@ export class Manager {
    *  flips the state and surfaces errors; this just keeps the load gate held until
    *  that resolves. */
   private async awaitNotStarting(): Promise<void> {
-    const deadline = Date.now() + READINESS_TIMEOUT_MS + 5_000
-    while (this.state === 'starting' && Date.now() < deadline) await sleep(200)
+    const deadline = loadTiming.now() + READINESS_TIMEOUT_MS + 5_000
+    while (this.state === 'starting' && loadTiming.now() < deadline) await loadTiming.sleep(200)
   }
 
   private async startInternal(opts: StartOpts, retryNote?: string, beforeSpawn?: () => void): Promise<void> {
@@ -457,7 +462,11 @@ export class Manager {
     const logStream = new RotatingLogStream(logPath) // truncates; rotates to .1 past 50 MB
     // The log is best-effort: without a listener, a failed write (disk full) is an unhandled 'error' event,
     // which takes the whole daemon down.
-    logStream.on('error', (e) => console.warn(`[engine] log write failed: ${e.message}`))
+    this.logStreamFailed = false
+    logStream.on('error', (e) => {
+      this.logStreamFailed = true
+      console.warn(`[engine] log write failed: ${e.message}`)
+    })
     // Header so the raw engine log is self-explanatory. `port` is the engine's OWN
     // loopback port (allocated 8081+), DISTINCT from the TurboLLM app/UI port the
     // user configures — surfacing it here stops the "it says 8081 even though I
@@ -776,6 +785,30 @@ export class Manager {
     this.generation++
     this.lastActivity = Date.now()
   }
+  /** Marks the engine in use until the returned release is called, for work that sends requests with gaps between them
+   *  (a one-shot CLI routine: one request per turn, its tools run in between). Every idle read honours it (isHeld: the
+   *  idle watchdog, engineIsIdle, the router's eviction), but it is no generation: activeRequests and the live
+   *  generation of the engine card stay at what is really in flight. The release is idempotent. */
+  hold(): () => void {
+    this.holds++
+    this.lastActivity = Date.now()
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.holds = Math.max(0, this.holds - 1)
+      this.lastActivity = Date.now()
+    }
+  }
+  /** Whether a hold() is in place, or the chat work holdsEngine reports. */
+  isHeld(): boolean {
+    return this.holds > 0 || !!this.holdsEngine?.()
+  }
+  /** Whether a hold() is in place: work running between its own requests (a one-shot CLI routine). Unlike isHeld()
+   *  it leaves out holdsEngine's chat work, whose parked approval waits active work and host idleness exclude. */
+  hasHolds(): boolean {
+    return this.holds > 0
+  }
   generationEnd(): void {
     this.generation = Math.max(0, this.generation - 1)
     if (this.generation === 0) this.liveGen = null
@@ -860,9 +893,14 @@ export class Manager {
 
   private async readiness(child: ChildProcess, port: number): Promise<void> {
     const kind = this.opts?.engine.kind ?? 'llama-server'
-    const deadline = Date.now() + READINESS_TIMEOUT_MS
+    const deadline = loadTiming.now() + READINESS_TIMEOUT_MS
+    // Stall watch (review 4.8): the global load lock is held through this loop, so a hung engine would block every
+    // other load for the whole cap. Output and probe-answer changes count as progress; see LoadProgress.
+    const stallMs = loadStallMs(kind, this.store.read().engineLoadStallSeconds)
+    const progress = new LoadProgress(loadTiming.now(), logSize(this.logPathStr), loadTiming.processActivity(this.pid))
+    let warmingUp = false
     for (;;) {
-      await sleep(500)
+      await loadTiming.sleep(loadTiming.pollMs)
       if (this.child !== child || this.state !== 'starting') return
       // mlx/vllm load the model in a background thread AFTER the HTTP socket binds, so
       // /v1/models answers 200 even when the load crashed — which would otherwise flip
@@ -887,7 +925,8 @@ export class Manager {
           return
         }
       }
-      if (await probeReady(port)) {
+      const probe = await loadTiming.probe(port)
+      if (probe.ready) {
         // LiteRT-LM binds its socket and answers /v1/models before any model is loaded (it loads on the first chat
         // request), so the socket is not readiness: load it with a one-token warm-up, which is also where a bad
         // bundle or an unusable GPU surfaces.
@@ -900,7 +939,7 @@ export class Manager {
             // sends: the model file's own path (engineModelAlias('litert-lm', path) resolves
             // to the same thing — there is deliberately no second wrapper for it).
             this.opts.modelPath,
-            AbortSignal.timeout(Math.max(1000, deadline - Date.now())),
+            AbortSignal.timeout(Math.max(1000, deadline - loadTiming.now())),
           )
           if (!res.ok) {
             if (this.child === child && this.state === 'starting') {
@@ -922,12 +961,31 @@ export class Manager {
         }
         return
       }
-      if (Date.now() > deadline) {
+      const now = loadTiming.now()
+      if (now > deadline) {
         if (this.child === child && this.state === 'starting') {
           this.state = 'error'
           this.errInfo = {
             code: 'readiness_timeout',
             message: `The model did not become ready within ${Math.round(READINESS_TIMEOUT_MS / 1000)} seconds.`,
+            exitCode: -1,
+            logTail: readTail(this.logPathStr, 20),
+          }
+          child.kill('SIGKILL')
+        }
+        return
+      }
+      progress.observe(now, logSize(this.logPathStr), probe.answer, loadTiming.processActivity(this.pid))
+      // Latched: once the engine says it is warming up, the rest of the load is silent by design (see WARMUP_MARKER).
+      warmingUp ||= readTail(this.logPathStr, 50).some((l) => WARMUP_MARKER.test(l))
+      if (!warmingUp && !this.logStreamFailed && progress.silentFor(now) >= stallMs) {
+        if (this.child === child && this.state === 'starting') {
+          // Same code as the cap's: it is the same failure (the engine never became ready), so the telemetry class, the
+          // exit handler's preDiagnosed guard and the UI's banner treat it alike; only the message says why.
+          this.state = 'error'
+          this.errInfo = {
+            code: 'readiness_timeout',
+            message: `The engine made no progress for ${Math.round(stallMs / MINUTE_MS)} minutes while loading (no output, no process activity, and its readiness check did not change), so the load was stopped.`,
             exitCode: -1,
             logTail: readTail(this.logPathStr, 20),
           }
@@ -943,7 +1001,7 @@ export class Manager {
     if (ttl <= 0) return
     // In use: a generation, or work the count cannot see (holdsEngine: a compaction, an approval wait, a reply's title
     // call). The clock restarts, so the timeout counts from when that work let go, not from the load.
-    if (this.generation > 0 || this.holdsEngine?.()) {
+    if (this.generation > 0 || this.isHeld()) {
       this.lastActivity = Date.now()
       return
     }
@@ -1016,6 +1074,85 @@ export function engineCommand(opts: StartOpts, port: number, slotSavePath?: stri
  *  Strix Halo APU still hadn't finished loading at 120s). Flat-bumped to 600s for every
  *  kind rather than trying to model disk throughput. */
 const READINESS_TIMEOUT_MS = 600_000
+
+const MINUTE_MS = 60_000
+
+/** A load that shows no progress for the configured window (Config.engineLoadStallSeconds, default 120 s, 0 = off) ends
+ *  early and frees the global load lock (ADR-067 stays: one load at a time, held through readiness; review 4.8). Native
+ *  engines only (llama.cpp, KoboldCpp, llamafile): they print as they load (llama.cpp a dot per ~1% of the weights
+ *  read), so a silent window means hung, not busy. A longer window is what the 10-minute cap above already is.
+ *
+ *  Three things are NOT stalls and stand the watch down (the engine is busy without printing): the warm-up phase
+ *  (WARMUP_MARKER), the engine process's own CPU or disk activity (processActivity), and a failed log stream. */
+function loadStallMs(kind: string, seconds: number): number {
+  const native = kind === 'llama-server' || kind === 'koboldcpp' || kind === 'llamafile'
+  return native && seconds > 0 ? seconds * 1000 : Infinity
+}
+// The Python engines (vLLM, SGLang, the MLX family, LiteRT-LM, Laya) are exempt (Infinity: only the cap applies): they
+// compile kernels (FlashInfer's ninja build, torch.compile, CUDA-graph capture) and run LiteRT-LM's first-request
+// warm-up with no output or probe change for minutes at a time, and a false stall-fail there would discard minutes of
+// valid work.
+
+/** llama.cpp (and its forks: ik_llama, TurboQuant, Prism) logs "common_init_from_params: warming up the model with an
+ *  empty run - please wait ... (--no-warmup to disable)" and then prints nothing until the run ends, with /health a
+ *  constant 503. With mmap and CPU-offloaded experts that run is where tens of GB are paged in, minutes on a slow disk.
+ *  Matches the phrase, not "--no-warmup": the logged launch command carries that flag for users who pass it. */
+const WARMUP_MARKER = /warming up the model/i
+
+/** What counts as a load making progress: the engine's log grew (or rotated: any change in size), the readiness probe's
+ *  answer changed (the port started accepting connections, /health went from refused to 503), or the engine process's
+ *  own activity counter moved (null = unreadable here, which never counts). The log size is read at each poll rather
+ *  than hooked into the stdout pipe: it sees exactly what reached the log, and survives rotation. */
+class LoadProgress {
+  private at: number
+  constructor(now: number, private logBytes: number, private activity: number | null, private answer = '') { this.at = now }
+  observe(now: number, logBytes: number, answer: string, activity: number | null): void {
+    if (logBytes !== this.logBytes || answer !== this.answer || (activity !== null && activity !== this.activity)) this.at = now
+    this.logBytes = logBytes
+    this.answer = answer
+    if (activity !== null) this.activity = activity
+  }
+  silentFor(now: number): number { return now - this.at }
+}
+
+function logSize(path: string): number {
+  try { return statSync(path).size } catch { return -1 }
+}
+
+export interface ProbeResult { ready: boolean; answer: string }
+
+/** The load clock, sleep and readiness probe, as one mutable object so a test can drive the real readiness loop with a
+ *  virtual clock and a fake probe instead of waiting minutes (manager.stall.test.ts). Production values are the real ones. */
+export const loadTiming = {
+  now: (): number => Date.now(),
+  sleep: (ms: number): Promise<void> => sleep(ms),
+  probe: (port: number): Promise<ProbeResult> => probeHealth(port),
+  processActivity: (pid: number): number | null => readProcessActivity(pid),
+  pollMs: 500,
+}
+
+/** A counter that moves while the engine process is busy, or null when this platform has no cheap way to read one.
+ *  Linux: /proc/<pid>/io read_bytes (disk bytes the process caused to be fetched: mmap page-in counts) plus the
+ *  utime+stime clock ticks from /proc/<pid>/stat. Windows and macOS: null. Windows has no cheap, reliable per-process
+ *  I/O counter without a native addon or a spawned PowerShell/wmic per poll, and macOS has none without `ps`/`proc_pid`
+ *  bindings, so there the log and the warm-up marker are the only signals. */
+function readProcessActivity(pid: number): number | null {
+  if (process.platform !== 'linux' || pid <= 0) return null
+  let total = 0
+  let found = false
+  try {
+    const m = /^read_bytes:\s*(\d+)/m.exec(readFileSync(`/proc/${pid}/io`, 'utf8'))
+    if (m) { total += Number(m[1]); found = true }
+  } catch { /* another user's process, or gone */ }
+  try {
+    // comm (field 2) may contain spaces and parens: split after its closing paren; utime and stime are then fields 12 and 13.
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+    const ticks = Number(rest[11]) + Number(rest[12])
+    if (Number.isFinite(ticks)) { total += ticks; found = true }
+  } catch { /* gone */ }
+  return found ? total : null
+}
 
 /** Environment for a spawned engine. For native engines (llama.cpp, koboldcpp, llamafile) on
  *  Linux and Android, points `LD_LIBRARY_PATH` at the binary's own directory: a source build
@@ -1164,21 +1301,29 @@ async function allocPort(preferredPort?: number): Promise<number> {
 // We use /v1/models only for engines that genuinely lack /health (e.g. mlx-lm,
 // which 404/501s the route).
 export async function probeReady(port: number): Promise<boolean> {
+  return (await probeHealth(port)).ready
+}
+
+/** probeReady's verdict plus the probe's answer as a string ('down', '503', '404/200'...), which the load stall watch
+ *  compares between polls: a change (the port opening, /health starting to answer) is progress. */
+async function probeHealth(port: number): Promise<ProbeResult> {
   const base = `http://127.0.0.1:${port}`
+  let health: number
   try {
     const r = await fetch(`${base}/health`, { signal: AbortSignal.timeout(1500) })
-    if (r.status === 200) return true
+    health = r.status
+    if (health === 200) return { ready: true, answer: '200' }
     // 404/501 → this engine has no /health route; fall through to /v1/models below.
     // 503 (still loading) or any other status → not ready yet, keep polling.
-    if (r.status !== 404 && r.status !== 501) return false
+    if (health !== 404 && health !== 501) return { ready: false, answer: String(health) }
   } catch {
-    return false // connection refused / not up yet → keep polling
+    return { ready: false, answer: 'down' } // connection refused / not up yet → keep polling
   }
   try {
     const r = await fetch(`${base}/v1/models`, { signal: AbortSignal.timeout(1500) })
-    return r.status === 200
+    return { ready: r.status === 200, answer: `${health}/${r.status}` }
   } catch {
-    return false
+    return { ready: false, answer: `${health}/down` }
   }
 }
 
@@ -1387,17 +1532,32 @@ export async function reapStaleEngines(dataDir: string): Promise<number> {
  *  startup reap is the real guarantee. Owner-scoped so a daemon exiting during a restart
  *  overlap never kills the incoming daemon's engine. */
 export function killTrackedEnginesSync(dataDir: string): void {
-  for (const { pid, owner, group, file } of readEnginePidFiles(dataDir)) {
-    if (owner !== process.pid) continue // not ours — leave another daemon's engine + file alone
-    try {
-      if (process.platform === 'win32') {
-        spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
-      } else {
-        killPosix(pid, group)
+  const ours = readEnginePidFiles(dataDir).filter((e) => e.owner === process.pid) // not ours — leave another daemon's engine + file alone
+  let batchCompleted = true
+  if (process.platform === 'win32') {
+    // One taskkill for every engine, with a timeout: a synchronous call per engine, unbounded, let one hung taskkill
+    // block the daemon's exit for good (the same batch as util/tether.ts's killTetheredSync).
+    if (ours.length > 0) {
+      try {
+        const r = spawnSync('taskkill', ['/F', '/T', ...ours.flatMap((e) => ['/PID', String(e.pid)])], { stdio: 'ignore', windowsHide: true, timeout: 10_000 })
+        batchCompleted = !r.error && !r.signal
+      } catch {
+        /* process already gone */
       }
-    } catch {
-      /* process already gone */
     }
+  } else {
+    for (const { pid, group } of ours) {
+      try {
+        killPosix(pid, group)
+      } catch {
+        /* process already gone */
+      }
+    }
+  }
+  // A taskkill that timed out did not finish: the engines may still be alive, and their pidfiles are the only way the
+  // next startup's reaper can find them, so they stay.
+  if (!batchCompleted) return
+  for (const { file } of ours) {
     try { rmSync(file, { force: true }) } catch { /* best-effort */ }
   }
 }

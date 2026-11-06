@@ -19,6 +19,7 @@ import type { Deps } from '../deps'
 import type { Routine, RoutineRun, RoutineRunStatus } from './schema'
 import { withPinnedModel, type ModelSwapOutcome, type PinnedRoute, type SwapGate } from './model-swap'
 import { createRunDeadline, ROUTINE_RUN_TIMEOUT_MS } from './runaway-guard'
+import { computeNextFireTime } from './schedule'
 import { runChatRoutine, resumeChatRoutine, type ChatRunOutcome } from './chat-runner'
 import { runCodeRoutine, resumeCodeRoutine, type CodeRunOutcome } from './code-runner'
 import { parsePendingToolCall } from './approval'
@@ -129,6 +130,70 @@ function engineFreeForRoutine(d: Deps): boolean {
   return engineIsIdle(d.manager) && !autotuneRunning(d)
 }
 
+/** Routine runs that hold, or may hold, a slot of each gate: from their gate acquire to their end. A pi Code routine's
+ *  session takes the gate itself before every request, so it holds nothing between two of them: counting the run, not
+ *  the instant of the hold, is what lets a waiter tell it from the user. */
+const routineRuns = new WeakMap<GenerationGate, number>()
+
+/** Registers a routine run on `gate` until the returned function is called. The call is idempotent. */
+export function joinRoutineRuns(gate: GenerationGate): () => void {
+  routineRuns.set(gate, (routineRuns.get(gate) ?? 0) + 1)
+  let left = false
+  return () => {
+    if (left) return
+    left = true
+    routineRuns.set(gate, (routineRuns.get(gate) ?? 1) - 1)
+  }
+}
+
+function onlyRoutinesHold(gate: GenerationGate): boolean {
+  const { inFlight } = gate.stats()
+  return inFlight > 0 && inFlight <= (routineRuns.get(gate) ?? 0)
+}
+
+/** How long a routine may wait in line behind other routines: one run's length (ROUTINE_RUN_TIMEOUT_MS), and never
+ *  past its next fire. ADR-319 skips a routine rather than backfilling it a period later, so a wait that outlived its
+ *  own period would run the fire in the next one's slot. A longer queue than a run is also a sign the engine is
+ *  oversubscribed, where skipping is the answer. */
+function queueWaitBudgetMs(routine: Routine): number {
+  const now = new Date()
+  return Math.min(ROUTINE_RUN_TIMEOUT_MS, computeNextFireTime(routine.scheduleRule, now).getTime() - now.getTime())
+}
+
+const QUEUE_TIMEOUT = 'queue_timeout'
+
+/** A routine's gate acquire. The gate gives a waiter up after its own 3-minute queue timeout, which suits a leaked hold
+ *  but skipped every routine past the first on a single-slot engine when several fell due together (scalability review
+ *  4.3): five routines at 09:00 meant three lost their run, each rescheduled a whole period later. While every holder is
+ *  a routine run, which will release in its own time and is bounded by its own deadline, a routine therefore stays in
+ *  line until `signal` (its queueWaitBudgetMs) ends the wait, which throws QUEUE_TIMEOUT. A holder that is not a
+ *  routine (the user's chat turn, a title or compaction call) keeps the old rule: the gate's own error, which the
+ *  routine records as gate_timeout, ADR-319's "skip if busy". Not a backfill either: it is the same fire, run later in
+ *  the same period. The gate warns of a leaked hold on every timeout, which a wait behind routines is not. */
+export async function acquireGateAmongRoutines(gate: GenerationGate, signal: AbortSignal): Promise<() => void> {
+  for (;;) {
+    try {
+      return await gate.acquire('bg', { signal, leakSuspected: () => !onlyRoutinesHold(gate) })
+    } catch (e) {
+      if (!onlyRoutinesHold(gate)) throw e
+      const reason = (e as Error).message
+      if (reason === 'gate_acquire_aborted') throw new Error(QUEUE_TIMEOUT)
+      if (reason !== 'gate_acquire_timeout') throw e
+    }
+  }
+}
+
+/** Marks the engine in use for a one-shot CLI run's whole length (scalability review 4.13). The CLI sends one gateway
+ *  request per turn and runs its tools between them, where the generation count reads zero: a routine due then on
+ *  another model passed engineFreeForRoutine and swapped its model in under the running CLI. The hold is the engine's
+ *  own (Manager.hold), which every idle read honours (engineIsIdle, the router's eviction, the idle watchdog) without
+ *  the engine card calling it a generation. Only the engine serving the run is held: `route.manager` when its model sits
+ *  in a pool slot, else the primary, so the user's loads onto the other are not refused for the run's length. The
+ *  release is idempotent. */
+function holdEngine(d: Deps, route?: PinnedRoute): () => void {
+  return (route?.manager ?? d.manager).hold()
+}
+
 /** CLI-flavor Code Routines (`codingAgent: 'claude_cli'`, Phase 3). Builds `runCliCodeRoutine`'s
  *  dependency bundle from the daemon's real `Deps` and returns the terminal status the run
  *  actually reached.
@@ -170,6 +235,7 @@ export async function runCliRoutineBranch(
     gate: d.gate ?? ABSENT_GATE,
     getLoadedModelKey: () => d.manager.status().model?.key ?? null,
     getEngineIdle: () => engineFreeForRoutine(d),
+    holdEngine: (route) => holdEngine(d, route),
     loadExplicit: (modelKey, overrides, opts) => d.modelRouter.loadExplicit(modelKey, overrides, opts),
     reloadAfterRender: (modelKey, routineModelKey) => d.modelRouter.reloadAfterRender(modelKey, routineModelKey),
     now: () => new Date(),
@@ -391,33 +457,41 @@ export async function executeRoutine(
     return _runCliInteractiveBranch(d, routine, run)
   }
 
+  let release: (() => void) | undefined
+  let leaveRoutineRuns: (() => void) | undefined
+  if (d.gate) {
+    // A chat routine holds the gate for its whole run. An in-app pi Code session acquires this
+    // same gate itself before EVERY provider request (code-session.ts's before_provider_request
+    // hook), so holding it across the run would self-deadlock against a single-slot engine (the
+    // same hazard cli-routine.ts documents): a pi routine holds it only for the swap decision and
+    // load, and again for the restore (pinnedGate). Without it, a swap would not wait for a chat
+    // routine, compaction, title or memory call, which hold the gate without raising the
+    // activeRequests engineIsIdle() reads, and would stop the engine under them.
+    // The wait has its own budget, apart from the run's deadline below, which starts once the gate is held: a run that
+    // queued for most of its ten minutes would otherwise be aborted midway, with its side effects half done.
+    const queue = createRunDeadline(queueWaitBudgetMs(routine))
+    try {
+      release = await acquireGateAmongRoutines(d.gate, queue.signal)
+      leaveRoutineRuns = joinRoutineRuns(d.gate)
+    } catch (e) {
+      const skipReason = (e as Error).message === QUEUE_TIMEOUT ? QUEUE_TIMEOUT : 'gate_timeout'
+      d.db.updateRoutineRun(run.id, { status: 'skipped', skipReason, endedAt: new Date().toISOString() })
+      return 'skipped'
+    } finally {
+      queue.cancel()
+    }
+  }
   const deadline = createRunDeadline()
   try {
-    let release: (() => void) | undefined
-    try {
-      // A chat routine holds the gate for its whole run. An in-app pi Code session acquires this
-      // same gate itself before EVERY provider request (code-session.ts's before_provider_request
-      // hook), so holding it across the run would self-deadlock against a single-slot engine (the
-      // same hazard cli-routine.ts documents): a pi routine holds it only for the swap decision and
-      // load, and again for the restore (pinnedGate). Without it, a swap would not wait for a chat
-      // routine, compaction, title or memory call, which hold the gate without raising the
-      // activeRequests engineIsIdle() reads, and would stop the engine under them.
-      if (d.gate) release = await d.gate.acquire('bg', { signal: deadline.signal })
-    } catch {
-      d.db.updateRoutineRun(run.id, { status: 'skipped', skipReason: 'gate_timeout', endedAt: new Date().toISOString() })
-      return 'skipped'
-    }
-    try {
-      let ranStatus: RoutineRunStatus = 'errored'
-      const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter, isAutotuneRunning: () => autotuneRunning(d), holdsGate: !!d.gate }, routine.modelKey, async (route) => {
-        const outcome = await dispatchRoutine(d, routine, run, deadline.signal, route)
-        ranStatus = finalizeOutcome(d, run.id, outcome)
-      }, pinnedGate(d, routine, () => { release?.(); release = undefined }))
-      return finalizeSwapOutcome(d, run.id, swap, ranStatus)
-    } finally {
-      release?.()
-    }
+    let ranStatus: RoutineRunStatus = 'errored'
+    const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter, isAutotuneRunning: () => autotuneRunning(d), holdsGate: !!d.gate }, routine.modelKey, async (route) => {
+      const outcome = await dispatchRoutine(d, routine, run, deadline.signal, route)
+      ranStatus = finalizeOutcome(d, run.id, outcome)
+    }, pinnedGate(d, routine, () => { release?.(); release = undefined }))
+    return finalizeSwapOutcome(d, run.id, swap, ranStatus)
   } finally {
+    release?.()
+    leaveRoutineRuns?.()
     deadline.cancel()
   }
 }

@@ -181,7 +181,9 @@ test('OpenAI: a request the engine has not answered yet already counts as genera
     await waitUntil(() => engine.received() === 1)
     assert.equal(pool.counts.starts - pool.counts.ends, 1, 'in flight before the engine sent a header')
     engine.release()
-    assert.equal((await pending).status, 200)
+    const res = await pending
+    assert.equal(res.status, 200)
+    await res.text() // the usage tap is fed as the client reads (scalability review 4.5)
     await waitUntil(() => pool.counts.ends === 1)
     assert.equal(pool.counts.starts, 1, 'started once, not again when the reply arrived')
   } finally {

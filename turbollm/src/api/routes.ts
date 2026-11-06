@@ -2,11 +2,12 @@
 import type { Context, Hono, MiddlewareHandler } from 'hono'
 import { bodyLimit } from 'hono/body-limit'
 import { streamSSE } from 'hono/streaming'
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { execFileSync } from 'node:child_process'
 import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
+import { createGateVersionReader } from '../comfyui/gate-version'
 import { readTail } from '../engines/engine-log'
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
@@ -201,6 +202,8 @@ function backendEnableBusy(d: Deps, backendId: string): string | null {
 }
 
 export function registerApi(app: Hono, d: Deps): void {
+  // The gate node's installed version, cached per file (status is polled every couple of seconds).
+  const gateVersion = createGateVersionReader()
   // ---- meta ----
   app.get('/api/v1/status', (c) => {
     // The engine/model/engineStats/liveGeneration block comes from the SHARED builder
@@ -302,15 +305,7 @@ export function registerApi(app: Hono, d: Deps): void {
       comfyui: (() => {
         const snap = d.comfy?.snapshot() ?? null
         if (!snap) return null
-        const gatePath = d.store.read().comfyui.gatePath
-        let installedVersion: number | null = null
-        if (gatePath) {
-          try {
-            const src = readFileSync(join(gatePath, '__init__.py'), 'utf-8')
-            const m = src.match(/^GATE_VERSION\s*=\s*(\d+)/m)
-            if (m) installedVersion = Number(m[1])
-          } catch { /* file missing or unreadable */ }
-        }
+        const installedVersion = gateVersion(d.store.read().comfyui.gatePath)
         return { ...snap, installedVersion, currentVersion: GATE_VERSION }
       })(),
       telemetryLevel: d.store.read().telemetry.level,
@@ -2542,14 +2537,30 @@ export function registerApi(app: Hono, d: Deps): void {
     return c.json({ ok: true })
   })
 
+  // ?model=<modelKey> picks a loaded pool slot's log (keep-N, embedding, Laya) instead of the primary's. The key is
+  // matched against the router's live slots and never becomes a path, so only a slot's own log file can be read.
+  // The slot may go before a stream's next tick; its log is then simply quiet (a path of ''), like a stopped primary.
+  const engineLogSource = (c: Context): { path: () => string } | null => {
+    const model = c.req.query('model')
+    if (model === undefined || model === '') return { path: () => d.manager.logPath() }
+    if (!d.modelRouter?.slotLogs().some((s) => s.modelKey === model)) return null
+    return { path: () => d.modelRouter.slotLogs().find((s) => s.modelKey === model)?.logPath ?? '' }
+  }
+
   app.get('/api/v1/engine/logs', (c) => {
     const tail = Math.min(Number(c.req.query('tail')) || 200, 2000)
-    return c.json({ lines: readTail(d.manager.logPath(), tail) })
+    const source = engineLogSource(c)
+    if (!source) return err(c, 404, 'slot_not_found', 'No loaded model by that key has an engine log.')
+    // slots: the models whose logs ?model= can pick, so the UI offers a selector only when there are some.
+    return c.json({ lines: readTail(source.path(), tail), slots: (d.modelRouter?.slotLogs() ?? []).map((s) => s.modelKey) })
   })
 
-  app.get('/api/v1/engine/logs/stream', (c) =>
+  app.get('/api/v1/engine/logs/stream', (c) => {
+    const source = engineLogSource(c)
+    if (!source) return err(c, 404, 'slot_not_found', 'No loaded model by that key has an engine log.')
+    const logPath = source.path
     // holdOpen: the key or the open LAN that let it in can go while it runs (see endStaleStreams).
-    streamSSE(c, holdOpen(c, async (stream) => {
+    return streamSSE(c, holdOpen(c, async (stream) => {
       // `bytePos`/`lastPath` are this CONNECTION's own cursor. `manager.ts`'s engine start
       // TRUNCATES the log file (a restart rewrites the same path from empty) and `logPath()`
       // itself changes on an engine switch — either way the file can shrink below `bytePos`,
@@ -2599,7 +2610,7 @@ export function registerApi(app: Hono, d: Deps): void {
         aborted = true
       })
       while (!aborted) {
-        const path = d.manager.logPath()
+        const path = logPath()
         if (path && existsSync(path)) {
           const size = statSync(path).size
           // A restart rewrites the same path, and the next run's log can outgrow a short one (a
@@ -2660,8 +2671,8 @@ export function registerApi(app: Hono, d: Deps): void {
         if (ticks++ % 37 === 0) await stream.writeSSE({ data: '', event: 'ping', id: logCursor(lastPath, bytePos - carry.length, before) })
         await stream.sleep(400)
       }
-    })),
-  )
+    }))
+  })
 
   // ---- Developer request log (issue #211 follow-up) ----
   // Every completion this daemon has proxied (external API clients, Code sessions, in-app

@@ -71,7 +71,7 @@ import { localDaemonOrigin } from '../daemon-pid'
 import { sessionAuth } from '../code/session-auth'
 import { resolveClaudePermissionMode } from '../terminal/agent-modes'
 import type { ModelRouter, RouteResult } from '../gateway/model-router'
-import { refusedAsBusy } from './model-swap'
+import { refusedAsBusy, type PinnedRoute } from './model-swap'
 
 export interface CliRoutineDeps {
   store: ConversationStore
@@ -90,6 +90,11 @@ export interface CliRoutineDeps {
    *  hot-swap the model out from under a live foreground chat turn. Kept as a thin function rather
    *  than the whole Manager so tests don't have to fake Manager's full surface. */
   getEngineIdle: () => boolean
+  /** Marks the engine in use until the returned release is called (execute.ts's holdEngine). The run holds it from its
+   *  model decision to the CLI's exit, released BEFORE the restore, which the router refuses on a busy engine: the CLI
+   *  sends one gateway request per turn, and between two of them nothing else tells another routine the engine is taken.
+   *  `route`: the swap's result, when the run's model sits in a pool slot. Absent: no hold (tests, embedders). */
+  holdEngine?: (route?: PinnedRoute) => () => void
   /** `ModelRouter.loadExplicit`, or an equivalent. Returns `{ target }` on success and
    *  `{ status: 503, message }` on failure — it does not throw for a missing model. Its arguments are passed on
    *  (the restore below passes `restoreAfter`). */
@@ -157,6 +162,8 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
   let previousModel: string | null = null
   // The swap's own result, which the restore hands back (see the restore in the finally).
   let swap: RouteResult | undefined
+  // The engine hold (see `holdEngine`): taken once the run is committed to its model, let go before the restore.
+  let releaseEngine: (() => void) | undefined
 
   // The exception boundary opens HERE, immediately after the run row exists, and covers the WHOLE
   // body — availability probe, conflict decision, swap, spawn, parse. Anything narrower strands the
@@ -216,6 +223,8 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
       previousModel = currentlyLoaded
     }
 
+    releaseEngine = deps.holdEngine?.(swap && 'target' in swap ? swap : undefined)
+
     // 3. Build the non-interactive invocation. A session-scoped token (session-auth.ts) gives this
     // run's gateway traffic the same clean per-session attribution a live terminal session gets.
     const token = sessionAuth.mint(run.id)
@@ -272,6 +281,7 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
     // kill-endpoint revoke, so a routine's auth never outlives its one-shot subprocess. Safe even
     // if nothing was ever minted.
     sessionAuth.revoke(run.id)
+    releaseEngine?.() // before the restore: the router refuses to stop a model on an engine that is in use
     // 7. Restore the previously-loaded model (spec 20 §5). Best-effort and swallowed on failure,
     // exactly as model-swap.ts:58-64 does: a restore that throws here would replace the run's real
     // outcome with an unrelated error and leave the caller with no result at all.

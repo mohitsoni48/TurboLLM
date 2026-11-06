@@ -242,7 +242,7 @@ test('enqueue: a whole-folder download clicked again checks only what it still h
   try {
     const { modelDir, stateDir } = newDirs()
     const st = statfsSync(modelDir)
-    const shard = Math.floor(st.bavail * st.bsize * 0.4)
+    const shard = Math.floor(st.bavail * st.bsize * 0.25)
     const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
     await dm.enqueue({ repo: 'owner/big', rfilename: SHARDS[0], size: shard, subdir: 'big/ckpt-2' })
     await dm.enqueue({ repo: 'owner/big', rfilename: SHARDS[2], size: shard, subdir: 'big/ckpt-2' })
@@ -630,7 +630,7 @@ for (const [platform, folds] of [['win32', true], ['darwin', true], ['android', 
       const modelDir = platform === 'android' ? join(termux, 'storage', 'shared', 'models') : plain
       mkdirSync(modelDir, { recursive: true })
       const st = statfsSync(modelDir)
-      const shard = Math.floor(st.bavail * st.bsize * 0.4)
+      const shard = Math.floor(st.bavail * st.bsize * 0.25)
       const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
       await dm.enqueue({ repo: 'owner/big', rfilename: SHARDS[0], size: shard, subdir: 'Big/Ckpt-2' })
       await dm.enqueue({ repo: 'owner/big', rfilename: SHARDS[2], size: shard, subdir: 'Big/Ckpt-2' })

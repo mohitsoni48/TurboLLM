@@ -179,3 +179,18 @@ export function isRetentionValue(field: RetentionBoundedField, v: unknown): v is
 export function isChatApprovalWaitMinutes(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= CHAT_APPROVAL_WAIT_MINUTES.min && v <= CHAT_APPROVAL_WAIT_MINUTES.max
 }
+
+/** How many files the download manager streams at once (Config.downloadConcurrency, downloads/downloads.ts). Config
+ *  only: no settings route exposes it. Normalize loads a value outside it as `default`; 2 is spec 10's long-standing
+ *  figure, and one connection per file stays, so more files at once is the only knob. */
+export const DOWNLOAD_CONCURRENCY = { min: 1, max: 8, default: 2 } as const
+
+/** Seconds a native engine's load may show no progress before it is stopped and the global load lock freed (Config.engineLoadStallSeconds,
+ *  engines/manager.ts; scalability review 4.8). 0 turns the stall watch off, leaving only the 10-minute readiness cap. Config only and
+ *  host-only (outside CONFIG_BOUNDS, which a Turbo Link peer may write). Normalize loads a value outside it as `default`. */
+export const ENGINE_LOAD_STALL_SECONDS = { min: 0, max: 600, default: 120 } as const
+
+/** The gateway's request-body cap in MB (Config.gateway.maxBodyMb, gateway/gateway.ts). Config only and host-only:
+ *  it stays out of CONFIG_BOUNDS, whose leaves a Turbo Link peer may write (link/config-scope.ts), because a peer must
+ *  never be able to raise the body size this machine buffers. Normalize loads a value outside it as `default`. */
+export const GATEWAY_MAX_BODY_MB = { min: 1, max: 4096, default: 128 } as const

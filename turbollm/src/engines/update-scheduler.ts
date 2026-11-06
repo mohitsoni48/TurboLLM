@@ -42,7 +42,7 @@ export function engineIsIdle(manager: Manager): boolean {
   if (st.state === 'starting' || st.state === 'stopping') return false
   if (st.state !== 'running') return true // stopped/error → nothing generating
   // Running: idle only when no completion is streaming right now.
-  return (manager.sessionStats().activeRequests ?? 0) === 0
+  return (manager.sessionStats().activeRequests ?? 0) === 0 && !manager.isHeld?.()
 }
 
 export class UpdateScheduler {

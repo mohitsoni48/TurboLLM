@@ -1,6 +1,7 @@
 // Gateway: /v1/* OpenAI-compatible pass-through + Anthropic translation (spec 06).
 import { randomUUID } from 'node:crypto'
-import type { Context, Hono } from 'hono'
+import type { Context, Hono, MiddlewareHandler } from 'hono'
+import { bodyLimit } from 'hono/body-limit'
 import { streamSSE } from 'hono/streaming'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import { createPatch } from 'diff'
@@ -10,6 +11,7 @@ import type { Manager } from '../engines/manager'
 import type { RetryReason } from './model-router'
 import type { ToolCallRecord } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
+import { GATEWAY_MAX_BODY_MB } from '../config/config-bounds'
 import { applyEngineTokenLimit, engineModelAlias, shapeForEngine } from '../engines/compat'
 import { litertLmForcedToolChoiceError, litertLmUnappliedParameters, shapeLitertLmRequest } from '../engines/litert-lm-request'
 import { unlistedForLoading } from '../engines/registry'
@@ -201,11 +203,48 @@ function classifyFetchError(e: unknown, ac: AbortController): { status: Contentf
 export interface GatewayOptions {
   pingIntervalMs?: number
   gateAcquireTimeoutMs?: number
+  /** Overrides CLIENT_IDLE_MS, the window a streaming client may go without reading. */
+  clientIdleMs?: number
+}
+
+/** How long a streaming OpenAI client may go without pulling its next chunk before the gateway gives up on it
+ *  (`tapForClient`). Reading is what keeps the engine generating, so a client that stops reading but keeps the
+ *  connection open (paused reader, throttled tab, wedged tunnel with no RST) would otherwise hold the engine slot, the
+ *  gate and the keep-N eviction block until generation ends. Two minutes outlasts any real reader's pause between
+ *  chunks; the engine's own generation stalls (a long prefill) do not count, only the gap on the client's side. */
+const CLIENT_IDLE_MS = 120_000
+
+/** `gateway.maxBodyMb`, read on every /v1 request, so through the non-cloning read() (scalability 1.6). The default is
+ *  generous because base64 vision payloads are large (config-bounds.ts GATEWAY_MAX_BODY_MB). */
+const gatewayMaxBodyMb = (d: Deps): number => d.store.read().gateway?.maxBodyMb ?? GATEWAY_MAX_BODY_MB.default
+
+/** The request-body cap for the gateway's routes (scalability review 4.4): `/v1/*` here, and the Turbo Link chat
+ *  endpoint, which hands its body to the same handler (link/link-routes.ts).
+ *  Each handler buffers its body whole and JSON.parses it synchronously, so over LAN/remote access one huge (or several
+ *  concurrent) body is an OOM or a stalled event loop. bodyLimit refuses on Content-Length and, for a chunked body that
+ *  announces none, counts bytes as they stream in and aborts at the cap — before any handler reads it. The cap is read
+ *  per request so a config edit applies without a restart, and the refusal speaks the protocol of the route it hit
+ *  (Anthropic's envelope on /v1/messages*, OpenAI's elsewhere). */
+export function gatewayBodyLimit(d: Deps): MiddlewareHandler {
+  return (c, next) => {
+    const mb = gatewayMaxBodyMb(d)
+    return bodyLimit({
+      maxSize: mb * 1024 * 1024,
+      onError: (ctx) => {
+        const message = `Request body exceeds the gateway's ${mb} MB limit (gateway.maxBodyMb).`
+        return ctx.req.path.startsWith('/v1/messages')
+          ? ctx.json({ type: 'error', error: { type: 'request_too_large', message } }, 413)
+          : ctx.json({ error: { message, type: 'invalid_request_error', code: 'request_too_large' } }, 413)
+      },
+    })(c, next)
+  }
 }
 
 export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): void {
   const pingIntervalMs = opts.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS
   const gateAcquireTimeoutMs = opts.gateAcquireTimeoutMs ?? 600_000
+  app.use('/v1/*', gatewayBodyLimit(d))
+
   // ── POST /v1/messages — Anthropic translation (spec 06 §2) ───────────────
 
   app.post('/v1/messages', async (c) => {
@@ -882,7 +921,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
   // to avoid — this codebase has already paid once for two implementations of one idea
   // drifting apart (admin probe() vs LinkManager.probeOnce).
 
-  app.all('/v1/*', (c) => gatewayV1Handler(c, d))
+  app.all('/v1/*', (c) => gatewayV1Handler(c, d, { clientIdleMs: opts.clientIdleMs }))
 }
 
 /** Overrides for a caller that is NOT the public /v1/* mount. */
@@ -896,6 +935,8 @@ export interface GatewayV1Options {
    *  the OWNER touching their own machine (host-idle.ts), or one peer's request would
    *  block the next peer's wake for the whole idle grace window. Defaults to 'local'. */
   origin?: 'local' | 'link'
+  /** Test override for CLIENT_IDLE_MS. */
+  clientIdleMs?: number
 }
 
 /** Hop-by-hop headers (RFC 9110 §7.6.1): each describes one connection, the client's to us or ours to the engine,
@@ -1435,7 +1476,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // Counted as generating from BEFORE the fetch (review H1): llama-server sends no header until a non-stream reply is
   // generated whole (or, streaming, until prefill ends), so started once fetch() resolved, the engine read idle for
   // that whole window to keep-N eviction, its pool idle-TTL watchdog and hostIdleState, any of which could stop it
-  // under this request. `!remote`: see the tee below (I-1, I-4). Ended exactly once, on whichever path finishes it.
+  // under this request. `!remote`: see the tap below (I-1, I-4). Ended exactly once, on whichever path finishes it.
   let localGenerating = isChat && !remote
   if (localGenerating) serving.manager.generationStart()
   const endLocalGeneration = (): void => {
@@ -1472,16 +1513,16 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   }
 
   // Best-effort session-stats recording (B4) for OpenAI chat completions, fully
-  // fail-safe and non-intrusive: tee the body so the client still gets the exact
-  // upstream stream/bytes unchanged while we sniff usage off the copy.
+  // fail-safe and non-intrusive: the client still gets the exact upstream stream/bytes
+  // unchanged while we sniff usage off a copy fed only as fast as the client reads (`tapForClient`).
   // `!remote` (I-1, I-4): the HOST recorded this generation behind its façade — through
   // this very function — so recording it again here double-counts every federated
   // generation in `gateway_daily`, and `generationStart()` would light up this machine's
   // engine card (and its `hostIdleState`) for work its own engine is not doing.
   if (res.ok && res.body && isChat && !remote) {
     try {
-      const [a, b] = res.body.tee()
-      // Still in flight (started before the fetch) while the teed copy drains, which publishes the live token count to
+      const { client: a, tap: b, clientClosed } = tapForClient(res.body, opts.clientIdleMs ?? CLIENT_IDLE_MS)
+      // Still in flight (started before the fetch) while the tap drains, which publishes the live token count to
       // the engine card. (OpenAI clients don't get the prefill % — injecting return_progress would pollute their stream.)
       // The requester's own `stream` flag decides the drain shape: a non-streaming
       // OpenAI client (common for scripted/extension callers, `stream` false/absent)
@@ -1489,9 +1530,9 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // parser would silently see no matches and record nothing (GitHub #71: this
       // gap would have made external-client tracking wrong for a common case).
       const drain = parsedBody?.stream === true
-        ? recordOpenAiStreamUsage(d, serving.manager, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness, logId)
+        ? recordOpenAiStreamUsage(d, serving.manager, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness, logId, clientClosed)
         : recordOpenAiJsonUsage(d, serving.manager, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness, logId)
-      // Released when the teed copy finishes draining — i.e. when the engine has actually
+      // Released when the tap finishes draining — i.e. when the engine has actually
       // stopped generating, NOT when this handler returns. Returning the streaming Response
       // hands bytes to the client while the engine is still busy, so releasing the slot here
       // would let the next queued request in on top of a still-running generation.
@@ -1516,7 +1557,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // SAME body to the client unread (the whole point of a pass-through). A status-only message
   // costs nothing to the stream; a detailed one would silently truncate every error response
   // this branch forwards. Same "never touch the client-facing stream" rule the success path
-  // above follows via `tee()` instead.
+  // above follows via `tapForClient()` instead.
   finalizeLog(
     res.ok
       ? { status: res.status, durationMs: Date.now() - requestStart }
@@ -1543,7 +1584,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       asClientStatus(res.status),
     )
   }
-  // A Turbo Link chat stream lands here, not in the tee above: the injection happened on this machine.
+  // A Turbo Link chat stream lands here, not in the tap above: the injection happened on this machine.
   if (injectedUsage && res.ok && res.body) return withoutInjectedUsage(res.body, res)
   if (remote) {
     // fetch has already decoded whatever the host's side compressed (Cloudflare's edge gzips JSON for a client that
@@ -1555,6 +1596,62 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     return new Response(res.body, { status: res.status, headers: relayed })
   }
   return new Response(res.body, { status: res.status, headers: relayedHeaders(res) })
+}
+
+/** Split an engine body into the stream the client gets and a copy for usage parsing, WITHOUT `tee()` (scalability review
+ *  4.5). `tee()` reads the source as fast as its fastest branch: the parsing branch drained the engine whatever the
+ *  client did, so a client that stalled without closing (stalled tunnel, paused reader) never fired an abort, the engine
+ *  generated to max_tokens, the client's branch buffered the lot, and the gate slot stayed held to the end. Here the
+ *  source is read only when the client pulls (highWaterMark 0), and the tap is fed from those same reads, so a stalled
+ *  client stops the engine fetch via TCP backpressure and buffers nothing.
+ *  A client that stays stalled past `idleMs` is cut off like one that left: the engine reader is cancelled (which ends
+ *  the generation), the client's stream errors, and the tap CLOSES (not errors) so the parser still returns what it saw
+ *  and the caller records that partial turn; `clientClosed()` tells it the end was the client's. A source error still
+ *  errors both, so the parser's catch logs it as an engine fault. */
+function tapForClient(body: ReadableStream<Uint8Array>, idleMs: number): { client: ReadableStream<Uint8Array>; tap: ReadableStream<Uint8Array>; clientClosed: () => boolean } {
+  const reader = body.getReader()
+  let tapCtl!: ReadableStreamDefaultController<Uint8Array>
+  const tap = new ReadableStream<Uint8Array>({ start: (ctl) => { tapCtl = ctl } })
+  let clientGone = false
+  let idleTimer: ReturnType<typeof setTimeout> | undefined
+  const stopWaiting = (): void => { clearTimeout(idleTimer); idleTimer = undefined }
+  // The tap is closed at most once, whichever of end / cancel / idle comes first.
+  const clientLeft = (reason: unknown): Promise<void> => {
+    if (clientGone) return Promise.resolve()
+    clientGone = true
+    stopWaiting()
+    tapCtl.close()
+    return reader.cancel(reason)
+  }
+  let clientCtl!: ReadableStreamDefaultController<Uint8Array>
+  const waitForClient = (): void => {
+    idleTimer = setTimeout(() => {
+      const idle = new Error(`Client stopped reading for ${Math.round(idleMs / 1000)}s.`)
+      void clientLeft(idle).catch(() => {})
+      clientCtl.error(idle)
+    }, idleMs)
+    idleTimer.unref() // a body nobody ever reads must not keep the process alive for the window
+  }
+  const client = new ReadableStream<Uint8Array>({
+    start(ctl) { clientCtl = ctl; waitForClient() },
+    async pull(ctl) {
+      stopWaiting()
+      try {
+        const { done, value } = await reader.read()
+        if (clientGone) return
+        if (done) { tapCtl.close(); ctl.close(); return }
+        tapCtl.enqueue(value) // drained eagerly by the parser: never accumulates
+        ctl.enqueue(value)
+        waitForClient()
+      } catch (e) {
+        if (clientGone) return
+        tapCtl.error(e)
+        ctl.error(e)
+      }
+    },
+    cancel: (reason) => clientLeft(reason ?? new Error('Client closed the stream.')),
+  }, { highWaterMark: 0 })
+  return { client, tap, clientClosed: () => clientGone }
 }
 
 /** The client's copy of a streamed chat completion as it would have been without the `stream_options.include_usage`
@@ -1927,7 +2024,7 @@ function recordOpenAiUsage(d: Deps, engine: Manager, oai: Record<string, unknown
   } catch { /* swallow — stats are best-effort */ }
 }
 
-/** Drain a teed copy of a NON-streaming OpenAI JSON body (a single response, not SSE) to
+/** Drain the tap copy of a NON-streaming OpenAI JSON body (a single response, not SSE) to
  *  record usage — the `/v1/*` pass-through's counterpart to `recordOpenAiStreamUsage` for
  *  requests where the caller didn't set `stream: true`. Never touches the client-facing
  *  stream; all errors are swallowed. `startedAt` (Date.now() at the ORIGINAL fetch call) —
@@ -1999,10 +2096,10 @@ class StreamingToolCallAccumulator {
   }
 }
 
-/** Drain a teed copy of a streaming OpenAI SSE body to record final usage (B4) plus a
+/** Drain the tap copy of a streaming OpenAI SSE body to record final usage (B4) plus a
  *  durable `api_usage` row (GitHub #71). Never touches the client-facing stream; all
  *  errors are swallowed. `startedAt` — see recordOpenAiJsonUsage's doc comment; same reason. */
-async function recordOpenAiStreamUsage(d: Deps, engine: Manager, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null, harness: string | null = null, logId: string | null = null): Promise<void> {
+async function recordOpenAiStreamUsage(d: Deps, engine: Manager, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null, harness: string | null = null, logId: string | null = null, clientClosed: () => boolean = () => false): Promise<void> {
   // Developer request log (issue #211 follow-up): `captureBody` gates only whether the
   // generated text is reassembled; TTFT/finish-reason are cheap enough to always track once
   // `logId` exists.
@@ -2026,7 +2123,11 @@ async function recordOpenAiStreamUsage(d: Deps, engine: Manager, body: ReadableS
         toolCalls?.observe(chunk)
       },
     })
-    const { promptTokens, completionTokens, promptTps, genTps, ttftMs, finishReason, responseText } = result
+    const { promptTokens, promptTps, genTps, ttftMs, finishReason, responseText } = result
+    // A client that left early never saw the engine's final usage chunk: the content deltas counted so far stand in
+    // for the generated tokens (the prompt count is whatever the stream had reported, 0 when nothing yet).
+    const closedEarly = clientClosed()
+    const completionTokens = closedEarly && result.completionTokens === 0 ? liveOut : result.completionTokens
     if (codeSessionId && toolCalls) {
       try { observeCodeSessionTurn(d, codeSessionId, toolCalls.calls()) } catch { /* swallow */ }
     }
@@ -2040,7 +2141,10 @@ async function recordOpenAiStreamUsage(d: Deps, engine: Manager, body: ReadableS
     })
     if (logId && d.requestLog) {
       d.requestLog.finalize(logId, {
-        status: 200, promptTokens, completionTokens, promptTps, genTps, ttftMs, finishReason,
+        // An interrupted turn (Esc in a client, an idle cut-off) is the client's doing, not an engine fault.
+        status: closedEarly ? null : 200,
+        error: closedEarly ? { code: 'client_closed', message: 'The client closed the stream before the response finished.' } : undefined,
+        promptTokens, completionTokens, promptTps, genTps, ttftMs, finishReason,
         durationMs: startedAt != null ? Date.now() - startedAt : null,
         responseBody: captureBody ? JSON.stringify({ content: responseText }) : undefined,
       })

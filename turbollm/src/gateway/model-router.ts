@@ -2,16 +2,18 @@
 // When a /v1/* request includes a `model` field, the router resolves it against
 // the local model library and loads (or swaps to) that model automatically.
 // Inspired by llama-swap; operates on the existing Manager + Scanner primitives.
+import { join } from 'node:path'
 import { Manager, type StartOpts } from '../engines/manager'
 import type { ConfigStore, Engine, LastLoaded } from '../config/config'
 import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import type { ComfyGuard } from '../engines/comfy-guard'
-import type { LoadProfile } from '../models/profile'
+import { placeOnFreeVram, type LoadProfile } from '../models/profile'
 import { manualLoadRefusal, modelIncompatibility, refusedOnEveryEngine, type Incompatibility } from '../engines/compat'
 import { engineForModel } from '../engines/registry'
-import { buildStartOpts } from '../engines/start-opts'
-import { getSysInfo } from '../sysinfo/sysinfo'
+import { buildStartOpts, gpuBlockUserSet } from '../engines/start-opts'
+import { getSysInfo, type SysInfo } from '../sysinfo/sysinfo'
+import { type GpuUse, readGpuUse } from './gpu-use'
 import { parseRemoteId } from '../link/model-id'
 import type { RemoteCatalog } from '../link/remote-catalog'
 import { modelLoadsRefused } from '../auth'
@@ -172,6 +174,10 @@ export class ModelRouter {
     private catalog?: RemoteCatalog,
     /** Builds the Manager for a new pool slot; a parameter only so a test can watch what it loads. */
     private newSlotManager: () => Manager = () => new Manager(store, { poolSlot: true }),
+    /** The cards' current use, read right before a default-profile pool-slot load (placeOnFreeVram); a parameter only so
+     *  a test can fake the reading. Null: unreadable, or not trustworthy for this engine (gpu-use.ts). `fresh`: not the
+     *  cached reading. */
+    private gpuUse: (engine: Engine, fresh?: boolean) => Promise<GpuUse | null> = (engine, fresh) => readGpuUse(engine, join(store.dir(), 'engines', 'build'), fresh),
   ) {}
 
   /** Wire auto-tune, which doLoad waits for: between two probes the primary reads 'stopped', so a load took it and the
@@ -303,6 +309,21 @@ export class ModelRouter {
       slots.push({ modelKey: load.modelKey, state: load.cancelled ? 'stopping' : 'starting', primary: false, lastUsedMs: load.startedMs })
     }
     return slots
+  }
+
+  /** The engine log of every alive pool slot (never the primary), for GET /api/v1/engine/logs?model=. The key is the
+   *  only thing a caller names; the path comes from the slot's own manager. */
+  slotLogs(): { modelKey: string; logPath: string }[] {
+    const logs: { modelKey: string; logPath: string }[] = []
+    for (const slot of this.extraSlots.values()) {
+      const logPath = slot.manager.logPath()
+      if (this.isOccupied(slot.manager.status().state) && logPath) logs.push({ modelKey: slot.modelKey, logPath })
+    }
+    for (const load of this.layaLoads.values()) {
+      const logPath = load.manager.logPath()
+      if (logPath) logs.push({ modelKey: load.modelKey, logPath })
+    }
+    return logs
   }
 
   /** How many models are loaded beside the primary (GET /api/v1/status's `poolModels`): the alive pool slots, and a
@@ -660,14 +681,30 @@ export class ModelRouter {
       return { status: 503, message, permanent: true }
     }
 
-    const opts = this.buildOpts(entry, engine, overrides)
+    let opts = this.buildOpts(entry, engine, overrides)
     if (!opts) return { status: 503, message: 'Model is incomplete or unreadable.' }
 
     const keepN = Math.max(1, this.store.read().gateway.keepN)
     const ownHolds = explicit?.holdsGate ? 1 : 0
     // Side models (embedding, Laya) don't consume a chat slot — they get their own implicit slot
     // so a loaded chat model is never evicted just because a side model is requested.
-    const needsNewSlot = isSideModel(entry) || this.chatSlotCount() < keepN
+    let needsNewSlot = isSideModel(entry) || this.chatSlotCount() < keepN
+    let replaceAfterEviction: (() => Promise<void>) | undefined
+    // A chat model joining engines that already hold VRAM (scalability review 4.7): its default profile sized against
+    // empty cards, so it is placed where there is room, or an idle LRU engine goes first when there is none.
+    if (needsNewSlot && !isSideModel(entry) && this.chatSlotCount() > 0) {
+      const placed = await this.placeOnFreeVram(entry, engine, opts, overrides)
+      if (placed === 'nofit') {
+        needsNewSlot = false
+        // The idle engine that goes frees its card: placed again once it has stopped, from a fresh reading, and the
+        // default profile stays when even that does not fit (never a second eviction).
+        const loadOpts = opts
+        replaceAfterEviction = async () => {
+          const again = await this.placeOnFreeVram(entry, engine, loadOpts, overrides, true)
+          if (again && again !== 'nofit') Object.assign(loadOpts, again)
+        }
+      } else if (placed) opts = placed
+    }
     // A Laya model never takes the primary, even an empty one: the chat screen shows and talks to whatever the
     // primary holds, and a Laya engine answers only /v1/systemone.
     const targetManager = entry.laya
@@ -693,12 +730,29 @@ export class ModelRouter {
     this.loadingKey = entry.key
     this.loadingSlot = targetManager === this.manager ? undefined : { manager: targetManager, engineId: opts.engine.id }
     try {
-      return await this.loadInto(entry, engine, opts, targetManager, inFlight, explicit !== undefined, victimBusy)
+      return await this.loadInto(entry, engine, opts, targetManager, inFlight, explicit !== undefined, victimBusy, replaceAfterEviction)
     } finally {
       this.loadingKey = undefined
       this.loadingSlot = undefined
       if (inFlight && this.layaLoads.get(entry.key) === inFlight) this.layaLoads.delete(entry.key)
     }
+  }
+
+  /** StartOpts for a default profile that loads on the card(s) with room for it; 'nofit' when none has; undefined to load as
+   *  built. Only an automatic llama-server profile whose gpu block the user did not set (gpuUserSet, ADR-060), and only
+   *  when the cards' use is readable and its card numbers are the engine's (gpuUse: bounded, cached, null otherwise), so a
+   *  failed or untrustworthy reading leaves today's behaviour. Never with ComfyUI's integration on: its resident models
+   *  would read as used (they are freed only by the load's own hook, after this), so an idle model would be evicted for
+   *  memory the load frees anyway, and two models could evict each other in turn. `fresh`: a reading after an eviction. */
+  private async placeOnFreeVram(entry: ModelEntry, engine: Engine, opts: StartOpts, overrides?: Partial<LoadProfile>, fresh = false): Promise<StartOpts | 'nofit' | undefined> {
+    if (entry.format !== 'gguf' || engine.kind !== 'llama-server' || !opts.profile) return undefined
+    if (this.store.snapshot().comfyui.enabled) return undefined
+    if (gpuBlockUserSet({ entry, engine, cfg: this.store.snapshot(), sys: getSysInfo(), overrides })) return undefined
+    const use = await this.gpuUse(engine, fresh).catch(() => null)
+    if (!use) return undefined
+    const fit = placeOnFreeVram(opts.profile, entry, use.sys, use.usedMb)
+    if (fit.kind === 'nofit') return 'nofit'
+    return fit.kind === 'place' ? this.buildOpts(entry, engine, { ...overrides, gpu: fit.gpu }, use.sys) ?? undefined : undefined
   }
 
   /** The load itself, and what follows it. A Laya load (`inFlight`) stays tracked until this returns, so a cancelled
@@ -712,6 +766,8 @@ export class ModelRouter {
     inFlight: LayaLoad | undefined,
     explicit = false,
     victimBusy: () => boolean = () => false,
+    /** Runs once the victim of an eviction has stopped, before the spawn: it may change `opts` (the object load() holds). */
+    afterVictimStopped?: () => Promise<void>,
   ): Promise<RouteResult> {
     // Single chokepoint (rule 3): load() stops whatever this slot held, runs the
     // reverse gate (free ComfyUI VRAM), spawns, and waits for readiness — all under
@@ -732,6 +788,7 @@ export class ModelRouter {
           // Ejected while it waited for the gate: never spawn an engine for it.
           if (inFlight?.cancelled) throw new Error(UNLOADED_WHILE_LOADING)
           try {
+            await afterVictimStopped?.()
             await (this.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve())
           } catch (e) {
             comfyRefused = true
@@ -987,7 +1044,7 @@ export class ModelRouter {
    *  turn, an extension call), or chat work holds it with none in flight (Manager.holdsEngine, the primary's only: a
    *  compaction, a tool-approval wait, a reply's title or memory call), which an eviction would fail just the same. */
   private isGenerating(manager: Manager, ownHolds = 0): boolean {
-    return (manager.sessionStats().activeRequests ?? 0) > 0 || !!manager.holdsEngine?.() || this.gateBusy(manager, ownHolds)
+    return (manager.sessionStats().activeRequests ?? 0) > 0 || !!manager.holdsEngine?.() || !!manager.isHeld?.() || this.gateBusy(manager, ownHolds)
   }
 
   /** A request holds `manager`'s gate or waits on it (setGates): one admitted, or about to be, onto this engine.
@@ -1101,10 +1158,10 @@ export class ModelRouter {
   /** Gateway loads build their StartOpts through the one shared builder (start-opts.ts), like the
    *  manual Load and the boot resume, so a Jev model's launch flags and a pinned port reach
    *  auto-swap loads too. doLoad has already checked compatibility (a manual load's only for a Laya model). */
-  private buildOpts(entry: ModelEntry, engine: Engine, overrides?: Partial<LoadProfile>): StartOpts | null {
+  private buildOpts(entry: ModelEntry, engine: Engine, overrides?: Partial<LoadProfile>, sys: SysInfo = getSysInfo()): StartOpts | null {
     if (entry.incomplete || entry.parseError) return null
     return buildStartOpts({
-      entry, engine, cfg: this.store.snapshot(), sys: getSysInfo(), overrides, trigger: 'gateway_switch',
+      entry, engine, cfg: this.store.snapshot(), sys, overrides, trigger: 'gateway_switch',
     })
   }
 

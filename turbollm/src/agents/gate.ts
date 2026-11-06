@@ -61,8 +61,11 @@ export class GenerationGate {
    *   2. `timeoutMs` (default {@link DEFAULT_ACQUIRE_TIMEOUT_MS}) is an unconditional last-resort
    *      self-heal against a LEAKED hold from any cause, including ones not yet found — every
    *      acquire() call gets this protection whether or not its caller passes a signal.
+   * `leakSuspected`, asked when the timeout fires, is for a caller that knows better than the gate whether the holder
+   * is leaked (a routine queued behind other routines, which retries the wait): the timeout rejects either way, and
+   * the leaked-hold warning is only logged when it says true.
    */
-  async acquire(priority: 'fg' | 'bg', opts?: { signal?: AbortSignal; timeoutMs?: number }): Promise<() => void> {
+  async acquire(priority: 'fg' | 'bg', opts?: { signal?: AbortSignal; timeoutMs?: number; leakSuspected?: () => boolean }): Promise<() => void> {
     if (this.inFlight < this.capacity()) {
       this.inFlight++
       return this.makeRelease()
@@ -103,7 +106,7 @@ export class GenerationGate {
 
       timer = setTimeout(() => {
         removeFromQueue()
-        console.warn(`[gate] acquire('${priority}') timed out after ${timeoutMs}ms still queued — the current holder likely leaked its release without calling it. Rejecting instead of silently granting access, to avoid two concurrent requests hitting the same engine.`)
+        if (opts?.leakSuspected?.() ?? true) console.warn(`[gate] acquire('${priority}') timed out after ${timeoutMs}ms still queued — the current holder likely leaked its release without calling it. Rejecting instead of silently granting access, to avoid two concurrent requests hitting the same engine.`)
         waiter.giveUp(new Error('gate_acquire_timeout'))
       }, timeoutMs)
 

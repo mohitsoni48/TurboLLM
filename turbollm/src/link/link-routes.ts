@@ -7,7 +7,7 @@ import type { ApiKey, DeepReadonly } from '../config/config'
 // `validate()` that may cross the façade (see the `invalid_config` branch below).
 import { ValueError } from '../config/config'
 import { linkAuth, requireCapability } from './link-auth'
-import { gatewayV1Handler } from '../gateway/gateway'
+import { gatewayBodyLimit, gatewayV1Handler } from '../gateway/gateway'
 import { isJsonObject, NOT_A_JSON_OBJECT } from '../gateway/jev-serving'
 import { buildModelStatus } from '../api/status-view'
 import { startEngine, stopEngine } from '../api/engine-lifecycle'
@@ -203,6 +203,9 @@ export function registerLinkAuth(app: Hono, d: Deps): void {
 export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegistered?: boolean }): void {
   const linkApp = app as unknown as Hono<LinkEnv>
   if (!opts?.authAlreadyRegistered) registerLinkAuth(app, d)
+  // The gateway's body cap on everything a peer key can POST, registered right after linkAuth (Hono runs middleware in
+  // registration order) so a caller without a valid key is refused before a byte is buffered.
+  app.use('/api/link/v1/*', gatewayBodyLimit(d))
 
   linkApp.post('/api/link/v1/hello', (c) => {
     const key = c.get('linkKey')

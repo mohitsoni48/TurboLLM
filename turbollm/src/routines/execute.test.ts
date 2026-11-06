@@ -31,6 +31,7 @@ function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gat
   const manager = {
     status: () => ({ state: 'running', model: current ? { key: current } : null }),
     sessionStats: () => ({ activeRequests: opts.activeRequests ?? 0 }),
+    hold: () => () => {}, // a one-shot CLI routine holds the engine for its run (holdEngine)
     target: () => 'http://engine.invalid.local:1',
     currentOpts: () => null,
   } as unknown as Manager

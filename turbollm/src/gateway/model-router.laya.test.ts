@@ -177,7 +177,7 @@ function routerWithSlots(gate: Promise<void>, options: { keepN?: number; models?
     const slot = gatedSlot(gate, { failsToStart: options.failsToStart })
     made.push(slot)
     return slot.manager
-  })
+  }, async () => null) // no real nvidia-smi: a pool-slot chat load reads the cards (placeOnFreeVram)
   return { r, made }
 }
 

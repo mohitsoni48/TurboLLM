@@ -307,8 +307,9 @@ for (const [path, body] of [
     const { deps, ledger } = ledgerDeps({ remote: false })
     const res = await drive(deps, path, { ...(body as object), model: 'Qwen3' } as Record<string, unknown>)
     assert.equal(res.status, 200)
-    // The OpenAI path records usage off a TEED copy of the body, which drains after the
-    // handler has already returned its Response — so settle before reading the ledger.
+    // The OpenAI path records usage off a tap fed as the client reads the body (scalability review 4.5), so read it,
+    // then settle before reading the ledger.
+    await res.text()
     await new Promise((r) => setTimeout(r, 20))
     assert.equal(ledger.gateAcquires, 1)
     assert.equal(ledger.generationStarts, 1)

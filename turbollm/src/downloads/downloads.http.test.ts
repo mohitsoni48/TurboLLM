@@ -99,7 +99,8 @@ const server = createServer((req, res) => {
 })
 await new Promise((r) => server.listen(0, '127.0.0.1', r))
 const { modelDir, stateDir } = JSON.parse(process.env.PROBE_DIRS)
-const store = { dir: () => stateDir, snapshot: () => ({ primaryModelDir: modelDir, modelDirs: [modelDir] }) }
+const cfg = { primaryModelDir: modelDir, modelDirs: [modelDir] }
+const store = { dir: () => stateDir, snapshot: () => cfg, read: () => cfg }
 const dm = new DownloadManager(store, () => {}, () => ({}))
 const results = []
 for (let i = 0; i < 3; i++) {

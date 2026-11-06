@@ -41,3 +41,11 @@ test('hostIdleState: a generating pool slot makes the host busy though the prima
   } as unknown as Deps
   assert.equal(hostIdleState(d).generating, true)
 })
+
+test('hostIdleState: a routine holding the primary between its requests makes the host busy (scalability 4.13)', () => {
+  const d = {
+    manager: { sessionStats: () => ({ activeRequests: 0 }), hasHolds: () => true },
+    modelRouter: { poolGenerating: () => false },
+  } as unknown as Deps
+  assert.equal(hostIdleState(d).generating, true)
+})

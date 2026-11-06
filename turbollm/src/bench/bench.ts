@@ -16,8 +16,8 @@ import { prunePresets, setModelProfile, getModelProfile, VRAM_HEADROOM_SPILL_MB,
 import type { Manager, StartOpts } from '../engines/manager'
 import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
-import { backendIdFromBinPath } from '../engines/update'
-import { isEngineInBuildDir } from '../engines/build-runner'
+import { numbersCardsAsListed } from '../engines/card-numbering'
+import { parseNvidiaVramPerCard, parseRocmVramPerCard, readGpuVramPerCardMb } from './gpu-vram'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import { automaticProfile, deriveDefault, deriveTensorSplit, estimateVram, estimateVramPerGpu, gpuBudgetMb, legacySeedProfile, mergeUserSet, profileToArgs, resolveProfile, userSetProfile, type GpuProfile, type LoadProfile } from '../models/profile'
 import { isSpilling, spillFloor, spillMb } from './spill'
@@ -40,6 +40,9 @@ import {
   parseLlmSampling,
   type CardSampling,
 } from '../models/card-sampling'
+
+// Moved to gpu-vram.ts (the gateway reads them without this module); re-exported for the callers here.
+export { parseNvidiaVramPerCard, parseRocmVramPerCard, readGpuVramPerCardMb }
 
 /** A single candidate the sweep evaluated. `outcome` is 'ok' on a measured run, or
  *  the failure mode (timeout/crash/oom) — the sweep keeps going on a failure. */
@@ -2257,34 +2260,6 @@ export function vramCardFor(
   return { index: p.gpu.mainGpu >= 0 ? p.gpu.mainGpu : 0, of: sys.gpus.length }
 }
 
-/** The variables that renumber the cards a CUDA or ROCm engine sees, which nvidia-smi and rocm-smi ignore (HIP takes
- *  GPU_DEVICE_ORDINAL as well). */
-const DEVICE_SELECTION_VARS = ['CUDA_VISIBLE_DEVICES', 'HIP_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES', 'GPU_DEVICE_ORDINAL']
-
-/** Whether the engine's `--main-gpu N` is card N of the readers' lists (nvidia-smi's and rocm-smi's, in PCI bus
- *  order, as sysinfo's). A CUDA build numbers the fastest card first (CUDA_DEVICE_ORDER's default, FASTEST_FIRST), so
- *  on a box of two models its card 0 can be the listing's card 1; a Vulkan build numbers them in the Vulkan loader's
- *  order, which puts the GPU driving the display first (Mesa's device-select layer, Windows' adapter order) even among
- *  cards of one model; and the variables above renumber them. Card N of the listing was then another card than the
- *  engine's, and its reading too low, so card N is read as the engine's only where the two orders are very unlikely
- *  to differ: a CUDA or ROCm build on cards all of one model (FASTEST_FIRST leaves the order of equal cards
- *  unspecified, PCI order in practice), with none of those variables set. Elsewhere the card a load grows is taken
- *  as its own (BenchRunner.readLoadVram). The build is known by an official install's directory, or as one
- *  TurboLLM compiled, which is CUDA: inside `buildRoot`, the folder its builds go to (`<data dir>/engines/build`, as
- *  build-runner.ts places them), and with the source it was built from, not a release install there. A sourceRepo
- *  alone proves nothing: any engine can be given one (registry.setSource), and an `engines/build` folder of another
- *  project is not TurboLLM's. */
-function numbersCardsAsListed(
-  sys: SysInfo, engine: Pick<Engine, 'binPath' | 'sourceRepo' | 'release'> | undefined, env: NodeJS.ProcessEnv, buildRoot: string | undefined,
-): boolean {
-  const [first] = sys.gpus
-  if (sys.gpus.some((g) => g.name !== first.name || g.vramMb !== first.vramMb)) return false
-  if (DEVICE_SELECTION_VARS.some((v) => env[v] !== undefined)) return false
-  const builtHere = !!buildRoot && !!engine?.sourceRepo && !engine.release && isEngineInBuildDir(engine.binPath, buildRoot)
-  const backend = backendIdFromBinPath(engine?.binPath ?? '') || (builtHere ? 'cuda' : '')
-  return backend === 'cuda' || backend === 'rocm'
-}
-
 /** Sum of per-card readings — or only `card`'s, when given and the tool listed exactly as many
  *  cards as sysinfo did. On a count mismatch the index could name the wrong card, so the sum is
  *  kept: it over-reads (conservative) where a wrong card could under-read. */
@@ -2309,16 +2284,6 @@ export function cardThatGrew(before: number[], after: number[]): number | undefi
   return growth[top] >= LOAD_CARD_MIN_GROWTH_MB && growth[top] >= 2 * others ? top : undefined
 }
 
-/** Pure parser for `nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits`: one MB figure per GPU, in
- *  the same order sysinfo enumerated them from the same tool (an unreadable one as 0). */
-export function parseNvidiaVramPerCard(stdout: string): number[] {
-  return stdout
-    .trim()
-    .split('\n')
-    .map((l) => parseInt(l.trim(), 10))
-    .map((n) => (Number.isFinite(n) ? n : 0))
-}
-
 /** The same output summed over every GPU, or just `card`'s (see {@link sumCards}). Null when nothing positive was
  *  read. */
 export function parseNvidiaVramUsed(stdout: string, card?: VramCard): number | null {
@@ -2330,60 +2295,12 @@ export function parseNvidiaVramUsed(stdout: string, card?: VramCard): number | n
 // are daemon timers, so a probe hung on a wedged driver outlived a daemon that died meanwhile.
 const probeExecFile = tetheredExecFile({ kind: 'probe' })
 
-/** Best-effort current NVIDIA VRAM use in MB, per GPU. Null on non-NVIDIA or when nvidia-smi is
- *  absent — never throws (spec 09 §1). */
-function readNvidiaVramPerCardMb(): Promise<number[] | null> {
-  return probeExecFile('nvidia-smi', ['--query-gpu=memory.used', '--format=csv,noheader,nounits'], { timeout: 8000, windowsHide: true })
-    .then(({ stdout }) => (stdout ? parseNvidiaVramPerCard(stdout) : null), () => null)
-}
-
-/** Pure parser for `rocm-smi --showmeminfo vram --json` output, split out for direct testing
- *  (mirrors `sysinfo.ts`'s `parseRocmSmi`): each card's "VRAM Total Used Memory (B)" in MB (a card
- *  without it as 0). Null on unparseable JSON. */
-export function parseRocmVramPerCard(memJson: string): number[] | null {
-  try {
-    const mem = JSON.parse(memJson) as Record<string, Record<string, string>>
-    const perCard: number[] = []
-    for (const fields of Object.values(mem)) {
-      const usedKey = Object.keys(fields).find((k) => /VRAM Total Used Memory/i.test(k))
-      const bytes = usedKey ? parseInt(String(fields[usedKey]).trim(), 10) || 0 : 0
-      perCard.push(bytes / 1e6)
-    }
-    return perCard
-  } catch {
-    return null
-  }
-}
-
 /** The same output summed across every card, or just `card`'s (see {@link sumCards}), in MB.
  *  Null on unparseable JSON or when no card reports a positive used-memory figure. */
 export function parseRocmVramUsed(memJson: string, card?: VramCard): number | null {
   const perCard = parseRocmVramPerCard(memJson)
   const mb = perCard === null ? 0 : Math.round(sumCards(perCard, card))
   return mb > 0 ? mb : null
-}
-
-/** Best-effort current AMD VRAM use in MB, per card, via ROCm's rocm-smi. Null when
- *  rocm-smi is absent (ROCm not installed) or its output can't be parsed — never throws.
- *  Mirrors `sysinfo.ts`'s `parseRocmSmi` (same `--showmeminfo vram --json` call), reading
- *  "VRAM Total Used Memory (B)" instead of "VRAM Total Memory (B)" (ADR-217: before this, the
- *  headroom gate had zero VRAM protection on AMD — nvidia-smi's reading silently came back
- *  null on every AMD box and {@link overHeadroom} treats unknown VRAM as "never over"). */
-function readRocmVramPerCardMb(): Promise<number[] | null> {
-  return probeExecFile('rocm-smi', ['--showmeminfo', 'vram', '--json'], { timeout: 8000, windowsHide: true })
-    .then(({ stdout }) => (stdout ? parseRocmVramPerCard(stdout) : null), () => null)
-}
-
-/** Best-effort current GPU VRAM use in MB per card, in sysinfo's order, vendor-aware (ADR-217).
- *  Tries nvidia-smi first (unconditionally — cheap to attempt, and correct even without `sys`),
- *  then falls back to rocm-smi only when the box has a known AMD GPU. Null when neither reads a
- *  positive figure (Intel/Apple/CPU-only, or no live VRAM reader for that vendor). Never throws. */
-async function readGpuVramPerCardMb(sys: SysInfo): Promise<number[] | null> {
-  const nv = await readNvidiaVramPerCardMb()
-  if (nv !== null && nv.some((n) => n > 0)) return nv
-  if (!sys.gpus.some((g) => g.vendor === 'amd')) return null
-  const amd = await readRocmVramPerCardMb()
-  return amd !== null && amd.some((n) => n > 0) ? amd : null
 }
 
 /** Best-effort current GPU VRAM use in MB, summed across GPUs (settleGpu's reading). Null when

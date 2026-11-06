@@ -810,6 +810,7 @@ function restrictedDeps(opts: {
   const router = new ModelRouter(
     store as never, registry as never, opts.primary as unknown as Manager, scanner as never, comfy as never, undefined,
     () => (opts.slot ?? managerIn('stopped')) as unknown as Manager,
+    async () => null, // no real nvidia-smi: a pool-slot chat load reads the cards first (placeOnFreeVram)
   )
   const d = {
     ...fakeDeps(),

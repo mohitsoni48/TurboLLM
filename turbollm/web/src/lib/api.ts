@@ -628,12 +628,16 @@ export function restartEngine(): Promise<{ ok: true }> {
 }
 
 // ── Engine logs ───────────────────────────────────────────────────────────────
-export function getEngineLogs(tail = 200): Promise<EngineLogs> {
-  return request<EngineLogs>(`/api/v1/engine/logs?tail=${tail}`)
+/** `model`: a pool slot's model key (one of the response's `slots`) to read that slot's log; omitted, the primary's. */
+export function getEngineLogs(tail = 200, model?: string): Promise<EngineLogs> {
+  return request<EngineLogs>(`/api/v1/engine/logs?tail=${tail}${model ? `&model=${encodeURIComponent(model)}` : ''}`)
 }
 
 /** URL for the SSE live log tail (consumed via sse.ts's subscribeSse — not EventSource, which can't send the key). */
 export const engineLogStreamUrl = '/api/v1/engine/logs/stream'
+
+/** The live tail of a pool slot's log (`model`), or of the primary's when there is none. */
+export const engineLogStreamUrlFor = (model: string) => (model ? `${engineLogStreamUrl}?model=${encodeURIComponent(model)}` : engineLogStreamUrl)
 
 // ── Developer request log (issue #211 follow-up) ─────────────────────────────
 export interface RequestLogFilter {

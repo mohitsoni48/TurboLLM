@@ -9,7 +9,7 @@ import { basename, dirname, join } from 'node:path'
 import type { LinkGrant, LinkRecord } from '../link/types'
 import type { ChatStoreConfig } from '../chat/store/load-adapter.js'
 import type { ReleaseProvenance } from '../engines/release-install'
-import { CHAT_APPROVAL_WAIT_MINUTES, RETENTION_BOUNDS, type RetentionBoundedField } from './config-bounds'
+import { CHAT_APPROVAL_WAIT_MINUTES, DOWNLOAD_CONCURRENCY, ENGINE_LOAD_STALL_SECONDS, GATEWAY_MAX_BODY_MB, RETENTION_BOUNDS, type RetentionBoundedField } from './config-bounds'
 import { writeFileAtomicSync } from '../util/atomic-write'
 
 export const SCHEMA_VERSION = 4
@@ -303,6 +303,10 @@ export interface Gateway {
    *  swap (unload A, load B). Values 2–4 keep multiple models hot in a pool with
    *  LRU eviction. Capped at 4. */
   keepN: number
+  /** Largest request body, in MB, the `/v1/*` gateway accepts before refusing it with a 413 (scalability review 4.4):
+   *  a body is buffered whole and JSON.parsed synchronously, so over LAN/remote access an unbounded one is an OOM or a
+   *  stalled event loop. The default leaves room for base64 vision payloads. Config-file only. */
+  maxBodyMb: number
 }
 
 /** The developer request log (issue #211 follow-up, superseding ADR-409): every completion this
@@ -591,6 +595,12 @@ export interface Config {
   /** The folder downloads/imports land in (spec 01 §3, ADR-035). When '' or not in
    *  modelDirs, the FIRST entry in modelDirs is the effective default. */
   primaryModelDir: string
+  /** How many files the download manager streams at once (config-bounds.ts DOWNLOAD_CONCURRENCY: 1-8, default 2). Config
+   *  only: no settings route exposes it. */
+  downloadConcurrency: number
+  /** Seconds a native engine's load may show no progress before it is stopped (config-bounds.ts ENGINE_LOAD_STALL_SECONDS: 0-600,
+   *  default 120, 0 = never stall-stop). Config only. */
+  engineLoadStallSeconds: number
   /** Saved per-model LoadProfiles, nested by (modelKey → engineId → {@link ProfileEntry})
    *  so two installed engines (even two builds of the same kind, e.g. llama.cpp CUDA vs
    *  Vulkan, each with its own {@link Engine.id}) keep independent tunes for the same
@@ -807,6 +817,8 @@ export function defaultConfig(): Config {
     defaultEngineSeeded: false,
     modelDirs: [],
     primaryModelDir: '',
+    downloadConcurrency: DOWNLOAD_CONCURRENCY.default,
+    engineLoadStallSeconds: ENGINE_LOAD_STALL_SECONDS.default,
     modelProfiles: {},
     modelPresets: {},
     lastPresetId: {},
@@ -822,7 +834,7 @@ export function defaultConfig(): Config {
     modelDefaults: { ctx: BUILTIN_MODEL_DEFAULT_CTX, ngl: 99, imageMaxTokens: 0, maxTokens: 0 },
     featuredOverrideUrl: '',
     comfyui: { enabled: false, gatePath: '', url: '', reverseGate: false, cachePersist: false },
-    gateway: { autoSwap: true, keepN: 1 },
+    gateway: { autoSwap: true, keepN: 1, maxBodyMb: GATEWAY_MAX_BODY_MB.default },
     requestLog: { enabled: true, captureBodies: false, maxEntries: 500 },
     retention: { enabled: true, apiUsageRawDays: RETENTION_BOUNDS.apiUsageRawDays.default, routineRunsKept: RETENTION_BOUNDS.routineRunsKept.default },
     tools: { chatApprovalWaitMinutes: CHAT_APPROVAL_WAIT_MINUTES.default },
@@ -1200,6 +1212,17 @@ function normalize(c: Config): void {
   // Primary model dir (spec 01 §3, ADR-035): absent in old files → '' (effective
   // default falls back to the first modelDir). Never throw on an old config.
   c.primaryModelDir ??= ''
+  // Absent in older files, or hand-edited out of range / to a non-integer: the default, never a throw on load.
+  const dlc = c.downloadConcurrency as unknown
+  c.downloadConcurrency =
+    typeof dlc === 'number' && Number.isInteger(dlc) && dlc >= DOWNLOAD_CONCURRENCY.min && dlc <= DOWNLOAD_CONCURRENCY.max
+      ? dlc
+      : DOWNLOAD_CONCURRENCY.default
+  const els = c.engineLoadStallSeconds as unknown
+  c.engineLoadStallSeconds =
+    typeof els === 'number' && Number.isInteger(els) && els >= ENGINE_LOAD_STALL_SECONDS.min && els <= ENGINE_LOAD_STALL_SECONDS.max
+      ? els
+      : ENGINE_LOAD_STALL_SECONDS.default
   // Per-engine model profiles (issue #35, schema v3): modelProfiles moved from a flat
   // { modelKey → profile } map to a nested { modelKey → { engineId → ProfileEntry } } map
   // so two installed engines keep independent tunes for the same model. Migrate in place,
@@ -1290,6 +1313,8 @@ function normalize(c: Config): void {
   c.gateway = {
     autoSwap: gw.autoSwap !== false,
     keepN: typeof gw.keepN === 'number' && gw.keepN >= 1 ? Math.min(Math.floor(gw.keepN), 4) : 1,
+    maxBodyMb: typeof gw.maxBodyMb === 'number' && gw.maxBodyMb >= GATEWAY_MAX_BODY_MB.min
+      ? Math.min(Math.floor(gw.maxBodyMb), GATEWAY_MAX_BODY_MB.max) : GATEWAY_MAX_BODY_MB.default,
   }
   // Developer request log (issue #211 follow-up): absent in pre-this-feature configs →
   // defaults (on, bodies off). `captureBodies` in particular must never silently flip on for
