@@ -72,7 +72,15 @@ function releasePdfSlot(): void {
   pdfWaiters.shift()?.()
 }
 
-export type PdfParseOutcome = { kind: 'text'; text: string } | { kind: 'unreadable' } | { kind: 'timeout' } | { kind: 'busy' }
+export type PdfParseOutcome =
+  | { kind: 'text'; text: string }
+  | { kind: 'unreadable' }
+  | { kind: 'timeout' }
+  | { kind: 'busy' }
+  /** The PDF reader itself could not be loaded in this install (pdfjs-dist or its native canvas
+   *  addon missing, e.g. a platform without the prebuilt binary). Distinct from 'unreadable' so a
+   *  broken install is never reported as a bad document. */
+  | { kind: 'unavailable' }
 
 const WORKER_EXT = import.meta.url.endsWith('.ts') ? '.ts' : '.js'
 const WORKER_PATH = new URL(`./pdf-text-worker${WORKER_EXT}`, import.meta.url)
@@ -88,16 +96,21 @@ const WORKER_PATH = new URL(`./pdf-text-worker${WORKER_EXT}`, import.meta.url)
  *  cap (at most two such spikes at once). */
 export async function extractPdfText(
   data: Uint8Array,
-  opts?: { timeoutMs?: number; queueTimeoutMs?: number },
+  opts?: { timeoutMs?: number; queueTimeoutMs?: number; workerPath?: URL },
 ): Promise<PdfParseOutcome> {
   const timeoutMs = opts?.timeoutMs ?? PDF_PARSE_TIMEOUT_MS
   if (!(await acquirePdfSlot(opts?.queueTimeoutMs ?? PDF_PARSE_QUEUE_TIMEOUT_MS))) {
     return { kind: 'busy' }
   }
+  // The bytes are TRANSFERRED to the worker rather than structured-cloned (a clone of a 10 MB
+  // PDF is a second 10 MB copy plus the parse). A view that does not own its whole buffer
+  // (a pooled Buffer slice) is copied first so the transfer cannot detach someone else's memory.
+  const owned = data.byteOffset === 0 && data.byteLength === data.buffer.byteLength ? data : data.slice()
   let worker: Worker
     try {
-      worker = new Worker(WORKER_PATH, {
-        workerData: { data },
+      worker = new Worker(opts?.workerPath ?? WORKER_PATH, {
+        workerData: { data: owned },
+        transferList: [owned.buffer as ArrayBuffer],
         // 10 MB in, and a heap ceiling that lets pdfjs work while keeping a runaway document
         // from growing the JS heap without limit. External (ArrayBuffer) memory is NOT covered
         // — see the header comment.
@@ -120,7 +133,8 @@ export async function extractPdfText(
           resolve(outcome)
         }
         const watchdog = setTimeout(() => finish({ kind: 'timeout' }), timeoutMs)
-        worker.once('message', (m: { text?: string | null }) => {
+        worker.once('message', (m: { text?: string | null; unavailable?: boolean }) => {
+          if (m?.unavailable === true) return finish({ kind: 'unavailable' })
           finish(typeof m?.text === 'string' && m.text ? { kind: 'text', text: m.text } : { kind: 'unreadable' })
         })
         worker.once('error', () => finish({ kind: 'unreadable' }))
