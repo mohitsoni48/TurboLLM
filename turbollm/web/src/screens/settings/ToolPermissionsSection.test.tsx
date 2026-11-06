@@ -83,8 +83,8 @@ describe('ToolPermissionsSection: Wait for an answer', () => {
 })
 
 describe('ToolPermissionsSection: Read PDFs in fetch_url', () => {
-  // The switches in order: Auto-allow all, then Read PDFs in fetch_url.
-  const pdfSwitch = () => screen.getAllByRole('switch')[1] as HTMLButtonElement
+  // Accessible name comes from the switch's aria-label (the visible label sits in a sibling div).
+  const pdfSwitch = () => screen.getByRole('switch', { name: 'Read PDFs in fetch_url' }) as HTMLButtonElement
 
   it('is off by default and says what off does', async () => {
     await renderOpen()
