@@ -262,6 +262,10 @@ export interface ToolsConfig {
    *  instead. Only silences a resolved 'ask' — an explicit 'deny' (global or
    *  per-conversation) is still honored; see resolveToolPolicy. */
   autoAllowAll?: boolean
+  /** Settings → Tool permissions → "Read PDFs in fetch_url", default OFF (a proposed safety default:
+   *  fetch_url feeds untrusted remote bytes to a PDF parser). When false, a PDF reply gets a fixed
+   *  "PDF reading is disabled" note and is never parsed or decoded. */
+  pdfReading?: boolean
   /** How long a chat reply waits for the answers to its tool calls set to Ask, all its calls
    *  together, in whole minutes (Settings → Tool permissions; CHAT_APPROVAL_WAIT_MINUTES's bounds,
    *  default 30). Past it the call still waiting, and every later one of the reply, is not run and
@@ -1313,6 +1317,7 @@ function normalize(c: Config): void {
   }
   c.tools.toolPolicies = toolPolicies
   c.tools.autoAllowAll = tl.autoAllowAll === true
+  c.tools.pdfReading = tl.pdfReading === true
   // Absent in configs written before the setting, or hand-edited out of range: the default (30
   // minutes), never a throw on load. A fraction is floored, as the minutes it stands for.
   const wait = tl.chatApprovalWaitMinutes
