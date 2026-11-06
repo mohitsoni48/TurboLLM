@@ -964,6 +964,8 @@ export type DaemonSettings = {
    *  call that would show an "awaiting approval" prompt runs immediately instead.
    *  Only silences a resolved 'ask' — an explicit 'deny' is still honored. */
   autoAllowAll: boolean
+  /** Settings → Tool permissions, default off: whether fetch_url may parse PDF replies. */
+  pdfReading: boolean
   /** How long a chat reply waits for the answers to its tool calls set to Ask, all its calls
    *  together, in whole minutes (0-1440, default 30); past it they are not run and the reply goes
    *  on. 0 waits until answered. Optional: a daemon from before the setting does not send it. */
