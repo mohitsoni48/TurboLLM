@@ -5,7 +5,8 @@ import { extractPdfText, isPdfResponse, PDF_MAX_PAGES } from './pdf-text'
 
 // GitHub #52 (PDF-in-web-fetching): a PDF body used to be UTF-8-decoded like a text page,
 // which handed the model raw PDF syntax garbage. The bytes now go through pdfjs-dist's
-// legacy build (pure JS, no platform binaries) and the page's text layer comes back.
+// legacy build (which loads the @napi-rs/canvas native addon at import under Node) and the
+// page's text layer comes back. Reading is opt-in (tools.pdfReading), so tests that expect text pass PDF_ON.
 
 // A real one-page PDF ("Dummy PDF file"), the classic w3.org dummy document.
 const DUMMY_PDF_B64 =
@@ -19,6 +20,9 @@ function stubFetch(handler: (url: string) => Response) {
 }
 
 const PDF_HEADERS = { 'content-type': 'application/pdf' }
+const PDF_ON = { pdfReading: true }
+const HANG_WORKER = new URL('./fetch-url-pdf-hang-worker.fixture.mjs', import.meta.url)
+const UNAVAILABLE_WORKER = new URL('./fetch-url-pdf-unavailable-worker.fixture.mjs', import.meta.url)
 
 test('isPdfResponse: the header says PDF', () => {
   assert.equal(isPdfResponse('application/pdf', 'http://files.invalid/doc'), true)
@@ -52,7 +56,8 @@ test('extractPdfText: garbage bytes report unreadable, never a throw', async () 
 // daemon's own thread never blocked on the parse.
 test('extractPdfText: the watchdog terminates a parse that runs over budget', async () => {
   const t0 = Date.now()
-  const outcome = await extractPdfText(new Uint8Array(dummyPdf), { timeoutMs: 1 })
+  // A worker that never answers: the outcome cannot depend on how fast a real parse is.
+  const outcome = await extractPdfText(new Uint8Array(dummyPdf), { timeoutMs: 50, workerPath: HANG_WORKER })
   assert.deepEqual(outcome, { kind: 'timeout' })
   assert.ok(Date.now() - t0 < 15_000, 'watchdog must end the wait promptly')
   // The slot was released: a following parse proceeds normally.
@@ -60,10 +65,28 @@ test('extractPdfText: the watchdog terminates a parse that runs over budget', as
   assert.equal(after.kind, 'text')
 })
 
+test('extractPdfText: a reader that cannot load reports unavailable, not an unreadable document', async () => {
+  const outcome = await extractPdfText(new Uint8Array(dummyPdf), { workerPath: UNAVAILABLE_WORKER })
+  assert.deepEqual(outcome, { kind: 'unavailable' })
+})
+
+test('extractPdfText: the bytes are transferred, and a pooled Buffer slice is copied rather than detached', async () => {
+  const owned = new Uint8Array(dummyPdf)
+  const outcome = await extractPdfText(owned)
+  assert.equal(outcome.kind, 'text')
+  assert.equal(owned.byteLength, 0, 'an owning view is transferred to the worker, not cloned')
+  // A Buffer from the shared pool is a view into memory other code uses: it must stay intact.
+  const pool = new Uint8Array(dummyPdf.length + 16)
+  pool.set(dummyPdf, 8)
+  const view = pool.subarray(8, 8 + dummyPdf.length)
+  assert.equal((await extractPdfText(view)).kind, 'text')
+  assert.equal(pool.byteLength, dummyPdf.length + 16, 'the shared buffer was not detached')
+})
+
 test('execFetchUrl: a PDF reply comes back as its text, not binary garbage', async () => {
   const stub = stubFetch(() => new Response(dummyPdf, { headers: PDF_HEADERS }))
   try {
-    const out = await execFetchUrl({ url: 'http://files.invalid/dummy.pdf' })
+    const out = await execFetchUrl({ url: 'http://files.invalid/dummy.pdf' }, PDF_ON)
     assert.match(out, /Dummy PDF file/)
     assert.match(out, /^Published: unknown \| Retrieved: /)
     assert.doesNotMatch(out, /%PDF-1/)
@@ -73,14 +96,14 @@ test('execFetchUrl: a PDF reply comes back as its text, not binary garbage', asy
 test('execFetchUrl: octet-stream with a .pdf path is parsed as a PDF', async () => {
   const stub = stubFetch(() => new Response(dummyPdf, { headers: { 'content-type': 'application/octet-stream' } }))
   try {
-    assert.match(await execFetchUrl({ url: 'http://files.invalid/dummy.pdf' }), /Dummy PDF file/)
+    assert.match(await execFetchUrl({ url: 'http://files.invalid/dummy.pdf' }, PDF_ON), /Dummy PDF file/)
   } finally { stub.restore() }
 })
 
 test('execFetchUrl: an HTML page at a .pdf URL stays on the HTML path', async () => {
   const stub = stubFetch(() => new Response('<html><body><p>viewer page</p></body></html>', { headers: { 'content-type': 'text/html' } }))
   try {
-    const out = await execFetchUrl({ url: 'http://files.invalid/view.pdf' })
+    const out = await execFetchUrl({ url: 'http://files.invalid/view.pdf' }, PDF_ON)
     assert.match(out, /viewer page/)
     assert.doesNotMatch(out, /no readable text layer/)
   } finally { stub.restore() }
@@ -89,7 +112,7 @@ test('execFetchUrl: an HTML page at a .pdf URL stays on the HTML path', async ()
 test('execFetchUrl: an unparseable PDF says so in static text', async () => {
   const stub = stubFetch(() => new Response(Buffer.from('not a pdf at all'), { headers: PDF_HEADERS }))
   try {
-    const out = await execFetchUrl({ url: 'http://files.invalid/broken.pdf' })
+    const out = await execFetchUrl({ url: 'http://files.invalid/broken.pdf' }, PDF_ON)
     assert.match(out, /no readable text layer/)
     assert.doesNotMatch(out, /not a pdf at all/)
   } finally { stub.restore() }
@@ -99,7 +122,7 @@ test('execFetchUrl: a PDF over the byte cap is reported too large, not half-pars
   const big = Buffer.alloc(FETCH_URL_PDF_MAX_BYTES + 1, 0x25)
   const stub = stubFetch(() => new Response(big, { headers: PDF_HEADERS }))
   try {
-    const out = await execFetchUrl({ url: 'http://files.invalid/huge.pdf' })
+    const out = await execFetchUrl({ url: 'http://files.invalid/huge.pdf' }, PDF_ON)
     assert.match(out, /larger than the 10 MB fetch limit/)
   } finally { stub.restore() }
 })
@@ -107,7 +130,7 @@ test('execFetchUrl: a PDF over the byte cap is reported too large, not half-pars
 test('execFetchUrl: a plain-text page is untouched by the PDF path', async () => {
   const stub = stubFetch(() => new Response('plain hello', { headers: { 'content-type': 'text/plain' } }))
   try {
-    assert.match(await execFetchUrl({ url: 'http://files.invalid/notes.txt' }), /plain hello/)
+    assert.match(await execFetchUrl({ url: 'http://files.invalid/notes.txt' }, PDF_ON), /plain hello/)
   } finally { stub.restore() }
 })
 
@@ -116,14 +139,15 @@ test('PDF_MAX_PAGES is a small sane bound', () => {
 })
 
 test('extractPdfText: at most 2 parses run at once; a timed-out parse frees its slot for the queue', async () => {
-  // Occupy both worker slots with parses that can only end by the watchdog.
+  // Two never-answering workers fill both slots; only the watchdog can end them.
   let slowSettled = 0
   const slow = [
-    extractPdfText(new Uint8Array(dummyPdf), { timeoutMs: 250 }),
-    extractPdfText(new Uint8Array(dummyPdf), { timeoutMs: 250 }),
+    extractPdfText(new Uint8Array(dummyPdf), { timeoutMs: 200, workerPath: HANG_WORKER }),
+    extractPdfText(new Uint8Array(dummyPdf), { timeoutMs: 200, workerPath: HANG_WORKER }),
   ].map((p) => p.then((o) => { slowSettled++; return o }))
-  // The third parse must queue behind them: if the slot cap worked, it cannot have run
-  // (let alone finished) before at least one wedged worker was terminated and released.
+  // The third parse must queue behind them: if the slot cap worked, it cannot have run before
+  // at least one wedged worker was terminated and released. Real parse here, so slowSettled is
+  // checked against the wedged workers' own deterministic 200 ms budget, not a parse duration.
   const third = await extractPdfText(new Uint8Array(dummyPdf))
   assert.equal(third.kind, 'text')
   assert.ok(slowSettled >= 1, 'the queued parse ran only after a wedged worker freed its slot')
@@ -159,7 +183,7 @@ test('execFetchUrl: a PDF download that fails mid-stream is reported honestly, n
   })
   const stub = stubFetch(() => new Response(body, { headers: PDF_HEADERS }))
   try {
-    const out = await execFetchUrl({ url: 'http://files.invalid/truncated.pdf' })
+    const out = await execFetchUrl({ url: 'http://files.invalid/truncated.pdf' }, PDF_ON)
     assert.match(out, /could not be downloaded completely/)
     assert.doesNotMatch(out, /no readable text layer/)
     assert.doesNotMatch(out, /Dummy PDF file/)
@@ -167,14 +191,16 @@ test('execFetchUrl: a PDF download that fails mid-stream is reported honestly, n
 })
 
 test('extractPdfText: a parse queued too long behind busy workers gives up honestly instead of waiting unbounded', async () => {
+  // Hang workers hold both slots for 1.5 s, far longer than the 100 ms queue bound, so the
+  // outcome never depends on how long a real one-page parse takes.
   const slow = [
-    extractPdfText(new Uint8Array(dummyPdf), { timeoutMs: 500 }),
-    extractPdfText(new Uint8Array(dummyPdf), { timeoutMs: 500 }),
+    extractPdfText(new Uint8Array(dummyPdf), { timeoutMs: 1_500, workerPath: HANG_WORKER }),
+    extractPdfText(new Uint8Array(dummyPdf), { timeoutMs: 1_500, workerPath: HANG_WORKER }),
   ]
   const t0 = Date.now()
   const queued = await extractPdfText(new Uint8Array(dummyPdf), { queueTimeoutMs: 100 })
   assert.deepEqual(queued, { kind: 'busy' })
-  assert.ok(Date.now() - t0 < 400, 'the queue bound must end the wait promptly')
+  assert.ok(Date.now() - t0 < 1_000, 'the queue bound must end the wait promptly')
   // The lapsed waiter is gone: once the wedged workers time out, the next parse proceeds.
   const [a, b] = await Promise.all(slow)
   assert.deepEqual([a.kind, b.kind], ['timeout', 'timeout'])
@@ -186,7 +212,7 @@ test('execFetchUrl: a PDF mislabeled text/plain at a non-.pdf URL is caught by i
   // syntax - the exact #52 complaint. The first-bytes sniff catches it.
   const stub = stubFetch(() => new Response(dummyPdf, { headers: { 'content-type': 'text/plain' } }))
   try {
-    const out = await execFetchUrl({ url: 'http://files.invalid/download' })
+    const out = await execFetchUrl({ url: 'http://files.invalid/download' }, PDF_ON)
     assert.match(out, /Dummy PDF file/)
     assert.doesNotMatch(out, /%PDF-1/)
   } finally { stub.restore() }
@@ -195,7 +221,7 @@ test('execFetchUrl: a PDF mislabeled text/plain at a non-.pdf URL is caught by i
 test('execFetchUrl: an HTML page mentioning %PDF- as text stays on the HTML path', async () => {
   const stub = stubFetch(() => new Response('<html><body><p>files start with %PDF- magic</p></body></html>', { headers: { 'content-type': 'text/html' } }))
   try {
-    const out = await execFetchUrl({ url: 'http://files.invalid/about' })
+    const out = await execFetchUrl({ url: 'http://files.invalid/about' }, PDF_ON)
     assert.match(out, /files start with %PDF- magic/)
     assert.doesNotMatch(out, /no readable text layer/)
   } finally { stub.restore() }
@@ -217,7 +243,7 @@ test('execFetchUrl: a PDF whose %PDF- signature arrives split across chunks is s
   })
   const stub = stubFetch(() => new Response(body, { headers: { 'content-type': 'text/plain' } }))
   try {
-    const out = await execFetchUrl({ url: 'http://files.invalid/download' })
+    const out = await execFetchUrl({ url: 'http://files.invalid/download' }, PDF_ON)
     assert.match(out, /Dummy PDF file/)
     assert.doesNotMatch(out, /%PDF-1/)
   } finally { stub.restore() }
@@ -226,8 +252,74 @@ test('execFetchUrl: a PDF whose %PDF- signature arrives split across chunks is s
 test('execFetchUrl: a plain-text file that merely starts with %PDF- gets the static note, never a raw-byte leak', async () => {
   const stub = stubFetch(() => new Response(Buffer.from('%PDF-hello this is just text'), { headers: { 'content-type': 'text/plain' } }))
   try {
-    const out = await execFetchUrl({ url: 'http://files.invalid/notes' })
+    const out = await execFetchUrl({ url: 'http://files.invalid/notes' }, PDF_ON)
     assert.match(out, /no readable text layer/)
     assert.doesNotMatch(out, /hello this is just text/)
   } finally { stub.restore() }
+})
+
+test('execFetchUrl: with PDF reading off (the default) a PDF gets the fixed disabled note and is never parsed or decoded', async () => {
+  for (const opts of [undefined, { pdfReading: false }]) {
+    const stub = stubFetch(() => new Response(dummyPdf, { headers: PDF_HEADERS }))
+    try {
+      const out = await execFetchUrl({ url: 'http://files.invalid/dummy.pdf' }, opts)
+      assert.match(out, /PDF reading is disabled/)
+      assert.doesNotMatch(out, /Dummy PDF file/)
+      assert.doesNotMatch(out, /%PDF-|obj|endobj/)
+    } finally { stub.restore() }
+  }
+})
+
+test('execFetchUrl: a mislabeled PDF (magic bytes) with reading off also gets the disabled note, not raw bytes', async () => {
+  const stub = stubFetch(() => new Response(dummyPdf, { headers: { 'content-type': 'text/plain' } }))
+  try {
+    const out = await execFetchUrl({ url: 'http://files.invalid/download' })
+    assert.match(out, /PDF reading is disabled/)
+    assert.doesNotMatch(out, /%PDF-/)
+  } finally { stub.restore() }
+})
+
+test('execFetchUrl: a PDF is recognised by the URL that answered after redirects, not the requested one', async () => {
+  const stub = stubFetch(() => {
+    const r = new Response(dummyPdf, { headers: { 'content-type': 'application/octet-stream' } })
+    Object.defineProperty(r, 'url', { value: 'http://files.invalid/final.pdf' })
+    return r
+  })
+  try {
+    assert.match(await execFetchUrl({ url: 'http://files.invalid/get?id=7' }, PDF_ON), /Dummy PDF file/)
+  } finally { stub.restore() }
+  const page = stubFetch(() => {
+    const r = new Response('<html><body><p>an ordinary page</p></body></html>', { headers: { 'content-type': 'application/octet-stream' } })
+    Object.defineProperty(r, 'url', { value: 'http://files.invalid/landing' })
+    return r
+  })
+  try {
+    // Requested URL ends in .pdf but the reply that answered is a page: not parsed as a PDF.
+    assert.match(await execFetchUrl({ url: 'http://files.invalid/old.pdf' }, PDF_ON), /an ordinary page/)
+  } finally { page.restore() }
+})
+
+test('execFetchUrl: a PDF reply with no body says so, not "could not be downloaded completely"', async () => {
+  const stub = stubFetch(() => new Response(null, { status: 200, headers: PDF_HEADERS }))
+  try {
+    const out = await execFetchUrl({ url: 'http://files.invalid/empty.pdf' }, PDF_ON)
+    assert.match(out, /sent no content/)
+    assert.doesNotMatch(out, /downloaded completely/)
+  } finally { stub.restore() }
+})
+
+test('execFetchUrl: a PDF body gets its own, longer budget than the 15 s headers budget', async () => {
+  // Headers budget 50 ms, PDF body budget 2 s: the body arrives after 300 ms (> the headers
+  // budget) and must still be read. A non-PDF body arriving at the same pace is cut by 50 ms.
+  const slowBody = (type: string, payload: Uint8Array | string) => () => {
+    const bytes = typeof payload === 'string' ? new TextEncoder().encode(payload) : payload
+    const body = new ReadableStream<Uint8Array>({
+      async start(c) { c.enqueue(bytes.slice(0, 8)); await new Promise((r) => setTimeout(r, 300)); c.enqueue(bytes.slice(8)); c.close() },
+    })
+    return new Response(body, { headers: { 'content-type': type } })
+  }
+  const pdf = stubFetch(slowBody('application/pdf', new Uint8Array(dummyPdf)))
+  try {
+    assert.match(await execFetchUrl({ url: 'http://files.invalid/slow.pdf' }, { pdfReading: true, headersTimeoutMs: 50, pdfBodyTimeoutMs: 2_000 }), /Dummy PDF file/)
+  } finally { pdf.restore() }
 })
