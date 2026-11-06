@@ -35,6 +35,13 @@ export default defineConfig({
     // hook at all and target a real file directly, in both dev/tsx and the built package alike.
     'run-code-worker': 'src/tools/run-code-worker.ts',
     'run-code-sandbox': 'src/tools/run-code-sandbox.ts',
+    // fetch_url's PDF parse is a second pair of the same shape (see pdf-text.ts /
+    // pdf-text-worker.ts / pdf-text-extract.ts): a real file per role, so a spawned
+    // worker_threads Worker loads them without any tsx loader hook, in dev and built alike.
+    // Keeping pdf-text-extract its own entry also keeps pdfjs-dist OUT of cli.js's chunk
+    // graph — the daemon's main thread never loads it.
+    'pdf-text-worker': 'src/tools/pdf-text-worker.ts',
+    'pdf-text-extract': 'src/tools/pdf-text-extract.ts',
     // The Code/Agents feature's entries, imported lazily by cli.js (see the top of this file).
     'code-routes': 'src/code/code-routes.ts',
     'code-run-manager': 'src/code/code-run-manager.ts',
