@@ -520,6 +520,40 @@ const ALL: CatalogEngine[] = [
     ],
   },
   {
+    id: 'llama.cpp-tq3',
+    name: 'llama.cpp-tq3',
+    kind: 'llama-server',
+    description:
+      'A llama.cpp fork (turbo-tan) adding TQ3_1S/TQ4S KV-cache quantization — ~3.5-bit, a sweet spot between Turbo3 and Turbo4 — via CUDA kernels, so long contexts cost far less VRAM. Ships llama-server but publishes no prebuilt binaries — build it, then add your own engine.',
+    provision: 'github-release',
+    homepage: 'https://github.com/turbo-tan/llama.cpp-tq3',
+    repo: 'turbo-tan/llama.cpp-tq3',
+    // Same situation as ik_llama.cpp: the fork ships NO prebuilt release assets
+    // (verified 2026-11-03: zero releases on the repo, only upstream-sync tags), so it
+    // lists as "build it → Add your own engine" with NO install endpoint. If it ever
+    // publishes prebuilt llama-server archives, flip the variant's hasPrebuilt and add
+    // an endpoint.
+    platforms: ['win32', 'darwin', 'linux'],
+    support: 'experimental',
+    installEndpoint: '',
+    note: 'No prebuilt binaries are published. Build llama-server from the fork, then use "Add your own engine" to point TurboLLM at it — it runs on the standard llama-server path. The TQ3_1S/TQ4S KV-cache types need a CUDA (NVIDIA) build; on other backends the fork behaves like stock llama.cpp.',
+    defaultBranch: 'main',
+    variants: [
+      {
+        id: 'llama.cpp-tq3-source',
+        label: 'Build from source',
+        repo: 'turbo-tan/llama.cpp-tq3',
+        // No hardware gate on listing — the user picks their own backend when they compile
+        // (the KV-cache feature itself is CUDA-only; the note says so). Same treatment as
+        // ik_llama.cpp: hasPrebuilt:false drives the "build it" UI.
+        requires: {},
+        stability: 'experimental',
+        speed: 'baseline',
+        hasPrebuilt: false,
+      },
+    ],
+  },
+  {
     id: 'llamafile',
     name: 'llamafile',
     kind: 'llamafile',
