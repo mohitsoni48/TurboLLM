@@ -78,7 +78,7 @@ export const FETCH_URL_TOOL = {
   type: 'function' as const,
   function: {
     name: 'fetch_url',
-    description: 'Fetch the text content of a URL. Returns the main text of the page, stripped of HTML. PDF documents are read too: their text layer is extracted like page text.',
+    description: 'Fetch the text content of a URL. Returns the main text of the page, stripped of HTML. PDF documents are read too when PDF reading is enabled in Settings: their text layer is extracted like page text.',
     parameters: {
       type: 'object',
       properties: {
@@ -540,25 +540,46 @@ function byteAt(chunks: Uint8Array[], i: number): number | undefined {
   return undefined
 }
 
-export async function execFetchUrl(args: Record<string, unknown>): Promise<string> {
+/** Total wall-clock for fetching a PDF body once its headers arrived. The 15 s budget below
+ *  covers connecting and the headers (and any non-PDF body, unchanged); a 10 MB PDF on an ordinary
+ *  connection needs longer than that, so a PDF reply gets this budget for its body instead. */
+export const FETCH_URL_PDF_BODY_TIMEOUT_MS = 60_000
+
+export async function execFetchUrl(
+  args: Record<string, unknown>,
+  opts: { pdfReading?: boolean; headersTimeoutMs?: number; pdfBodyTimeoutMs?: number } = {},
+): Promise<string> {
   const url = String(args.url ?? '').trim()
   if (!url) return 'Error: url is required.'
   if (!/^https?:\/\//i.test(url)) return 'Error: URL must start with http:// or https://'
 
   let resp: Response
+  // One controller instead of AbortSignal.timeout(15_000): same 15 s default, but a PDF body can be
+  // given its own, longer budget once we know the reply is a PDF (see FETCH_URL_PDF_BODY_TIMEOUT_MS).
+  const abort = new AbortController()
+  let abortTimer = setTimeout(() => abort.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), opts.headersTimeoutMs ?? 15_000)
+  const rearmTimeout = (ms: number) => {
+    clearTimeout(abortTimer)
+    abortTimer = setTimeout(() => abort.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), ms)
+  }
   try {
     const fetched = await fetchWithSsrfCheck(url, {
       headers: { 'User-Agent': 'TurboLLM/0.7 (tool-fetch)' },
-      signal: AbortSignal.timeout(15_000),
+      signal: abort.signal,
     })
-    if (typeof fetched === 'string') return fetched
+    if (typeof fetched === 'string') { clearTimeout(abortTimer); return fetched }
     resp = fetched
   } catch (e) {
+    clearTimeout(abortTimer)
     return `Error: could not fetch URL — ${(e as Error).message}`
   }
 
   const contentType = resp.headers.get('content-type') ?? ''
-  const asPdf = isPdfResponse(contentType, url)
+  // The URL that actually answered (after redirects): a link that redirects to a .pdf file is a
+  // PDF, and a .pdf-looking link that redirects to a page is not. resp.url is empty on a
+  // hand-built Response, so the requested URL stays the fallback.
+  const asPdf = isPdfResponse(contentType, resp.url || url)
+  if (asPdf) rearmTimeout(opts.pdfBodyTimeoutMs ?? FETCH_URL_PDF_BODY_TIMEOUT_MS)
   // Streamed up to FETCH_URL_MAX_BYTES instead of resp.text(), which would buffer a huge or
   // endless body whole before any of it is cut. A PDF body is collected as BYTES instead of
   // decoded text: its text layer is extracted below, and a UTF-8 decode of raw PDF bytes was
@@ -568,6 +589,8 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
   let pdfBytes: Uint8Array | null = null
   let pdfReadFailed = false
   let sniffedPdf = false
+  let pdfDisabled = false
+  let pdfNoBody = false
   if (resp.body) {
     const reader = resp.body.getReader()
     let read = 0
@@ -599,7 +622,12 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
       byteAt(head, 2) === 0x44 && // D
       byteAt(head, 3) === 0x46 && // F
       byteAt(head, 4) === 0x2d // -
-    if (asPdf || sniffedPdf) {
+    if (sniffedPdf) rearmTimeout(opts.pdfBodyTimeoutMs ?? FETCH_URL_PDF_BODY_TIMEOUT_MS)
+    if ((asPdf || sniffedPdf) && opts.pdfReading !== true) {
+      // PDF reading is off: nothing more is read or decoded, so neither a parser nor the old
+      // raw-bytes-as-text path ever sees the document.
+      pdfDisabled = true
+    } else if (asPdf || sniffedPdf) {
       const chunks: Uint8Array[] = head
       if (headFailed) pdfReadFailed = true
       if (read >= FETCH_URL_PDF_MAX_BYTES) cut = true
@@ -648,17 +676,24 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
       }
     }
     await reader.cancel().catch(() => {})
+  } else if (asPdf) {
+    pdfNoBody = true
   }
+  clearTimeout(abortTimer)
   let content: string
   let published: string | undefined
   let modified: string | undefined
 
   if (asPdf || sniffedPdf) {
-    if (cut) {
+    if (pdfDisabled) {
+      content = '(PDF reading is disabled, so this document was not read. It can be turned on in Settings, under Tool permissions.)'
+    } else if (cut) {
       // Static text, like the truncation marker's: no page bytes reach it. A cut PDF cannot
       // be parsed (its xref table is at the end), so "too large" is the honest answer, not a
       // half-document.
       content = `(this PDF is larger than the ${Math.round(FETCH_URL_PDF_MAX_BYTES / 1024 / 1024)} MB fetch limit and was not read. Fetch a smaller document or a specific page instead.)`
+    } else if (pdfNoBody) {
+      content = '(the server sent no content for this PDF, so there was nothing to read.)'
     } else if (pdfReadFailed || pdfBytes === null) {
       content = '(this PDF could not be downloaded completely and was not read. Try again, or fetch a specific page instead.)'
     } else {
@@ -670,6 +705,8 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
         ? outcome.text
         : outcome.kind === 'busy'
           ? '(the document reader is busy with other PDFs right now and this one was queued too long. Try again shortly.)'
+          : outcome.kind === 'unavailable'
+            ? '(PDF reading is not available in this install, so this document was not read.)'
           : outcome.kind === 'timeout'
             ? '(this PDF took too long to read and was stopped. It may be unusually complex or damaged; its contents are not available.)'
             : '(this PDF has no readable text layer — it may be a scan, encrypted, or corrupt. Its contents are not available.)'
