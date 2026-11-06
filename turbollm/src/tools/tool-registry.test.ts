@@ -17,6 +17,8 @@ import { join } from 'node:path'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpDir } from '../test-support/tmp'
+import { dummyPdf } from '../test-support/dummy-pdf'
+import { stubFetch } from '../test-support/fetch-stub'
 
 const EMPTY_TOOLS_CFG = {} as ToolsConfig
 
@@ -617,4 +619,18 @@ test('an HTTP MCP server that expires the session (404) gets a new session and t
     http.closeAllConnections?.()
     await new Promise((r) => http.close(r))
   }
+})
+
+test('executeTool: fetch_url observes tools.pdfReading from config, and updateConfig flips it', async () => {
+  // The disabled note proves the PDF was never parsed; the flip proves the tool path reads the
+  // config updateConfig installed, not the constructor's.
+  const stub = stubFetch(() => new Response(new Uint8Array(dummyPdf), { headers: { 'content-type': 'application/pdf' } }))
+  try {
+    const reg = new ToolRegistry(EMPTY_TOOLS_CFG)
+    const off = await reg.executeTool({ id: 'p1', name: 'fetch_url', args: { url: 'http://files.invalid/dummy.pdf' } })
+    assert.match(off, /PDF reading is disabled/)
+    reg.updateConfig({ pdfReading: true } as ToolsConfig)
+    const on = await reg.executeTool({ id: 'p2', name: 'fetch_url', args: { url: 'http://files.invalid/dummy.pdf' } })
+    assert.match(on, /Dummy PDF file/)
+  } finally { stub.restore() }
 })
