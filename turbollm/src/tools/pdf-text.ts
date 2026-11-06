@@ -11,8 +11,8 @@
 
 import { Worker } from 'node:worker_threads'
 
-/** Pages read before stopping — re-exported from the worker side so tests and callers see
- *  one value. */
+/** Pages read before stopping. The worker side (pdf-text-extract.ts) holds its own copy of
+ *  this value — the worker thread does not import this module — so keep the two in sync. */
 export const PDF_MAX_PAGES = 40
 
 /** True for a reply whose bytes should be parsed as a PDF: the header says so, or a
