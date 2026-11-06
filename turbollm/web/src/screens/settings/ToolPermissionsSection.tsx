@@ -107,9 +107,10 @@ export function ToolPermissionsSection() {
             <div className="text-[11px] text-faint">
               Let fetch_url read the text of PDF documents. Off, a PDF gets a fixed &quot;PDF reading is disabled&quot; note.
               A PDF comes from an untrusted site and is opened by a PDF parser.
+              On, chats and Code sessions read PDFs without asking each time.
             </div>
           </div>
-          <Switch checked={pdfReading} onCheckedChange={setPdfReading} disabled={save.isPending} />
+          <Switch aria-label="Read PDFs in fetch_url" checked={pdfReading} onCheckedChange={setPdfReading} disabled={save.isPending} />
         </div>
 
         <div className="mb-3 flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2.5">
