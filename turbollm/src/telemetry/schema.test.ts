@@ -203,7 +203,7 @@ test('validateEvent: ui_action accepts the Phase 6i SettingsScreen batch actions
     'switch_settings_tab', 'set_theme', 'save_settings', 'install_comfyui_gate',
     'uninstall_comfyui_gate', 'test_hf_token', 'save_hf_token', 'toggle_telemetry_preview',
     'toggle_submission_log', 'regenerate_machine_id', 'restart_daemon', 'dismiss_restart_overlay',
-    'reload_after_restart', 'save_personalization',
+    'reload_after_restart', 'save_personalization', 'toggle_pdf_reading',
   ]
   for (const action of actions) {
     const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'settings', action } }))
