@@ -107,6 +107,7 @@ async function readBodies(d: Deps, socket: Socket, headers: Record<string, strin
 const HOST_ONLY: [string, (cfg: Config) => unknown][] = [
   ['requireApiKey', (cfg) => ({ requireApiKey: !cfg.daemon.requireApiKey })],
   ['lanBind', (cfg) => ({ lanBind: !cfg.daemon.lanBind })],
+  ['pdfReading', (cfg) => ({ pdfReading: !(cfg.tools?.pdfReading ?? false) })],
   ['port', (cfg) => ({ port: cfg.daemon.port + 1 })],
   ['remoteAccess', () => ({ remoteAccess: { cloudflare: { accessTeamDomain: 'https://evil.cloudflareaccess.com', accessAud: 'evil-aud' } } })],
   ['remoteAccess', () => ({ remoteAccess: { ngrok: { authtoken: 'attacker-token' } } })],
