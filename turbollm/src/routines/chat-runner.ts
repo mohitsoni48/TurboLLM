@@ -323,6 +323,8 @@ function runOutcome(d: Deps, convId: string, outcome: GenerationOutcome<ChatRunO
 function failureText(failure: GenerationFailure): string {
   if (failure.kind === 'http') return failure.reason ? `Engine returned ${failure.status}: ${failure.reason}` : `Engine returned ${failure.status}.`
   if (failure.kind === 'engine') return failure.message
-  return `Engine request failed: ${failure.message}`
+  // Only the request (or reading its reply) failing is the engine's; any other throw is the run's own (its persistence,
+  // a tool) and is reported as it is.
+  return failure.request ? `Engine request failed: ${failure.message}` : failure.message
 }
 

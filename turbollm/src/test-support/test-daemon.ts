@@ -18,10 +18,15 @@ export interface TestDaemon extends BootedDaemon {
   stop(): Promise<void>
 }
 
+/** The telemetry env var as it was before the first running test daemon set it, and how many are running. */
+let telemetryBefore: { value: string | undefined; running: number } | null = null
+
 /** Boots a test daemon; `configure` edits its config before the boot reads it, `options` turns one of the inert
  *  defaults back on (such as auto-load). */
 export async function bootTestDaemon(configure: (c: Config) => void = () => {}, options: Partial<BootOptions> = {}): Promise<TestDaemon> {
   // The `--no-telemetry` mechanism itself (ADR-299: the flag is this env var, not a second code path).
+  telemetryBefore ??= { value: process.env[TELEMETRY_ENV], running: 0 }
+  telemetryBefore.running++
   process.env[TELEMETRY_ENV] = 'off'
   const dataDir = tmpDir('tllm-boot-')
   const modelDir = join(dataDir, 'models')
@@ -53,8 +58,17 @@ export async function bootTestDaemon(configure: (c: Config) => void = () => {}, 
     async stop() {
       await daemon.close()
       stopDaemonTicks()
+      restoreTelemetryEnv()
     },
   }
+}
+
+/** Puts the telemetry env var back once the last running test daemon has stopped. */
+function restoreTelemetryEnv(): void {
+  if (!telemetryBefore || --telemetryBefore.running > 0) return
+  if (telemetryBefore.value === undefined) delete process.env[TELEMETRY_ENV]
+  else process.env[TELEMETRY_ENV] = telemetryBefore.value
+  telemetryBefore = null
 }
 
 /** The port the listener bound, once its listen callback has run. */

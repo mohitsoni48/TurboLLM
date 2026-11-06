@@ -4,7 +4,13 @@
 // timer. The timers stay as a safety net: {@link pollWhileLive} lengthens them only while the stream is
 // really open, so a daemon without the route, a scoped token refused it, or a dropped stream all fall
 // back to the cadence each query had before.
-import { useQueryClient, type QueryClient, type QueryKey } from '@tanstack/react-query'
+//
+// Open only while the tab shows. The daemon speaks plain HTTP/1.1, and a browser keeps at most 6
+// connections to one host across all its tabs: an idle stream held by every hidden tab left the visible
+// one's requests queued behind them, and the app looked hung. A hidden tab's polls are paused anyway
+// (refetchIntervalInBackground: false), so it misses nothing it would show; on showing again it reopens
+// the stream and refetches everything once.
+import { useQueryClient, type InvalidateQueryFilters, type Query, type QueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { subscribeSse, type SseMessage } from './sse'
 
@@ -29,28 +35,36 @@ export function pollWhileLive(pollMs: number, fallbackMs = EVENT_FALLBACK_POLL_M
   return streamOpen ? Math.max(pollMs, fallbackMs) : pollMs
 }
 
-/** Each family key's query prefixes. Literal rather than imported from the *-queries modules, which import
- *  this one (live-events.test.tsx checks they still agree). */
-const FAMILY_TARGETS: Record<string, QueryKey[]> = {
-  status: [['status']],
-  conversations: [['conversations'], ['folders']],
-  memory: [['memory-facts']],
-  routines: [['routines'], ['routine'], ['routine-runs']],
-  downloads: [['downloads']],
-  models: [['models']],
-  engines: [['engines'], ['engine-updates']],
-  'code-sessions': [['code-sessions'], ['code-session']],
-  settings: [['settings']],
+const byPrefix = (...queryKey: string[]): InvalidateQueryFilters => ({ queryKey })
+
+/** The sidebar's polled first page of each list (chatKeys.listHead): refetching it is what tells the list a
+ *  row changed (useConversationListPoll), so the pages the user scrolled to are refetched only when it did. */
+const conversationListHeads: InvalidateQueryFilters = {
+  predicate: (query: Query) => query.queryKey[0] === 'conversations' && query.queryKey[2] === 'head',
 }
 
-/** Keys naming one entity: `<scope>:<id>`, onto that entity's own query. */
-const ENTITY_TARGETS: Record<string, (id: string) => QueryKey> = {
-  conversation: (id) => ['conversation', id],
-  'routine-runs': (id) => ['routine-runs', id],
+/** Each family key's queries. Literal rather than imported from the *-queries modules, which import this one
+ *  (live-events.test.tsx checks they still agree). A routine's runs are announced by their own key. */
+const FAMILY_TARGETS: Record<string, InvalidateQueryFilters[]> = {
+  status: [byPrefix('status')],
+  conversations: [conversationListHeads, byPrefix('folders')],
+  memory: [byPrefix('memory-facts')],
+  routines: [byPrefix('routines'), byPrefix('routine')],
+  downloads: [byPrefix('downloads')],
+  models: [byPrefix('models')],
+  engines: [byPrefix('engines'), byPrefix('engine-updates')],
+  'code-sessions': [byPrefix('code-sessions'), byPrefix('code-session')],
+  settings: [byPrefix('settings')],
 }
 
-/** The query keys an invalidation key names; none for a key this build does not know. */
-export function invalidationTargets(key: string): QueryKey[] {
+/** Keys naming one entity: `<scope>:<id>`, onto that entity's own queries. */
+const ENTITY_TARGETS: Record<string, (id: string) => InvalidateQueryFilters> = {
+  conversation: (id) => byPrefix('conversation', id),
+  'routine-runs': (id) => byPrefix('routine-runs', id),
+}
+
+/** The queries an invalidation key names; none for a key this build does not know. */
+export function invalidationTargets(key: string): InvalidateQueryFilters[] {
   const family = FAMILY_TARGETS[key]
   if (family) return family
   const colon = key.indexOf(':')
@@ -58,25 +72,57 @@ export function invalidationTargets(key: string): QueryKey[] {
   return entity ? [entity(key.slice(colon + 1))] : []
 }
 
-/** Mounted once, in the app shell: holds the stream open for the page's lifetime. */
+/** Mounted once, in the app shell: holds the stream open whenever the page shows, for its lifetime. */
 export function useLiveInvalidation(): void {
   const qc = useQueryClient()
-  useEffect(() => {
-    let reopened = false
-    const close = subscribeSse(eventsStreamUrl, (msg) => applyInvalidation(qc, msg), {
-      onOpen: () => {
-        streamOpen = true
-        // A reopened stream may have missed keys while it was down; the first open follows the page's own loads.
-        if (reopened) void qc.invalidateQueries()
-        reopened = true
-      },
-      onClose: () => { streamOpen = false },
-    })
-    return () => {
-      close()
+  useEffect(() => followWhileVisible(qc), [qc])
+}
+
+/** Opens the stream while the tab shows and lets it go while hidden. Returns the function that stops it. */
+function followWhileVisible(qc: QueryClient): () => void {
+  let closeStream: (() => void) | null = null
+  const follow = (resync: boolean) => { closeStream ??= openStream(qc, resync) }
+  const letGo = () => {
+    closeStream?.()
+    closeStream = null
+    streamOpen = false
+  }
+  const onVisibilityChange = () => (tabHidden() ? letGo() : follow(true))
+
+  if (!tabHidden()) follow(false)
+  document.addEventListener('visibilitychange', onVisibilityChange)
+  return () => {
+    document.removeEventListener('visibilitychange', onVisibilityChange)
+    letGo()
+  }
+}
+
+function tabHidden(): boolean {
+  return document.visibilityState === 'hidden'
+}
+
+/** One stream, reopened by subscribeSse when it drops. Every open but the first catches up on what it may have
+ *  missed while down, as does the first when `resyncOnOpen` (the tab showing again). A drop refetches at once, so
+ *  each poll restarts at the fast cadence it falls back to rather than finishing its long wait first. Being let go
+ *  (the tab hiding, the shell unmounting) refetches nothing. Returns the function that lets it go. */
+function openStream(qc: QueryClient, resyncOnOpen: boolean): () => void {
+  let resync = resyncOnOpen
+  let lettingGo = false
+  const close = subscribeSse(eventsStreamUrl, (msg) => applyInvalidation(qc, msg), {
+    onOpen: () => {
+      streamOpen = true
+      if (resync) void qc.invalidateQueries()
+      resync = true
+    },
+    onClose: () => {
       streamOpen = false
-    }
-  }, [qc])
+      if (!lettingGo) void qc.invalidateQueries()
+    },
+  })
+  return () => {
+    lettingGo = true
+    close()
+  }
 }
 
 function applyInvalidation(qc: QueryClient, msg: SseMessage): void {
@@ -86,7 +132,7 @@ function applyInvalidation(qc: QueryClient, msg: SseMessage): void {
     void qc.invalidateQueries()
     return
   }
-  for (const queryKey of keys.flatMap(invalidationTargets)) void qc.invalidateQueries({ queryKey })
+  for (const filters of keys.flatMap(invalidationTargets)) void qc.invalidateQueries(filters)
 }
 
 function parseKeys(data: string): string[] {

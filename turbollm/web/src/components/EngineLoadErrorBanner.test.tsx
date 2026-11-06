@@ -133,4 +133,24 @@ describe('EngineLoadErrorBanner', () => {
     await userEvent.setup().click(screen.getByRole('button', { name: 'Retry' }))
     expect(loadModel).toHaveBeenCalledWith('qwen3-8b')
   })
+
+  // A failed gateway auto-swap leaves lastLoaded naming the PREVIOUS model (it is recorded once a load succeeds):
+  // Retry loads the model the failure names, not that one.
+  it('retries the model the failure names over the lastLoaded record', async () => {
+    vi.mocked(loadModel).mockClear()
+    const error = { ...readinessTimeout, failReason: 'timeout' as const, modelKey: 'gemma-27b' }
+    const status = { ...statusWith('error', error), lastLoaded: { modelKey: 'qwen3-8b', engineId: 'e1' } }
+    renderBanner(status)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Retry' }))
+    expect(loadModel).toHaveBeenCalledWith('gemma-27b')
+  })
+
+  it('falls back to lastLoaded when the failure names no model (an older daemon, or no load recorded)', async () => {
+    vi.mocked(loadModel).mockClear()
+    const error = { ...readinessTimeout, failReason: 'timeout' as const, modelKey: '' }
+    const status = { ...statusWith('error', error), lastLoaded: { modelKey: 'qwen3-8b', engineId: 'e1' } }
+    renderBanner(status)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Retry' }))
+    expect(loadModel).toHaveBeenCalledWith('qwen3-8b')
+  })
 })

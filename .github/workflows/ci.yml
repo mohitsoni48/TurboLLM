@@ -73,7 +73,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ripgrep fd-find tini
 
       - name: Unit tests (${{ matrix.shard }})
-        run: npx tsx --test --test-timeout=60000 $(npx tsx src/test-support/list-shard.ts ${{ matrix.shard }})
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        # The list is captured first: the exit status of a $(...) used as an argument is ignored, so a failing or empty
+        # list-shard would run `tsx --test` with no files, which falls back to Node's own discovery and can pass.
+        run: |
+          files=$(npx tsx src/test-support/list-shard.ts "$SHARD") || exit 1
+          [ -n "$files" ] || { echo "empty shard $SHARD"; exit 1; }
+          npx tsx --test --test-timeout=60000 $files
         working-directory: turbollm
 
   # A Windows smoke subset of the unit tests: the code that spawns through cmd.exe and the job sentinel, where a

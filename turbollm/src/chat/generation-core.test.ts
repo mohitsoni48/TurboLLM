@@ -561,3 +561,29 @@ test('a failure says whether the request itself threw, or the reading of its rep
     } finally { engine.restore() }
   }
 })
+
+test("skill-creator: with no onSaveSkill port the core never reads d.db and offers no save_skill; with one, the call runs the port", async () => {
+  const toolsOffered: string[][] = []
+  for (const withPort of [false, true]) {
+    const deps = fakeDeps()
+    const d = new Proxy(deps.d, { get: (t, k) => { if (k === 'db') throw new Error('core touched d.db'); return Reflect.get(t, k) } }) as Deps
+    const saves: number[] = []
+    const engine = fakeEngine((n, init) => {
+      const names = ((JSON.parse(String(init?.body)).tools ?? []) as Array<{ function: { name: string } }>).map((t) => t.function.name)
+      if (n === 1) toolsOffered.push(names)
+      return n === 1 && withPort
+        ? sse({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'c1', function: { name: 'save_skill', arguments: '{}' } }] }, finish_reason: 'tool_calls' }] })
+        : sse(content('ok'), stop)
+    })
+    try {
+      const turn = turnFor({ conv: { id: 'conv-1', sampling: {}, preserveThinking: false, skillIds: ['skill-creator'] } as GenerationTurn['conv'] })
+      await runGenerationCore(d, turn, {
+        persistence: fakePersistence(), sink: () => {}, approval: approval({ isCodeAuthorized: true }),
+        ...(withPort ? { onSaveSkill: () => { saves.push(1); return 'tid' } } : {}),
+      })
+    } finally { engine.restore() }
+    assert.equal(saves.length, withPort ? 1 : 0)
+  }
+  assert.equal(toolsOffered[0]!.includes('save_skill'), false)
+  assert.equal(toolsOffered[1]!.includes('save_skill'), true)
+})

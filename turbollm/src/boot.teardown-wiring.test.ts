@@ -97,3 +97,17 @@ test('the store stays open until what the caller also waits for has ended', asyn
   await closing
   assert.throws(() => d.deps.db.listConversations(), 'closed once it ended')
 })
+
+test('close() is idempotent: a signal during a restart\'s teardown joins the running one, and each step runs once', async (t) => {
+  const d = await bootTestDaemon()
+  const log: string[] = []
+  watchTeardown(t, d, log)
+  const first = d.close({ forRestart: true })
+  const second = d.close() // the first call's options win: this does not turn into a plain shutdown
+  assert.strictEqual(second, first, 'the same promise whatever the options')
+  await Promise.all([first, second])
+  for (const step of [...STOPS, ...WAITS, 'wait:downloads', 'store closed']) {
+    assert.equal(log.filter((l) => l === step).length, 1, `${step} ran once`)
+  }
+  assert.strictEqual(d.close(), first, 'and a call after it ended still returns it')
+})

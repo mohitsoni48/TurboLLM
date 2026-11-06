@@ -209,26 +209,32 @@ export function useAgentAvailability() {
 const STATUS_FALLBACK_POLL_MS = 15_000
 
 /** Status poll every 2s, paused when the tab is hidden (spec 00 §4), or every
- *  {@link STATUS_FALLBACK_POLL_MS} while the invalidation stream is open. Polls at 1s while an auto-tune
- *  sweep, an engine build or a generation runs: their progress is continuous and nothing announces it
- *  step by step (spec 09 §1). */
+ *  {@link STATUS_FALLBACK_POLL_MS} while the invalidation stream is open. Polls at 1s while
+ *  {@link statusChangesEverySecond}, so the inline progress, the "Loading model… (Ns)" counter and the
+ *  live "Generating…" indicator stay live (spec 09 §1). */
 export function useStatus(): UseQueryResult<Status> {
   return useQuery({
     queryKey: queryKeys.status,
     queryFn: getStatus,
-    // Poll faster (1s) while an auto-tune sweep runs OR a completion is actively
-    // streaming, so the inline progress and the live "Generating…" indicator stay live.
-    refetchInterval: (q) =>
-      q.state.data?.bench?.running ||
-      q.state.data?.engineBuild?.active ||
-      (q.state.data?.engineStats?.activeRequests ?? 0) > 0
-        ? 1000
-        : pollWhileLive(2000, STATUS_FALLBACK_POLL_MS),
+    refetchInterval: (q) => (statusChangesEverySecond(q.state.data) ? 1000 : pollWhileLive(2000, STATUS_FALLBACK_POLL_MS)),
     refetchIntervalInBackground: false,
     // Keep the prior value visible while a poll is in flight to avoid flicker.
     placeholderData: (prev) => prev,
     retry: false,
   })
+}
+
+/** Whether the status shows work whose progress moves continuously with nothing announcing each step: an
+ *  auto-tune sweep, an engine build, an engine backend download, a generation, or a model still loading. */
+export function statusChangesEverySecond(s: Status | undefined): boolean {
+  if (!s) return false
+  return Boolean(s.bench?.running || s.engineBuild?.active || s.engineProvision?.active)
+    || (s.engineStats?.activeRequests ?? 0) > 0
+    || modelLoading(s)
+}
+
+function modelLoading(s: Status): boolean {
+  return s.engine?.state === 'starting' || s.laya?.state === 'starting' || s.jev?.state === 'starting'
 }
 
 /** Live hardware usage (ADR-383). Polls only while `enabled` — which HardwareBar ties to

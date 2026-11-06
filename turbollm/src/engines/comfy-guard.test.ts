@@ -12,6 +12,7 @@ import { ComfyGuard } from './comfy-guard'
 import type { FetchImpl } from './comfy-guard'
 import type { StartOpts, Status } from './manager'
 import { tmpDir } from '../test-support/tmp'
+import { COALESCE_WINDOW_MS, eventBus } from '../events/bus'
 
 /** Records the reverse-gate `POST {url}/free` calls so tests can assert on them, and
  *  returns a scripted response. `throws` simulates an unreachable/timed-out ComfyUI. */
@@ -777,4 +778,22 @@ test('cachePersist: the saved cache is restored only into the model it was saved
   await reload
 
   assert.equal(restores(f.calls).length, 0, "A's cache is not restored into B")
+})
+
+// The status bar explains a paused engine from `comfyui.held`; nothing else announces it turning on or off.
+test('taking and giving back the GPU each announce status', async () => {
+  const heard: string[] = []
+  const unsubscribe = eventBus.subscribe((keys) => heard.push(...keys))
+  try {
+    const { mgr } = fakeManager({ state: 'stopped', opts: null })
+    const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/turbollm_gate' }), mgr as never)
+    await g.acquire()
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50))
+    assert.deepEqual(heard.splice(0), ['status'])
+    await g.release()
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50))
+    assert.deepEqual(heard.splice(0), ['status'])
+  } finally {
+    unsubscribe()
+  }
 })

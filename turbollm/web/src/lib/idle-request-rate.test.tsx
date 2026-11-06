@@ -84,3 +84,36 @@ describe('idle request rate', () => {
     expect({ before, after }).toEqual({ before: 102, after: 44 })
   })
 })
+
+// A hidden tab holds no connection and sends nothing: its polls are paused, and its invalidation stream is let go
+// (the daemon is HTTP/1.1, and a browser keeps at most 6 connections to it across every tab).
+describe('idle request rate of a hidden tab', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('sends nothing for a minute and holds no stream open', async () => {
+    vi.useFakeTimers()
+    let visibility: DocumentVisibilityState = 'visible'
+    vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility)
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => idleDaemon(url, true))
+    vi.stubGlobal('fetch', fetchMock)
+    const qc = createQueryClient()
+    const { unmount } = render(<QueryClientProvider client={qc}><IdleChatScreen hardwareBar /></QueryClientProvider>)
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    visibility = 'hidden'
+    document.dispatchEvent(new Event('visibilitychange'))
+    await vi.advanceTimersByTimeAsync(0)
+    const before = fetchMock.mock.calls.length
+    await vi.advanceTimersByTimeAsync(60_000)
+    const streams = fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/v1/events'))
+
+    expect({ requests: fetchMock.mock.calls.length - before, streamsHeld: streams.filter(([, init]) => !init?.signal?.aborted).length })
+      .toEqual({ requests: 0, streamsHeld: 0 })
+    unmount()
+    qc.clear()
+  })
+})

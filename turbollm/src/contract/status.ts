@@ -37,6 +37,9 @@ export type EngineError = {
    *  older daemon: the banner then reads "Model load failed". */
   engineName?: string
   modelName?: string
+  /** Key of the model the failed load tried ('' when no load is recorded); what the banner's Retry loads. Absent from
+   *  an older daemon: the banner then falls back to `lastLoaded`. */
+  modelKey?: string
   /** False when that engine is not expected to load that model (the Models screen's compatibleWithActiveEngine for
    *  it): a model "Show models for every engine" lists loads only on the selected engine, so the recovery offers no
    *  engine advice and no re-download for it. Absent from an older daemon (read as true). */

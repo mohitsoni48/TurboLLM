@@ -15,6 +15,8 @@ import { isGone, killRecorded, pidWrittenTo, record, srcUrl, startStandInDaemon,
 import { tmpDir } from '../test-support/tmp'
 
 const skip = process.platform === 'win32' ? 'a POSIX shell stand-in engine' : false
+/** These run real child processes and SIGKILL a daemon; unmeasured on ubuntu runners, so more than `npm test`'s 60 s per-test default. */
+const SPAWN_TIMEOUT_MS = 180_000
 
 /** A stand-in llama-server: starts a grandchild that outlives a plain SIGTERM of the engine, records its pid, then
  *  answers /health on --port and exits at once on SIGTERM. `shebang: false` writes the bin as llamafile ships: no
@@ -56,7 +58,7 @@ process.on('SIGTERM', () => setTimeout(() => { fs.writeFileSync(${JSON.stringify
 }
 
 
-test('a daemon SIGKILLed with a model loaded takes the engine and its grandchild with it', { skip }, async () => {
+test('a daemon SIGKILLed with a model loaded takes the engine and its grandchild with it', { skip, timeout: SPAWN_TIMEOUT_MS }, async () => {
   const dir = tmpDir('tllm-engine-tether-')
   const { opts, grandchildFile } = await fakeEngine(dir)
   const d = await startStandInDaemon(`
@@ -80,7 +82,7 @@ setInterval(() => {}, 1e9)
   }
 })
 
-test('manager.shutdown(): the engine gets SIGTERM, and the grandchild it left goes with its group', { skip }, async (t) => {
+test('manager.shutdown(): the engine gets SIGTERM, and the grandchild it left goes with its group', { skip, timeout: SPAWN_TIMEOUT_MS }, async (t) => {
   const dir = tmpDir('tllm-engine-shutdown-')
   const { opts, grandchildFile } = await fakeEngine(dir)
   const manager = new Manager(ConfigStore.load(join(dir, 'config.json')))
@@ -102,7 +104,7 @@ test('manager.shutdown(): the engine gets SIGTERM, and the grandchild it left go
 // A Ctrl+C or SIGTERM while a stop is already under way (a Stop, an eject, the idle unload, a Settings restart's
 // teardown) found the engine 'stopping': shutdown() returned at once, the daemon exited about 1.5 s into the stop's
 // 8 s grace, and the exit handler SIGKILLed the engine's group before it could exit by itself.
-test('manager.shutdown() during a stop already under way waits for the engine to exit by itself', { skip }, async (t) => {
+test('manager.shutdown() during a stop already under way waits for the engine to exit by itself', { skip, timeout: SPAWN_TIMEOUT_MS }, async (t) => {
   const dir = tmpDir('tllm-engine-shutdown-stopping-')
   const termMs = 1500
   const { opts, grandchildFile, exitFile } = await fakeEngine(dir, { termMs })
@@ -125,7 +127,7 @@ test('manager.shutdown() during a stop already under way waits for the engine to
   }
 })
 
-test('a llamafile with no shebang (execve refuses it) loads through the wrapper\'s sh', { skip }, async (t) => {
+test('a llamafile with no shebang (execve refuses it) loads through the wrapper\'s sh', { skip, timeout: SPAWN_TIMEOUT_MS }, async (t) => {
   const dir = tmpDir('tllm-engine-llamafile-')
   const { opts, grandchildFile } = await fakeEngine(dir, { kind: 'llamafile', shebang: false })
   const manager = new Manager(ConfigStore.load(join(dir, 'config.json')))
@@ -176,7 +178,7 @@ function asWindows<T>(t: TestContext, calls: string[][], f: () => T): T {
 // holds its stdout is still 'running' to the manager, whose 'close' waits for that worker, so a stop (whose SIGTERM is
 // that force kill there), a forced stop and the grace's force kill sent taskkill for a pid Node had reaped: libuv had
 // closed the handle that kept it from being reused, so the tree it named could be another program's by then.
-test('on Windows a stop sends no taskkill once Node has seen the engine exit, while a worker it left holds its stdout (platform and execFile stubbed, so on every OS)', { skip }, async (t) => {
+test('on Windows a stop sends no taskkill once Node has seen the engine exit, while a worker it left holds its stdout (platform and execFile stubbed, so on every OS)', { skip, timeout: SPAWN_TIMEOUT_MS }, async (t) => {
   const dir = tmpDir('tllm-engine-exited-stop-')
   const { opts, grandchildFile } = await fakeEngine(dir, { stdoutHolder: true })
   const manager = new Manager(ConfigStore.load(join(dir, 'config.json')))
@@ -204,7 +206,7 @@ test('on Windows a stop sends no taskkill once Node has seen the engine exit, wh
 // The 'exit' handler's killTrackedEnginesSync kills by pidfile (taskkill /T on Windows, the pid as the fallback on
 // POSIX). The pidfile went only at the engine's 'close', which a worker holding its stdout holds back, so a daemon
 // exiting meanwhile killed a pid Node had reaped.
-test('the exit handler\'s kill names no engine Node has seen exit: its pidfile goes at the exit, while a worker it left still holds its stdout (platform and spawnSync stubbed, so on every OS)', { skip }, async (t) => {
+test('the exit handler\'s kill names no engine Node has seen exit: its pidfile goes at the exit, while a worker it left still holds its stdout (platform and spawnSync stubbed, so on every OS)', { skip, timeout: SPAWN_TIMEOUT_MS }, async (t) => {
   const dir = tmpDir('tllm-engine-exited-sync-')
   const { opts, grandchildFile } = await fakeEngine(dir, { stdoutHolder: true })
   const manager = new Manager(ConfigStore.load(join(dir, 'config.json')))

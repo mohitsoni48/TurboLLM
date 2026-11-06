@@ -4,7 +4,8 @@
 // agentic tool loop, reasoning and <think> parsing, the BUG-001 extra pass, the Research persona's confidence loop,
 // and the turn's stats, behind three ports so every caller gets the same loop and every engine quirk is patched once:
 //
-//  - PERSISTENCE (GenerationPersistence): where the reply lands. The core never touches `d.db`: the chat route's
+//  - PERSISTENCE (GenerationPersistence): where the reply lands. The core never touches `d.db` (the conversation store is the adapter's, reached only through these ports, save_skill's
+//    GenerationPorts.onSaveSkill included): the chat route's
 //    adapter writes the turn's placeholder row in the local ConversationStore; a caller with another store (the
 //    public API's chatStore) supplies its own port. ext/generation.ts's header (PERSISTENCE) is the bug that prevents.
 //  - SINK (EmitSink, emit-sink.ts): where the events go, wrapped in resilientSink so a failing sink never costs output.
@@ -29,7 +30,7 @@ import { checkReply } from '../tools/research-referee.js'
 import { executeToolCallWithApproval, newApprovalWaitBudget } from '../tools/execute-with-approval'
 import { buildSaveSkillTool } from '../agents/agent-tools'
 import { SkillStore } from '../agents/skills'
-import { saveSkillFromConversation, SKILL_AUTHORING_REFUSED } from '../agents/skill-jobs'
+import { SKILL_AUTHORING_REFUSED } from '../agents/skill-jobs'
 import { emitBenchResult } from '../telemetry/runtime/typed-emit'
 import { buildBenchResultConfig } from '../telemetry/events/perf'
 import { shouldEmitBenchResult, benchRateLimitKey, MIN_GEN_TOKENS_FOR_BENCH } from '../telemetry/runtime/bench-rate-limit'
@@ -198,6 +199,10 @@ export interface GenerationPorts<S = never> {
   beforeToolCall?(call: PendingToolCall, round: ToolRound): ToolCallVerdict<S>
   /** Told of every `usage` object the engine sends, as it sends it (the public API reports the last one raw). */
   onUsage?(usage: unknown): void
+  /** Starts writing a skill from this conversation (the save_skill tool of the 'skill-creator' skill); returns the job's id,
+   *  or null when there is nothing to save. Only the chat adapter supplies it, as it alone may read the conversation
+   *  store: without it save_skill is not offered. */
+  onSaveSkill?(): string | null
 }
 
 /** Why a turn the engine did not finish failed: the engine refused it (`http`, with its reason when it gave one) or
@@ -476,12 +481,12 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
     // same decision for this turn's caller (isLocalRequest || a real key), so a turn without it
     // is not offered save_skill, and a call the model makes anyway is refused here, before the
     // skill author starts (the tool skips the approval gate, so this is the only check).
-    const skillTools = enabledSkillIds.has('skill-creator')
+    const skillTools = enabledSkillIds.has('skill-creator') && ports.onSaveSkill
       ? buildSaveSkillTool(() => {
           if (!approval.isCodeAuthorized) return `Error: ${SKILL_AUTHORING_REFUSED}`
           // In-chat skill author: read THIS conversation in the background and write a
           // SKILL.md to the shared library.
-          const tid = saveSkillFromConversation(d, conv.id)
+          const tid = ports.onSaveSkill?.()
           return tid
             ? 'Started writing a skill from this conversation in the background. It will appear in the skill library shortly.'
             : 'There is nothing to turn into a skill yet.'
@@ -592,7 +597,10 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
       const pendingToolCalls = new Map<number, { id: string; name: string; argsBuffer: string }>()
 
       if (jsonTransport) {
+        // Reading the reply is still the request's: a body that is not JSON is the engine's, not the run's own.
+        requesting = true
         const completion = await readCompletion(res)
+        requesting = false
         if (completion.usage) {
           finalUsage = completion.usage
           ports.onUsage?.(completion.usage)

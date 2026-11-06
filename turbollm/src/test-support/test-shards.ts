@@ -44,3 +44,14 @@ function shardOf(file: string): ShardName {
 export function shardFiles(root: string, shard: ShardName): string[] {
   return allTestFiles(root).filter((f) => shardOf(f) === shard)
 }
+
+/** The files of the shard CI named, for `list-shard.ts`: throws on a name that is no shard and on a shard with no
+ *  files, because an empty list would make `tsx --test` fall back to Node's own file discovery and pass. */
+export function requireShardFiles(root: string, shard: string | undefined): string[] {
+  if (!(SHARD_NAMES as readonly string[]).includes(shard ?? '')) {
+    throw new Error(`unknown shard "${shard}"; the shards are ${SHARD_NAMES.join(', ')}`)
+  }
+  const files = shardFiles(root, shard as ShardName)
+  if (files.length === 0) throw new Error(`shard "${shard}" has no test files`)
+  return files
+}

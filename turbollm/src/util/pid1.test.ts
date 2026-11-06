@@ -106,8 +106,11 @@ async function inNamespace(pid1: string[]): Promise<string> {
 }
 
 const WARNING = /WARN TurboLLM's orphaned processes are not being reaped \(PID 1 is '(\S+)' and reaped nothing within 2 s\): every process TurboLLM ends would stay a zombie\. Run the image as shipped \(it starts tini\), or add --init\./
+/** Each test starts a pid namespace through `sudo -n unshare` and waits for it to end; unmeasured on ubuntu runners, so
+ *  it gets more than `npm test`'s 60 s per-test default. */
+const NAMESPACE_TIMEOUT_MS = 180_000
 
-test('node as PID 1 (the images before tini): the orphan stays a zombie, and the check says so', { skip }, async () => {
+test('node as PID 1 (the images before tini): the orphan stays a zombie, and the check says so', { skip, timeout: NAMESPACE_TIMEOUT_MS }, async () => {
   const out = await inNamespace(checkCommand(2000))
   assert.match(out, /RESULT not-reaped/)
   assert.match(out, WARNING)
@@ -117,7 +120,7 @@ test('node as PID 1 (the images before tini): the orphan stays a zombie, and the
 // The orphan used to be a `sh -c "exit 0"`: when it exited before the sh that started it, that sh reaped it itself,
 // it never reached PID 1, and the check said 'reaped' under node. Loaded with busy loops, 1 run in 3 did; here the
 // sh lingers every time.
-test('node as PID 1, the sh that starts the orphan slow to exit (a busy machine): the check still says so', { skip }, async () => {
+test('node as PID 1, the sh that starts the orphan slow to exit (a busy machine): the check still says so', { skip, timeout: NAMESPACE_TIMEOUT_MS }, async () => {
   const out = await inNamespace(checkCommand(2000, SLOW_SH))
   assert.match(out, /RESULT not-reaped/)
   assert.equal(WARNING.exec(out)?.[1], 'node')
@@ -126,7 +129,7 @@ test('node as PID 1, the sh that starts the orphan slow to exit (a busy machine)
 // bash's read takes an exported TMOUT for a timeout. Where the orphan's `sh` is bash (Fedora, Arch), a TMOUT shorter
 // than the sh that starts it took to exit let the orphan exit first, that sh reaped it, and the check said 'reaped'
 // under node. `env` sets the two (sudo would drop them) and execs node in place, so node is still PID 1.
-test('node as PID 1, bash as the orphan\'s sh with an exported TMOUT, and the sh that starts it slow to exit: the check still says so', { skip: skip || (!bash && 'needs bash') }, async () => {
+test('node as PID 1, bash as the orphan\'s sh with an exported TMOUT, and the sh that starts it slow to exit: the check still says so', { skip: skip || (!bash && 'needs bash'), timeout: NAMESPACE_TIMEOUT_MS }, async () => {
   const dir = tmpDir('tllm-pid1-tmout-')
   symlinkSync(bash, join(dir, 'sh'))
   const out = await inNamespace(['env', `PATH=${dir}:${process.env.PATH ?? '/usr/bin:/bin'}`, 'TMOUT=0.1', ...checkCommand(2000, SLOW_SH)])
@@ -134,20 +137,20 @@ test('node as PID 1, bash as the orphan\'s sh with an exported TMOUT, and the sh
   assert.equal(WARNING.exec(out)?.[1], 'node')
 })
 
-test('`tail -f /dev/null` as PID 1 with node under it (a GitHub Actions container job): the check says so', { skip }, async () => {
+test('`tail -f /dev/null` as PID 1 with node under it (a GitHub Actions container job): the check says so', { skip, timeout: NAMESPACE_TIMEOUT_MS }, async () => {
   const command = checkCommand(2000).map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(' ')
   const out = await inNamespace(['/bin/sh', '-c', `${command} & exec tail -f /dev/null`])
   assert.match(out, /RESULT not-reaped/)
   assert.equal(WARNING.exec(out)?.[1], 'tail')
 })
 
-test('tini as PID 1 (the images now): the orphan is reaped, and nothing is said', { skip: skip || (!tini && 'tini is not installed') }, async () => {
+test('tini as PID 1 (the images now): the orphan is reaped, and nothing is said', { skip: skip || (!tini && 'tini is not installed'), timeout: NAMESPACE_TIMEOUT_MS }, async () => {
   const out = await inNamespace([tini, '-s', '--', ...checkCommand(2000)])
   assert.match(out, /RESULT reaped/)
   assert.doesNotMatch(out, /WARN/)
 })
 
-test('a shell as PID 1 with tini -s under it (docker run --init, compose init: true): reaped, nothing said', { skip: skip || (!tini && 'tini is not installed') }, async () => {
+test('a shell as PID 1 with tini -s under it (docker run --init, compose init: true): reaped, nothing said', { skip: skip || (!tini && 'tini is not installed'), timeout: NAMESPACE_TIMEOUT_MS }, async () => {
   const command = [tini, '-s', '--', ...checkCommand(2000)].map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(' ')
   const out = await inNamespace(['/bin/sh', '-c', `${command}; :`])
   assert.match(out, /RESULT reaped/)

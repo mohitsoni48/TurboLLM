@@ -1270,6 +1270,7 @@ export async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx)
       refuseMcp: !ctx.isCodeAuthorized,
     },
     onSettled: () => d.chatTurns.release(convId, ac),
+    onSaveSkill: () => saveSkillFromConversation(d, convId),
   })
   // The placeholder is gone and the old reply back (restoreUnproduced): nothing to title or remember.
   if (outcome.restored) return

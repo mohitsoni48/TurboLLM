@@ -14,6 +14,13 @@ test('a config-backed write names the families it changes', () => {
   assert.deepEqual(keysForWrite('/api/v1/bench/run'), ['status'])
 })
 
+test('remote access and Turbo Link writes name the status they show in', () => {
+  assert.deepEqual(keysForWrite('/api/v1/remote/tunnel'), ['status'])
+  assert.deepEqual(keysForWrite('/api/v1/links'), ['status'])
+  assert.deepEqual(keysForWrite('/api/v1/links/l1/select'), ['status'])
+  assert.deepEqual(keysForWrite('/api/v1/linksx'), [])
+})
+
 test('paths whose stores announce their own changes, or that nothing caches, name nothing', () => {
   assert.deepEqual(keysForWrite('/api/v1/conversations/c1'), [])
   assert.deepEqual(keysForWrite('/api/v1/settingsx'), [])

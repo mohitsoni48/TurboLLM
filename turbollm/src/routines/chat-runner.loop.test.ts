@@ -271,3 +271,15 @@ test("a routine's run writes nothing into the engine's ledgers, the owner's acti
     assert.equal(lastLocalActivityMs(), null)
   } finally { engine.restore() }
 })
+
+test('a fault in the run\'s own persistence is reported as it is, not as an engine request failure', async () => {
+  const t = toolDouble()
+  const s = setup({ tools: t.tools })
+  const addMessage = s.d.db.addMessage.bind(s.d.db)
+  s.d.db.addMessage = (id, role, content, extra) => { if (extra?.toolCalls) throw new Error('conversation deleted mid-run'); return addMessage(id, role, content, extra) }
+  const engine = fakeEngine([callRound(null, [['c1', 'run_code', { code: 'return 1' }]]), answer('done')])
+  try {
+    const outcome = await runChatRoutine(s.d, s.r, s.run, new AbortController().signal)
+    assert.deepEqual(outcome, { status: 'errored', error: 'conversation deleted mid-run' })
+  } finally { engine.restore() }
+})

@@ -2,6 +2,7 @@
 // /api/v1/status so the web UI can show a download/extract progress bar.
 // Single in-process holder; provisioning runs once at startup.
 
+import { emitInvalidation } from '../events/bus'
 import { classifyProvisionFailure } from '../telemetry/classify'
 import type { PROVISION_FAIL_REASONS, PROVISION_TRIGGERS } from '../telemetry/core/enums'
 
@@ -22,8 +23,17 @@ export interface ProvisionStatus {
   startedAt: number
 }
 
+/** The keys a run's start and end stand for: the status bar, and the engine list a finished install changes. */
+const SETTLED_KEYS = ['status', 'engines'] as const
+
+/** How finely download progress is announced: once per tenth, not per chunk. */
+const PROGRESS_STEPS = 10
+
 export class ProvisionState {
   private s: ProvisionStatus = { active: false, phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null, startedAt: 0 }
+
+  /** @param announce Where changes are announced; the daemon's invalidation bus by default. */
+  constructor(private readonly announce: (key: string) => void = emitInvalidation) {}
 
   get(): ProvisionStatus {
     return { ...this.s }
@@ -51,14 +61,27 @@ export class ProvisionState {
     this.starts++
     this.trigger = trigger
     this.s = { active: true, phase: 'downloading', backend, pct: 0, part: 1, parts: 1, error: null, startedAt: Date.now() }
+    this.announceSettled()
   }
 
   progress(phase: 'downloading' | 'extracting', pct: number, part = 1, parts = 1): void {
     if (!this.s.active) return
+    const milestone = this.isMilestone(phase, pct, part)
     this.s.phase = phase
     this.s.pct = pct
     this.s.part = part
     this.s.parts = parts
+    if (milestone) this.announce('status')
+  }
+
+  /** A new phase, a new archive, or the download into another tenth. */
+  private isMilestone(phase: ProvisionStatus['phase'], pct: number, part: number): boolean {
+    const step = (p: number) => Math.floor(p * PROGRESS_STEPS)
+    return phase !== this.s.phase || part !== this.s.part || step(pct) !== step(this.s.pct)
+  }
+
+  private announceSettled(): void {
+    SETTLED_KEYS.forEach((key) => this.announce(key))
   }
 
   /** Optional observer for the terminal outcome, wired in cli.ts to the
@@ -71,12 +94,14 @@ export class ProvisionState {
   done(): void {
     const trigger = this.trigger
     this.s = { active: false, phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null, startedAt: 0 }
+    this.announceSettled()
     this.settle(true, trigger)
   }
 
   fail(error: string): void {
     const trigger = this.trigger
     this.s = { active: false, phase: 'error', backend: this.s.backend, pct: 0, part: 1, parts: 1, error, startedAt: this.s.startedAt }
+    this.announceSettled()
     this.settle(false, trigger, classifyProvisionFailure(error))
   }
 

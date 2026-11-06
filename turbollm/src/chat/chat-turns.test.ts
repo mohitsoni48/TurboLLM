@@ -124,3 +124,23 @@ test('two instances share nothing', () => {
   assert.deepEqual(two.inFlightChatIds(), [])
   assert.equal(two.holdsEngine(), false)
 })
+
+// A chat's slot (a reply running, or a compaction) shows in its conversation's `runningReplyId` / "Compacting…", and
+// taking or freeing it writes nothing to the DB: without an announcement another tab kept showing it up to 30 s.
+test('taking and freeing a chat slot announce that conversation', () => {
+  const heard: string[] = []
+  const turns = new ChatTurns((key) => heard.push(key))
+  const reply = new AbortController()
+  turns.claim('c1', reply, 'r1')
+  assert.deepEqual(heard.splice(0), ['conversation:c1'])
+  turns.release('c1', new AbortController())
+  assert.deepEqual(heard.splice(0), [], 'another turn\'s release frees nothing')
+  turns.release('c1', reply)
+  assert.deepEqual(heard.splice(0), ['conversation:c1'])
+
+  const compaction = new AbortController()
+  turns.claimForCompaction('c2', compaction)
+  assert.deepEqual(heard.splice(0), ['conversation:c2'])
+  turns.stop('c2', compaction)
+  assert.deepEqual(heard.splice(0), ['conversation:c2'])
+})

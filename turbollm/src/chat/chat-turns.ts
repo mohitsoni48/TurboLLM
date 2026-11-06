@@ -2,12 +2,17 @@
 // chat-routes.ts, reached by import from the active-work probe, the engine lifecycle, the lifecycle routes and the
 // Code run manager. It is one instance now, built by bootDaemon and handed out as `d.chatTurns`, so a test gets its
 // own instead of inheriting the last test's turns, and nothing reaches it through a route module.
+import { emitInvalidation } from '../events/bus'
 
 /** How long `turnsEnded` waits at most by default: well inside `turbollm --stop`'s 10 s and the restart's 14 s
  *  watchdog. A stopped turn that is streaming saves its reply at once; only a tool call it is running holds it. */
 const TURNS_END_WAIT_MS = 3_000
 
 export class ChatTurns {
+  /** @param announce Where a chat's slot being taken or freed is announced (its conversation shows a running reply or
+   *  "Compacting…" from it, and no DB write says so); the daemon's invalidation bus by default. */
+  constructor(private readonly announce: (key: string) => void = emitInvalidation) {}
+
   /** Track in-flight abort controllers per conversation id. */
   private readonly inflight = new Map<string, AbortController>()
 
@@ -66,12 +71,14 @@ export class ChatTurns {
   claim(convId: string, ac: AbortController, replyId: string): void {
     this.inflight.set(convId, ac)
     this.turnReplies.set(ac, replyId)
+    this.announceSlot(convId)
   }
 
   /** Takes `convId`'s slot for a manual compaction (see `compactions`). */
   claimForCompaction(convId: string, ac: AbortController): void {
     this.compactions.add(ac)
     this.inflight.set(convId, ac)
+    this.announceSlot(convId)
   }
 
   /** Removes `convId`'s entry only while it is still `ac`'s own. Stop or a kill switch drops the
@@ -80,7 +87,13 @@ export class ChatTurns {
    *  to the NEXT turn, which an unconditional delete would leave untracked: unreachable by Stop
    *  and the kill switches, invisible to inFlightChatIds, and no longer a 409 guard. */
   release(convId: string, ac: AbortController): void {
-    if (this.inflight.get(convId) === ac) this.inflight.delete(convId)
+    if (this.inflight.get(convId) !== ac) return
+    this.inflight.delete(convId)
+    this.announceSlot(convId)
+  }
+
+  private announceSlot(convId: string): void {
+    this.announce(`conversation:${convId}`)
   }
 
   /** Stops a turn as POST /chat/stop does: aborts it and frees the chat at once. The turn's own

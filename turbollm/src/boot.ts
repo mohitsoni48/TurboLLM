@@ -1243,5 +1243,10 @@ export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
     })
   }
 
-  return { deps, app, listener: () => server, close }
+  // What the daemon exposes as close(): idempotent. A signal during a restart's teardown calls it again; every call
+  // returns the first call's promise, whatever its options (the first call's win), so no step runs twice.
+  let closing: Promise<void> | null = null
+  const closeOnce = (opts?: TeardownOptions): Promise<void> => (closing ??= close(opts))
+
+  return { deps, app, listener: () => server, close: closeOnce }
 }

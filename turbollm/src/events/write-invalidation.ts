@@ -14,6 +14,8 @@ const WRITE_FAMILIES: ReadonlyArray<{ prefix: string; keys: readonly string[] }>
   { prefix: '/api/v1/models', keys: ['models', 'status'] },
   { prefix: '/api/v1/modeldirs', keys: ['models', 'status'] },
   { prefix: '/api/v1/bench', keys: ['status'] },
+  { prefix: '/api/v1/remote', keys: ['status'] },
+  { prefix: '/api/v1/links', keys: ['status'] },
 ]
 
 /** The invalidation keys a successful write to `path` stands for. */
