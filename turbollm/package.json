@@ -55,7 +55,7 @@
     "@xterm/xterm": "^6.0.0",
     "diff": "^9.0.0",
     "hono": "^4.13.13",
-    "pdfjs-dist": "^6.5.438",
+    "pdfjs-dist": "6.5.438",
     "puppeteer-core": "^25.13.0",
     "sql.js": "^1.14.1",
     "typebox": "1.1.38",
