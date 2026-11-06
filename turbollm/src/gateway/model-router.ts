@@ -8,7 +8,7 @@ import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import type { ComfyGuard } from '../engines/comfy-guard'
 import type { LoadProfile } from '../models/profile'
-import { manualLoadRefusal, modelIncompatibility, refusedOnEveryEngine, type Incompatibility } from '../engines/compat'
+import { EMBEDDINGS_UNAVAILABLE, manualLoadRefusal, modelIncompatibility, refusedOnEveryEngine, type Incompatibility } from '../engines/compat'
 import { engineForModel } from '../engines/registry'
 import { buildStartOpts } from '../engines/start-opts'
 import { getSysInfo } from '../sysinfo/sysinfo'
@@ -1031,7 +1031,7 @@ function engineHoldsOneModel(engineKind: string): boolean {
  *  model it cannot sit beside. */
 const NO_EMBEDDINGS_ON_ONE_MODEL_ENGINE: RouteResult = {
   status: 503,
-  message: 'The TurboLLM SDK engine runs one chat model at a time and has no embeddings in this version.',
+  message: EMBEDDINGS_UNAVAILABLE,
   permanent: true,
 }
 

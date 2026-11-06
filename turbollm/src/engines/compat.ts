@@ -217,6 +217,15 @@ export function engineWithholdsVision(engineKind: string): boolean {
   return engineKind === TURBOLLM_SDK
 }
 
+/** True when `engineKind` serves no /v1/embeddings, so the daemon must refuse the request instead of relaying it. The SDK
+ *  has no embeddings in this version, and its unmatched-route reply is an empty 404. */
+export function engineWithholdsEmbeddings(engineKind: string): boolean {
+  return engineKind === TURBOLLM_SDK
+}
+
+/** Why an engine that {@link engineWithholdsEmbeddings} answers no embeddings request, nor loads an embedding model. */
+export const EMBEDDINGS_UNAVAILABLE = 'The TurboLLM SDK engine runs one chat model at a time and has no embeddings in this version.'
+
 /** The `vision_unavailable` refusal of an image sent to an engine that {@link engineWithholdsVision}. */
 export const VISION_UNAVAILABLE = 'The in-app engine can\'t read images in this version. Switch to the bundled llama.cpp engine in Engines to use images.'
 

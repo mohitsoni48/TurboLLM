@@ -128,3 +128,31 @@ test('count_tokens on llama.cpp still asks the engine to tokenize', async () => 
     assert.deepEqual(calls.map((c) => c.url), [`${ENGINE}/tokenize`])
   })
 })
+
+// QA F3 (B-08): the SDK serves no /v1/embeddings, and its unmatched-route reply is an empty 404. The daemon answers
+// for it with the router's refusal of an embedding model on the SDK, so a client reads why in the OpenAI shape.
+for (const [label, body] of [
+  ['no model', JSON.stringify({ input: 'hi' })],
+  ['the chat model', JSON.stringify({ model: KEY, input: 'hi' })],
+] as const) {
+  test(`POST /v1/embeddings naming ${label} on the SDK engine is refused by the daemon, not sent to the engine`, async () => {
+    await withRecordingEngine(async (calls) => {
+      const res = await gatewayFor('turbollm-sdk').request('/v1/embeddings', { method: 'POST', headers: CLIENT_HEADERS, body })
+      assert.equal(calls.length, 0)
+      assert.equal(res.status, 503)
+      assert.equal(res.headers.get('x-should-retry'), 'false')
+      const { error } = (await res.json()) as { error: { message: string; code: string } }
+      assert.equal(error.message, 'The TurboLLM SDK engine runs one chat model at a time and has no embeddings in this version.')
+      assert.equal(error.code, 'model_not_loaded')
+    })
+  })
+}
+
+test('POST /v1/embeddings to llama.cpp is still sent to the engine', async () => {
+  await withRecordingEngine(async (calls) => {
+    await gatewayFor('llama-server').request('/v1/embeddings', {
+      method: 'POST', headers: CLIENT_HEADERS, body: JSON.stringify({ model: KEY, input: 'hi' }),
+    })
+    assert.deepEqual(calls.map((c) => c.url), [`${ENGINE}/v1/embeddings`])
+  })
+})

@@ -7,7 +7,10 @@ import { createPatch } from 'diff'
 import type { Deps } from '../deps'
 import type { ToolCallRecord } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
-import { applyEngineTokenLimit, engineModelAlias, engineWithholdsTools, engineWithholdsVision, shapeForEngine, VISION_UNAVAILABLE } from '../engines/compat'
+import {
+  applyEngineTokenLimit, EMBEDDINGS_UNAVAILABLE, engineModelAlias, engineWithholdsEmbeddings, engineWithholdsTools,
+  engineWithholdsVision, shapeForEngine, VISION_UNAVAILABLE,
+} from '../engines/compat'
 import { litertLmForcedToolChoiceError, litertLmUnappliedParameters, shapeLitertLmRequest } from '../engines/litert-lm-request'
 import { unlistedForLoading } from '../engines/registry'
 import { presentedKey } from '../auth'
@@ -108,6 +111,13 @@ function anthropicErrorType(status: number): string {
  *  out-of-range status from a misbehaving engine can't crash response construction. */
 function asClientStatus(status: number): ContentfulStatusCode {
   return (status >= 400 && status <= 599 ? status : 500) as ContentfulStatusCode
+}
+
+/** The OpenAI-shaped 503 for a request the router could not place; a permanent refusal also tells the client not to
+ *  retry (see the identical line in /v1/messages). */
+function modelNotLoaded(c: Context, refusal: { message: string; permanent?: boolean }): Response {
+  if (refusal.permanent) c.header('x-should-retry', 'false')
+  return c.json({ error: { message: refusal.message, type: 'model_not_loaded', code: 'model_not_loaded' } }, 503)
 }
 
 interface WrongEndpointRefusal {
@@ -1072,16 +1082,14 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   }
   // An embeddings request reaches a running embedding model's pool slot even with auto-swap off (see the router).
   const routeResult = await d.modelRouter.route(requestedModel, { embeddings: isEmbeddings })
-  if ('status' in routeResult) {
-    if (routeResult.permanent) c.header('x-should-retry', 'false') // see the identical line in /v1/messages above
-    return c.json(
-      { error: { message: routeResult.message, type: 'model_not_loaded', code: 'model_not_loaded' } },
-      503,
-    )
-  }
+  if ('status' in routeResult) return modelNotLoaded(c, routeResult)
   const target = routeResult.target
   /** Turbo Link (ADR-376) — see the identical binding in the /v1/messages handler above. */
   const remote = routeResult.remote
+  // No model, or the chat model, routes an embeddings request to the primary; the SDK would answer an empty 404.
+  if (isEmbeddings && !remote && engineWithholdsEmbeddings(routeResult.engineKind ?? servingEngineKind(d))) {
+    return modelNotLoaded(c, { message: EMBEDDINGS_UNAVAILABLE, permanent: true })
+  }
 
   // Turbo Link is CHAT-only by design (ADR-376) — the comment below this block used to say
   // a qualified id could never even reach the remote branch for a non-chat endpoint, since
