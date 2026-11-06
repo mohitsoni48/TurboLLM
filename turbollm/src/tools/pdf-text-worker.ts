@@ -9,12 +9,24 @@ import { parentPort, workerData } from 'node:worker_threads'
 // own extension says which sibling is real: `.ts` under tsx, `.js` in the built package.
 const EXTRACT_EXT = import.meta.url.endsWith('.ts') ? '.ts' : '.js'
 const EXTRACT_URL = new URL(`./pdf-text-extract${EXTRACT_EXT}`, import.meta.url)
-const { parsePdfText } = await import(EXTRACT_URL.href) as typeof import('./pdf-text-extract.js')
-
 if (!parentPort) {
   throw new Error('pdf-text-worker.ts must be run as a worker_threads Worker, not imported directly.')
 }
 
-const data = (workerData as { data?: unknown } | undefined)?.data
-const text = data instanceof Uint8Array ? await parsePdfText(data) : null
-parentPort.postMessage({ text })
+// Loading the reader is the one step that can fail because of the INSTALL (pdfjs-dist missing,
+// or its platform binary absent), not because of the document: say so, separately from a bad
+// PDF, so a broken install is never reported as an unreadable file.
+let parsePdfText: ((data: Uint8Array) => Promise<string | null>) | null = null
+try {
+  parsePdfText = (await import(EXTRACT_URL.href) as typeof import('./pdf-text-extract.js')).parsePdfText
+} catch {
+  parsePdfText = null
+}
+
+if (!parsePdfText) {
+  parentPort.postMessage({ unavailable: true })
+} else {
+  const data = (workerData as { data?: unknown } | undefined)?.data
+  const text = data instanceof Uint8Array ? await parsePdfText(data) : null
+  parentPort.postMessage({ text })
+}
