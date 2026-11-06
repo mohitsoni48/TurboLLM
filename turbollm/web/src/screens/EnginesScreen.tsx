@@ -2288,4 +2288,4 @@ const PLATFORM_DISPLAY: Record<string, string> = {
 }
 function platformName(p: string): string {
   return PLATFORM_DISPLAY[p] ?? p
-              }
+}
