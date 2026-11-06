@@ -40,12 +40,12 @@ test('prism and beellama copy no longer claims TurboLLM cannot install a prebuil
   }
 })
 
-// GitHub #76: llama.cpp-tq3 (turbo-tan) publishes NO prebuilt releases (verified 2026-11-03:
-// zero releases, only upstream-sync tags), so per the ADR-239 honesty rule it must list as
+// GitHub #76: llama.cpp-tq3 (turbo-tan) publishes NO prebuilt releases (verified 2026-11-06:
+// zero releases), so per the ADR-239 honesty rule it must list as
 // "build it → Add your own engine" — no install endpoint, no prebuilt variant, and a real
-// defaultBranch so the build flow never guesses one. Its note must also carry the CUDA-only
-// caveat for the TQ3_1S/TQ4S KV-cache types, since the card lists on every desktop OS.
-test('llama.cpp-tq3 lists as build-from-source only, with its default branch and the CUDA caveat', () => {
+// defaultBranch so the build flow never guesses one. Its note must also say TQ3_1S/TQ3_4S are
+// model-weight formats (not KV-cache types), since the card lists on every desktop OS.
+test('llama.cpp-tq3 lists as build-from-source only, with its default branch and the weight-format note', () => {
   const e = catalogForPlatform('linux').find((x) => x.id === 'llama.cpp-tq3')
   assert.ok(e, 'llama.cpp-tq3 catalog entry missing')
   assert.equal(e.installEndpoint, '')
@@ -56,5 +56,6 @@ test('llama.cpp-tq3 lists as build-from-source only, with its default branch and
   const variants = e.variants ?? []
   assert.equal(variants.length, 1)
   assert.equal(variants[0].hasPrebuilt, false)
-  assert.match(e.note ?? '', /CUDA/)
+  assert.match(e.note ?? '', /model-weight formats/)
+  assert.doesNotMatch(`${e.description} ${e.note}`, /TQ4S|KV-cache/)
 })
