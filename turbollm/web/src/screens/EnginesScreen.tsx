@@ -269,14 +269,14 @@ const ENGINE_META: Record<string, EngineMeta> = {
   },
   'llama.cpp-tq3': {
     icon: Gauge,
-    tagline: 'Tiny KV cache for long contexts',
+    tagline: 'Runs TurboQuant TQ3 weight GGUFs',
     format: 'GGUF',
     pros: [
-      'TQ3_1S/TQ4S KV cache — ~3.5-bit, between Turbo3 and Turbo4',
-      'Far less VRAM for long-context chats',
+      'Runs TQ3_1S/TQ3_4S model-weight GGUFs',
+      'TQ3_4S stores weights at 4.0 bits each',
       'Same llama-server + GGUF flow',
     ],
-    cons: ['No prebuilts — build from source', 'KV-cache types need CUDA (NVIDIA)', 'Fork-only KV quant types'],
+    cons: ['No prebuilts — build from source', 'Backend support depends on your build', 'Fork-only weight formats'],
   },
   koboldcpp: {
     icon: Feather,
@@ -2288,4 +2288,4 @@ const PLATFORM_DISPLAY: Record<string, string> = {
 }
 function platformName(p: string): string {
   return PLATFORM_DISPLAY[p] ?? p
-}
+      }
