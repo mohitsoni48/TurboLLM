@@ -398,14 +398,27 @@ export class SseMcpClient implements IMcpClient {
   }
 
   private async postNotification(msg: JsonRpcNotification): Promise<void> {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json', ...this.headers }
+    // The streamable-HTTP spec requires this Accept header on EVERY POST, notifications
+    // included (2025-06-18 transports, "Sending Messages to the Server": item 2 sets the
+    // header, item 3 allows the body to be a notification). Servers built on the official
+    // MCP SDK reject a POST without it with 406 before parsing the body.
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream',
+      ...this.headers,
+    }
     if (this.sessionId) headers['Mcp-Session-Id'] = this.sessionId
     const resp = await fetch(this.baseUrl, {
       method: 'POST', headers, body: JSON.stringify(msg),
       signal: AbortSignal.timeout(10_000),
     })
+    if (!resp.ok) {
+      // Include the body's first bytes (like sendRequest) so a rejected notification says
+      // WHY — a bare status made SDK servers' 406s read as silent handshake failures.
+      const txt = await resp.text().catch(() => '')
+      throw new Error(`MCP HTTP ${resp.status}: ${txt.slice(0, 200)}`)
+    }
     await resp.body?.cancel().catch(() => {})
-    if (!resp.ok) throw new Error(`MCP HTTP ${resp.status}: initialized notification failed`)
   }
 }
 
