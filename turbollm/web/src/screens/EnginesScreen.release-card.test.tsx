@@ -149,7 +149,7 @@ describe('catalogIdFor sourceRepo mapping', () => {
   // A tq3 engine built via "Add via git repo" carries sourceRepo turbo-tan/llama.cpp-tq3; it must
   // light up the llama.cpp-tq3 card, not fall through to the plain llama.cpp default.
   it('maps a turbo-tan/llama.cpp-tq3 source build to its own catalog card', () => {
-    expect(catalogIdFor(engine({ id: 'e1', name: 'tq3', kind: 'llama-server', sourceRepo: 'https://github.com/turbo-tan/llama.cpp-tq3' } as Parameters<typeof engine>[0]))).toBe('llama.cpp-tq3')
+    expect(catalogIdFor(engine({ id: 'e1', name: 'tq3', kind: 'llama-server', sourceRepo: 'https://github.com/turbo-tan/llama.cpp-tq3' }))).toBe('llama.cpp-tq3')
   })
 })
 
