@@ -8,7 +8,7 @@ import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import type { ComfyGuard } from '../engines/comfy-guard'
 import type { LoadProfile } from '../models/profile'
-import { EMBEDDINGS_UNAVAILABLE, manualLoadRefusal, modelIncompatibility, refusedOnEveryEngine, type Incompatibility } from '../engines/compat'
+import { EMBEDDINGS_UNAVAILABLE, engineHoldsOneModel, engineWithholdsEmbeddings, manualLoadRefusal, modelIncompatibility, refusedOnEveryEngine, type Incompatibility } from '../engines/compat'
 import { engineForModel } from '../engines/registry'
 import { buildStartOpts } from '../engines/start-opts'
 import { getSysInfo } from '../sysinfo/sysinfo'
@@ -599,7 +599,7 @@ export class ModelRouter {
 
     const engine = engineForModel(this.registry, entry)
     if (!engine) return { status: 503, message: 'No active engine. Set one up in TurboLLM.' }
-    if (entry.embedding && engineHoldsOneModel(engine.kind)) return NO_EMBEDDINGS_ON_ONE_MODEL_ENGINE
+    if (entry.embedding && engineWithholdsEmbeddings(engine.kind)) return NO_EMBEDDINGS_ON_ONE_MODEL_ENGINE
     const inc = this.loadRefusal(engine, entry, explicit?.manual)
     // Stays so until the owner installs or selects an engine that runs it, or shows every engine's models; a retry only
     // delays the message. Anything but a Laya model is refused only by an automatic load with that setting off, which
@@ -1020,11 +1020,6 @@ export class ModelRouter {
     })
   }
 
-}
-
-/** The Android app's in-app engine (the TurboLLM SDK) loads one model at a time: a second load replaces the first. */
-function engineHoldsOneModel(engineKind: string): boolean {
-  return engineKind === 'turbollm-sdk'
 }
 
 /** Permanent: the SDK has no embeddings in this version, and an embedding model loaded on it would unload the chat

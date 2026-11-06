@@ -113,6 +113,23 @@ function asClientStatus(status: number): ContentfulStatusCode {
   return (status >= 400 && status <= 599 ? status : 500) as ContentfulStatusCode
 }
 
+/** An embeddings request bound for an engine that {@link engineWithholdsEmbeddings}. Permanent: retrying won't help. */
+const EMBEDDINGS_REFUSAL = { message: EMBEDDINGS_UNAVAILABLE, permanent: true }
+
+/** True when an embeddings request would reach an engine with no embeddings through a load: the active engine, which a
+ *  load starts on, withholds them, and the request names no model already running in a pool slot (which keeps its own
+ *  engine). Asked before route(), so the request loads and evicts nothing. A linked machine's id is left to route(). */
+function embeddingsWithheldBeforeRouting(d: Deps, requestedModel: string): boolean {
+  if (!engineWithholdsEmbeddings(d.registry.active()?.kind ?? '')) return false
+  if (d.modelRouter.resolveRemoteTarget(requestedModel)) return false
+  return !runsInPoolSlot(d, requestedModel)
+}
+
+function runsInPoolSlot(d: Deps, requestedModel: string): boolean {
+  const entry = requestedModel.trim() ? d.modelRouter.resolveLocal(requestedModel) : undefined
+  return entry !== undefined && d.modelRouter.aliveSlots().some((s) => !s.primary && s.modelKey === entry.key)
+}
+
 /** The OpenAI-shaped 503 for a request the router could not place; a permanent refusal also tells the client not to
  *  retry (see the identical line in /v1/messages). */
 function modelNotLoaded(c: Context, refusal: { message: string; permanent?: boolean }): Response {
@@ -1080,15 +1097,17 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       return c.json({ error: { type: 'invalid_request_error', code, message } }, 400)
     }
   }
+  if (isEmbeddings && embeddingsWithheldBeforeRouting(d, requestedModel)) return modelNotLoaded(c, EMBEDDINGS_REFUSAL)
   // An embeddings request reaches a running embedding model's pool slot even with auto-swap off (see the router).
   const routeResult = await d.modelRouter.route(requestedModel, { embeddings: isEmbeddings })
   if ('status' in routeResult) return modelNotLoaded(c, routeResult)
   const target = routeResult.target
   /** Turbo Link (ADR-376) — see the identical binding in the /v1/messages handler above. */
   const remote = routeResult.remote
-  // No model, or the chat model, routes an embeddings request to the primary; the SDK would answer an empty 404.
+  // The primary can still run on the SDK after another engine was made active: routed there without a load, the SDK
+  // would answer an empty 404.
   if (isEmbeddings && !remote && engineWithholdsEmbeddings(routeResult.engineKind ?? servingEngineKind(d))) {
-    return modelNotLoaded(c, { message: EMBEDDINGS_UNAVAILABLE, permanent: true })
+    return modelNotLoaded(c, EMBEDDINGS_REFUSAL)
   }
 
   // Turbo Link is CHAT-only by design (ADR-376) — the comment below this block used to say

@@ -4,9 +4,13 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
+import type { ConfigStore, Engine } from '../config/config'
 import type { Deps } from '../deps'
-import type { ModelEntry } from '../models/scanner'
+import type { Manager, StartOpts } from '../engines/manager'
+import type { Registry } from '../engines/registry'
+import type { ModelEntry, Scanner } from '../models/scanner'
 import { registerGateway } from './gateway'
+import { ModelRouter } from './model-router'
 
 const ENGINE = 'http://engine.invalid'
 const MODEL_PATH = '/models/qwen3-0.6b-Q4_K_M.gguf'
@@ -25,6 +29,7 @@ function depsFor(engineKind: string): Deps {
       resolveRemoteTarget: () => undefined,
       resolveLocal: byKeyOrName,
       routeTo: async () => ({ target: ENGINE }),
+      aliveSlots: () => [],
     },
     store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     manager: {
@@ -155,4 +160,87 @@ test('POST /v1/embeddings to llama.cpp is still sent to the engine', async () =>
     })
     assert.deepEqual(calls.map((c) => c.url), [`${ENGINE}/v1/embeddings`])
   })
+})
+
+// QA fix round 2 (review M-1): an embeddings request naming another installed chat model is refused before routing.
+// Routed first, the one-model SDK engine swapped the loaded chat model out for it, and only then was it refused.
+function chatGguf(key: string): ModelEntry {
+  return {
+    key, name: key, quant: 'Q4_K_M', format: 'gguf', arch: 'qwen3', path: `/models/${key}.gguf`, nativeCtx: 4096,
+    vision: false, embedding: false, incomplete: false, parseError: null,
+  } as unknown as ModelEntry
+}
+
+/** The SDK engine active, `running` loaded in the primary, which records every model it is asked to load. */
+function sdkGatewayWithLoadedModel(running: string, library: ModelEntry[]) {
+  let loadedKey = running
+  const loads: string[] = []
+  const engine = { id: 'sdk', kind: 'turbollm-sdk', capabilities: { flags: [] } } as unknown as Engine
+  const manager = {
+    status: () => ({ state: 'running', err: null, port: 0, pid: 0, loadElapsedMs: 0, model: { key: loadedKey, name: loadedKey } }),
+    currentOpts: () => ({ engine, modelPath: `/models/${loadedKey}.gguf`, model: { name: loadedKey } }),
+    restartOpts: () => null,
+    target: () => ENGINE,
+    touch: () => {},
+    load: async (opts: StartOpts) => { loads.push(opts.model.key); loadedKey = opts.model.key },
+    generationStart: () => {},
+    generationEnd: () => {},
+  } as unknown as Manager
+  const store = {
+    snapshot: () => ({ gateway: { autoSwap: true, keepN: 1 }, modelDefaults: { maxTokens: 0 }, modelProfiles: {}, comfyui: {} }),
+    update: (fn: (c: Record<string, unknown>) => void) => fn({}),
+  } as unknown as ConfigStore
+  const scanner = { list: () => ({ models: library }), get: () => undefined } as unknown as Scanner
+  const registry = { active: () => engine } as unknown as Registry
+  const modelRouter = new ModelRouter(store, registry, manager, scanner, undefined)
+  const app = new Hono()
+  registerGateway(app, { scanner, modelRouter, store, manager, registry } as unknown as Deps)
+  return { app, loads, loadedKey: () => loadedKey }
+}
+
+test('POST /v1/embeddings naming an unloaded chat model on the SDK engine keeps the loaded model and loads nothing', async () => {
+  const { app, loads, loadedKey } = sdkGatewayWithLoadedModel('model-a', [chatGguf('model-a'), chatGguf('model-b')])
+  await withRecordingEngine(async (calls) => {
+    const res = await app.request('/v1/embeddings', {
+      method: 'POST', headers: CLIENT_HEADERS, body: JSON.stringify({ model: 'model-b', input: 'hi' }),
+    })
+    assert.equal(res.status, 503)
+    const { error } = (await res.json()) as { error: { message: string } }
+    assert.equal(error.message, 'The TurboLLM SDK engine runs one chat model at a time and has no embeddings in this version.')
+    assert.equal(calls.length, 0)
+  })
+  assert.deepEqual(loads, [], 'model-b was never loaded')
+  assert.equal(loadedKey(), 'model-a', 'model-a is still loaded')
+})
+
+/** The SDK engine active, with the router's answers for `model` overridden. */
+function sdkGatewayWithRouter(router: Partial<Deps['modelRouter']>): Hono {
+  const deps = depsFor('turbollm-sdk')
+  Object.assign(deps.modelRouter, router)
+  const app = new Hono()
+  registerGateway(app, deps)
+  return app
+}
+
+test('POST /v1/embeddings naming an embedding model running in a llama.cpp pool slot is relayed with the SDK active', async () => {
+  const app = sdkGatewayWithRouter({
+    aliveSlots: () => [{ modelKey: KEY, state: 'running', primary: false, lastUsedMs: 0 }],
+    route: async () => ({ target: ENGINE, engineKind: 'llama-server' }),
+  })
+  await withRecordingEngine(async (calls) => {
+    await app.request('/v1/embeddings', { method: 'POST', headers: CLIENT_HEADERS, body: JSON.stringify({ model: KEY, input: 'hi' }) })
+    assert.deepEqual(calls.map((c) => c.url), [`${ENGINE}/v1/embeddings`])
+  })
+})
+
+test('POST /v1/embeddings naming a linked machine is left to Turbo Link with the SDK active', async () => {
+  const remote = { linkId: 'l1', baseUrl: 'http://peer.invalid', token: 't', modelKey: 'm' }
+  const app = sdkGatewayWithRouter({
+    resolveRemoteTarget: () => ({ target: 'http://peer.invalid', remote }),
+    route: async () => ({ target: 'http://peer.invalid', remote }),
+  })
+  const res = await app.request('/v1/embeddings', {
+    method: 'POST', headers: CLIENT_HEADERS, body: JSON.stringify({ model: 'workstation/m', input: 'hi' }),
+  })
+  assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'link_embeddings_unsupported')
 })
