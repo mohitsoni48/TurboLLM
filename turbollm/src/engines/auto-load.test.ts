@@ -452,6 +452,7 @@ const LINKED_MODEL_LINE =
 interface RunDepsOptions {
   data?: Config
   initialScan?: Promise<void>
+  engineSetup?: Promise<void>
   activeEngine?: () => Engine | undefined
   comfyBlocked?: () => boolean
   findModel?: (key: string) => ModelEntry | undefined
@@ -673,6 +674,29 @@ test('runAutoLoad D8: an engine that becomes active during the scan is used afte
   assert.equal(record.loads.length, 1)
 })
 
+// QA F4 (B-19): on the first launch after an upgrade the active engine is still the removed LiteRT-LM row until the
+// Android engine setup unregisters it and activates the SDK. A scan that settles first must not plan on that row.
+test('runAutoLoad B-19: waits for the engine setup, so the last GGUF resumes on the engine it activates', async () => {
+  const setup = deferred()
+  let setupFinished = false
+  const sdk = engineOfKind('turbollm-sdk', 'TurboLLM SDK')
+  const { deps, record } = mkRunDeps({
+    engineSetup: setup.promise,
+    activeEngine: () => (setupFinished ? sdk : engineOfKind('litert-lm', 'litert-lm-android')),
+  })
+
+  const running = runAutoLoad(deps)
+  await flush()
+  assert.equal(record.snapshotCalls, 0)
+  setupFinished = true
+  setup.resolve()
+  await running
+
+  assert.deepEqual(record.logs, [])
+  assert.equal(record.loads.length, 1)
+  assert.equal(record.loads[0].opts.engine, sdk)
+})
+
 // An embedding resume is labelled `trigger: 'gateway_switch'` in `model_load` telemetry, and the router
 // rewrites `lastLoaded` to the same key. Both come from the router's own buildOpts/doLoad
 // (gateway/model-router.ts:435, 454, 274). They are identical for a manual embedding Load
@@ -828,6 +852,7 @@ function mkRunDeps(options: RunDepsOptions = {}) {
   }
   const deps: AutoLoadDeps = {
     initialScan: options.initialScan ?? Promise.resolve(),
+    engineSetup: options.engineSetup ?? Promise.resolve(),
     store,
     registry: { active: options.activeEngine ?? (() => LLAMA_SERVER) },
     comfy: {

@@ -3,7 +3,7 @@
 // decision order in the run's architecture §3.4 (plus row 3a, AC10). skipLine and
 // fallbackLine give the exact one-line reasons (architecture §4.4). All three are pure:
 // they read only their arguments and print nothing; the caller owns the console.
-// runAutoLoad is that caller at daemon start: it waits for the boot scan, plans once from one post-scan
+// runAutoLoad is that caller at daemon start: it waits for the boot scan and engine setup, plans once from one post-scan
 // snapshot, and loads through the manual Load's chokepoints, printing only through deps.log / deps.warn.
 import type { Config, ConfigStore, DevModel, Engine } from '../config/config'
 import type { ModelRouter } from '../gateway/model-router'
@@ -19,6 +19,9 @@ import { isTurboLinkEnabledIn } from '../link/gate'
 export interface AutoLoadDeps {
   /** The boot scan's promise (cli.ts). Never rejects (CoalescedRunner C4). */
   initialScan: Promise<void>
+  /** The boot's engine repair and registration (cli.ts: the Android bundled engines, then the SDK engine). Planned
+   *  after it, so the active engine is the one this launch runs, not a row an upgrade removed (QA F4, B-19). */
+  engineSetup: Promise<void>
   store: Pick<ConfigStore, 'snapshot'>
   registry: Pick<Registry, 'active'>
   comfy: Pick<ComfyGuard, 'isBlocked' | 'freeComfyUIBeforeLoad'>
@@ -39,7 +42,7 @@ export interface AutoLoadDeps {
 export async function runAutoLoad(deps: AutoLoadDeps): Promise<AutoLoadPlan> {
   let plan: AutoLoadPlan = { kind: 'disabled' }
   try {
-    await deps.initialScan
+    await Promise.all([deps.initialScan, deps.engineSetup])
     const cfg = deps.store.snapshot()
     plan = planAutoLoad({
       cfg,

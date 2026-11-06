@@ -58,3 +58,13 @@ test('the model dir is seeded before the boot scan, and the boot scan starts bef
     `boot order must be seed (${seeded}) < scan (${scanned}) < auto-load (${autoLoaded})`,
   )
 })
+
+// QA F4 (B-19): the Android engine repair and registration is kept as a promise and handed to auto-load, so the first
+// launch after an upgrade plans on the engine that setup activates, not the removed row it replaces.
+const KEEP_ANDROID_ENGINE_SETUP = 'const androidEngineSetup = ensureAndroidBundledEngine(registry)'
+const AUTO_LOAD_GETS_ENGINE_SETUP = /void runAutoLoad\(\{[\s\S]*?\bengineSetup: androidEngineSetup\b[\s\S]*?\}\)/
+
+test('auto-load is handed the Android engine setup promise', () => {
+  assert.equal(occurrencesOf(KEEP_ANDROID_ENGINE_SETUP), 1, `cli.ts must contain "${KEEP_ANDROID_ENGINE_SETUP}" once`)
+  assert.ok(AUTO_LOAD_GETS_ENGINE_SETUP.test(CLI), `cli.ts must match ${AUTO_LOAD_GETS_ENGINE_SETUP}`)
+})

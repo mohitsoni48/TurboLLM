@@ -528,8 +528,9 @@ const enginesDir = join(store.dir(), 'engines')
 // runs first: it must land before seedDefaultEngines' "any engine already configured?"
 // gate so a repaired/first-registered Android engine correctly short-circuits the
 // network-download seed path instead of racing it.
-void ensureAndroidBundledEngine(registry)
+const androidEngineSetup = ensureAndroidBundledEngine(registry)
   .then(() => ensureAndroidSdkEngine(registry)) // the app's in-app engine, its default (Option B); no-op elsewhere
+void androidEngineSetup
   .then(() => seedDefaultEngines(registry, enginesDir, provision, store))
   .then(() => registry.ensureProbed())
 const manager = new Manager(store)
@@ -1694,9 +1695,11 @@ if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean })
 
 // ── Auto-load last model on start (spec 05 §7) ────────────────────────────────
 // Not awaited, so boot never stalls. It waits for the boot scan itself, so a key the scan
-// migrates is resolved; the decision and every skip line live in engines/auto-load.ts.
+// migrates is resolved, and for the Android engine setup, so it plans on the engine this launch
+// activates; the decision and every skip line live in engines/auto-load.ts.
 void runAutoLoad({
   initialScan,
+  engineSetup: androidEngineSetup,
   store,
   registry,
   comfy,

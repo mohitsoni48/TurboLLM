@@ -1285,7 +1285,8 @@ for (const [label, autoSwap, loadEmbedding] of [
     })
     const warns: string[] = []
     await runAutoLoad({
-      initialScan: Promise.resolve(), store, registry, scanner, manager: nextManager, modelRouter: nextRouter,
+      initialScan: Promise.resolve(), engineSetup: Promise.resolve(), store, registry, scanner, manager: nextManager,
+      modelRouter: nextRouter,
       comfy: { isBlocked: () => false, freeComfyUIBeforeLoad: async () => {} },
       sysInfo: getSysInfo, log: () => {}, warn: (line) => { warns.push(line) },
     })
