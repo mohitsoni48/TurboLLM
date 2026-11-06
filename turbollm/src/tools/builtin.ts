@@ -677,7 +677,10 @@ export async function execFetchUrl(
     }
     await reader.cancel().catch(() => {})
   } else if (asPdf) {
-    pdfNoBody = true
+    // No body at all: the disabled note still wins over the no-content note, as it does on
+    // the with-body path (the pdfDisabled check there comes first too).
+    if (opts.pdfReading === true) pdfNoBody = true
+    else pdfDisabled = true
   }
   clearTimeout(abortTimer)
   let content: string
