@@ -2978,6 +2978,7 @@ export function registerApi(app: Hono, d: Deps): void {
       code?: { agentsMdProjectCandidates?: string[]; agentsMdGlobalCandidates?: string[]; defaultAgent?: string }
       toolPolicies?: Record<string, string>
       autoAllowAll?: boolean
+      pdfReading?: boolean
       chatApprovalWaitMinutes?: number
       cloudDeploy?: { runpodTemplateId?: string }
       experimental?: { memory?: boolean; cloudDeploy?: boolean; routines?: boolean; turboLink?: boolean; remoteAccess?: boolean }
@@ -3031,7 +3032,7 @@ export function registerApi(app: Hono, d: Deps): void {
       ['ghToken', b.ghToken, 'string'],
       ['tavilyApiKey', b.tavilyApiKey, 'string'],
       ['cloudDeploy.runpodTemplateId', b.cloudDeploy?.runpodTemplateId, 'string'],
-      ...(['autoGenerateTitles', 'autoMemoryEnabled', 'openBrowserOnStart', 'autoLoadOnStart', 'showAllEngineModels', 'lanBind', 'requireApiKey', 'autoAllowAll'] as const)
+      ...(['autoGenerateTitles', 'autoMemoryEnabled', 'openBrowserOnStart', 'autoLoadOnStart', 'showAllEngineModels', 'lanBind', 'requireApiKey', 'autoAllowAll', 'pdfReading'] as const)
         .map((f): [string, unknown, 'boolean'] => [f, b[f], 'boolean']),
       ['comfyui.enabled', b.comfyui?.enabled, 'boolean'],
       ['comfyui.reverseGate', b.comfyui?.reverseGate, 'boolean'],
@@ -3293,6 +3294,7 @@ export function registerApi(app: Hono, d: Deps): void {
       if (defaultAgent !== undefined) cfg.code.defaultAgent = defaultAgent
       if (toolPolicies !== undefined) cfg.tools.toolPolicies = toolPolicies
       if (b.autoAllowAll !== undefined) cfg.tools.autoAllowAll = !!b.autoAllowAll
+      if (b.pdfReading !== undefined) cfg.tools.pdfReading = !!b.pdfReading
       if (b.chatApprovalWaitMinutes !== undefined) cfg.tools.chatApprovalWaitMinutes = b.chatApprovalWaitMinutes
       if (b.autoLoadOnStart !== undefined) cfg.autoLoadOnStart = !!b.autoLoadOnStart
       if (b.showAllEngineModels !== undefined) cfg.showAllEngineModels = !!b.showAllEngineModels
@@ -4096,6 +4098,8 @@ function hostOnlySettingChanged(before: Config, after: Config): { field: string;
     ['build.toolchainDirs', 'the build toolchain folders', (c) => c.build.toolchainDirs],
     ['toolPolicies', 'tool permissions', (c) => c.tools.toolPolicies],
     ['autoAllowAll', '"Auto-allow all"', (c) => c.tools.autoAllowAll],
+    // Same posture as autoAllowAll: it widens what an untrusted URL's bytes may reach (the PDF parser).
+    ['pdfReading', '"Read PDFs in fetch_url"', (c) => c.tools.pdfReading],
     // Body capture records Code sessions' and `turbollm launch` agents' full prompts, which only
     // a hostGate caller may read back (REQUEST_BODIES_HOST_ONLY); switching it on from here was
     // the way to start that capture. Turning the log off hides from the owner what was sent.
@@ -4172,6 +4176,7 @@ function settingsPayload(d: Deps) {
     // Not secret — echoed back directly so Settings can render Tool Permissions.
     toolPolicies: cfg.tools.toolPolicies ?? {},
     autoAllowAll: cfg.tools.autoAllowAll ?? false,
+    pdfReading: cfg.tools.pdfReading ?? false,
     chatApprovalWaitMinutes: cfg.tools.chatApprovalWaitMinutes ?? CHAT_APPROVAL_WAIT_MINUTES.default,
     // Remote access (ADR-422). Secrets are WRITE-ONLY: the booleans say whether one is
     // stored, never what it is — same posture as hfToken/ghToken/tavilyApiKey.
