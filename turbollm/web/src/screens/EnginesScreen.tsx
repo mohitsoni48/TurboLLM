@@ -143,6 +143,7 @@ export function catalogIdFor(e: Engine, catalog?: Pick<CatalogEngine, 'id' | 're
   const repo = repoSlug(e.sourceRepo)
   if (repo === 'atomicbot-ai/atomic-llama-cpp-turboquant') return 'turboquant'
   if (repo === 'ikawrakow/ik_llama.cpp') return 'ik_llama.cpp'
+  if (repo === 'turbo-tan/llama.cpp-tq3') return 'llama.cpp-tq3'
   if (/[\\/]engines[\\/]turboquant[\\/]/.test(e.binPath)) return 'turboquant'
   return 'llama.cpp'
 }
@@ -265,6 +266,17 @@ const ENGINE_META: Record<string, EngineMeta> = {
       'Same llama-server + GGUF flow',
     ],
     cons: ['No prebuilts — build from source', 'CPU + CUDA only (no ROCm/Metal)', 'Some quant types are fork-only'],
+  },
+  'llama.cpp-tq3': {
+    icon: Gauge,
+    tagline: 'Tiny KV cache for long contexts',
+    format: 'GGUF',
+    pros: [
+      'TQ3_1S/TQ4S KV cache — ~3.5-bit, between Turbo3 and Turbo4',
+      'Far less VRAM for long-context chats',
+      'Same llama-server + GGUF flow',
+    ],
+    cons: ['No prebuilts — build from source', 'KV-cache types need CUDA (NVIDIA)', 'Fork-only KV quant types'],
   },
   koboldcpp: {
     icon: Feather,
