@@ -8,8 +8,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ToolPermissionsSection } from './ToolPermissionsSection'
 
 const save = { mutate: vi.fn(), isPending: false }
-const settings: { toolPolicies: Record<string, string>; autoAllowAll: boolean; chatApprovalWaitMinutes?: number } = {
-  toolPolicies: {}, autoAllowAll: false, chatApprovalWaitMinutes: 30,
+const settings: { toolPolicies: Record<string, string>; autoAllowAll: boolean; pdfReading?: boolean; chatApprovalWaitMinutes?: number } = {
+  toolPolicies: {}, autoAllowAll: false, pdfReading: false, chatApprovalWaitMinutes: 30,
 }
 
 vi.mock('../../lib/queries', () => ({
@@ -30,6 +30,7 @@ const field = () => screen.getByLabelText(/Wait for an answer/) as HTMLInputElem
 beforeEach(() => {
   save.mutate.mockClear()
   settings.chatApprovalWaitMinutes = 30
+  settings.pdfReading = false
 })
 
 describe('ToolPermissionsSection: Wait for an answer', () => {
@@ -78,5 +79,28 @@ describe('ToolPermissionsSection: Wait for an answer', () => {
     settings.chatApprovalWaitMinutes = undefined
     await renderOpen()
     expect(field().value).toBe('30')
+  })
+})
+
+describe('ToolPermissionsSection: Read PDFs in fetch_url', () => {
+  // The switches in order: Auto-allow all, then Read PDFs in fetch_url.
+  const pdfSwitch = () => screen.getAllByRole('switch')[1] as HTMLButtonElement
+
+  it('is off by default and says what off does', async () => {
+    await renderOpen()
+    expect(pdfSwitch().getAttribute('aria-checked')).toBe('false')
+    expect(screen.getByText(/PDF reading is disabled/)).toBeTruthy()
+  })
+
+  it('saves only pdfReading when switched on, and reflects an enabled daemon setting', async () => {
+    await renderOpen()
+    await userEvent.click(pdfSwitch())
+    expect(save.mutate.mock.calls.map((c) => c[0])).toEqual([{ pdfReading: true }])
+  })
+
+  it('shows on when the daemon reports it on', async () => {
+    settings.pdfReading = true
+    await renderOpen()
+    expect(pdfSwitch().getAttribute('aria-checked')).toBe('true')
   })
 })
