@@ -27,6 +27,8 @@ export async function parsePdfText(data: Uint8Array): Promise<string | null> {
       isEvalSupported: false,
       // A fetch_url reply is one-shot: no caching, no worker, no fonts fetched.
       disableFontFace: true,
+      // No console output from pdfjs: warnings about fonts/canvas would land in the daemon log.
+      verbosity: 0,
     } as Parameters<typeof getDocument>[0])
     const doc = await loadingTask.promise
     try {
