@@ -1217,6 +1217,12 @@ export type HfSortOption = 'best-match' | 'trending' | 'downloads' | 'likes' | '
  *  entry with summed size and `parts` > 1; safetensors component files each get
  *  their own entry with `safetensors: true`; .litertlm bundles each get their own
  *  self-contained entry with `litertlm: true`. */
+/** The hardware a `.litertlm` bundle targets; `soc` names the one SoC a 'soc' bundle runs on. */
+export type LitertlmTarget = {
+  kind: 'any' | 'gpu' | 'web' | 'npu' | 'soc' | 'desktop'
+  soc?: string
+}
+
 export type HfRepoFile = {
   name: string
   quant: string
@@ -1231,6 +1237,10 @@ export type HfRepoFile = {
    *  the build this bundle targets. `quant` keeps its usual meaning (the precision the
    *  name states, '?' when none — same as the library), so the two never collide. */
   variant?: string
+  /** For a `.litertlm` bundle: the hardware it was built for, read from its name (ADR-462). */
+  target?: LitertlmTarget
+  /** For a `.litertlm` bundle: whether the device the daemon runs on can run it (ADR-462). */
+  runsHere?: boolean
   sha256?: string
   url: string
   /** True when this exact repo file was downloaded via TurboLLM and is still on

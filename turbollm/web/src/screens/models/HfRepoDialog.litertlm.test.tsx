@@ -10,7 +10,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { HfRepoContent } from './HfRepoDialog'
+import { HfRepoContent, HfRepoDialog } from './HfRepoDialog'
 import { ApiError } from '../../lib/api'
 import type { LinkSummary } from '../../lib/link-api'
 import type { HfRepoDetail, HfRepoFile } from '../../lib/types'
@@ -48,11 +48,12 @@ function repoDetail(over: Partial<HfRepoDetail> = {}): HfRepoDetail {
   } as HfRepoDetail
 }
 
-const state: { detail: HfRepoDetail } = { detail: repoDetail() }
+const DESKTOP_SYS = { gpus: [{ vramMb: 16000 }] }
+const state: { detail: HfRepoDetail; sys: unknown } = { detail: repoDetail(), sys: DESKTOP_SYS }
 
 vi.mock('../../lib/queries', () => ({
   useHfRepo: () => ({ data: state.detail }),
-  useSysInfo: () => ({ data: { gpus: [{ vramMb: 16000 }] } }),
+  useSysInfo: () => ({ data: state.sys }),
   useStatus: () => ({ data: { engine: { kind: 'litert-lm' } } }),
   // mutate records the input AND runs the caller's onSuccess, so a download's toast
   // fires the way it does against the real mutation (the single-file path toasts there).
@@ -90,11 +91,11 @@ vi.mock('../../lib/api', async (importOriginal) => ({
   track: vi.fn(),
 }))
 
-function renderContent() {
+function renderContent(preselectFile?: string) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <QueryClientProvider client={qc}>
-      <HfRepoContent repo="litert-community/gemma-4-E2B-it-litert-lm" onClose={vi.fn()} />
+      <HfRepoContent repo="litert-community/gemma-4-E2B-it-litert-lm" onClose={vi.fn()} preselectFile={preselectFile} />
     </QueryClientProvider>,
   )
 }
@@ -111,6 +112,7 @@ async function pickVariant(label: string | RegExp) {
 
 beforeEach(() => {
   state.detail = repoDetail()
+  state.sys = DESKTOP_SYS
   linkState.links = []
   enqueue.mockClear()
   requestLoad.mockClear()
@@ -308,6 +310,138 @@ describe('HfRepoContent — a .litertlm repo with same-named bundles in differen
         sha256: 'sha-web',
       },
     ])
+  })
+})
+
+// ADR-462 (W-6, architecture §4.6): the daemon says which bundles this device runs. Those are listed first and the rest
+// are folded under "Built for other hardware (N)", visible on request, never removed (ADR-402). Nothing is picked by
+// size; on Android, the one bundle any device runs is preselected when there is exactly one, and a curated Discover row
+// preselects its own bundle.
+describe('HfRepoContent — bundles ordered by the hardware they run on', () => {
+  type Target = NonNullable<HfRepoFile['target']>
+  const targeted = (name: string, variant: string, sizeBytes: number, target: Target, runsHere: boolean): HfRepoFile =>
+    ({ ...bundle(name, variant, sizeBytes, `sha-${name}`), target, runsHere })
+  // The nine live gemma-4-E2B bundles, as the daemon answers them on an Android phone whose SoC it does not know.
+  const E2B_ON_UNKNOWN_SOC = [
+    targeted('gemma-4-E2B-it.litertlm', 'Default', 2_588_147_712, { kind: 'any' }, true),
+    targeted('gemma-4-E2B-it-gpu.litertlm', 'GPU', 2.0e9, { kind: 'gpu' }, true),
+    targeted('gemma-4-E2B-it-web.litertlm', 'Web', 2.1e9, { kind: 'web' }, false),
+    targeted('gemma-4-E2B-it_Google_Tensor_G5.litertlm', 'Google Tensor G5', 3.1e9, { kind: 'soc', soc: 'GOOGLE_TENSOR_G5' }, false),
+    targeted('gemma-4-E2B-it_Google_Tensor_G6.litertlm', 'Google Tensor G6', 3.1e9, { kind: 'soc', soc: 'GOOGLE_TENSOR_G6' }, false),
+    targeted('gemma-4-E2B-it_npu_uncompiled.litertlm', 'NPU', 2.9e9, { kind: 'npu' }, false),
+    targeted('gemma-4-E2B-it_Qualcomm_QCS8275.litertlm', 'Qualcomm QCS8275', 3.0e9, { kind: 'soc', soc: 'QCS8275' }, false),
+    targeted('gemma-4-E2B-it_Intel_LNL.litertlm', 'Intel LNL', 2.7e9, { kind: 'desktop' }, false),
+    targeted('gemma-4-E2B-it_Intel_PTL.litertlm', 'Intel PTL', 2.7e9, { kind: 'desktop' }, false),
+  ]
+  const PHONE = { os: 'android/arm64', ramMB: 7655, gpus: [] }
+  const ANDROID_EXPLAINER = /Bundles for other hardware are folded away\. Use the one listed first unless you know you need another\./
+  const trigger = () => screen.getAllByRole('button').find((b) => b.getAttribute('aria-haspopup') === 'menu')!
+  const openPicker = async () => {
+    const user = userEvent.setup()
+    await user.click(trigger())
+    return user
+  }
+  const itemTexts = () => screen.getAllByRole('menuitem').map((el) => el.textContent)
+
+  beforeEach(() => {
+    state.detail = repoDetail({ files: E2B_ON_UNKNOWN_SOC })
+    state.sys = PHONE
+  })
+
+  it('on an unknown-SoC phone lists Default and GPU, folds the other 7, and preselects Default', async () => {
+    renderContent()
+    expect(trigger().textContent).toMatch(/^Default/)
+
+    await openPicker()
+    expect(itemTexts()).toEqual(['GPU · 2.0 GB', 'Default · 2.6 GB', 'Built for other hardware (7)'])
+  })
+
+  it('expands the fold on click, and a folded bundle can be downloaded', async () => {
+    renderContent()
+    const user = await openPicker()
+    await user.click(screen.getByRole('menuitem', { name: 'Built for other hardware (7)' }))
+    expect(itemTexts()).toHaveLength(2 + 1 + 7)
+    expect(itemTexts()).toContain('Google Tensor G5 · 3.1 GB')
+
+    await user.click(screen.getByRole('menuitem', { name: /Google Tensor G5/ }))
+    await user.click(screen.getByRole('button', { name: /Download/ }))
+    expect(queued()).toEqual([expect.objectContaining({ rfilename: 'gemma-4-E2B-it_Google_Tensor_G5.litertlm' })])
+  })
+
+  it('preselects nothing when two bundles any device runs are listed', () => {
+    state.detail = repoDetail({
+      files: [
+        targeted('Gemma3-1B-IT_int4.litertlm', 'Default', 0.6e9, { kind: 'any' }, true),
+        targeted('Gemma3-1B-IT_q8_ekv4096.litertlm', 'Default', 1.0e9, { kind: 'any' }, true),
+      ],
+    })
+    renderContent()
+    expect(trigger().textContent).toMatch(/Select a variant/)
+  })
+
+  it('preselects the curated bundle over the one any device runs', () => {
+    renderContent('gemma-4-E2B-it-gpu.litertlm')
+    expect(trigger().textContent).toMatch(/^GPU/)
+  })
+
+  it('ignores a curated bundle the repo does not list', () => {
+    renderContent('gemma-4-E2B-it-missing.litertlm')
+    expect(trigger().textContent).toMatch(/^Default/)
+  })
+
+  it('says on Android to use the bundle listed first, not to match the hardware', () => {
+    renderContent()
+    expect(screen.getByText(ANDROID_EXPLAINER)).toBeInTheDocument()
+    expect(screen.queryByText(/Pick the variant matching your hardware/)).not.toBeInTheDocument()
+  })
+
+  it('says on Android with known memory whether the selected bundle fits this phone', () => {
+    renderContent()
+    expect(screen.getByText(/^Fits in this phone's memory/)).toBeInTheDocument()
+  })
+
+  it('says it does not fit a phone whose budget is below the bundle', () => {
+    state.sys = { os: 'android/arm64', ramMB: 5000, gpus: [] }
+    renderContent()
+    expect(screen.getByText(/^Larger than this phone's free memory/)).toBeInTheDocument()
+  })
+
+  it('makes no memory claim on Android while the memory is unknown', () => {
+    state.sys = { os: 'android/arm64', ramMB: 0, gpus: [] }
+    renderContent()
+    expect(screen.queryByText(/this phone's/)).not.toBeInTheDocument()
+  })
+
+  it('on a desktop takes the new order but preselects nothing and claims no fit', async () => {
+    state.sys = DESKTOP_SYS
+    renderContent()
+    expect(trigger().textContent).toMatch(/Select a variant/)
+    expect(screen.queryByText(/this phone's/)).not.toBeInTheDocument()
+    expect(screen.queryByText(ANDROID_EXPLAINER)).not.toBeInTheDocument()
+
+    await openPicker()
+    expect(itemTexts().slice(0, 3)).toEqual(['GPU · 2.0 GB', 'Default · 2.6 GB', 'Built for other hardware (7)'])
+    expect(document.querySelectorAll('[title*="VRAM"], [title*="fit" i]').length).toBe(0)
+  })
+
+  it('on a desktop selects the curated bundle, and nothing for one the repo does not list', () => {
+    state.sys = DESKTOP_SYS
+    const { unmount } = renderContent('gemma-4-E2B-it.litertlm')
+    expect(trigger().textContent).toMatch(/^Default/)
+    unmount()
+    renderContent('gemma-4-E2B-it-missing.litertlm')
+    expect(trigger().textContent).toMatch(/Select a variant/)
+  })
+
+  it('HfRepoDialog hands its preselectFile to the content', () => {
+    state.sys = DESKTOP_SYS
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <HfRepoDialog repo="litert-community/gemma-4-E2B-it-litert-lm" onClose={vi.fn()} preselectFile="gemma-4-E2B-it-gpu.litertlm" />
+      </QueryClientProvider>,
+    )
+    expect(trigger().textContent).toMatch(/^GPU/)
   })
 })
 
