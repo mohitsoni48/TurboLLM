@@ -16,7 +16,7 @@ import { engineWorkBusy, registerApi } from './routes'
 import type { Deps } from '../deps'
 import { ConfigStore, type Engine } from '../config/config'
 import { planAutoLoad } from '../engines/auto-load'
-import { availableBackends } from '../engines/download'
+import { availableBackends, serverBinNameFor } from '../engines/download'
 import { BuildState } from '../engines/build-state'
 import { ProvisionState } from '../engines/provision-state'
 import { writeReleaseMarker } from '../engines/release-install'
@@ -26,22 +26,26 @@ import { Registry } from '../engines/registry'
 import type { ModelEntry } from '../models/scanner'
 import { tmpDir } from '../test-support/tmp'
 
+// The fake engine binary is named as the host names the real one (llama-server.exe on Windows): an engine whose
+// binPath is not that file counts as not installed.
+const SERVER = serverBinNameFor()
+
 function harness(busy: 'download' | 'build' | null) {
   const dataDir = tmpDir('tllm-engine-delete-')
   const forkDir = join(dataDir, 'engines', 'build', 'myfork')
   mkdirSync(forkDir, { recursive: true })
-  writeFileSync(join(forkDir, 'llama-server'), 'bin')
+  writeFileSync(join(forkDir, SERVER), 'bin')
   const otherForkDir = join(dataDir, 'engines', 'build', 'otherfork')
   mkdirSync(otherForkDir, { recursive: true })
-  writeFileSync(join(otherForkDir, 'llama-server'), 'bin')
+  writeFileSync(join(otherForkDir, SERVER), 'bin')
   const backend = availableBackends()[0]!
   const backendDir = join(dataDir, 'engines', `llama.cpp-b1-${backend.id}`)
   mkdirSync(backendDir, { recursive: true })
-  writeFileSync(join(backendDir, 'llama-server'), 'bin')
+  writeFileSync(join(backendDir, SERVER), 'bin')
   const engines = [
-    { id: 'fork', name: 'My fork', kind: 'llama-server', binPath: join(forkDir, 'llama-server') },
-    { id: 'be', name: 'llama.cpp', kind: 'llama-server', binPath: join(backendDir, 'llama-server') },
-    { id: 'other', name: 'Other fork', kind: 'llama-server', binPath: join(otherForkDir, 'llama-server') },
+    { id: 'fork', name: 'My fork', kind: 'llama-server', binPath: join(forkDir, SERVER) },
+    { id: 'be', name: 'llama.cpp', kind: 'llama-server', binPath: join(backendDir, SERVER) },
+    { id: 'other', name: 'Other fork', kind: 'llama-server', binPath: join(otherForkDir, SERVER) },
   ]
   const removed: string[] = []
   const added: string[] = []
@@ -121,7 +125,7 @@ for (const busy of ['download', 'build'] as const) {
     const h = harness(busy)
     const res = await h.app.request('/api/v1/engines', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'My fork', binPath: join(h.forkDir, 'llama-server') }),
+      body: JSON.stringify({ name: 'My fork', binPath: join(h.forkDir, SERVER) }),
     })
     assert.equal(res.status, 409)
     assert.equal(await errorCode(res), 'engine_already_running')
@@ -142,10 +146,10 @@ test('with no engine work running, a re-register, a purge and a backend delete s
   const h = harness(null)
   const add = await h.app.request('/api/v1/engines', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'My fork', binPath: join(h.forkDir, 'llama-server') }),
+    body: JSON.stringify({ name: 'My fork', binPath: join(h.forkDir, SERVER) }),
   })
   assert.equal(add.status, 201)
-  assert.deepEqual(h.added, [join(h.forkDir, 'llama-server')])
+  assert.deepEqual(h.added, [join(h.forkDir, SERVER)])
   assert.equal((await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })).status, 200)
   assert.equal(existsSync(h.forkDir), false)
   assert.equal((await h.app.request(`/api/v1/engines/backends/${h.backendId}`, { method: 'DELETE' })).status, 200)
@@ -242,7 +246,7 @@ for (const [route, enableBackend] of enableRoutes) {
   test(`${route} and DELETE /engines/backends/:id refuse each other while either runs`, async () => {
     const h = harness(null)
     writeFileSync(join(h.backendDir, '.turbollm-provisioned'), '') // a finished install, so Enable finds it
-    const bin = join(h.backendDir, 'llama-server')
+    const bin = join(h.backendDir, SERVER)
     let probed!: () => void
     const activated: string[] = []
     Object.assign(h.d.registry, {
@@ -304,7 +308,7 @@ for (const [route, enableBackend] of enableRoutes) {
     provision.done()
     provision.start('another-backend', 'user_install')
     assert.equal((await enableBackend(h)).status, 200, 'another backend\'s download does not refuse it')
-    assert.deepEqual([h.added, activated], [[join(h.backendDir, 'llama-server')], ['fork2']])
+    assert.deepEqual([h.added, activated], [[join(h.backendDir, SERVER)], ['fork2']])
   })
 }
 
@@ -375,7 +379,7 @@ test('POST /engines of a Disabled release install refuses its forget and its dis
   const h = harness(null)
   const dir = join(h.dataDir, 'engines', 'build', 'ggml-org-llama.cpp-cpu')
   mkdirSync(dir, { recursive: true })
-  const bin = join(dir, 'llama-server')
+  const bin = join(dir, SERVER)
   writeFileSync(bin, 'bin')
   writeReleaseMarker(dir, {
     repo: 'ggml-org/llama.cpp', tag: 'b1', asset: 'llama-b1-bin-cpu.zip', assetKey: 'cpu',
@@ -413,7 +417,7 @@ test('POST /engines of an uploaded zip install refuses its discard while it prob
   const h = harness(null)
   const dir = join(h.dataDir, 'engines', 'build', 'myzip')
   mkdirSync(dir, { recursive: true })
-  const bin = join(dir, 'llama-server')
+  const bin = join(dir, SERVER)
   writeFileSync(bin, 'bin')
   writeFileSync(join(dir, ZIP_BUILD_MARKER), 'myzip.zip\n2026-09-01T00:00:00.000Z\n')
   const enable = heldEnable(h, 'myzip', bin)
@@ -445,7 +449,7 @@ for (const tool of ['CUDA Toolkit', 'git']) {
     assert.equal(disable.status, 200)
     const enable = await h.app.request('/api/v1/engines', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'Other fork', binPath: join(h.otherForkDir, 'llama-server') }),
+      body: JSON.stringify({ name: 'Other fork', binPath: join(h.otherForkDir, SERVER) }),
     })
     assert.equal(enable.status, 201)
     assert.equal((await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })).status, 200)
@@ -517,7 +521,7 @@ test('POST /build/cuda starts a run that leaves Disable open while it downloads'
 function disabledBuild(dataDir: string, slug: string): string {
   const binDir = join(dataDir, 'engines', 'build', slug, 'build', 'bin')
   mkdirSync(binDir, { recursive: true })
-  const bin = join(binDir, 'llama-server')
+  const bin = join(binDir, SERVER)
   writeFileSync(bin, "#!/bin/sh\necho 'error while loading shared libraries: libcuda.so.1' >&2\nexit 127\n", { mode: 0o755 })
   return bin
 }
@@ -537,7 +541,7 @@ test('DELETE /engines/build refuses a folder an engine or a remembered source cl
   const h = harness(null)
   const del = (binPath: string) => h.app.request(`/api/v1/engines/build?binPath=${encodeURIComponent(binPath)}`, { method: 'DELETE' })
 
-  let res = await del(join(h.forkDir, 'llama-server')) // the registered "My fork"
+  let res = await del(join(h.forkDir, SERVER)) // the registered "My fork"
   assert.equal(res.status, 409)
   assert.equal(await errorCode(res), 'build_dir_taken')
   assert.equal(existsSync(h.forkDir), true)
@@ -550,7 +554,7 @@ test('DELETE /engines/build refuses a folder an engine or a remembered source cl
   assert.equal(existsSync(remembered), true)
 
   const parked = disabledBuild(h.dataDir, '.myfork-1700000000000.prev') // a rebuild's parked previous build
-  for (const binPath of [parked, join(h.backendDir, 'llama-server'), join(h.dataDir, 'engines', 'build', 'gone', 'llama-server'), '']) {
+  for (const binPath of [parked, join(h.backendDir, SERVER), join(h.dataDir, 'engines', 'build', 'gone', SERVER), '']) {
     res = await del(binPath)
     assert.equal(res.status, 404, binPath)
     assert.equal(await errorCode(res), 'engine_not_found')
@@ -670,7 +674,7 @@ test('DELETE /engines/:id?purge=1 whose folder is locked is 409 engine_files_loc
   assert.equal(await errorCode(res), 'engine_files_locked')
   assert.deepEqual(h.removed, [], 'still registered')
   assert.deepEqual(h.forgotten, [])
-  assert.equal(existsSync(join(h.forkDir, 'llama-server')), true)
+  assert.equal(existsSync(join(h.forkDir, SERVER)), true)
 
   const again = await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })
   assert.equal(again.status, 200)
@@ -715,13 +719,13 @@ test('DELETE /engines/:id?purge=1 whose renamed-aside folder stays locked still 
 // other still ran from, and that engine stayed registered with its binary gone.
 test('DELETE /engines/:id?purge=1 leaves the folder to another registered engine that runs from it, until that one goes too', async () => {
   const h = harness(null)
-  h.engines.push({ id: 'twin', name: 'My fork (8 slots)', kind: 'llama-server', binPath: join(h.forkDir, 'llama-server') })
+  h.engines.push({ id: 'twin', name: 'My fork (8 slots)', kind: 'llama-server', binPath: join(h.forkDir, SERVER) })
   const buildRoot = join(h.dataDir, 'engines', 'build')
   const res = await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })
   assert.equal(res.status, 200)
   assert.deepEqual(h.removed, ['fork'])
   assert.equal(h.forgotten.length, 1, 'the purged engine\'s remembered source is dropped as usual')
-  assert.equal(existsSync(join(h.forkDir, 'llama-server')), true, 'the other engine still runs from it')
+  assert.equal(existsSync(join(h.forkDir, SERVER)), true, 'the other engine still runs from it')
   assert.deepEqual(fs.readdirSync(buildRoot).sort(), ['myfork', 'otherfork'], 'nothing is renamed aside')
 
   assert.equal((await h.app.request('/api/v1/engines/twin?purge=1', { method: 'DELETE' })).status, 200)
@@ -733,7 +737,7 @@ test('DELETE /engines/:id?purge=1 leaves the folder to another registered engine
 // A Disabled custom engine is a remembered source with no registry entry, and its Enable re-registers it from its
 // folder: DELETE /engines/build already counts one as a claim on the folder. The purge counted only registered engines.
 test('DELETE /engines/:id?purge=1 leaves the folder to a Disabled custom engine that runs from it, not to its own remembered source', async () => {
-  const bin = (h: ReturnType<typeof harness>) => join(h.forkDir, 'llama-server')
+  const bin = (h: ReturnType<typeof harness>) => join(h.forkDir, SERVER)
   const own = harness(null)
   own.sources.push({ binPath: bin(own) }) // the purged engine's own (keyed by its binPath), which the purge forgets
   assert.equal((await own.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })).status, 200)
@@ -755,7 +759,7 @@ test('DELETE /engines/:id?purge=1 whose unregister fails puts the folder back', 
   h.failRemove.on = true // the config write behind registry.remove is refused
   const res = await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })
   assert.equal(res.status, 500)
-  assert.equal(existsSync(join(h.forkDir, 'llama-server')), true, 'the still-registered engine keeps its files')
+  assert.equal(existsSync(join(h.forkDir, SERVER)), true, 'the still-registered engine keeps its files')
   assert.deepEqual(fs.readdirSync(join(h.dataDir, 'engines', 'build')).sort(), ['myfork', 'otherfork'])
   assert.deepEqual(h.forgotten, [])
 })

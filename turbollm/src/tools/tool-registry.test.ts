@@ -455,6 +455,9 @@ process.stdin.on('data', (c) => {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n')
   }
 })
+// A real MCP server exits when its stdin closes. Without this the stub outlived its client: on Windows, where the
+// client spawns through cmd.exe and killing cmd.exe does not reach it, it kept the whole test process alive.
+process.stdin.on('end', () => process.exit(0))
 setInterval(() => {}, 1000)
 `
 
