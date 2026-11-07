@@ -8,6 +8,7 @@ import type { ReleaseProvenance } from './release-install'
 import { normRepoUrl, sameRepo } from './build-runner'
 import type { ModelEntry } from '../models/scanner'
 import { modelIncompatibility, type Incompatibility } from './compat'
+import type { SdkEngineInfo } from './sdk-engines'
 
 /** Auto-provisioned official builds live under `<dataDir>/engines/llama.cpp-…/`.
  *  User forks are arbitrary paths and are never auto-removed. */
@@ -301,8 +302,29 @@ export class Registry {
    *  llama-server), so llama.cpp capabilities/flags don't apply — its backend/context/threads go through a
    *  generated --config file instead (see litertLmProfileToConfig). Registration is otherwise identical to a
    *  single-binary engine, so it shares that path. */
-  addLitertLm(name: string, binPath: string, version: string): Engine {
-    return this.addSingleBinary('litert-lm', name || 'LiteRT-LM', binPath, version)
+  addLitertLm(name: string, binPath: string, version: string, opts: { fillEmptySelection?: boolean } = {}): Engine {
+    return this.addSingleBinary('litert-lm', name || 'LiteRT-LM', binPath, version, opts)
+  }
+
+  /** Insert or repair the SDK row for `info.id` (ADR-462). Identity = kind 'turbollm-sdk' + sdkEngine.id; a legacy row
+   *  (no sdkEngine, the M1 single row) is adopted when `adoptLegacy` is set, so it keeps its id and its settings.
+   *  Repairs name, baseUrl and the descriptor in place (same id). It never selects a row: the Android reconciler
+   *  decides that. The bearer token is per app process and read from the environment, so it is never stored. */
+  upsertSdkEngine(info: SdkEngineInfo, baseUrl: string, opts: { adoptLegacy?: boolean } = {}): Engine {
+    let out: Engine | undefined
+    this.store.update((c) => {
+      const row = findSdkRow(c.engines, info.id, opts.adoptLegacy === true) ?? pushNewSdkRow(c.engines)
+      row.name = info.name
+      row.baseUrl = baseUrl
+      row.sdkEngine = { id: info.id, kind: info.kind, formats: [...info.formats], backends: [...info.backends] }
+      out = structuredClone(row)
+    })
+    return out!
+  }
+
+  /** Every row of kind 'turbollm-sdk', in list order. */
+  sdkEngines(): Engine[] {
+    return this.store.snapshot().engines.filter((e) => e.kind === TURBOLLM_SDK_KIND)
   }
 
   /** Register the Android app's in-app engine (kind='turbollm-sdk'), an HTTP server at `baseUrl` with no binary.
@@ -342,7 +364,13 @@ export class Registry {
   /** Shared registration for a single-binary, non-llama-server engine kind (koboldcpp,
    *  llamafile, litert-lm). Mirrors addMlx/addVllm: no llama-server probe, empty capabilities, and
    *  replace-in-place when the same path is re-registered. */
-  private addSingleBinary(kind: string, name: string, binPath: string, version: string): Engine {
+  private addSingleBinary(
+    kind: string,
+    name: string,
+    binPath: string,
+    version: string,
+    opts: { fillEmptySelection?: boolean } = {},
+  ): Engine {
     const eng: Engine = {
       id: randomUUID(),
       name: name.trim() || kind,
@@ -359,7 +387,8 @@ export class Registry {
         eng.id = existing.id
       } else {
         c.engines.push(eng)
-        if (!c.activeEngineId) c.activeEngineId = eng.id // a new registration only (see addMlx)
+        // a new registration only (see addMlx)
+        if (!c.activeEngineId && opts.fillEmptySelection !== false) c.activeEngineId = eng.id
       }
     })
     return eng
@@ -605,6 +634,28 @@ export class Registry {
  *  Shared between {@link Registry.recordCustomSource}/{@link Registry.forgetCustomSource} and
  *  a live {@link Engine} so the two can be cross-referenced (same shape: sourceRepo?/
  *  sourceBranch?/sourceCommit?/binPath). */
+const TURBOLLM_SDK_KIND = 'turbollm-sdk'
+
+/** The row for the SDK engine `sdkEngineId`, else (when adopting) the legacy row that names no SDK engine. */
+function findSdkRow(engines: Engine[], sdkEngineId: string, adoptLegacy: boolean): Engine | undefined {
+  const sdkRows = engines.filter((e) => e.kind === TURBOLLM_SDK_KIND)
+  return sdkRows.find((e) => e.sdkEngine?.id === sdkEngineId) ?? (adoptLegacy ? sdkRows.find((e) => !e.sdkEngine) : undefined)
+}
+
+function pushNewSdkRow(engines: Engine[]): Engine {
+  const row: Engine = {
+    id: randomUUID(),
+    name: '',
+    binPath: '',
+    kind: TURBOLLM_SDK_KIND,
+    version: 'in-app',
+    capabilities: { kvTypes: [], flags: [] },
+    addedAt: new Date().toISOString(),
+  }
+  engines.push(row)
+  return row
+}
+
 export function customSourceKey(s: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; binPath: string }): string {
   if (!s.sourceRepo) return s.binPath
   return `${normRepoUrl(s.sourceRepo)}#${(s.sourceBranch ?? '').trim().toLowerCase()}#${(s.sourceCommit ?? '').trim().toLowerCase()}`
