@@ -3,9 +3,13 @@ import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import ProfileExtraStep from './ProfileExtraStep'
 import type { OnboardingCtx } from '../../../lib/onboarding/types'
+import type { Engine } from '../../../lib/types'
+import { activateEngine } from '../../../lib/api'
+
+const enginesState = vi.hoisted(() => ({ engines: [] as unknown[], activeEngineId: null as string | null }))
 
 vi.mock('../../../lib/queries', () => ({
-  useEngines: () => ({ data: { engines: [], activeEngineId: null } }),
+  useEngines: () => ({ data: { engines: enginesState.engines, activeEngineId: enginesState.activeEngineId } }),
 }))
 vi.mock('../../../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../lib/api')>()),
@@ -34,6 +38,32 @@ describe('ProfileExtraStep endpoint copy', () => {
 
     expect(execCommand).toHaveBeenCalledWith('copy')
     expect(await screen.findByRole('button', { name: 'Copied' })).toBeInTheDocument()
+  })
+})
+
+// QG-1 (ADR-462): the Pro engine picker listed the Android app's engines by their registered names
+// ("llama-server-android"), and the SDK's two engines are told apart only by their titles.
+describe('ProfileExtraStep Pro engine picker', () => {
+  const row = (over: Partial<Engine> & { id: string; name: string }): Engine =>
+    ({ binPath: '', version: '', capabilities: { kvTypes: [], flags: [] }, ...over })
+  const sdk = (id: string, sdkId: string, name: string) =>
+    row({ id, name, kind: 'turbollm-sdk', sdkEngine: { id: sdkId, kind: sdkId, formats: [], backends: ['cpu'] } })
+
+  it('names the three Android engines by their titles, and a tap still activates that row', async () => {
+    enginesState.engines = [
+      sdk('lit', 'litert-lm', 'LiteRT-LM'),
+      sdk('cpu', 'llama.cpp-cpu', 'llama.cpp (CPU)'),
+      row({ id: 'srv', name: 'llama-server-android', kind: 'llama-server' }),
+    ]
+    enginesState.activeEngineId = 'lit'
+    render(<ProfileExtraStep onContinue={vi.fn()} onSkip={vi.fn()} ctx={{ ...developerCtx, profile: 'pro' }} />)
+
+    const labels = screen.getAllByRole('button').map((b) => b.textContent).filter((t) => t !== 'Continue')
+    expect(labels).toEqual(['LiteRT-LM', 'llama.cpp (CPU)', 'llama.cpp server (CPU)'])
+    expect(screen.queryByText(/llama-server-android/)).toBeNull()
+
+    await userEvent.click(screen.getByRole('button', { name: 'llama.cpp server (CPU)' }))
+    expect(activateEngine).toHaveBeenCalledWith('srv')
   })
 })
 

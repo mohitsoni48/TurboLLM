@@ -246,6 +246,78 @@ describe('EnginesScreen — the Android app\'s built-in engines', () => {
   })
 })
 
+// ADR-462: the default Android build ships the SDK's two engines beside the spawned llama.cpp server; each card says
+// what it is, and the SDK's cards never read "TurboLLM SDK" or the raw "in-app".
+describe('EnginesScreen — the in-app SDK engines beside the llama.cpp server', () => {
+  const sdk = (id: string, sdkId: string, name: string, formats: Engine['formats']) =>
+    engine({ id, name, kind: 'turbollm-sdk', version: 'in-app', formats, sdkEngine: { id: sdkId, kind: sdkId, formats: formats ?? [], backends: ['cpu'] } })
+  const SDK_LLAMA = sdk('sdk-llama', 'llama.cpp-cpu', 'llama.cpp (CPU)', ['gguf'])
+  const SDK_LITERT = sdk('sdk-litert', 'litert-lm', 'LiteRT-LM', ['litertlm'])
+  const SERVER = engine({ id: 'srv', name: 'llama-server-android', kind: 'llama-server', binPath: '/data/app/lib/arm64/libllama_server.so', formats: ['gguf'] })
+  const SERVER_FOOTER = "Use this one for tools, image input and embeddings. The in-app engines don't run them yet."
+  const androidApp = (engines: Engine[]) => {
+    state.sys = { os: 'android/android', cpu: '', cores: 8, ramMB: 8000, gpus: [], bundledEnginesOnly: true }
+    state.engines = engines
+  }
+  const cardTitles = () => screen.getAllByText(/./, { selector: 'div.rounded-xl span.text-sm.font-semibold' }).map((s) => s.textContent)
+  const card = (title: string) => screen.getByText(title, { selector: 'span.font-semibold' }).closest('div.rounded-xl') as HTMLElement
+
+  it('lists LiteRT-LM, then llama.cpp (CPU), then the llama.cpp server, each with its detail', () => {
+    androidApp([SERVER, SDK_LLAMA, SDK_LITERT])
+    state.activeEngineId = SDK_LITERT.id
+    renderScreen()
+
+    expect(cardTitles()).toEqual(['LiteRT-LM', 'llama.cpp', 'llama.cpp server'])
+    expect(within(card('LiteRT-LM')).getByText('CPU · GPU')).toBeTruthy()
+    expect(within(card('llama.cpp')).getByText('CPU')).toBeTruthy()
+    expect(within(card('llama.cpp server')).getByText('CPU · tools, images')).toBeTruthy()
+    expect(screen.getByText('LiteRT-LM · CPU · GPU')).toBeTruthy()
+  })
+
+  it('never shows "TurboLLM SDK" or the raw "in-app" version, and says the SDK engines are built into the app', () => {
+    androidApp([SERVER, SDK_LLAMA, SDK_LITERT])
+    state.activeEngineId = SDK_LITERT.id
+    renderScreen()
+
+    expect(screen.queryByText(/TurboLLM SDK/)).toBeNull()
+    expect(screen.queryByText('in-app')).toBeNull()
+    expect(within(card('LiteRT-LM')).getByText('Built into the app')).toBeTruthy()
+    expect(within(card('llama.cpp')).getByText('Built into the app')).toBeTruthy()
+    expect((within(card('LiteRT-LM')).getByRole('button', { name: 'In use' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('takes each SDK card\'s copy from the runtime it is, without install, tools or vision lines', () => {
+    androidApp([SERVER, SDK_LLAMA, SDK_LITERT])
+    state.activeEngineId = SDK_LITERT.id
+    renderScreen()
+
+    expect(within(card('LiteRT-LM')).getByText("Google's on-device runtime")).toBeTruthy()
+    expect(within(card('llama.cpp')).getByText('The universal default')).toBeTruthy()
+    for (const title of ['LiteRT-LM', 'llama.cpp']) {
+      expect(within(card(title)).queryByText(/termux|python|cuda|install|tools|tool call|vision|image/i)).toBeNull()
+    }
+  })
+
+  it('says on the LiteRT-LM card that it runs .litertlm models, and on the server why it exists', () => {
+    androidApp([SERVER, SDK_LLAMA, SDK_LITERT])
+    state.activeEngineId = SDK_LITERT.id
+    renderScreen()
+
+    expect(within(card('LiteRT-LM')).getByText('Runs .litertlm models once it is selected')).toBeTruthy()
+    expect(within(card('llama.cpp server')).getByText(SERVER_FOOTER)).toBeTruthy()
+    expect(within(card('llama.cpp')).getByText('Updates with the app')).toBeTruthy()
+  })
+
+  it('keeps the server footer plain when no SDK engine is registered', () => {
+    androidApp([SERVER])
+    state.activeEngineId = SERVER.id
+    renderScreen()
+
+    expect(screen.queryByText(SERVER_FOOTER)).toBeNull()
+    expect(within(card('llama.cpp server')).getByText('Updates with the app')).toBeTruthy()
+  })
+})
+
 describe('EnginesScreen — the Laya catalog card', () => {
   it('offers Install, wired to the laya install endpoint', async () => {
     state.catalog = [LAYA_CATALOG]
