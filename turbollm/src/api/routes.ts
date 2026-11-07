@@ -82,6 +82,7 @@ import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
 import { engineFormats, engineWithholdsVision, modelIncompatibility } from '../engines/compat'
+import { litertlmHost, litertlmRunsHere } from '../models/litertlm'
 import { ScannerError, type ModelEntry } from '../models/scanner'
 import { automaticProfile, configuredCtx, estimateVram, legacySeedProfile, type LoadProfile, resolveProfile, userSetProfile } from '../models/profile'
 import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
@@ -3727,6 +3728,7 @@ export function registerApi(app: Hono, d: Deps): void {
       }
 
       let verifying = false
+      const host = litertlmHost()
       const files = detail.files.map((f) => {
         // 1) Provenance: downloaded via TurboLLM. sha256 is the exact-identity key. The
         //    (repo, filename) name fallback is UNCONDITIONAL for every row listed by its
@@ -3767,7 +3769,9 @@ export function registerApi(app: Hono, d: Deps): void {
             }
           }
         }
-        return { ...f, downloaded: !!local, localKey: local?.key ?? null }
+        // A .litertlm bundle says whether this device runs it (ADR-462): the web and onboarding read this one answer.
+        const runsHere = f.target ? { runsHere: litertlmRunsHere(f.target, host) } : {}
+        return { ...f, downloaded: !!local, localKey: local?.key ?? null, ...runsHere }
       })
       // Checkpoint rows (ADR-434 (h)) are annotated the same way, but by sha or destination
       // path: provenance `filename` is a basename, so two checkpoints' identical

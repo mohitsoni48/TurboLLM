@@ -6,7 +6,7 @@
 import { quantFromName } from '../gguf/gguf'
 import type { EngineFormatRef } from '../engines/compat'
 import { detectJev } from '../models/jev'
-import { litertlmQuantFromName } from '../models/litertlm'
+import { litertlmQuantFromName, litertlmTarget, type LitertlmTarget } from '../models/litertlm'
 import type { TextClassifierRuntime } from '../models/text-classifier'
 import { DownloadError } from '../downloads/downloads'
 import { findCheckpoints, MAX_CHECKPOINT_CONFIG_FETCHES, type HfCheckpoint } from './checkpoints'
@@ -141,6 +141,11 @@ export interface HfRepoFile {
    *  'INT4', 'Q8', '?', exactly what the library scanner's litertlmQuantFromName reads),
    *  so no field carries two meanings and Discover and the library agree on a file. */
   variant?: string
+  /** For a `.litertlm` bundle: the hardware it was built for, from its name (ADR-462, litertlmTarget). */
+  target?: LitertlmTarget
+  /** For a `.litertlm` bundle in the repo-detail reply: whether this device runs it (litertlmRunsHere), computed by the
+   *  route from the host it runs on. */
+  runsHere?: boolean
   /** HF LFS sha256 when published in the tree metadata; used for integrity. */
   sha256?: string
   /** Download URL for the first/only part (resolve/main). */
@@ -821,6 +826,7 @@ function litertlmFiles(entries: RawTreeEntry[], urlFor: (path: string) => string
       name: (basenameCount.get(base(e.path)) ?? 0) > 1 ? e.path : base(e.path),
       quant: litertlmQuantFromName(base(e.path)),
       variant: litertlmVariantLabel(prefix, e.path.replace(LITERTLM_RE, '')),
+      target: litertlmTarget(e.path),
       sizeBytes: sizeOf(e),
       parts: 1,
       mmproj: false,

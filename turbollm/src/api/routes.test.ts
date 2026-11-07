@@ -657,3 +657,49 @@ test('GET /api/v1/engines gives each row its formats, passes the SDK descriptor 
   assert.equal(body.activeEngineId, 'litert')
   assert.deepEqual(body.customDisabled, [{ ...disabled, binPathExists: false }])
 })
+
+// ADR-462 (plan D-12): the repo detail says, per .litertlm bundle, whether this device runs it. It is computed here,
+// from the host the daemon runs on (the app hands over its SoC), so the web and onboarding share one rule.
+test('GET /api/v1/hf/models/:owner/:name marks which .litertlm bundles run on this device', async (t) => {
+  const saved = { lib: process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR, soc: process.env.TURBOLLM_ANDROID_SOC }
+  t.after(() => {
+    for (const [name, value] of [['TURBOLLM_ANDROID_NATIVE_LIB_DIR', saved.lib], ['TURBOLLM_ANDROID_SOC', saved.soc]] as const) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  })
+  process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = '/data/app/com.turbollm/lib/arm64'
+  process.env.TURBOLLM_ANDROID_SOC = 'Qualcomm SM8550'
+  const bundle = (name: string, target: unknown) => ({ name, quant: '?', sizeBytes: 1, parts: 1, mmproj: false, litertlm: true, url: 'u', target })
+  const detail = {
+    repo: 'litert-community/Gemma3-1B-IT', gated: false, license: 'gemma', downloads: 1, likes: 1, card: '', litertlm: true,
+    files: [
+      bundle('Gemma3-1B-IT_int4.litertlm', { kind: 'any' }),
+      bundle('Gemma3-1B-IT_q4_ekv1280_sm8550.litertlm', { kind: 'soc', soc: 'SM8550' }),
+      bundle('Gemma3-1B-IT_q4_ekv1280_sm8650.litertlm', { kind: 'soc', soc: 'SM8650' }),
+      bundle('Gemma3-1B-IT-web.litertlm', { kind: 'web' }),
+    ],
+  }
+
+  const res = await appWithRepoDetail(detail, [], []).request('/api/v1/hf/models/litert-community/Gemma3-1B-IT')
+
+  assert.equal(res.status, 200)
+  const body = (await res.json()) as { files: { name: string; runsHere?: boolean }[] }
+  assert.deepEqual(body.files.map((f) => [f.name, f.runsHere]), [
+    ['Gemma3-1B-IT_int4.litertlm', true],
+    ['Gemma3-1B-IT_q4_ekv1280_sm8550.litertlm', true],
+    ['Gemma3-1B-IT_q4_ekv1280_sm8650.litertlm', false],
+    ['Gemma3-1B-IT-web.litertlm', false],
+  ])
+})
+
+test('GET /api/v1/hf/models/:owner/:name adds no runsHere to a GGUF file', async () => {
+  const detail = {
+    repo: 'unsloth/Qwen3-GGUF', gated: false, license: 'apache-2.0', downloads: 1, likes: 1, card: '',
+    files: [{ name: 'Qwen3-Q4_K_M.gguf', quant: 'Q4_K_M', sizeBytes: 1, parts: 1, mmproj: false, url: 'u' }],
+  }
+  const body = (await (await appWithRepoDetail(detail, [], []).request('/api/v1/hf/models/unsloth/Qwen3-GGUF')).json()) as {
+    files: Record<string, unknown>[]
+  }
+  assert.equal('runsHere' in body.files[0], false)
+})

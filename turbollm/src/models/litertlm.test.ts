@@ -15,7 +15,12 @@ import {
   litertlmHeaderFromFile,
   litertlmNativeCtxFromFile,
   litertlmNativeCtxFromName,
+  litertlmHost,
   litertlmQuantFromName,
+  litertlmRunsHere,
+  litertlmTarget,
+  type LitertlmHost,
+  type LitertlmTarget,
 } from './litertlm'
 import { tmpDir } from '../test-support/tmp'
 import { fakeLitertlmBundle as fakeBundle, fakeLitertlmBundleOf, fakeLlmMetadata } from '../test-support/litertlm-bundle'
@@ -415,4 +420,97 @@ test('litertlmHeaderFromFile and litertlmEntryFor: the entry carries the bundle\
   assert.deepEqual(h.sampler, { topK: 20, topP: 0.95, temp: 0.6 })
   assert.deepEqual(litertlmEntryFor(p, dir, 10, 0, h).sampler, { topK: 20, topP: 0.95, temp: 0.6 })
   assert.equal('sampler' in litertlmEntryFor(p, dir, 10, 0, { sampler: null }), false)
+})
+
+// ADR-462 (plan D-12): each .litertlm bundle says which hardware it was built for, and whether this device runs it. A
+// phone faced 9-11 bundles per repo, most for another SoC, an NPU, Intel or a browser (architecture §3.9, live tree
+// reads 2026-11-07). The exact HF file names are not available offline, so these are the names the hf.litertlm fixtures
+// already use (the default bundle, -gpu, -web, _Google_Tensor_G5, _q4_ekv1280_mt6989) and, for the rest, that same
+// naming with each suffix §3.9's table names.
+
+const GEMMA4_E2B: [string, LitertlmTarget][] = [
+  ['gemma-4-E2B-it.litertlm', { kind: 'any' }],
+  ['gemma-4-E2B-it-gpu.litertlm', { kind: 'gpu' }],
+  ['gemma-4-E2B-it-web.litertlm', { kind: 'web' }],
+  ['gemma-4-E2B-it_Google_Tensor_G5.litertlm', { kind: 'soc', soc: 'GOOGLE_TENSOR_G5' }],
+  ['gemma-4-E2B-it_Google_Tensor_G6.litertlm', { kind: 'soc', soc: 'GOOGLE_TENSOR_G6' }],
+  ['gemma-4-E2B-it_npu_uncompiled.litertlm', { kind: 'npu' }],
+  ['gemma-4-E2B-it_Qualcomm_QCS8275.litertlm', { kind: 'soc', soc: 'QCS8275' }],
+  ['gemma-4-E2B-it_Intel_LNL.litertlm', { kind: 'desktop' }],
+  ['gemma-4-E2B-it_Intel_PTL.litertlm', { kind: 'desktop' }],
+]
+
+const GEMMA3_1B: [string, LitertlmTarget][] = [
+  ['Gemma3-1B-IT_int4.litertlm', { kind: 'any' }],
+  ['Gemma3-1B-IT_q8_ekv4096.litertlm', { kind: 'any' }],
+  ['Gemma3-1B-IT_gpu_composite_q4.litertlm', { kind: 'gpu' }],
+  ['Gemma3-1B-IT_q4_ekv1280_mt6989.litertlm', { kind: 'soc', soc: 'MT6989' }],
+  ['Gemma3-1B-IT_q4_ekv1280_mt6991.litertlm', { kind: 'soc', soc: 'MT6991' }],
+  ['Gemma3-1B-IT_q4_ekv1280_mt6993.litertlm', { kind: 'soc', soc: 'MT6993' }],
+  ['Gemma3-1B-IT_q4_ekv1280_sm8550.litertlm', { kind: 'soc', soc: 'SM8550' }],
+  ['Gemma3-1B-IT_q4_ekv1280_sm8650.litertlm', { kind: 'soc', soc: 'SM8650' }],
+  ['Gemma3-1B-IT_q4_ekv1280_sm8750.litertlm', { kind: 'soc', soc: 'SM8750' }],
+  ['Gemma3-1B-IT_q4_ekv1280_sm8850.litertlm', { kind: 'soc', soc: 'SM8850' }],
+  ['Gemma3-1B-IT_q4_ekv1280_Google_Tensor_G5.litertlm', { kind: 'soc', soc: 'GOOGLE_TENSOR_G5' }],
+]
+
+test('litertlmTarget: the nine gemma-4-E2B-it bundles', () => {
+  for (const [name, target] of GEMMA4_E2B) assert.deepEqual(litertlmTarget(name), target, name)
+})
+
+test('litertlmTarget: the eleven Gemma3-1B-IT bundles', () => {
+  for (const [name, target] of GEMMA3_1B) assert.deepEqual(litertlmTarget(name), target, name)
+})
+
+test('litertlmTarget: the first matching rule wins, and a subfolder or case changes nothing', () => {
+  assert.deepEqual(litertlmTarget('gpu/model_web.litertlm'), { kind: 'web' })
+  assert.deepEqual(litertlmTarget('MODEL-GPU.LITERTLM'), { kind: 'gpu' })
+  assert.deepEqual(litertlmTarget('model_sm8550_gpu.litertlm'), { kind: 'soc', soc: 'SM8550' })
+})
+
+const ANDROID_UNKNOWN_SOC = { android: true, soc: '' }
+const ANDROID_SM8550 = { android: true, soc: 'Qualcomm SM8550' }
+const ANDROID_TENSOR_G5 = { android: true, soc: 'Google Tensor G5' }
+const DESKTOP = { android: false, soc: '' }
+const runsOn = (host: LitertlmHost) => [...GEMMA4_E2B, ...GEMMA3_1B]
+  .filter(([, target]) => litertlmRunsHere(target, host))
+  .map(([name]) => name)
+
+test('litertlmRunsHere: a phone with an unknown SoC runs the any and GPU bundles, no SoC one', () => {
+  assert.deepEqual(runsOn(ANDROID_UNKNOWN_SOC), [
+    'gemma-4-E2B-it.litertlm', 'gemma-4-E2B-it-gpu.litertlm',
+    'Gemma3-1B-IT_int4.litertlm', 'Gemma3-1B-IT_q8_ekv4096.litertlm', 'Gemma3-1B-IT_gpu_composite_q4.litertlm',
+  ])
+})
+
+test('litertlmRunsHere: a Qualcomm SM8550 phone runs the SM8550 bundle and not the SM8650 one', () => {
+  assert.equal(litertlmRunsHere({ kind: 'soc', soc: 'SM8550' }, ANDROID_SM8550), true)
+  assert.equal(litertlmRunsHere({ kind: 'soc', soc: 'SM8650' }, ANDROID_SM8550), false)
+  assert.equal(litertlmRunsHere({ kind: 'soc', soc: 'SM855' }, ANDROID_SM8550), false, 'a whole token, not a prefix')
+})
+
+test('litertlmRunsHere: a Google Tensor G5 phone runs both Tensor G5 bundles and not the G6 one', () => {
+  const tensor = runsOn(ANDROID_TENSOR_G5).filter((name) => /tensor/i.test(name))
+  assert.deepEqual(tensor, ['gemma-4-E2B-it_Google_Tensor_G5.litertlm', 'Gemma3-1B-IT_q4_ekv1280_Google_Tensor_G5.litertlm'])
+})
+
+test('litertlmRunsHere: a phone never runs a WEB, NPU or desktop bundle', () => {
+  for (const kind of ['web', 'npu', 'desktop'] as const) assert.equal(litertlmRunsHere({ kind }, ANDROID_SM8550), false, kind)
+})
+
+test('litertlmRunsHere: a desktop runs any, GPU and desktop bundles, and no SoC one', () => {
+  assert.deepEqual(runsOn(DESKTOP), [
+    'gemma-4-E2B-it.litertlm', 'gemma-4-E2B-it-gpu.litertlm', 'gemma-4-E2B-it_Intel_LNL.litertlm',
+    'gemma-4-E2B-it_Intel_PTL.litertlm', 'Gemma3-1B-IT_int4.litertlm', 'Gemma3-1B-IT_q8_ekv4096.litertlm',
+    'Gemma3-1B-IT_gpu_composite_q4.litertlm',
+  ])
+  assert.equal(litertlmRunsHere({ kind: 'soc', soc: 'SM8550' }, { android: false, soc: 'Qualcomm SM8550' }), false)
+})
+
+test('litertlmHost: the packaged app is Android, with the SoC the app hands over; anything else is a desktop', () => {
+  assert.deepEqual(litertlmHost({ TURBOLLM_ANDROID_NATIVE_LIB_DIR: '/app/lib', TURBOLLM_ANDROID_SOC: 'Qualcomm SM8350' }), {
+    android: true, soc: 'Qualcomm SM8350',
+  })
+  assert.deepEqual(litertlmHost({ TURBOLLM_ANDROID_NATIVE_LIB_DIR: '/app/lib' }), { android: true, soc: '' })
+  assert.deepEqual(litertlmHost({ TURBOLLM_ANDROID_SOC: 'Qualcomm SM8350' }), { android: false, soc: 'Qualcomm SM8350' })
 })

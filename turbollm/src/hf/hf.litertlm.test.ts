@@ -309,3 +309,20 @@ test('browseModels under sglang (safetensors) asks for no facet, like vLLM', asy
     globalThis.fetch = real
   }
 })
+
+// ADR-462 (plan D-12): each bundle in the repo detail carries the hardware it targets, beside its unchanged variant label.
+test('a .litertlm repo detail gives each bundle its hardware target, and the variant labels are unchanged', async () => {
+  const stub = stubHf(LITERT_TREE)
+  try {
+    const detail = await client().getRepo(stub.repo)
+    const byName = (name: string) => detail.files.find((f) => f.name === name)
+    assert.deepEqual(byName('gemma-4-E2B-it.litertlm')?.target, { kind: 'any' })
+    assert.deepEqual(byName('gemma-4-E2B-it-gpu.litertlm')?.target, { kind: 'gpu' })
+    assert.deepEqual(byName('gemma-4-E2B-it-web.litertlm')?.target, { kind: 'web' })
+    assert.deepEqual(byName('gemma-4-E2B-it_Google_Tensor_G5.litertlm')?.target, { kind: 'soc', soc: 'GOOGLE_TENSOR_G5' })
+    assert.deepEqual(detail.files.map((f) => f.variant), ['GPU', 'WEB', 'Default', 'Google Tensor G5'])
+    assert.equal(detail.files.length, 4, 'no bundle is dropped: folding is the web\'s job')
+  } finally {
+    stub.restore()
+  }
+})
