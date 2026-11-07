@@ -69,7 +69,7 @@ const ofKind = (actions: AndroidEngineAction[], ...kinds: AndroidEngineAction['k
 const STRUCTURAL: AndroidEngineAction['kind'][] = ['register-bundled', 'reinstate-bundled', 'retire', 'copy-state']
 
 test('a fresh install with both SDK engines: two upserts (the gguf one adopts) and the CPU file registered', () => {
-  assert.deepEqual(planAndroidEngines(input()), [
+  assert.deepEqual(planAndroidEngines(input()).filter((a) => a.kind !== 'activate'), [
     { kind: 'upsert-sdk', info: LLAMA_INFO, adoptLegacy: true },
     { kind: 'upsert-sdk', info: LITERT_INFO, adoptLegacy: false },
     { kind: 'register-bundled', name: ANDROID_ENGINE_NAME, file: CPU_FILE },
@@ -87,7 +87,9 @@ test('adoptLegacy goes to the first available entry that reads gguf, wherever it
 })
 
 test('an unreadable SDK list repairs the SDK URL and registers or retires no SDK row', () => {
-  const actions = planAndroidEngines(input({ engines: [LLAMA_SDK_ROW, CPU_ROW], sdk: { baseUrl: SDK_URL, engines: null } }))
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, CPU_ROW], activeEngineId: LLAMA_SDK_ROW.id, sdk: { baseUrl: SDK_URL, engines: null },
+  }))
   assert.deepEqual(actions, [
     { kind: 'repair-sdk-url', baseUrl: SDK_URL },
     { kind: 'repair-bundled', name: ANDROID_ENGINE_NAME, file: CPU_FILE },
@@ -95,7 +97,7 @@ test('an unreadable SDK list repairs the SDK URL and registers or retires no SDK
 })
 
 test('without the SDK this launch, no SDK action at all', () => {
-  const actions = planAndroidEngines(input({ engines: [LLAMA_SDK_ROW, CPU_ROW], sdk: null }))
+  const actions = planAndroidEngines(input({ engines: [LLAMA_SDK_ROW, CPU_ROW], activeEngineId: CPU_ROW.id, sdk: null }))
   assert.deepEqual(actions, [{ kind: 'repair-bundled', name: ANDROID_ENGINE_NAME, file: CPU_FILE }])
 })
 
@@ -186,4 +188,129 @@ test('planning over an upgraded result (legacy adopted, server row retired and c
     retired: { [ANDROID_LITERT_LM_ENGINE_NAME]: retiredEntry(LITERT_SERVER_ROW, LITERT_SDK_ROW.id) },
   }))
   assert.deepEqual(ofKind(actions, ...STRUCTURAL), [])
+})
+
+// Rule 4 (plan D-6): an engine is activated only on a fresh install or when nothing usable is active, and then by what
+// can read lastLoaded (I-4, I-5). ADR-455 plan R-5 ("the SDK row is activated when first registered") is superseded.
+
+const GGUF_LAST = 'qwen|Q4_K_M|1'
+const LITERT_LAST = 'gemma|litertlm|2'
+
+const activations = (actions: AndroidEngineAction[]) => ofKind(actions, 'activate')
+const activates = (engineId: string): AndroidEngineAction[] => [{ kind: 'activate', engineId }]
+
+test('a fresh install activates LiteRT-LM', () => {
+  assert.deepEqual(activations(planAndroidEngines(input())), activates('litert-lm'))
+})
+
+test('a fresh install with no available LiteRT-LM entry activates the llama.cpp SDK row', () => {
+  const sdk = { baseUrl: SDK_URL, engines: [LLAMA_INFO, { ...LITERT_INFO, available: false }] }
+  assert.deepEqual(activations(planAndroidEngines(input({ sdk }))), activates('llama.cpp-cpu'))
+})
+
+test('a fresh install with the SDK not started activates the spawned CPU row it registers', () => {
+  assert.deepEqual(activations(planAndroidEngines(input({ sdk: null }))), activates(ANDROID_ENGINE_NAME))
+})
+
+test('R-5 superseded (ADR-462, D-17): a v1.15.0 user on llama-server-android with a GGUF last model stays on it', () => {
+  const actions = planAndroidEngines(input({
+    engines: [CPU_ROW, LITERT_SERVER_ROW], activeEngineId: CPU_ROW.id, lastLoaded: { modelKey: GGUF_LAST, engineId: CPU_ROW.id },
+  }))
+  assert.deepEqual(activations(actions), [])
+})
+
+test('a v1.15.0 user on litert-lm-android with a .litertlm last model: settings copied, LiteRT-LM SDK row activated', () => {
+  const actions = planAndroidEngines(input({
+    engines: [CPU_ROW, LITERT_SERVER_ROW],
+    activeEngineId: LITERT_SERVER_ROW.id,
+    lastLoaded: { modelKey: LITERT_LAST, engineId: LITERT_SERVER_ROW.id },
+  }))
+  assert.deepEqual(ofKind(actions, 'copy-state', 'activate'), [
+    { kind: 'copy-state', from: LITERT_SERVER_ROW.id, to: 'litert-lm', format: 'litertlm' },
+    { kind: 'activate', engineId: 'litert-lm' },
+  ])
+})
+
+test('the M1 legacy row with a GGUF last model stays active', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LEGACY_ROW, CPU_ROW], activeEngineId: LEGACY_ROW.id, lastLoaded: { modelKey: GGUF_LAST, engineId: LEGACY_ROW.id },
+  }))
+  assert.deepEqual(activations(actions), [])
+})
+
+test('the M1 legacy row with a .litertlm last model moves to the LiteRT-LM row, once', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LEGACY_ROW, CPU_ROW], activeEngineId: LEGACY_ROW.id, lastLoaded: { modelKey: LITERT_LAST, engineId: LEGACY_ROW.id },
+  }))
+  assert.deepEqual(activations(actions), activates('litert-lm'))
+  const adopted = sdkRow(LEGACY_ROW.id, LLAMA_INFO)
+  const next = planAndroidEngines(input({
+    engines: [adopted, LITERT_SDK_ROW, CPU_ROW], activeEngineId: adopted.id, lastLoaded: { modelKey: LITERT_LAST, engineId: adopted.id },
+  }))
+  assert.deepEqual(activations(next), [], 'the adopted row is no longer the legacy row, so the user\'s pick stands')
+})
+
+test('the active row retired while lastLoaded is GGUF lands on a GGUF row, never LiteRT-LM', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW, VK_ROW],
+    activeEngineId: VK_ROW.id,
+    lastLoaded: { modelKey: GGUF_LAST, engineId: VK_ROW.id },
+  }))
+  assert.deepEqual(activations(actions), activates(LLAMA_SDK_ROW.id))
+})
+
+test('with the SDK list unreadable and an SDK row active, nothing is activated', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW], activeEngineId: LITERT_SDK_ROW.id, sdk: { baseUrl: SDK_URL, engines: null },
+  }))
+  assert.deepEqual(activations(actions), [])
+})
+
+test('with the SDK not started and an SDK row active, the CPU row takes over; without its file, nothing does', () => {
+  const engines = [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW]
+  const withCpu = planAndroidEngines(input({ engines, activeEngineId: LITERT_SDK_ROW.id, sdk: null }))
+  assert.deepEqual(activations(withCpu), activates(CPU_ROW.id))
+  const withoutCpu = planAndroidEngines(input({ engines, activeEngineId: LITERT_SDK_ROW.id, sdk: null, nativeLibFiles: new Set() }))
+  assert.deepEqual(activations(withoutCpu), [])
+})
+
+test('an active SDK engine that becomes unavailable is replaced by the row that reads lastLoaded', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW],
+    activeEngineId: LITERT_SDK_ROW.id,
+    lastLoaded: { modelKey: GGUF_LAST, engineId: LITERT_SDK_ROW.id },
+    sdk: { baseUrl: SDK_URL, engines: [LLAMA_INFO, { ...LITERT_INFO, available: false }] },
+  }))
+  assert.deepEqual(activations(actions), activates(LLAMA_SDK_ROW.id))
+})
+
+test('lastLoaded\'s own row is not chosen when it cannot read the last model\'s format', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW], activeEngineId: '', lastLoaded: { modelKey: LITERT_LAST, engineId: CPU_ROW.id },
+  }))
+  assert.deepEqual(activations(actions), activates(LITERT_SDK_ROW.id))
+})
+
+test('lastLoaded\'s own row is chosen when it is live and reads the format', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW], activeEngineId: '', lastLoaded: { modelKey: GGUF_LAST, engineId: CPU_ROW.id },
+  }))
+  assert.deepEqual(activations(actions), activates(CPU_ROW.id))
+})
+
+test('a user-added engine that is active stays active', () => {
+  const userEngine = row('mine', 'My llama.cpp', 'llama-server', { binPath: '/sdcard/llama-server' })
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW, userEngine],
+    activeEngineId: userEngine.id,
+    lastLoaded: { modelKey: LITERT_LAST, engineId: userEngine.id },
+  }))
+  assert.deepEqual(activations(actions), [])
+})
+
+test('planning over the activated fresh install activates nothing again', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW], activeEngineId: LITERT_SDK_ROW.id,
+  }))
+  assert.deepEqual(ofKind(actions, ...STRUCTURAL, 'activate'), [])
 })

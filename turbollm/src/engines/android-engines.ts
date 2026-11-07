@@ -56,7 +56,8 @@ export interface AndroidEngineInput {
   formatOf: (modelKey: string) => ModelFormat | undefined
 }
 
-/** `copy-state` names its target by SDK engine id: a new row's id exists only once the applier has upserted it. */
+/** `copy-state` names its target, and `activate` a row this start creates, by SDK engine id (or, for a spawned row
+ *  registered this start, its bundled name): a new row's id exists only once the applier has added it. */
 export type AndroidEngineAction =
   | { kind: 'upsert-sdk'; info: SdkEngineInfo; adoptLegacy: boolean }
   | { kind: 'repair-sdk-url'; baseUrl: string }
@@ -66,10 +67,12 @@ export type AndroidEngineAction =
   | { kind: 'copy-state'; from: string; to: string; format: ModelFormat }
   | { kind: 'activate'; engineId: string }
 
-/** What the reconciler does this start, in order: SDK rows (rule 1), spawned rows (rule 2), the one copy (rule 3). */
+/** What the reconciler does this start, in order: SDK rows (rule 1), spawned rows (rule 2), the one copy (rule 3), and
+ *  at most one activation (rule 4). */
 export function planAndroidEngines(input: AndroidEngineInput): AndroidEngineAction[] {
   const rows = [...planSdkRows(input), ...planBundledRows(input)]
-  return [...rows, ...planCopies(input, rows)]
+  const activation = planActivation(input, rows)
+  return [...rows, ...planCopies(input, rows), ...activation]
 }
 
 /** Rule 1: one upsert per available SDK engine, the first reading GGUF adopting the M1 row; an SDK row whose engine is
@@ -107,6 +110,150 @@ function planCopies(input: AndroidEngineInput, rows: AndroidEngineAction[]): And
   return [litertServerSource(input, rows), adoptedLegacySource(input, rows)]
     .filter((from): from is string => from !== undefined)
     .map((from) => ({ kind: 'copy-state', from, to: SDK_LITERT_ENGINE_ID, format: 'litertlm' }))
+}
+
+/** Rule 4: an engine is activated only on a fresh install, when nothing usable is active, for the M1 row with a
+ *  `.litertlm` last model, or when the SDK did not start while an SDK row is active. Never over a live, runnable pick
+ *  (I-4), and when nothing usable is active, onto the row that reads lastLoaded (I-5). */
+function planActivation(input: AndroidEngineInput, rows: AndroidEngineAction[]): AndroidEngineAction[] {
+  const target = activationTarget(input, rows, liveRowsAfter(input, rows))
+  return target !== undefined && target !== input.activeEngineId ? [{ kind: 'activate', engineId: target }] : []
+}
+
+function activationTarget(input: AndroidEngineInput, rows: AndroidEngineAction[], live: PlannedRow[]): string | undefined {
+  const lastFormat = input.lastLoaded.modelKey ? input.formatOf(input.lastLoaded.modelKey) : undefined
+  const active = activeRow(input)
+  if (!active || isRetiredBy(rows, active.id)) {
+    return isFreshInstall(input) ? defaultRow(live)?.ref : rowForLastLoaded(input, live, lastFormat)?.ref
+  }
+  if (isLegacySdkRow(active) && lastFormat === 'litertlm') return sdkRowOf(live, SDK_LITERT_ENGINE_ID)?.ref
+  if (input.sdk === null && active.kind === TURBOLLM_SDK_KIND) return spawnedCpuRow(live)?.ref
+  return undefined
+}
+
+/** No app-owned row (spawned or SDK), nothing remembered as retired, and no model ever loaded. */
+function isFreshInstall({ engines, retired, lastLoaded }: AndroidEngineInput): boolean {
+  return !engines.some(isAppOwnedRow) && Object.keys(retired).length === 0 && lastLoaded.modelKey === ''
+}
+
+/** lastLoaded's own row when it is live and reads the last model's format; else the first app row that reads it (SDK
+ *  rows in catalog order, then spawned rows); with no known format, the fresh-install default. A known format no row
+ *  reads activates nothing rather than strand lastLoaded on an engine that cannot load it. */
+function rowForLastLoaded(
+  input: AndroidEngineInput,
+  live: PlannedRow[],
+  lastFormat: ModelFormat | undefined,
+): PlannedRow | undefined {
+  const own = live.find((r) => r.ref === input.lastLoaded.engineId)
+  if (own && (lastFormat === undefined || own.formats.includes(lastFormat))) return own
+  if (lastFormat === undefined) return defaultRow(live)
+  return live.find((r) => r.origin !== 'other' && r.formats.includes(lastFormat))
+}
+
+/** The fresh-install default (founder Q2): the SDK's LiteRT-LM row, else the first SDK row reading GGUF, else the
+ *  spawned CPU row. */
+function defaultRow(live: PlannedRow[]): PlannedRow | undefined {
+  return sdkRowOf(live, SDK_LITERT_ENGINE_ID)
+    ?? live.find((r) => r.origin === 'sdk' && r.formats.includes('gguf'))
+    ?? spawnedCpuRow(live)
+}
+
+function sdkRowOf(live: PlannedRow[], sdkEngineId: string): PlannedRow | undefined {
+  return live.find((r) => r.origin === 'sdk' && r.sdkEngineId === sdkEngineId)
+}
+
+function spawnedCpuRow(live: PlannedRow[]): PlannedRow | undefined {
+  return live.find((r) => r.origin === 'bundled' && r.bundledName === ANDROID_ENGINE_NAME)
+}
+
+/** A row as it will be once the plan is applied. `ref` is its id, or, for a row the plan creates, the SDK engine id
+ *  (upsert-sdk) or the bundled name (register-bundled), which the applier resolves to the new row's id. */
+interface PlannedRow {
+  ref: string
+  origin: 'sdk' | 'bundled' | 'other'
+  sdkEngineId?: string
+  bundledName?: string
+  formats: ModelFormat[]
+}
+
+/** The rows that can run after the plan: SDK rows (none when the SDK did not start), spawned rows whose file ships,
+ *  then every other row, in that order. */
+function liveRowsAfter(input: AndroidEngineInput, rows: AndroidEngineAction[]): PlannedRow[] {
+  return [...liveSdkRows(input, rows), ...liveBundledRows(input, rows), ...otherRows(input)]
+}
+
+function liveSdkRows({ sdk, engines }: AndroidEngineInput, rows: AndroidEngineAction[]): PlannedRow[] {
+  if (!sdk) return []
+  const kept = engines.filter((e) => e.kind === TURBOLLM_SDK_KIND && !isRetiredBy(rows, e.id))
+  if (!sdk.engines) return kept.map(plannedSdkRow)
+  const upserted = rows.filter(isUpsert).map((a): PlannedRow => ({
+    ref: rowUpsertedBy(engines, a)?.id ?? a.info.id, origin: 'sdk', sdkEngineId: a.info.id, formats: a.info.formats,
+  }))
+  const legacyLeft = kept.filter((e) => isLegacySdkRow(e) && !upserted.some((r) => r.ref === e.id))
+  return [...upserted, ...legacyLeft.map(plannedSdkRow)]
+}
+
+function liveBundledRows({ engines, retired }: AndroidEngineInput, rows: AndroidEngineAction[]): PlannedRow[] {
+  return ANDROID_BUNDLED_ENGINES.flatMap(({ name, kind }): PlannedRow[] => {
+    const action = rows.filter(isBundledKeep).find((a) => a.name === name)
+    if (!action) return []
+    return [{ ref: bundledRef(action, engines, retired), origin: 'bundled', bundledName: name, formats: kindFormats(kind) }]
+  })
+}
+
+/** The id a kept spawned row will have: its own, the remembered one, or (a new registration) its bundled name. */
+function bundledRef(action: BundledKeep, engines: Engine[], retired: AndroidEngineInput['retired']): string {
+  if (action.kind === 'reinstate-bundled') return retired[action.name].id
+  if (action.kind === 'repair-bundled') return ownBundledRow(engines, action.name, action.file)?.id ?? action.name
+  return action.name
+}
+
+function otherRows({ engines }: AndroidEngineInput): PlannedRow[] {
+  return engines.filter((e) => !isAppOwnedRow(e)).map((e) => ({ ref: e.id, origin: 'other', formats: rowFormats(e) }))
+}
+
+function plannedSdkRow(engine: Engine): PlannedRow {
+  return { ref: engine.id, origin: 'sdk', sdkEngineId: engine.sdkEngine?.id, formats: rowFormats(engine) }
+}
+
+/** The existing row an upsert lands on, as Registry.upsertSdkEngine finds it. */
+function rowUpsertedBy(engines: Engine[], { info, adoptLegacy }: UpsertSdk): Engine | undefined {
+  const sdkRows = engines.filter((e) => e.kind === TURBOLLM_SDK_KIND)
+  return sdkRows.find((e) => e.sdkEngine?.id === info.id) ?? (adoptLegacy ? sdkRows.find(isLegacySdkRow) : undefined)
+}
+
+type UpsertSdk = Extract<AndroidEngineAction, { kind: 'upsert-sdk' }>
+type BundledKeep = Extract<AndroidEngineAction, { kind: 'register-bundled' | 'repair-bundled' | 'reinstate-bundled' }>
+
+function isUpsert(action: AndroidEngineAction): action is UpsertSdk {
+  return action.kind === 'upsert-sdk'
+}
+
+function isBundledKeep(action: AndroidEngineAction): action is BundledKeep {
+  return action.kind === 'register-bundled' || action.kind === 'repair-bundled' || action.kind === 'reinstate-bundled'
+}
+
+/** The formats a row reads. TODO(D-8): replaced by compat's engineFormats, which this table mirrors for the kinds an
+ *  Android start can hold. */
+function rowFormats(engine: Engine): ModelFormat[] {
+  if (engine.sdkEngine) return engine.sdkEngine.formats
+  return kindFormats(engine.kind)
+}
+
+function kindFormats(kind: string): ModelFormat[] {
+  if (kind === TURBOLLM_SDK_KIND) return ['gguf', 'litertlm']
+  if (kind === 'litert-lm') return ['litertlm']
+  if (kind === 'llama-server') return ['gguf']
+  return []
+}
+
+function activeRow({ engines, activeEngineId }: AndroidEngineInput): Engine | undefined {
+  return activeEngineId ? engines.find((e) => e.id === activeEngineId) : undefined
+}
+
+function isAppOwnedRow(engine: Engine): boolean {
+  return engine.kind === TURBOLLM_SDK_KIND
+    || ANDROID_BUNDLED_ENGINES.some(({ name, file }) => engine.name === name && basename(engine.binPath) === file)
 }
 
 /** The litert-lm-android row whose settings still need the copy: retired by this plan, or remembered and not copied. */
