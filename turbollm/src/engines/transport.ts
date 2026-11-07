@@ -59,6 +59,8 @@ export interface SdkLoadRequest {
   contextSize?: number
   threads?: number
   backend: 'auto' | 'cpu' | 'gpu'
+  /** The SDK engine to load on (ADR-462); absent on the M1 legacy row, which the SDK routes by format. */
+  engine?: string
 }
 
 /** What the SDK's status reports about the model it has loaded. */

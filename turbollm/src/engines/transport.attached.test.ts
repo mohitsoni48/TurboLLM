@@ -6,6 +6,8 @@ import { test } from 'node:test'
 import type { ChildProcess } from 'node:child_process'
 import { AttachedTransport, SdkEngineError, SpawnedTransport } from './transport'
 import { fakeSdk, sdkAccepted, sdkStatus } from '../test-support/fake-sdk'
+import type { Engine } from '../config/config'
+import { sdkLoadRequest, type StartOpts } from './manager'
 
 const SDK_URL = 'http://sdk.invalid:1'
 const LOAD = { path: '/data/models/qwen.gguf', backend: 'auto' as const }
@@ -159,4 +161,38 @@ test('a spawned engine is forced to stop after a grace; the SDK engine is not', 
   const neverStarted = {} as ChildProcess
   assert.equal(new SpawnedTransport(neverStarted, 1, Promise.resolve()).forcesStop(), true)
   assert.equal(new AttachedTransport(SDK_URL, () => 'tok').forcesStop(), false)
+})
+
+// ADR-462 (plan D-9): a load on an SDK row names that row's SDK engine, so the SDK refuses a model the engine cannot
+// read instead of routing it to whichever engine reads its format. The M1 legacy row names none: the SDK routes it by
+// format, as before.
+
+function sdkRowOpts(sdkEngine?: Engine['sdkEngine']): StartOpts {
+  const engine: Engine = {
+    id: 'row', name: 'LiteRT-LM', binPath: '', kind: 'turbollm-sdk', version: 'in-app', baseUrl: SDK_URL,
+    capabilities: { kvTypes: [], flags: [] }, addedAt: '', ...(sdkEngine ? { sdkEngine } : {}),
+  }
+  return { engine, model: { key: 'k', name: 'qwen', quant: 'Q4_K_M', ctx: 4096, vision: false }, modelPath: LOAD.path, extraArgs: [] }
+}
+
+test('a load on the LiteRT-LM SDK row names its engine in the body', () => {
+  const opts = sdkRowOpts({ id: 'litert-lm', kind: 'litert-lm', formats: ['litertlm'], backends: ['gpu', 'cpu'] })
+  assert.equal(sdkLoadRequest(opts).engine, 'litert-lm')
+})
+
+test('a load on the legacy SDK row sends no engine key at all', () => {
+  assert.equal('engine' in sdkLoadRequest(sdkRowOpts()), false)
+})
+
+test('the SDK\'s engine_format_mismatch refusal is model_load_failed carrying the SDK\'s own message', async () => {
+  const message = "LiteRT-LM (litert-lm) can't read GGUF models."
+  const sdk = fakeSdk({
+    'POST /sdk/v1/load': [{ status: 400, body: { error: { message, type: 'invalid_request_error', code: 'engine_format_mismatch', param: 'engine' } } }],
+  })
+  const transport = new AttachedTransport(SDK_URL, () => 'tok', sdk.fetch)
+  const err = await refusal(transport.start({ ...LOAD, engine: 'litert-lm' }, 60_000))
+  assert.equal(err.code, 'model_load_failed')
+  assert.equal(err.message, message)
+  assert.deepEqual(sdk.sent[0].body, { ...LOAD, engine: 'litert-lm' })
+  assert.deepEqual(sdk.routesCalled(), ['POST /sdk/v1/load'], 'no retry')
 })

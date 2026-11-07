@@ -1123,13 +1123,17 @@ function sdkToken(): string | undefined {
 }
 
 /** The profile as the SDK's load takes it (architecture §6.6). An unset (0) ctx or threads is left to the SDK; ngl and
- *  the llama-server flags in extraArgs have no SDK equivalent (ignoredLaunchSettings). */
-function sdkLoadRequest(opts: StartOpts): SdkLoadRequest {
+ *  the llama-server flags in extraArgs have no SDK equivalent (ignoredLaunchSettings). An SDK row names its SDK engine
+ *  (ADR-462), so the SDK refuses a model that engine cannot read; the M1 legacy row names none and the SDK routes by
+ *  format. */
+export function sdkLoadRequest(opts: StartOpts): SdkLoadRequest {
+  const engine = opts.engine.sdkEngine?.id
   return {
     path: opts.modelPath,
     contextSize: opts.profile?.ctx || undefined,
     threads: opts.profile?.threads || undefined,
     backend: opts.litertLmConfig?.default.backend ?? 'auto',
+    ...(engine ? { engine } : {}),
   }
 }
 
