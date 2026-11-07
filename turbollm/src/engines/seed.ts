@@ -9,47 +9,11 @@ import type { Registry } from './registry'
 import type { ConfigStore, Engine } from '../config/config'
 import type { ProvisionState } from './provision-state'
 import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
-import { LITERT_LM_NATIVE_SERVER, litertLmNativeVersion } from './litert-lm'
+import { litertLmNativeVersion } from './litert-lm'
+import { ANDROID_BUNDLED_ENGINES, ANDROID_ENGINE_NAME } from './android-engines'
 import { LLAMA_BUILD, fallbackChain, provisionBackend, recommendBackendId, type BackendId, type ProvisionProgress } from './download'
 
 const VALID_BACKENDS: BackendId[] = ['cuda', 'rocm', 'sycl', 'vulkan', 'metal', 'cpu']
-
-/** Fixed identity for the one engine the Android app ever registers for itself — never
- *  user-renamable to something else on Android (there's no "add engine" UI reachable in
- *  the WebView-only app shell), so matching on this exact name is a safe, stable way to
- *  find "the engine this function owns" across restarts without persisting a separate id
- *  anywhere. */
-const ANDROID_ENGINE_NAME = 'llama-server-android'
-
-/** The optional second engine: the same llama.cpp server built with the Vulkan backend, so the
- *  GPU can be tried on devices whose driver supports it.
- *
- *  It is a SEPARATE, statically-linked binary rather than extra backend .so files next to the CPU
- *  engine, and that is not a packaging preference — it is forced twice over. `nativeLibraryDir` is
- *  flat, so a shared Vulkan build's libggml.so/libllama.so would collide with the CPU engine's
- *  under identical names. And measured on a Galaxy S21 FE (Mali-G78): with `libggml-vulkan.so`
- *  merely PRESENT in that directory, llama-server died during load_model even at `-ngl 0`, while
- *  moving that one file aside let the identical binary load and serve in ~2s. Sharing a directory
- *  would therefore let a flaky GPU driver take the working CPU engine down with it. Two
- *  self-contained binaries keep that blast radius to whichever engine the user selected.
- *
- *  Registered only when the file is actually in the APK, so a build without it simply has one
- *  engine instead of logging a failure for something that was never shipped. */
-const ANDROID_VULKAN_ENGINE_NAME = 'llama-server-android-vulkan'
-
-/** The app's bundled LiteRT-LM engine: the native port of `litert-lm serve` that TurboLLM-Android ships beside
- *  liblitert-lm.so (litert-lm.ts, LITERT_LM_NATIVE_SERVER). Registered only when the APK carries it, like the Vulkan
- *  engine. Not activated: like every engine, it loads models only once the user selects it in Engines (a .litertlm
- *  model loads on nothing else, see engineForModel). */
-const ANDROID_LITERT_LM_ENGINE_NAME = 'litert-lm-android'
-
-/** The engines the APK may ship in nativeLibraryDir, by the name each is registered under. Only the CPU engine is
- *  required, and only when the in-app SDK engine is not there to be the default (ensureAndroidBundledEngine). */
-const ANDROID_BUNDLED_ENGINES: { name: string; file: string; kind: 'llama-server' | 'litert-lm' }[] = [
-  { name: ANDROID_ENGINE_NAME, file: 'libllama_server.so', kind: 'llama-server' },
-  { name: ANDROID_VULKAN_ENGINE_NAME, file: 'libllama_server_vk.so', kind: 'llama-server' },
-  { name: ANDROID_LITERT_LM_ENGINE_NAME, file: LITERT_LM_NATIVE_SERVER, kind: 'litert-lm' },
-]
 
 /** The app's in-app engine (the TurboLLM SDK, kind 'turbollm-sdk'): an HTTP server inside the app process, not a
  *  binary. The app sets TURBOLLM_ANDROID_SDK_URL when it started it this launch. */
