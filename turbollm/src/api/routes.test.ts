@@ -320,7 +320,7 @@ test('GET /api/v1/hf/search searches only what the active engine runs, a LiteRT-
   const res = await app.request('/api/v1/hf/search?q=gemma')
 
   assert.equal(res.status, 200)
-  assert.deepEqual(calls, [['gemma', 'llama-server', 'best-match']])
+  assert.deepEqual(calls, [['gemma', { kind: 'llama-server' }, 'best-match']])
 })
 
 test('GET /api/v1/hf/search ignores an unknown category and searches as before', async () => {
@@ -330,7 +330,7 @@ test('GET /api/v1/hf/search ignores an unknown category and searches as before',
   const res = await appWithHfSearch(hf).request('/api/v1/hf/search?q=qwen&category=sentiment')
 
   assert.equal(res.status, 200)
-  assert.deepEqual(calls, [['qwen', 'llama-server', 'best-match']])
+  assert.deepEqual(calls, [['qwen', { kind: 'llama-server' }, 'best-match']])
 })
 
 // The HF repo-detail route overlays each checkpoint row with "is it already downloaded, and

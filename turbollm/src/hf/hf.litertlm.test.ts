@@ -286,7 +286,7 @@ test('browseModels under the litert-lm engine asks HF for the litert-lm facet, n
     return new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } })
   }) as typeof fetch
   try {
-    await client().browseModels('trending', 'litert-lm')
+    await client().browseModels('trending', { kind: 'litert-lm' })
     const url = urls[0]
     assert.match(url, /filter=litert-lm&/)
     assert.doesNotMatch(url, /filter=gguf/)
@@ -303,7 +303,7 @@ test('browseModels under sglang (safetensors) asks for no facet, like vLLM', asy
     return new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } })
   }) as typeof fetch
   try {
-    await client().browseModels('trending', 'sglang')
+    await client().browseModels('trending', { kind: 'sglang' })
     assert.doesNotMatch(urls[0], /filter=/)
   } finally {
     globalThis.fetch = real

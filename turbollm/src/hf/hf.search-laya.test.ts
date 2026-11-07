@@ -33,14 +33,14 @@ const LAYA_ONNX = { id: 'techtheist/laya-onnx', library_name: 'onnxruntime', tag
 
 test('searchModels under llama.cpp also finds the Laya repos the Laya engine can run, listed first', async () => {
   await withSearch({ gguf: [GGUF_CONVERSION], laya: [LAYA, LAYA_MLX, GGUF_CONVERSION, LAYA_NATIVE, LAYA_ONNX] }, async () => {
-    const repos = (await client().searchModels('laya', 'llama-server')).map((r) => r.repo)
+    const repos = (await client().searchModels('laya', { kind: 'llama-server' })).map((r) => r.repo)
     assert.deepEqual(repos, ['convaiinnovations/laya', 'telepatia-ai/laya-pt-es-typed', 'mys/laya-GGUF'])
   })
 })
 
 test('searchModels asks for Laya repos with the same query and sort', async () => {
   await withSearch({ gguf: [], laya: [] }, async (urls) => {
-    await client().searchModels('decision', 'llama-server', 'downloads')
+    await client().searchModels('decision', { kind: 'llama-server' }, 'downloads')
     const layaUrl = urls.find((u) => u.includes('filter=laya'))
     assert.ok(layaUrl, 'no Laya search was made')
     assert.match(layaUrl, /search=decision/)
@@ -50,7 +50,7 @@ test('searchModels asks for Laya repos with the same query and sort', async () =
 
 test('searchModels with no format filter (vLLM) makes no extra Laya search: every repo is already in', async () => {
   await withSearch({ gguf: [], laya: [LAYA], unfiltered: [LAYA] }, async (urls) => {
-    const repos = (await client().searchModels('laya', 'vllm')).map((r) => r.repo)
+    const repos = (await client().searchModels('laya', { kind: 'vllm' })).map((r) => r.repo)
     assert.deepEqual(repos, ['convaiinnovations/laya'])
     assert.equal(urls.filter((u) => u.includes('filter=laya')).length, 0)
   })
@@ -63,7 +63,7 @@ test('a failed Laya search never fails the search itself', async () => {
     return new Response(JSON.stringify([GGUF_CONVERSION]), { status: 200, headers: { 'content-type': 'application/json' } })
   }) as typeof fetch
   try {
-    const repos = (await client().searchModels('laya', 'llama-server')).map((r) => r.repo)
+    const repos = (await client().searchModels('laya', { kind: 'llama-server' })).map((r) => r.repo)
     assert.deepEqual(repos, ['mys/laya-GGUF'])
   } finally {
     globalThis.fetch = real

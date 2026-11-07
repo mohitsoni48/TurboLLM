@@ -4308,10 +4308,11 @@ function telemetryPreview(level: string, version: string) {
  *  it lists what runs on the Laya engine or vLLM whichever engine is active, so it ignores the active engine. */
 async function searchHf(d: Deps, q: string, sort: HfSortOption, category: string | undefined): Promise<HfSearchItem[]> {
   if (category === TEXT_CLASSIFICATION_CATEGORY) return d.hf.searchTextClassification(q, sort)
-  const engineKind = d.registry.active()?.kind
+  const engine = d.registry.active()
   // Only what the active engine runs, LiteRT-LM included: a .litertlm model loads only while LiteRT-LM is the active
-  // engine (engineForModel), so its repos are searched then and not beside another engine's.
-  return q ? d.hf.searchModels(q, engineKind, sort) : d.hf.browseModels(sort, engineKind)
+  // engine (engineForModel), so its repos are searched then and not beside another engine's. An in-app SDK row
+  // searches by the formats its own SDK engine reads (ADR-462).
+  return q ? d.hf.searchModels(q, engine, sort) : d.hf.browseModels(sort, engine)
 }
 
 /** Heuristic count of local quant variants that plausibly belong to an HF repo

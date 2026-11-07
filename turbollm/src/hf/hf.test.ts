@@ -158,7 +158,7 @@ test('the response cache is bounded: old entries are evicted, recent ones kept',
   try {
     const hf = new HfClient(() => '', '0.0.0-test')
     // 'vllm' has no library filter, so each search is exactly one cached listing request.
-    for (let i = 0; i < 450; i++) await hf.searchModels(`query-${i}`, 'vllm')
+    for (let i = 0; i < 450; i++) await hf.searchModels(`query-${i}`, { kind: 'vllm' })
     const cache = (hf as unknown as { cache: Map<string, unknown> }).cache
     assert.equal(cache.size, 200)
     const keys = [...cache.keys()]
