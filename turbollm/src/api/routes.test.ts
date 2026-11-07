@@ -519,6 +519,7 @@ test('POST /api/v1/engines/:id/activate refuses a switch while auto-tune runs', 
   const d = {
     manager: { status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }), clearError: () => {} },
     bench: { isRunning: () => tuning },
+    store: { snapshot: () => ({}) },
     registry: {
       active: () => engines.find((e) => e.id === activeId),
       get: (id: string) => engines.find((e) => e.id === id),

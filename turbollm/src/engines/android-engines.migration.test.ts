@@ -192,7 +192,7 @@ test('M-1 case 8: the SDK not started over case 1 changes nothing', async (t) =>
   assert.deepEqual(after, before)
 })
 
-test('M-1 case 8: the SDK not started over case 5 activates the CPU server; the SDK\'s return does not switch back', async (t) => {
+test('M-1 case 8: the SDK not started over case 5 activates the CPU server; the SDK\'s return switches back to the LiteRT-LM row', async (t) => {
   const phone = androidPhone(t, m1LegacyRow(LITERT_MODEL))
   const before = phone.config()
 
@@ -202,7 +202,8 @@ test('M-1 case 8: the SDK not started over case 5 activates the CPU server; the 
   assertUserSettingsByteEqual(withoutSdk, before)
 
   const sdkBack = await phone.start(DEFAULT_APK)
-  assert.equal(sdkBack.activeEngineId, CPU_ID, 'the engine now active stands')
+  assert.equal(sdkBack.activeEngineId, sdkRowId(sdkBack, 'litert-lm'), 'the row that reads the .litertlm lastLoaded')
+  assert.equal(sdkBack.androidSdkFallback, undefined, 'the fallback is forgotten once undone')
   assert.deepEqual(sdkBack.lastLoaded, before.lastLoaded)
 })
 

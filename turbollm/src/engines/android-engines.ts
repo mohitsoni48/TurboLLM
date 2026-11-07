@@ -3,7 +3,9 @@
 // pure planner over the rows, the remembered retired rows, the shipped files and the SDK's engine list.
 import { existsSync } from 'node:fs'
 import { basename, join } from 'node:path'
-import { migrateEngineId, type ConfigStore, type Engine, type LastLoaded, type RetiredEngine } from '../config/config'
+import {
+  migrateEngineId, type AndroidSdkFallback, type ConfigStore, type Engine, type LastLoaded, type RetiredEngine,
+} from '../config/config'
 import { engineFormats, type ModelFormat } from './compat'
 import { LITERT_LM_NATIVE_SERVER, litertLmNativeVersion } from './litert-lm'
 import type { Registry } from './registry'
@@ -56,10 +58,13 @@ export interface AndroidEngineInput {
   sdk: { baseUrl: string; engines: SdkEngineInfo[] | null } | null
   /** From the boot scan. */
   formatOf: (modelKey: string) => ModelFormat | undefined
+  /** cfg.androidSdkFallback: an earlier start without the SDK moved the selection to the CPU server. */
+  sdkFallback?: AndroidSdkFallback
 }
 
 /** `copy-state` names its target, and `activate` a row this start creates, by SDK engine id (or, for a spawned row
- *  registered this start, its bundled name): a new row's id exists only once the applier has added it. */
+ *  registered this start, its bundled name): a new row's id exists only once the applier has added it. An `activate`
+ *  with `fallbackFrom` is the CPU server standing in for the SDK this launch, remembered once it really happens. */
 export type AndroidEngineAction =
   | { kind: 'upsert-sdk'; info: SdkEngineInfo; adoptLegacy: boolean }
   | { kind: 'reinstate-sdk'; info: SdkEngineInfo }
@@ -68,7 +73,8 @@ export type AndroidEngineAction =
   | { kind: 'reinstate-bundled'; name: string; file: string }
   | { kind: 'retire'; engineId: string; remember: boolean; key: string }
   | { kind: 'copy-state'; from: string; to: string; format: ModelFormat }
-  | { kind: 'activate'; engineId: string }
+  | { kind: 'activate'; engineId: string; fallbackFrom?: string }
+  | { kind: 'forget-fallback' }
 
 /** What the reconciler does this start, in order: SDK rows (rule 1), spawned rows (rule 2), the one copy (rule 3), and
  *  at most one activation (rule 4). */
@@ -129,23 +135,55 @@ function planCopies(input: AndroidEngineInput, rows: AndroidEngineAction[]): And
 
 /** Rule 4: an engine is activated only on a fresh install, when nothing usable is active, for the M1 row with a
  *  `.litertlm` last model, or when the SDK did not start while an SDK row is active. Never over a live, runnable pick
- *  (I-4), and when nothing usable is active, onto the row that reads lastLoaded (I-5). */
+ *  (I-4), and when nothing usable is active, onto the row that reads lastLoaded (I-5). The CPU server standing in for
+ *  the SDK is remembered, and undone on the next start whose SDK list is readable (MAJ-1). */
 function planActivation(input: AndroidEngineInput, rows: AndroidEngineAction[]): AndroidEngineAction[] {
-  const target = activationTarget(input, rows, liveRowsAfter(input, rows))
-  return target !== undefined && target !== input.activeEngineId ? [{ kind: 'activate', engineId: target }] : []
+  const live = liveRowsAfter(input, rows)
+  if (input.sdkFallback && input.sdk?.engines) return planFallbackEnd(input, input.sdkFallback, rows, live)
+  return activationsOf(input, activationTarget(input, rows, live))
 }
 
-function activationTarget(input: AndroidEngineInput, rows: AndroidEngineAction[], live: PlannedRow[]): string | undefined {
+/** The SDK is back: the row active before the fallback, as rule 4 would treat it were it still active, unless the user
+ *  picked an engine since. Either way the fallback is over. */
+function planFallbackEnd(
+  input: AndroidEngineInput,
+  fallback: AndroidSdkFallback,
+  rows: AndroidEngineAction[],
+  live: PlannedRow[],
+): AndroidEngineAction[] {
+  const forget: AndroidEngineAction = { kind: 'forget-fallback' }
+  if (input.activeEngineId !== fallback.to) return [forget]
+  const restored = activationTarget({ ...input, activeEngineId: fallback.from }, rows, live)
+    ?? activationOf(live.find((r) => r.ref === fallback.from))
+  return [...activationsOf(input, restored), forget]
+}
+
+type Activation = Omit<Extract<AndroidEngineAction, { kind: 'activate' }>, 'kind'>
+
+function activationsOf(input: AndroidEngineInput, activation: Activation | undefined): AndroidEngineAction[] {
+  return activation && activation.engineId !== input.activeEngineId ? [{ kind: 'activate', ...activation }] : []
+}
+
+function activationTarget(input: AndroidEngineInput, rows: AndroidEngineAction[], live: PlannedRow[]): Activation | undefined {
   const lastFormat = input.lastLoaded.modelKey ? input.formatOf(input.lastLoaded.modelKey) : undefined
   const active = activeRow(input)
   if (!active || isRetiredBy(rows, active.id)) {
-    return isFreshInstall(input) ? defaultRow(live)?.ref : rowForLastLoaded(input, live, lastFormat)?.ref
+    if (!isFreshInstall(input)) return activationOf(rowForLastLoaded(input, live, lastFormat))
+    return activationOf(defaultRow(live), input.sdk === null ? FRESH_INSTALL_FALLBACK : undefined)
   }
   if (isLegacySdkRow(active) && lastFormat === 'litertlm' && sdkEngineAvailable(input, SDK_LITERT_ENGINE_ID)) {
-    return sdkRowOf(live, SDK_LITERT_ENGINE_ID)?.ref
+    return activationOf(sdkRowOf(live, SDK_LITERT_ENGINE_ID))
   }
-  if (input.sdk === null && active.kind === TURBOLLM_SDK_KIND) return spawnedCpuRow(live)?.ref
+  if (input.sdk === null && active.kind === TURBOLLM_SDK_KIND) return activationOf(spawnedCpuRow(live), active.id)
   return undefined
+}
+
+/** The `fallbackFrom` of a fresh install's CPU server: no row was active. */
+const FRESH_INSTALL_FALLBACK = ''
+
+function activationOf(row: PlannedRow | undefined, fallbackFrom?: string): Activation | undefined {
+  if (!row) return undefined
+  return fallbackFrom === undefined ? { engineId: row.ref } : { engineId: row.ref, fallbackFrom }
 }
 
 /** No app-owned row (spawned or SDK), nothing remembered as retired, and no model ever loaded. */
@@ -355,6 +393,7 @@ function androidEngineInput(
     nativeLibFiles: shippedFiles(launch.nativeLibDir),
     sdk: launch.sdk,
     formatOf: launch.formatOf,
+    sdkFallback: cfg.androidSdkFallback,
   }
 }
 
@@ -407,7 +446,9 @@ class AndroidEngineApplier {
       case 'copy-state':
         return this.copyState(action)
       case 'activate':
-        return this.activate(action.engineId)
+        return this.activate(action)
+      case 'forget-fallback':
+        return this.forgetFallback()
     }
   }
 
@@ -490,14 +531,27 @@ class AndroidEngineApplier {
     console.log(`android: copied the ${format} model settings of engine ${from} onto ${toId}`)
   }
 
-  private activate(ref: string): void {
+  private activate({ engineId: ref, fallbackFrom }: Extract<AndroidEngineAction, { kind: 'activate' }>): void {
     const engineId = this.rowIdOf(ref)
     if (this.deps.registry.list().activeEngineId !== this.expectedActive) {
       console.log(`android: skipped activating ${ref}: an engine was picked meanwhile`)
       return
     }
     this.deps.registry.activate(engineId)
+    if (fallbackFrom !== undefined) this.rememberFallback({ from: fallbackFrom, to: engineId })
     console.log(`android: ${this.deps.registry.get(engineId)?.name ?? engineId} is the active engine`)
+  }
+
+  private rememberFallback(fallback: AndroidSdkFallback): void {
+    this.deps.store.update((c) => {
+      c.androidSdkFallback = fallback
+    })
+  }
+
+  private forgetFallback(): void {
+    this.deps.store.update((c) => {
+      delete c.androidSdkFallback
+    })
   }
 
   private warnWhenNothingCanRun(): void {

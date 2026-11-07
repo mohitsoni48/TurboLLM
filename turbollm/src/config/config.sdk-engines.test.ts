@@ -109,3 +109,16 @@ test('D-15: a retired SDK row remembered under sdk:<id> survives a save and a lo
   })
   assert.equal(ConfigStore.load(path).snapshot().androidRetiredEngines?.['sdk:litert-lm']?.id, 'sdk-row')
 })
+
+test('MAJ-1: androidSdkFallback survives a save and a load', () => {
+  const fallback = { from: 'sdk-litert', to: 'cpu' }
+  assert.deepEqual(loadRaw(withEngines([], { androidSdkFallback: fallback })).androidSdkFallback, fallback)
+  assert.deepEqual(loadRaw(withEngines([], { androidSdkFallback: { from: '', to: 'cpu' } })).androidSdkFallback, { from: '', to: 'cpu' })
+})
+
+test('MAJ-1: an androidSdkFallback without string from and to, or naming an unsafe key, is dropped', () => {
+  for (const bad of ['x', null, { from: 'a' }, { from: 1, to: 'b' }, { from: 'a', to: '__proto__' }, { from: 'constructor', to: 'b' }]) {
+    const cfg = loadRaw(withEngines([], { androidSdkFallback: bad }))
+    assert.equal('androidSdkFallback' in cfg, false, JSON.stringify(bad))
+  }
+})

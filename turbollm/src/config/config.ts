@@ -111,6 +111,13 @@ export interface SdkEngineDescriptor {
  *  settings were already copied onto, so the one copy (ADR-462) happens once. */
 export type RetiredEngine = Engine & { copiedTo?: string }
 
+/** The Android app's fallback to its CPU server on a start without the in-app SDK: `from` is the row that was active
+ *  ('' on a fresh install), `to` the CPU server's row. */
+export interface AndroidSdkFallback {
+  from: string
+  to: string
+}
+
 /** A custom (non-catalog) engine's identity, remembered independent of its live
  *  {@link Engine} registration (GitHub: "custom engine treated as an outsider").
  *
@@ -595,6 +602,9 @@ export interface Config {
    *  the profiles, presets and lastLoaded still keyed on that id (ADR-462). Keyed by the bundled name, or
    *  `sdk:<sdk engine id>`. Bounded: one entry per bundled name plus one per SDK engine id ever listed. */
   androidRetiredEngines?: Record<string, RetiredEngine>
+  /** Android only: set when a start without the in-app SDK moved the selection to the CPU server, so the next start
+   *  whose SDK engine list is readable restores the earlier pick (founder Q2, I-5). Any pick by the user ends it. */
+  androidSdkFallback?: AndroidSdkFallback
   activeEngineId: string
   /** The first-run seed (engines/seed.ts seedDefaultEngines) has run: it installed and selected the default llama.cpp
    *  build, or the config had an engine (or a custom engine's identity) when it was loaded. The seed runs only while
@@ -1572,6 +1582,7 @@ function normalize(c: Config): void {
     if ('sdkEngine' in e && !isSdkEngineDescriptor(e.sdkEngine)) delete e.sdkEngine
   }
   if (c.androidRetiredEngines !== undefined) c.androidRetiredEngines = wellFormedRetiredEngines(c.androidRetiredEngines)
+  if ('androidSdkFallback' in c && !isAndroidSdkFallback(c.androidSdkFallback)) delete c.androidSdkFallback
   // A selected engine that is gone leaves none selected, as Registry.remove does, and an empty selection stays empty:
   // filling it with the first engine on every load selected one the user never picked. Only a file with no selection
   // on record at all (hand-written, or from before the key) starts on the first engine that can be active. A first run
@@ -1873,6 +1884,12 @@ function wellFormedRetiredEngines(value: unknown): Record<string, RetiredEngine>
     kept[key] = entry
   }
   return kept
+}
+
+function isAndroidSdkFallback(value: unknown): value is AndroidSdkFallback {
+  if (typeof value !== 'object' || value === null) return false
+  const { from, to } = value as Partial<AndroidSdkFallback>
+  return typeof from === 'string' && typeof to === 'string' && !isUnsafeMapKey(from) && !isUnsafeMapKey(to)
 }
 
 function isRetiredEngine(value: unknown): value is RetiredEngine {

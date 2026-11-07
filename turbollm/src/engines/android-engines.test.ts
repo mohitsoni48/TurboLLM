@@ -203,6 +203,8 @@ const LITERT_LAST = 'gemma|litertlm|2'
 
 const activations = (actions: AndroidEngineAction[]) => ofKind(actions, 'activate')
 const activates = (engineId: string): AndroidEngineAction[] => [{ kind: 'activate', engineId }]
+const fallsBackTo = (engineId: string, fallbackFrom: string): AndroidEngineAction[] =>
+  [{ kind: 'activate', engineId, fallbackFrom }]
 
 test('a fresh install activates LiteRT-LM', () => {
   assert.deepEqual(activations(planAndroidEngines(input())), activates('litert-lm'))
@@ -213,8 +215,8 @@ test('a fresh install with no available LiteRT-LM entry activates the llama.cpp 
   assert.deepEqual(activations(planAndroidEngines(input({ sdk }))), activates('llama.cpp-cpu'))
 })
 
-test('a fresh install with the SDK not started activates the spawned CPU row it registers', () => {
-  assert.deepEqual(activations(planAndroidEngines(input({ sdk: null }))), activates(ANDROID_ENGINE_NAME))
+test('a fresh install with the SDK not started activates the spawned CPU row it registers, as a fallback', () => {
+  assert.deepEqual(activations(planAndroidEngines(input({ sdk: null }))), fallsBackTo(ANDROID_ENGINE_NAME, ''))
 })
 
 test('R-5 superseded (ADR-462, D-17): a v1.15.0 user on llama-server-android with a GGUF last model stays on it', () => {
@@ -274,7 +276,7 @@ test('with the SDK list unreadable and an SDK row active, nothing is activated',
 test('with the SDK not started and an SDK row active, the CPU row takes over; without its file, nothing does', () => {
   const engines = [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW]
   const withCpu = planAndroidEngines(input({ engines, activeEngineId: LITERT_SDK_ROW.id, sdk: null }))
-  assert.deepEqual(activations(withCpu), activates(CPU_ROW.id))
+  assert.deepEqual(activations(withCpu), fallsBackTo(CPU_ROW.id, LITERT_SDK_ROW.id))
   const withoutCpu = planAndroidEngines(input({ engines, activeEngineId: LITERT_SDK_ROW.id, sdk: null, nativeLibFiles: new Set() }))
   assert.deepEqual(activations(withoutCpu), [])
 })
@@ -286,7 +288,101 @@ test('M-1 finding: the M1 legacy row active with a .litertlm last model and the 
     lastLoaded: { modelKey: LITERT_LAST, engineId: LEGACY_ROW.id },
     sdk: null,
   }))
-  assert.deepEqual(activations(actions), activates(CPU_ROW.id))
+  assert.deepEqual(activations(actions), fallsBackTo(CPU_ROW.id, LEGACY_ROW.id))
+})
+
+// MAJ-1 (stage-6 review, founder Q2, I-5): a fallback to the CPU server while the SDK is down is remembered, and the
+// next start whose SDK list is readable restores the earlier pick, unless the user picked an engine meanwhile.
+
+const BOTH_SDK_ENGINES = { baseUrl: SDK_URL, engines: [LLAMA_INFO, LITERT_INFO] }
+const forgetsFallback: AndroidEngineAction = { kind: 'forget-fallback' }
+const fallbackActions = (actions: AndroidEngineAction[]) => ofKind(actions, 'activate', 'forget-fallback')
+
+test('MAJ-1 1: LiteRT-LM active with a .litertlm last model and the SDK not started: the CPU row, remembered as a fallback', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW],
+    activeEngineId: LITERT_SDK_ROW.id,
+    lastLoaded: { modelKey: LITERT_LAST, engineId: LITERT_SDK_ROW.id },
+    sdk: null,
+  }))
+  assert.deepEqual(fallbackActions(actions), fallsBackTo(CPU_ROW.id, LITERT_SDK_ROW.id))
+})
+
+test('MAJ-1 2: the SDK back with the fallback still active restores LiteRT-LM and forgets the fallback', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW],
+    activeEngineId: CPU_ROW.id,
+    lastLoaded: { modelKey: LITERT_LAST, engineId: LITERT_SDK_ROW.id },
+    sdkFallback: { from: LITERT_SDK_ROW.id, to: CPU_ROW.id },
+    sdk: BOTH_SDK_ENGINES,
+  }))
+  assert.deepEqual(fallbackActions(actions), [...activates(LITERT_SDK_ROW.id), forgetsFallback])
+})
+
+test('MAJ-1 3: the SDK back after the user picked another row: the pick stands and the fallback is forgotten', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW],
+    activeEngineId: LLAMA_SDK_ROW.id,
+    lastLoaded: { modelKey: LITERT_LAST, engineId: LITERT_SDK_ROW.id },
+    sdkFallback: { from: LITERT_SDK_ROW.id, to: CPU_ROW.id },
+    sdk: BOTH_SDK_ENGINES,
+  }))
+  assert.deepEqual(fallbackActions(actions), [forgetsFallback])
+})
+
+test('MAJ-1 4: a fresh install without the SDK falls back to the CPU row; the SDK\'s first readable start applies LiteRT-LM', () => {
+  assert.deepEqual(activations(planAndroidEngines(input({ sdk: null }))), fallsBackTo(ANDROID_ENGINE_NAME, ''))
+  const next = planAndroidEngines(input({
+    engines: [CPU_ROW], activeEngineId: CPU_ROW.id, sdkFallback: { from: '', to: CPU_ROW.id }, sdk: BOTH_SDK_ENGINES,
+  }))
+  assert.deepEqual(fallbackActions(next), [...activates('litert-lm'), forgetsFallback])
+})
+
+test('MAJ-1 5: the M1 row with a .litertlm last model returns to the LiteRT-LM row, never the adopted llama.cpp row', () => {
+  const lastLoaded = { modelKey: LITERT_LAST, engineId: LEGACY_ROW.id }
+  const down = planAndroidEngines(input({ engines: [LEGACY_ROW, CPU_ROW], activeEngineId: LEGACY_ROW.id, lastLoaded, sdk: null }))
+  assert.deepEqual(activations(down), fallsBackTo(CPU_ROW.id, LEGACY_ROW.id))
+  const back = planAndroidEngines(input({
+    engines: [LEGACY_ROW, CPU_ROW],
+    activeEngineId: CPU_ROW.id,
+    lastLoaded,
+    sdkFallback: { from: LEGACY_ROW.id, to: CPU_ROW.id },
+    sdk: BOTH_SDK_ENGINES,
+  }))
+  assert.deepEqual(fallbackActions(back), [...activates('litert-lm'), forgetsFallback])
+})
+
+test('MAJ-1 6: the SDK back but its list unreadable: no activation, and the fallback is kept', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW],
+    activeEngineId: CPU_ROW.id,
+    lastLoaded: { modelKey: LITERT_LAST, engineId: LITERT_SDK_ROW.id },
+    sdkFallback: { from: LITERT_SDK_ROW.id, to: CPU_ROW.id },
+    sdk: { baseUrl: SDK_URL, engines: null },
+  }))
+  assert.deepEqual(fallbackActions(actions), [])
+})
+
+test('MAJ-1 7: the recorded row unavailable on the return: the row that reads lastLoaded, and the fallback is forgotten', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW],
+    activeEngineId: CPU_ROW.id,
+    lastLoaded: { modelKey: GGUF_LAST, engineId: LLAMA_SDK_ROW.id },
+    sdkFallback: { from: LITERT_SDK_ROW.id, to: CPU_ROW.id },
+    sdk: { baseUrl: SDK_URL, engines: [LLAMA_INFO, { ...LITERT_INFO, available: false }] },
+  }))
+  assert.deepEqual(fallbackActions(actions), [...activates(LLAMA_SDK_ROW.id), forgetsFallback])
+})
+
+test('MAJ-1 8: llama.cpp (CPU) picked by hand with a .litertlm last model goes back to llama.cpp (CPU) after a fallback', () => {
+  const lastLoaded = { modelKey: LITERT_LAST, engineId: LITERT_SDK_ROW.id }
+  const engines = [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW]
+  const down = planAndroidEngines(input({ engines, activeEngineId: LLAMA_SDK_ROW.id, lastLoaded, sdk: null }))
+  assert.deepEqual(activations(down), fallsBackTo(CPU_ROW.id, LLAMA_SDK_ROW.id))
+  const back = planAndroidEngines(input({
+    engines, activeEngineId: CPU_ROW.id, lastLoaded, sdkFallback: { from: LLAMA_SDK_ROW.id, to: CPU_ROW.id }, sdk: BOTH_SDK_ENGINES,
+  }))
+  assert.deepEqual(fallbackActions(back), [...activates(LLAMA_SDK_ROW.id), forgetsFallback])
 })
 
 test('an active SDK engine that becomes unavailable is replaced by the row that reads lastLoaded', () => {
@@ -514,6 +610,33 @@ test('applier: a v1.15.0 LiteRT-LM user gets their .litertlm settings copied ont
   assert.equal(cfg.androidRetiredEngines?.[ANDROID_LITERT_LM_ENGINE_NAME]?.id, server.id)
   assert.equal(cfg.androidRetiredEngines?.[ANDROID_LITERT_LM_ENGINE_NAME]?.copiedTo, litertId)
   assert.deepEqual(cfg.lastLoaded, { modelKey: LITERT_LAST, engineId: server.id }, 'lastLoaded is not moved')
+})
+
+test('applier MAJ-1: a boot without the SDK records the fallback in config.json, and the SDK\'s return clears it', async (t) => {
+  quiet(t)
+  const lib = nativeLibDir([CPU_FILE])
+  const path = configWith([LLAMA_SDK_ROW, LITERT_SDK_ROW, cpuEngineIn(lib)], LITERT_SDK_ROW.id, {
+    lastLoaded: { modelKey: LITERT_LAST, engineId: LITERT_SDK_ROW.id },
+  })
+  await reconcile(appRegistry(t, path), { lib })
+  const down = ConfigStore.load(path).snapshot()
+  assert.equal(down.activeEngineId, 'cpu')
+  assert.deepEqual(down.androidSdkFallback, { from: LITERT_SDK_ROW.id, to: 'cpu' })
+
+  await reconcile(appRegistry(t, path), { lib, sdkUrl: SDK_URL })
+  const back = ConfigStore.load(path).snapshot()
+  assert.equal(back.activeEngineId, LITERT_SDK_ROW.id)
+  assert.equal(back.androidSdkFallback, undefined)
+})
+
+test('applier MAJ-1: no fallback is recorded when a pick made meanwhile skips the activation', async (t) => {
+  quiet(t)
+  const userPicksLlama = (registry: Registry) => registry.activate(LLAMA_SDK_ROW.id)
+  const path = configWith([LLAMA_SDK_ROW, LITERT_SDK_ROW], LITERT_SDK_ROW.id)
+  await reconcile(appRegistry(t, path, userPicksLlama), { lib: nativeLibDir([CPU_FILE]) })
+  const cfg = ConfigStore.load(path).snapshot()
+  assert.equal(cfg.activeEngineId, LLAMA_SDK_ROW.id)
+  assert.equal(cfg.androidSdkFallback, undefined)
 })
 
 test('applier G-9: with the SDK not started and no CPU file, one warning says no engine can run this launch', async (t) => {
