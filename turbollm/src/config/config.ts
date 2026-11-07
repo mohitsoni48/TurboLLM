@@ -9,6 +9,7 @@ import { basename, dirname, join } from 'node:path'
 import type { LinkGrant, LinkRecord } from '../link/types'
 import type { ChatStoreConfig } from '../chat/store/load-adapter.js'
 import type { ReleaseProvenance } from '../engines/release-install'
+import type { ModelFormat } from '../engines/compat'
 import { CHAT_APPROVAL_WAIT_MINUTES } from './config-bounds'
 
 export const SCHEMA_VERSION = 4
@@ -91,7 +92,24 @@ export interface Engine {
   /** Set only on the Android app's in-app engine (kind 'turbollm-sdk'): where its HTTP server listens. Its bearer
    *  token is deliberately not stored here: it changes every app process and is read from the environment. */
   baseUrl?: string
+  /** Set only on a row of kind 'turbollm-sdk': which of the SDK's engines this row is, as the SDK reported it
+   *  (GET /sdk/v1/engines). Refreshed at every start. Absent on a row registered before ADR-462 (the M1 single row),
+   *  which the Android reconciler adopts as the llama.cpp row on its next start. */
+  sdkEngine?: SdkEngineDescriptor
 }
+
+export interface SdkEngineDescriptor {
+  /** 'llama.cpp-cpu' | 'litert-lm' | a future id: opaque to the daemon. */
+  id: string
+  /** The SDK runtime family: 'llama.cpp' | 'litert-lm'. */
+  kind: string
+  formats: ModelFormat[]
+  backends: Array<'cpu' | 'gpu'>
+}
+
+/** A row the Android reconciler retired, remembered so it can come back under its id. `copiedTo` names the row its
+ *  settings were already copied onto, so the one copy (ADR-462) happens once. */
+export type RetiredEngine = Engine & { copiedTo?: string }
 
 /** A custom (non-catalog) engine's identity, remembered independent of its live
  *  {@link Engine} registration (GitHub: "custom engine treated as an outsider").
@@ -572,6 +590,11 @@ export interface Config {
   engines: Engine[]
   /** Custom (non-catalog) engine identities, kept across Disable — see {@link CustomEngineSource}. */
   customEngineSources: CustomEngineSource[]
+  /** Android only: app-owned engine rows the reconciler retired (an APK that does not ship a bundled file, an SDK
+   *  engine that stopped being available), so a later start that has them again reinstates the same id, and with it
+   *  the profiles, presets and lastLoaded still keyed on that id (ADR-462). Keyed by the bundled name, or
+   *  `sdk:<sdk engine id>`. Bounded: one entry per bundled name plus one per SDK engine id ever listed. */
+  androidRetiredEngines?: Record<string, RetiredEngine>
   activeEngineId: string
   /** The first-run seed (engines/seed.ts seedDefaultEngines) has run: it installed and selected the default llama.cpp
    *  build, or the config had an engine (or a custom engine's identity) when it was loaded. The seed runs only while
@@ -1546,7 +1569,9 @@ function normalize(c: Config): void {
     // Per-engine auto-update policy (ADR-085): absent/garbage in pre-Phase-6 configs
     // → 'notify' (the safe default — surface updates, never silently auto-apply).
     e.updatePolicy = e.updatePolicy === 'off' || e.updatePolicy === 'auto' ? e.updatePolicy : 'notify'
+    if ('sdkEngine' in e && !isSdkEngineDescriptor(e.sdkEngine)) delete e.sdkEngine
   }
+  if (c.androidRetiredEngines !== undefined) c.androidRetiredEngines = wellFormedRetiredEngines(c.androidRetiredEngines)
   // A selected engine that is gone leaves none selected, as Registry.remove does, and an empty selection stays empty:
   // filling it with the first engine on every load selected one the user never picked. Only a file with no selection
   // on record at all (hand-written, or from before the key) starts on the first engine that can be active. A first run
@@ -1829,6 +1854,31 @@ export function ownEntry<T>(map: Readonly<Record<string, T>> | undefined, key: s
  *  prototype instead of adding an entry, and the other two only ever name built-ins. */
 export function isUnsafeMapKey(key: string): boolean {
   return key === '__proto__' || key === 'constructor' || key === 'prototype'
+}
+
+function isSdkEngineDescriptor(value: unknown): value is SdkEngineDescriptor {
+  if (typeof value !== 'object' || value === null) return false
+  const { id, formats } = value as Partial<SdkEngineDescriptor>
+  return typeof id === 'string' && Array.isArray(formats) && formats.every((f) => typeof f === 'string')
+}
+
+/** The remembered retired rows a hand-edited or damaged file can hold safely: a safe key, and a value that is at least
+ *  an engine (a string id, name and kind). A `copiedTo` that is not a string is dropped, the entry kept. */
+function wellFormedRetiredEngines(value: unknown): Record<string, RetiredEngine> {
+  const kept: Record<string, RetiredEngine> = {}
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return kept
+  for (const [key, entry] of Object.entries(value)) {
+    if (isUnsafeMapKey(key) || !isRetiredEngine(entry)) continue
+    if ('copiedTo' in entry && typeof entry.copiedTo !== 'string') delete entry.copiedTo
+    kept[key] = entry
+  }
+  return kept
+}
+
+function isRetiredEngine(value: unknown): value is RetiredEngine {
+  if (typeof value !== 'object' || value === null) return false
+  const { id, name, kind } = value as Partial<Engine>
+  return typeof id === 'string' && typeof name === 'string' && typeof kind === 'string'
 }
 
 export function getModelProfile(cfg: Config, modelKey: string, engineId: string): unknown {
