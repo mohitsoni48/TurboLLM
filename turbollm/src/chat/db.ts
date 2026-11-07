@@ -1378,6 +1378,10 @@ export class ConversationStore {
     return this.routines.routineRunsBeyondNewest(routineId, keep, limit, after)
   }
 
+  isRoutineRunContinued(runId: string): boolean {
+    return this.routines.isRoutineRunContinued(runId)
+  }
+
   deleteRoutineRuns(runs: PrunableRoutineRun[]): { runs: number; conversations: number } {
     return this.routines.deleteRoutineRuns(runs)
   }

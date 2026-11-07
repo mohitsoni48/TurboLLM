@@ -201,6 +201,26 @@ test('a Code run whose session has a user turn after the run is kept past the ne
   store.close()
 })
 
+test('a Code run the user went on with while the sweep was deleting an earlier one keeps its session', async () => {
+  const store = new ConversationStore(IN_MEMORY_DATA_DIR)
+  const c = routine(store, 'code', 202)
+  const [first, second] = c.runs
+  const { calls, deleteCodeSession } = codeCleanup(store)
+  const slowFirst = async (id: string) => {
+    const result = await deleteCodeSession(id)
+    if (id === first.codeSessionId) messageAt(store, second.convId, 'user', second.endedAt + 30_000)
+    return result
+  }
+
+  const summary = await sweeper(store, { deleteCodeSession: slowFirst }).s.sweep()
+
+  assert.deepEqual(calls, [first.codeSessionId], 'the session continued mid-sweep is never handed to the cleanup')
+  assert.equal(summary?.routineRunsPruned, 1)
+  assert.ok(store.getRoutineRun(second.id))
+  assert.ok(store.getAgentRun(second.codeSessionId!))
+  store.close()
+})
+
 test('routine runs are pruned in small batches (each cascading a whole chat), yielding between them', async () => {
   const store = new ConversationStore(IN_MEMORY_DATA_DIR)
   routine(store, 'chat', 260)

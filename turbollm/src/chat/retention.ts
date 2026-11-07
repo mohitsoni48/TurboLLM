@@ -133,6 +133,8 @@ export class RetentionSweeper {
     for (const run of runs) {
       if (run.codeSessionId) {
         if (!this.d.deleteCodeSession) continue
+        // Listed a while ago, and each delete before this one awaited git: the user may have reopened this run since.
+        if (this.d.db.isRoutineRunContinued(run.id)) continue
         const result = await this.d.deleteCodeSession(run.codeSessionId)
         if (!result.deleted && result.reason === 'worktree_kept') {
           this.d.log(`[retention] kept routine run ${run.id}: its Code session ${run.codeSessionId} has a worktree that could not be removed (${result.worktreeNote})`)

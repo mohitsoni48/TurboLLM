@@ -212,6 +212,11 @@ export class RoutineRepo {
     return rows.map((r) => ({ id: r.id, startedAt: r.started_at, conversationId: r.conversation_id, codeSessionId: r.code_session_id }))
   }
 
+  /** Whether the user went on with run `runId` since it ended (ROUTINE_RUN_CONTINUED). */
+  isRoutineRunContinued(runId: string): boolean {
+    return !!this.db.prepare(`SELECT 1 AS yes FROM routine_runs r WHERE r.id = $id AND ${ROUTINE_RUN_CONTINUED}`).get({ $id: runId } as P)
+  }
+
   /** Deletes `runs` and each one's own chat conversation (chat-runner.ts creates a kind='agent'
    *  one per run; its messages go with it, ON DELETE CASCADE), in one transaction. A linked
    *  conversation of any other kind is left alone. A code run's session is not touched here: it
