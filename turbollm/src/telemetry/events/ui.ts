@@ -420,9 +420,9 @@ export const SCREENS = [
  *  mutually-independent files per PR avoids repeating a full deploy/verify/PR cycle 18 times
  *  for files this small, while every file still gets its own classification below and its own
  *  live-verify:
- *  - `screens/settings/ToolPermissionsSection.tsx` — 3 new actions, no skips, tagged
- *    `settings` (its only embedding). `toggle_auto_allow_tools`, `set_tool_policy` and
- *    `toggle_pdf_reading` are persistent per-tool/global CONFIG, genuinely different from Batch 25's
+ *  - `screens/settings/ToolPermissionsSection.tsx` — 2 new actions, no skips, tagged
+ *    `settings` (its only embedding). `toggle_auto_allow_tools` and `set_tool_policy` are
+ *    persistent per-tool/global CONFIG, genuinely different from Batch 25's
  *    `allow_tool_call`/`deny_tool_call`/etc., which are live, per-INSTANCE approval decisions
  *    on one in-flight tool call in a running chat.
  *  - `screens/models/ImportUrlDialog.tsx` — 2 new actions, no skips, tagged `models` (its only
@@ -633,7 +633,9 @@ export const UI_ACTIONS = [
 
   'toggle_artifact_interactive', 'toggle_artifact_fit', 'download_artifact',
 
-  'toggle_auto_allow_tools', 'set_tool_policy', 'toggle_pdf_reading',
+  'toggle_auto_allow_tools', 'set_tool_policy',
+  // Added after the Phase 6jj batch note above was written.
+  'toggle_pdf_reading',
   'close_import_url_dialog', 'import_model_url',
   'restart_engine',
   'cancel_custom_build_dialog', 'continue_custom_build_dialog',
