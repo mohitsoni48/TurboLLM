@@ -4,6 +4,7 @@
 // header for why new web tests go here rather than into vram.test.ts.
 import { describe, expect, test } from 'vitest'
 import {
+  LITERT_GEMMA_E2B_PICK,
   LITERT_SMALL_DEVICE_LADDER,
   LITERT_SMALLEST_PICK,
   modelDisplayName,
@@ -159,6 +160,7 @@ describe('pickOnboardingModel on a LiteRT-LM row', () => {
       expect(/qwen/i.test(c.repo), c.repo).toBe(false)
     }
     expect(LITERT_SMALL_DEVICE_LADDER[0]).toBe(LITERT_SMALLEST_PICK)
+    expect(LITERT_SMALL_DEVICE_LADDER[1]).toBe(LITERT_GEMMA_E2B_PICK)
   })
 
   // A swap of the smallest pick (N1) edits LITERT_SMALLEST_PICK and this one test, nothing else.

@@ -14,7 +14,7 @@ import { textClassificationRuntimeLabel } from '../../lib/model-kind'
 import { activeEngineOf, useEngines, useHfSearch, useSysInfo } from '../../lib/queries'
 import type { Engine, HfSearchCategory, HfSearchItem, HfSortOption, ModelFormat, TextClassificationRuntime } from '../../lib/types'
 import { fitBudgetMb, searchRowFitsHardware } from '../../lib/vram'
-import { LITERT_SMALLEST_PICK, requiredMb } from '../../lib/onboarding-pick'
+import { LITERT_GEMMA_E2B_PICK, LITERT_SMALLEST_PICK, requiredMb } from '../../lib/onboarding-pick'
 import { engineLabel, readsOnlyLitert } from '../../lib/engine-groups'
 import { isAndroidOs } from '../../lib/platform'
 import { EmptyState, InlineError } from '../../components/common'
@@ -65,7 +65,7 @@ const ANDROID_CURATED_PICKS: CuratedPick[] = [
 // which a LiteRT model cannot turn off yet).
 const ANDROID_LITERT_CURATED_PICKS: Required<CuratedPick>[] = [
   { ...LITERT_SMALLEST_PICK, note: 'Smallest — fits even the tightest phones' },
-  { repo: 'litert-community/gemma-4-E2B-it-litert-lm', file: 'gemma-4-E2B-it.litertlm', bytes: 2_588_147_712, note: 'Runs on the GPU or the CPU — a solid all-rounder' },
+  { ...LITERT_GEMMA_E2B_PICK, note: 'Runs on the GPU or the CPU — a solid all-rounder' },
   { repo: 'litert-community/gemma-4-E4B-it-litert-lm', file: 'gemma-4-E4B-it-gpu.litertlm', bytes: 2_969_059_328, note: 'Most capable pick, for phones with room to spare' },
   { repo: 'litert-community/Qwen3.5-2B', file: 'Qwen3.5-2B_int8.litertlm', bytes: 2_119_744_416, note: 'Thinks before it answers' },
 ]

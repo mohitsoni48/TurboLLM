@@ -69,17 +69,25 @@ export const SMALL_DEVICE_LADDER: readonly CandidateModel[] = [
 
 /** The smallest LiteRT-LM pick, for a phone whose active engine is LiteRT-LM (ADR-462). Founder decision N1
  *  (2026-11-07): LFM2.5-1.2B-Instruct, under the LFM Open License v1.0, accepted. Its model card says this file runs on
- *  both GPU and CPU. Swap = edit this one line (and the one evidence test that pins it); Discover's curated list
+ *  both GPU and CPU. Swap = edit this one constant (and the one evidence test that pins it); Discover's curated list
  *  spreads this same constant. Read off the live HF tree API on 2026-11-07. */
-export const LITERT_SMALLEST_PICK: CandidateModel = { repo: 'litert-community/LFM2.5-1.2B-Instruct', file: 'LFM2.5-1.2B-Instruct_int4_gpu.litertlm', bytes: 736_220_768 }
+export const LITERT_SMALLEST_PICK: CandidateModel = {
+  repo: 'litert-community/LFM2.5-1.2B-Instruct',
+  file: 'LFM2.5-1.2B-Instruct_int4_gpu.litertlm',
+  bytes: 736_220_768,
+}
 
-/** The LiteRT-LM ladder, the same floor-not-catalog idea as SMALL_DEVICE_LADDER. gemma-4-E2B's model card benchmarks
- *  this file on both CPU and GPU, so the SDK's GPU-then-CPU choice can fall back. No thinking model: a LiteRT model's
+/** The second LiteRT-LM rung. gemma-4-E2B's model card benchmarks this file on both CPU and GPU, so the SDK's
+ *  GPU-then-CPU choice can fall back. Discover's curated list spreads this same constant. */
+export const LITERT_GEMMA_E2B_PICK: CandidateModel = {
+  repo: 'litert-community/gemma-4-E2B-it-litert-lm',
+  file: 'gemma-4-E2B-it.litertlm',
+  bytes: 2_588_147_712,
+}
+
+/** The LiteRT-LM ladder, the same floor-not-catalog idea as SMALL_DEVICE_LADDER. No thinking model: a LiteRT model's
  *  thinking cannot be turned off yet. */
-export const LITERT_SMALL_DEVICE_LADDER: readonly CandidateModel[] = [
-  LITERT_SMALLEST_PICK,
-  { repo: 'litert-community/gemma-4-E2B-it-litert-lm', file: 'gemma-4-E2B-it.litertlm', bytes: 2_588_147_712 },
-]
+export const LITERT_SMALL_DEVICE_LADDER: readonly CandidateModel[] = [LITERT_SMALLEST_PICK, LITERT_GEMMA_E2B_PICK]
 
 /** The formats onboarding picks for: the active row's. On Android, before the reconciler has activated a row, those of
  *  the fresh-install default (ADR-462 rule 4): LiteRT-LM when the in-app SDK registered it, else the llama.cpp rows'
