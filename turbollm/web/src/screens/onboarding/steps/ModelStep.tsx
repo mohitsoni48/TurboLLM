@@ -291,7 +291,9 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
 }
 
 const ENGINE_POLL_MS = 1_000
-/** Covers the Android reconciler's 5 s budget for the in-app SDK plus the boot scan. */
+/** The Android reconciler's 5 s budget for reading the in-app SDK's engines (READ_BUDGET_MS, src/engines/sdk-engines.ts)
+ *  plus an allowance for the boot scan, which has no bound and has not been measured: the remaining 15 s is a guess.
+ *  Plan Z-2 step 9 (QG-2) measures it on a slow phone. */
 const ENGINE_WAIT_MS = 20_000
 
 /** The formats to pick a model for (onboardingFormats). On a fresh Android install this step can open before the
