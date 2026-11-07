@@ -5,8 +5,8 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { ConfigStore, type Engine } from '../config/config'
 import { Registry } from './registry'
+import { LITERT_INFO, LLAMA_INFO, sdkRowsOf } from '../test-support/android-engines'
 import { tmpDir } from '../test-support/tmp'
-import type { SdkEngineInfo } from './sdk-engines'
 
 const SDK_URL = 'http://sdk.invalid:1'
 
@@ -35,13 +35,6 @@ function emptyRegistry(): Registry {
 // ADR-462: one row per SDK engine, keyed by kind 'turbollm-sdk' + sdkEngine.id (plan D-4). The first five cases are the
 // former single-row registration's cases (M1), ported one-for-one.
 
-const LLAMA_INFO: SdkEngineInfo = {
-  id: 'llama.cpp-cpu', name: 'llama.cpp (CPU)', kind: 'llama.cpp', formats: ['gguf'], backends: ['cpu'], available: true,
-}
-const LITERT_INFO: SdkEngineInfo = {
-  id: 'litert-lm', name: 'LiteRT-LM', kind: 'litert-lm', formats: ['litertlm'], backends: ['gpu', 'cpu'], available: true,
-}
-
 /** The M1 build's single SDK row, which names no SDK engine. */
 function addLegacySdkRow(reg: Registry): Engine {
   const legacy: Engine = {
@@ -50,10 +43,6 @@ function addLegacySdkRow(reg: Registry): Engine {
   }
   reg.reinstate(legacy, false)
   return legacy
-}
-
-function sdkRows(reg: Registry): Engine[] {
-  return reg.list().engines.filter((e) => e.kind === 'turbollm-sdk')
 }
 
 test('upsertSdkEngine registers an in-app row at its base URL with no binary, carrying the descriptor', () => {
@@ -95,7 +84,7 @@ test('two SDK engines make two rows with distinct ids, and neither is active', (
   const llama = reg.upsertSdkEngine(LLAMA_INFO, SDK_URL)
   const litert = reg.upsertSdkEngine(LITERT_INFO, SDK_URL)
   assert.notEqual(llama.id, litert.id)
-  assert.deepEqual(reg.sdkEngines().map((e) => e.sdkEngine?.id), ['llama.cpp-cpu', 'litert-lm'])
+  assert.deepEqual(sdkRowsOf(reg).map((e) => e.sdkEngine?.id), ['llama.cpp-cpu', 'litert-lm'])
   assert.equal(reg.list().activeEngineId, '')
 })
 
@@ -106,7 +95,7 @@ test('upsertSdkEngine again keeps one row per SDK engine id and repairs its URL'
   const next = 'http://sdk-next.invalid:1'
   assert.equal(reg.upsertSdkEngine(LLAMA_INFO, next).id, llama.id)
   assert.equal(reg.upsertSdkEngine({ ...LITERT_INFO, name: 'LiteRT-LM 2' }, next).id, litert.id)
-  assert.deepEqual(sdkRows(reg).map((e) => [e.id, e.name, e.baseUrl]), [
+  assert.deepEqual(sdkRowsOf(reg).map((e) => [e.id, e.name, e.baseUrl]), [
     [llama.id, 'llama.cpp (CPU)', next],
     [litert.id, 'LiteRT-LM 2', next],
   ])
@@ -117,7 +106,7 @@ test('a legacy SDK row is adopted under its id when adoptLegacy is set', () => {
   const legacy = addLegacySdkRow(reg)
   const adopted = reg.upsertSdkEngine(LLAMA_INFO, 'http://sdk-next.invalid:1', { adoptLegacy: true })
   assert.equal(adopted.id, legacy.id)
-  assert.deepEqual(sdkRows(reg).map((e) => [e.id, e.name, e.sdkEngine?.id, e.baseUrl]), [
+  assert.deepEqual(sdkRowsOf(reg).map((e) => [e.id, e.name, e.sdkEngine?.id, e.baseUrl]), [
     [legacy.id, 'llama.cpp (CPU)', 'llama.cpp-cpu', 'http://sdk-next.invalid:1'],
   ])
 })

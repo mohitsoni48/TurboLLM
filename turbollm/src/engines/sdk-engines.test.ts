@@ -3,17 +3,11 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { readSdkEngines } from './sdk-engines'
+import { LITERT_INFO, LLAMA_INFO } from '../test-support/android-engines'
 import { fakeSdk, sdkEnginesReply } from '../test-support/fake-sdk'
 
 const BASE_URL = 'http://sdk.invalid:1'
 const ENV = { TURBOLLM_ANDROID_SDK_TOKEN: 'tok-123' }
-
-const LLAMA_ENTRY = {
-  id: 'llama.cpp-cpu', name: 'llama.cpp (CPU)', kind: 'llama.cpp', formats: ['gguf'], backends: ['cpu'], available: true,
-}
-const LITERT_ENTRY = {
-  id: 'litert-lm', name: 'LiteRT-LM', kind: 'litert-lm', formats: ['litertlm'], backends: ['gpu', 'cpu'], available: true,
-}
 
 function readWith(reply: Parameters<typeof fakeSdk>[0][string]) {
   const sdk = fakeSdk({ 'GET /sdk/v1/engines': reply })
@@ -21,12 +15,12 @@ function readWith(reply: Parameters<typeof fakeSdk>[0][string]) {
 }
 
 test('the architecture §2.4 reply parses to both engines, exactly', async () => {
-  const { result } = readWith([sdkEnginesReply([LLAMA_ENTRY, LITERT_ENTRY])])
-  assert.deepEqual(await result, [LLAMA_ENTRY, LITERT_ENTRY])
+  const { result } = readWith([sdkEnginesReply([LLAMA_INFO, LITERT_INFO])])
+  assert.deepEqual(await result, [LLAMA_INFO, LITERT_INFO])
 })
 
 test('the request carries the SDK bearer from the environment', async () => {
-  const { sdk, result } = readWith([sdkEnginesReply([LLAMA_ENTRY])])
+  const { sdk, result } = readWith([sdkEnginesReply([LLAMA_INFO])])
   await result
   assert.deepEqual(sdk.routesCalled(), ['GET /sdk/v1/engines'])
   assert.equal(sdk.sent[0].authorization, 'Bearer tok-123')
@@ -34,7 +28,7 @@ test('the request carries the SDK bearer from the environment', async () => {
 
 test('a 401 or a 500 reads as null', async () => {
   for (const status of [401, 500]) {
-    const listShaped = { object: 'list', data: [LLAMA_ENTRY] }
+    const listShaped = { object: 'list', data: [LLAMA_INFO] }
     assert.equal(await readWith([{ status, body: listShaped }]).result, null, `status ${status}`)
   }
 })
@@ -67,28 +61,28 @@ test('the request is bounded by an abort signal', async () => {
 })
 
 test('an unknown format is dropped from an entry, and an entry left with none is dropped', async () => {
-  const mixed = { ...LLAMA_ENTRY, formats: ['gguf', 'mlx2'] }
-  const onlyUnknown = { ...LITERT_ENTRY, id: 'future', formats: ['mlx2'] }
-  assert.deepEqual(await readWith([sdkEnginesReply([mixed, onlyUnknown])]).result, [LLAMA_ENTRY])
+  const mixed = { ...LLAMA_INFO, formats: ['gguf', 'mlx2'] }
+  const onlyUnknown = { ...LITERT_INFO, id: 'future', formats: ['mlx2'] }
+  assert.deepEqual(await readWith([sdkEnginesReply([mixed, onlyUnknown])]).result, [LLAMA_INFO])
 })
 
 test('unknown backends are dropped from an entry', async () => {
-  const entry = { ...LITERT_ENTRY, backends: ['gpu', 'npu', 'cpu'] }
-  assert.deepEqual(await readWith([sdkEnginesReply([entry])]).result, [LITERT_ENTRY])
+  const entry = { ...LITERT_INFO, backends: ['gpu', 'npu', 'cpu'] }
+  assert.deepEqual(await readWith([sdkEnginesReply([entry])]).result, [LITERT_INFO])
 })
 
 test('an unavailable entry keeps its reason', async () => {
-  const unavailable = { ...LLAMA_ENTRY, available: false, reason: 'No llama.cpp library in this build runs on this CPU.' }
+  const unavailable = { ...LLAMA_INFO, available: false, reason: 'No llama.cpp library in this build runs on this CPU.' }
   assert.deepEqual(await readWith([sdkEnginesReply([unavailable])]).result, [unavailable])
 })
 
 test('an entry missing an id, a name, a kind or a boolean available is dropped', async () => {
   const broken = [
-    { ...LLAMA_ENTRY, id: '' },
-    { ...LLAMA_ENTRY, name: 3 },
-    { ...LLAMA_ENTRY, kind: undefined },
-    { ...LLAMA_ENTRY, available: 'yes' },
+    { ...LLAMA_INFO, id: '' },
+    { ...LLAMA_INFO, name: 3 },
+    { ...LLAMA_INFO, kind: undefined },
+    { ...LLAMA_INFO, available: 'yes' },
     'not an entry',
   ]
-  assert.deepEqual(await readWith([sdkEnginesReply([...broken, LITERT_ENTRY])]).result, [LITERT_ENTRY])
+  assert.deepEqual(await readWith([sdkEnginesReply([...broken, LITERT_INFO])]).result, [LITERT_INFO])
 })

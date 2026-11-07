@@ -4,33 +4,25 @@
 // SDK), and asserts on the config file as it is read back from disk afterwards.
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import {
   ConfigStore, defaultConfig, getModelProfile, type Config, type Engine, type ModelPreset, type ProfileEntry,
 } from '../config/config'
+import {
+  CPU_FILE, LITERT_INFO, LLAMA_INFO, VK_FILE, appRegistry, bundledRow, engineRow, quietAndroidLog, reconcileWith,
+  shipNativeLibs, type AndroidTest,
+} from '../test-support/android-engines'
 import { tmpDir } from '../test-support/tmp'
 import type { ModelFormat } from './compat'
 import { LITERT_LM_NATIVE_SERVER } from './litert-lm'
-import { Registry } from './registry'
 import type { SdkEngineInfo } from './sdk-engines'
-import {
-  ANDROID_ENGINE_NAME, ANDROID_LITERT_LM_ENGINE_NAME, ANDROID_VULKAN_ENGINE_NAME, reconcileAndroidEngines,
-} from './android-engines'
+import { ANDROID_ENGINE_NAME, ANDROID_LITERT_LM_ENGINE_NAME, ANDROID_VULKAN_ENGINE_NAME } from './android-engines'
 
-const SDK_URL = 'http://127.0.0.1:41001'
-const NEXT_SDK_URL = 'http://127.0.0.1:41002'
-const M1_SDK_URL = 'http://127.0.0.1:40999'
-const CPU_FILE = 'libllama_server.so'
-const VK_FILE = 'libllama_server_vk.so'
-
-const LLAMA_INFO: SdkEngineInfo = {
-  id: 'llama.cpp-cpu', name: 'llama.cpp (CPU)', kind: 'llama.cpp', formats: ['gguf'], backends: ['cpu'], available: true,
-}
-const LITERT_INFO: SdkEngineInfo = {
-  id: 'litert-lm', name: 'LiteRT-LM', kind: 'litert-lm', formats: ['litertlm'], backends: ['gpu', 'cpu'], available: true,
-}
+const SDK_URL = 'http://sdk.invalid:1'
+const NEXT_SDK_URL = 'http://sdk-next.invalid:1'
+const M1_SDK_URL = 'http://sdk-m1.invalid:1'
 const LITERT_UNAVAILABLE: SdkEngineInfo = { ...LITERT_INFO, available: false, reason: 'Disabled for testing (debug build).' }
 
 const GGUF_MODEL = 'qwen|Q4_K_M|1'
@@ -340,8 +332,8 @@ test('M-1 (E-18): ten starts alternating with and without the bundled files keep
 type Fixture = (nativeLibDir: string) => Config
 
 /** A phone whose config.json is written from `fixture`. Every start loads that file, and returns it as read back. */
-function androidPhone(t: QuietTest, fixture: Fixture) {
-  silenceAndroidLog(t)
+function androidPhone(t: AndroidTest, fixture: Fixture) {
+  quietAndroidLog(t)
   const home = tmpDir('tllm-android-migration-')
   const configPath = join(home, 'config.json')
   const nativeLibDir = join(home, 'lib')
@@ -353,58 +345,26 @@ function androidPhone(t: QuietTest, fixture: Fixture) {
     },
     edit: (change: (c: Config) => void) => ConfigStore.load(configPath).update(change),
     start: async (start: AndroidStart) => {
-      shipFiles(nativeLibDir, start.shippedFiles)
+      shipNativeLibs(nativeLibDir, start.shippedFiles)
       await startApp(t, configPath, { nativeLibDir, start })
       return configOnDisk(configPath)
     },
   }
 }
 
-async function startApp(t: QuietTest, configPath: string, launch: { nativeLibDir: string; start: AndroidStart }) {
+async function startApp(t: AndroidTest, configPath: string, launch: { nativeLibDir: string; start: AndroidStart }) {
   const { nativeLibDir, start } = launch
-  const store = ConfigStore.load(configPath)
-  const env: NodeJS.ProcessEnv = { TURBOLLM_ANDROID_NATIVE_LIB_DIR: nativeLibDir }
-  if (start.sdkEngines !== undefined) env.TURBOLLM_ANDROID_SDK_URL = start.sdkUrl ?? SDK_URL
-  await reconcileAndroidEngines({
-    registry: registryWithoutBinaryProbe(t, store),
-    store,
-    env,
-    readSdk: async () => start.sdkEngines ?? null,
-    formatOf: async () => (modelKey) => LIBRARY[modelKey],
+  const sdkStarted = start.sdkEngines !== undefined
+  await reconcileWith(appRegistry(t, ConfigStore.load(configPath)), {
+    nativeLibDir,
+    sdkUrl: sdkStarted ? (start.sdkUrl ?? SDK_URL) : undefined,
+    sdkEngines: start.sdkEngines,
+    library: LIBRARY,
   })
-}
-
-/** Registry.add probes the llama-server binary, which a test cannot run; this registration keeps add's selection rule
- *  (fillEmptySelection) and skips the probe. */
-function registryWithoutBinaryProbe(t: QuietTest, store: ConfigStore): Registry {
-  const registry = new Registry(store)
-  type AddOpts = { fillEmptySelection?: boolean }
-  t.mock.method(registry, 'add', (async (name: string, binPath: string, _source: unknown, opts: AddOpts = {}) => {
-    const engine = engineRow(randomUUID(), name, 'llama-server', { binPath })
-    store.update((c) => {
-      c.engines.push(engine)
-      if (!c.activeEngineId && opts.fillEmptySelection !== false) c.activeEngineId = engine.id
-    })
-    return { engine }
-  }) as never)
-  return registry
-}
-
-function shipFiles(nativeLibDir: string, files: string[]): void {
-  rmSync(nativeLibDir, { recursive: true, force: true })
-  mkdirSync(nativeLibDir, { recursive: true })
-  for (const file of files) writeFileSync(join(nativeLibDir, file), '')
 }
 
 function configOnDisk(configPath: string): Config {
   return JSON.parse(readFileSync(configPath, 'utf8')) as Config
-}
-
-type QuietTest = { mock: { method: (o: object, m: string, f: (...args: never[]) => unknown) => unknown } }
-
-function silenceAndroidLog(t: QuietTest): void {
-  t.mock.method(console, 'log', () => {})
-  t.mock.method(console, 'warn', () => {})
 }
 
 function freshInstall(): Config {
@@ -414,7 +374,7 @@ function freshInstall(): Config {
 function v1150OnLlamaServer(nativeLibDir: string): Config {
   return {
     ...defaultConfig(),
-    engines: [bundledEngine(CPU_ID, ANDROID_ENGINE_NAME, nativeLibDir, CPU_FILE)],
+    engines: [bundledRow(CPU_ID, ANDROID_ENGINE_NAME, nativeLibDir, CPU_FILE)],
     activeEngineId: CPU_ID,
     lastLoaded: { modelKey: GGUF_MODEL, engineId: CPU_ID },
     modelProfiles: { [GGUF_MODEL]: { [CPU_ID]: GGUF_TUNE } },
@@ -427,8 +387,8 @@ function v1150OnLitertServer(nativeLibDir: string): Config {
   return {
     ...defaultConfig(),
     engines: [
-      bundledEngine(CPU_ID, ANDROID_ENGINE_NAME, nativeLibDir, CPU_FILE),
-      bundledEngine(LITERT_SERVER_ID, ANDROID_LITERT_LM_ENGINE_NAME, nativeLibDir, LITERT_LM_NATIVE_SERVER, 'litert-lm'),
+      bundledRow(CPU_ID, ANDROID_ENGINE_NAME, nativeLibDir, CPU_FILE),
+      bundledRow(LITERT_SERVER_ID, ANDROID_LITERT_LM_ENGINE_NAME, nativeLibDir, LITERT_LM_NATIVE_SERVER, 'litert-lm'),
     ],
     activeEngineId: LITERT_SERVER_ID,
     lastLoaded: { modelKey: LITERT_MODEL, engineId: LITERT_SERVER_ID },
@@ -448,7 +408,7 @@ function v1150OnLitertServer(nativeLibDir: string): Config {
 
 function v1150WithEveryBundledRow(nativeLibDir: string): Config {
   const config = v1150OnLitertServer(nativeLibDir)
-  config.engines.push(bundledEngine(VK_ID, ANDROID_VULKAN_ENGINE_NAME, nativeLibDir, VK_FILE))
+  config.engines.push(bundledRow(VK_ID, ANDROID_VULKAN_ENGINE_NAME, nativeLibDir, VK_FILE))
   config.activeEngineId = CPU_ID
   return config
 }
@@ -458,7 +418,7 @@ function m1LegacyRow(lastModel: string): Fixture {
     ...defaultConfig(),
     engines: [
       engineRow(M1_ID, 'TurboLLM SDK', 'turbollm-sdk', { baseUrl: M1_SDK_URL, version: 'in-app' }),
-      bundledEngine(CPU_ID, ANDROID_ENGINE_NAME, nativeLibDir, CPU_FILE),
+      bundledRow(CPU_ID, ANDROID_ENGINE_NAME, nativeLibDir, CPU_FILE),
     ],
     activeEngineId: M1_ID,
     lastLoaded: { modelKey: lastModel, engineId: M1_ID },
@@ -490,14 +450,6 @@ function nothingUsableActive(lastModel: string, lastEngineId: string): Fixture {
     activeEngineId: REMOVED_ID,
     lastLoaded: { modelKey: lastModel, engineId: lastEngineId },
   })
-}
-
-function engineRow(id: string, name: string, kind: string, extra: Partial<Engine> = {}): Engine {
-  return { id, name, binPath: '', kind, version: '1', capabilities: { kvTypes: [], flags: [] }, addedAt: SAVED_AT, ...extra }
-}
-
-function bundledEngine(id: string, name: string, nativeLibDir: string, file: string, kind = 'llama-server'): Engine {
-  return engineRow(id, name, kind, { binPath: join(nativeLibDir, file) })
 }
 
 function profileEntry(profile: Record<string, unknown>): ProfileEntry {

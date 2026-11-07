@@ -322,11 +322,6 @@ export class Registry {
     return out!
   }
 
-  /** Every row of kind 'turbollm-sdk', in list order. */
-  sdkEngines(): Engine[] {
-    return this.store.snapshot().engines.filter((e) => e.kind === TURBOLLM_SDK_KIND)
-  }
-
   /** Register a llamafile engine (kind='llamafile'). binPath is the single llamafile
    *  executable; it runs as llama.cpp's server (launched with --server --no-webui) and
    *  accepts the standard llama.cpp profile flags. */

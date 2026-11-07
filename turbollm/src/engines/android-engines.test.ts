@@ -2,12 +2,15 @@
 // remembered retired rows, which bundled files this APK ships and the SDK's engine list, and returns the actions the
 // applier carries out. These cases are table-driven over hand-built inputs, with no I/O.
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { ConfigStore, defaultConfig, type Config, type Engine, type RetiredEngine } from '../config/config'
-import { Registry } from './registry'
+import type { Registry } from './registry'
+import {
+  CPU_FILE, LITERT_INFO, LLAMA_INFO, VK_FILE, appRegistry, bundledRow, engineRow, quietAndroidLog, reconcileWith,
+  sdkRowFor, sdkRowsOf, shipNativeLibs, type AndroidTest, type MockedConsole,
+} from '../test-support/android-engines'
 import { tmpDir } from '../test-support/tmp'
 import type { ModelFormat } from './compat'
 import type { SdkEngineInfo } from './sdk-engines'
@@ -19,33 +22,16 @@ import {
 
 const NATIVE = '/data/app/com.turbollm/lib/arm64'
 const SDK_URL = 'http://sdk.invalid:1'
-const CPU_FILE = 'libllama_server.so'
-const VK_FILE = 'libllama_server_vk.so'
-
-const LLAMA_INFO: SdkEngineInfo = {
-  id: 'llama.cpp-cpu', name: 'llama.cpp (CPU)', kind: 'llama.cpp', formats: ['gguf'], backends: ['cpu'], available: true,
-}
-const LITERT_INFO: SdkEngineInfo = {
-  id: 'litert-lm', name: 'LiteRT-LM', kind: 'litert-lm', formats: ['litertlm'], backends: ['gpu', 'cpu'], available: true,
-}
-
-function row(id: string, name: string, kind: string, extra: Partial<Engine> = {}): Engine {
-  return { id, name, binPath: '', kind, version: '1', capabilities: { kvTypes: [], flags: [] }, addedAt: '', ...extra }
-}
-
-function bundledRow(id: string, name: string, file: string, kind = 'llama-server', dir?: string): Engine {
-  return row(id, name, kind, { binPath: dir === undefined ? `${NATIVE}/${file}` : join(dir, file) })
-}
 
 function sdkRow(id: string, info: SdkEngineInfo): Engine {
   const { formats, backends, kind } = info
-  return row(id, info.name, 'turbollm-sdk', { baseUrl: SDK_URL, sdkEngine: { id: info.id, kind, formats, backends } })
+  return engineRow(id, info.name, 'turbollm-sdk', { baseUrl: SDK_URL, sdkEngine: { id: info.id, kind, formats, backends } })
 }
 
-const CPU_ROW = bundledRow('cpu', ANDROID_ENGINE_NAME, CPU_FILE)
-const VK_ROW = bundledRow('vk', ANDROID_VULKAN_ENGINE_NAME, VK_FILE)
-const LITERT_SERVER_ROW = bundledRow('lsrv', ANDROID_LITERT_LM_ENGINE_NAME, LITERT_LM_NATIVE_SERVER, 'litert-lm')
-const LEGACY_ROW = row('m1', 'TurboLLM SDK', 'turbollm-sdk', { baseUrl: SDK_URL })
+const CPU_ROW = bundledRow('cpu', ANDROID_ENGINE_NAME, NATIVE, CPU_FILE)
+const VK_ROW = bundledRow('vk', ANDROID_VULKAN_ENGINE_NAME, NATIVE, VK_FILE)
+const LITERT_SERVER_ROW = bundledRow('lsrv', ANDROID_LITERT_LM_ENGINE_NAME, NATIVE, LITERT_LM_NATIVE_SERVER, 'litert-lm')
+const LEGACY_ROW = engineRow('m1', 'TurboLLM SDK', 'turbollm-sdk', { baseUrl: SDK_URL })
 const LLAMA_SDK_ROW = sdkRow('sdk-llama', LLAMA_INFO)
 const LITERT_SDK_ROW = sdkRow('sdk-litert', LITERT_INFO)
 
@@ -169,13 +155,13 @@ test('D-15: an SDK row whose engine is no longer listed as available is retired 
 })
 
 test('a user-added LiteRT-LM engine with another name is never touched', () => {
-  const userLitert = row('mine', 'My LiteRT', 'litert-lm', { binPath: `/sdcard/${LITERT_LM_NATIVE_SERVER}` })
+  const userLitert = engineRow('mine', 'My LiteRT', 'litert-lm', { binPath: `/sdcard/${LITERT_LM_NATIVE_SERVER}` })
   const actions = planAndroidEngines(input({ engines: [CPU_ROW, userLitert] }))
   assert.equal(actions.some((a) => JSON.stringify(a).includes('mine')), false)
 })
 
 test('a bundled name on another file is not the app\'s own row', () => {
-  const lookalike = row('look', ANDROID_VULKAN_ENGINE_NAME, 'llama-server', { binPath: '/sdcard/llama-server' })
+  const lookalike = engineRow('look', ANDROID_VULKAN_ENGINE_NAME, 'llama-server', { binPath: '/sdcard/llama-server' })
   const actions = planAndroidEngines(input({ engines: [CPU_ROW, lookalike] }))
   assert.deepEqual(ofKind(actions, 'retire'), [])
 })
@@ -410,7 +396,7 @@ test('lastLoaded\'s own row is chosen when it is live and reads the format', () 
 })
 
 test('a user-added engine that is active stays active', () => {
-  const userEngine = row('mine', 'My llama.cpp', 'llama-server', { binPath: '/sdcard/llama-server' })
+  const userEngine = engineRow('mine', 'My llama.cpp', 'llama-server', { binPath: '/sdcard/llama-server' })
   const actions = planAndroidEngines(input({
     engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW, userEngine],
     activeEngineId: userEngine.id,
@@ -427,18 +413,8 @@ test('planning over the activated fresh install activates nothing again', () => 
 })
 
 // The applier (plan D-7): reconcileAndroidEngines reads the SDK's list and the boot scan, plans, and applies the plan
-// to a real Registry over a temp config.json. It never throws, and on desktop it does nothing at all. A llama-server
-// registration probes its binary, which these tests cannot run on every platform, so Registry.add is stood in for by
-// a registration that keeps its selection rule (fillEmptySelection) and skips the probe.
-
-type MockedConsole = { mock: { callCount(): number; calls: { arguments: unknown[] }[] } }
-type AndroidTest = { mock: { method: (o: object, m: string, f: (...args: never[]) => unknown) => unknown } }
-
-function quiet(t: AndroidTest): { logs: MockedConsole; warns: MockedConsole } {
-  const logs = t.mock.method(console, 'log', () => {}) as MockedConsole
-  const warns = t.mock.method(console, 'warn', () => {}) as MockedConsole
-  return { logs, warns }
-}
+// to a real Registry over a temp config.json (test-support/android-engines.ts). It never throws, and on
+// desktop it does nothing at all.
 
 const mentions = (spy: MockedConsole, ...words: RegExp[]) =>
   spy.mock.calls.some((c) => words.every((w) => w.test(String(c.arguments[0]))))
@@ -446,8 +422,7 @@ const mentions = (spy: MockedConsole, ...words: RegExp[]) =>
 /** An APK's nativeLibraryDir holding `files`. */
 function nativeLibDir(files: string[]): string {
   const lib = join(tmpDir('tllm-android-engines-'), 'lib')
-  mkdirSync(lib, { recursive: true })
-  for (const file of files) writeFileSync(join(lib, file), '')
+  shipNativeLibs(lib, files)
   return lib
 }
 
@@ -457,25 +432,9 @@ function configWith(engines: Engine[], activeEngineId: string, extra: Partial<Co
   return path
 }
 
-type AddOpts = { fillEmptySelection?: boolean }
-
-/** A Registry over `path` whose llama-server registration skips the binary probe. `onAdd` runs inside it, between
- *  the plan and the activation, as a user's tap in that window would. */
-function appRegistry(t: AndroidTest, path: string, onAdd: (registry: Registry) => void = () => {}) {
-  const store = ConfigStore.load(path)
-  const registry = new Registry(store)
-  const addOpts: AddOpts[] = []
-  t.mock.method(registry, 'add', (async (name: string, binPath: string, _source: unknown, opts: AddOpts = {}) => {
-    addOpts.push(opts)
-    onAdd(registry)
-    const engine = row(randomUUID(), name, 'llama-server', { binPath })
-    store.update((c) => {
-      c.engines.push(engine)
-      if (!c.activeEngineId && opts.fillEmptySelection !== false) c.activeEngineId = engine.id
-    })
-    return { engine }
-  }) as never)
-  return { store, registry, addOpts }
+/** The app over the config.json at `path`. */
+function appAt(t: AndroidTest, path: string, onAdd?: (registry: Registry) => void) {
+  return appRegistry(t, ConfigStore.load(path), onAdd)
 }
 
 interface BootOptions {
@@ -486,28 +445,14 @@ interface BootOptions {
 
 /** One Android start's engine reconcile, with the SDK answering `sdkEngines` (both engines by default). */
 async function reconcile(app: { store: ConfigStore; registry: Registry }, opts: BootOptions): Promise<void> {
-  const env: NodeJS.ProcessEnv = { TURBOLLM_ANDROID_NATIVE_LIB_DIR: opts.lib }
-  if (opts.sdkUrl) env.TURBOLLM_ANDROID_SDK_URL = opts.sdkUrl
-  await reconcileAndroidEngines({
-    registry: app.registry,
-    store: app.store,
-    env,
-    readSdk: async () => {
-      if (opts.sdkEngines === 'throws') throw new Error('sdk exploded')
-      return opts.sdkEngines === undefined ? [LLAMA_INFO, LITERT_INFO] : opts.sdkEngines
-    },
-    formatOf: async () => (key) => FORMATS[key],
-  })
+  await reconcileWith(app, { nativeLibDir: opts.lib, sdkUrl: opts.sdkUrl, sdkEngines: opts.sdkEngines, library: FORMATS })
 }
 
-const sdkRowsOf = (registry: Registry) => registry.sdkEngines()
-const sdkRowFor = (registry: Registry, sdkEngineId: string) =>
-  registry.sdkEngines().find((e) => e.sdkEngine?.id === sdkEngineId)
 const NEXT_SDK_URL = 'http://sdk-next.invalid:1'
 
 test('applier: a fresh install ends with three rows and LiteRT-LM active', async (t) => {
-  quiet(t)
-  const app = appRegistry(t, configWith([], ''))
+  quietAndroidLog(t)
+  const app = appAt(t, configWith([], ''))
   await reconcile(app, { lib: nativeLibDir([CPU_FILE]), sdkUrl: SDK_URL })
   const names = app.registry.list().engines.map((e) => e.name)
   assert.deepEqual(names, ['llama.cpp (CPU)', 'LiteRT-LM', ANDROID_ENGINE_NAME])
@@ -515,31 +460,31 @@ test('applier: a fresh install ends with three rows and LiteRT-LM active', async
 })
 
 test('applier: registration never selects a row by itself', async (t) => {
-  quiet(t)
-  const app = appRegistry(t, configWith([], ''))
+  quietAndroidLog(t)
+  const app = appAt(t, configWith([], ''))
   await reconcile(app, { lib: nativeLibDir([CPU_FILE]), sdkUrl: SDK_URL })
   assert.deepEqual(app.addOpts, [{ fillEmptySelection: false }])
-  const litertOnly = appRegistry(t, configWith([], ''))
+  const litertOnly = appAt(t, configWith([], ''))
   await reconcile(litertOnly, { lib: nativeLibDir([LITERT_LM_NATIVE_SERVER]) })
   assert.deepEqual(litertOnly.registry.list().engines.map((e) => e.name), [ANDROID_LITERT_LM_ENGINE_NAME])
   assert.equal(litertOnly.registry.list().activeEngineId, '', 'the bundled LiteRT-LM server is registered, not selected')
 })
 
 test('applier: a user\'s pick made while the reconcile runs wins over its activation', async (t) => {
-  const { logs } = quiet(t)
+  const { logs } = quietAndroidLog(t)
   const userPicksLlama = (registry: Registry) => {
     const llama = sdkRowFor(registry, 'llama.cpp-cpu')
     if (llama) registry.activate(llama.id)
   }
-  const app = appRegistry(t, configWith([], ''), userPicksLlama)
+  const app = appAt(t, configWith([], ''), userPicksLlama)
   await reconcile(app, { lib: nativeLibDir([CPU_FILE]), sdkUrl: SDK_URL })
   assert.equal(app.registry.active()?.sdkEngine?.id, 'llama.cpp-cpu')
   assert.ok(mentions(logs, /android:/, /skip/i), 'one line says the activation was skipped')
 })
 
 test('applier: on desktop it reads neither the SDK nor the scan, and changes nothing', async (t) => {
-  quiet(t)
-  const app = appRegistry(t, configWith([CPU_ROW], CPU_ROW.id))
+  quietAndroidLog(t)
+  const app = appAt(t, configWith([CPU_ROW], CPU_ROW.id))
   const calls = { readSdk: 0, formatOf: 0 }
   await reconcileAndroidEngines({
     registry: app.registry,
@@ -559,9 +504,9 @@ test('applier: on desktop it reads neither the SDK nor the scan, and changes not
 })
 
 test('applier: an SDK read that throws is logged and the start goes on, repairing only the SDK URL', async (t) => {
-  const { warns } = quiet(t)
+  const { warns } = quietAndroidLog(t)
   const lib = nativeLibDir([CPU_FILE])
-  const app = appRegistry(t, configWith([LLAMA_SDK_ROW, cpuEngineIn(lib)], LLAMA_SDK_ROW.id))
+  const app = appAt(t, configWith([LLAMA_SDK_ROW, cpuEngineIn(lib)], LLAMA_SDK_ROW.id))
   await assert.doesNotReject(reconcile(app, { lib, sdkUrl: NEXT_SDK_URL, sdkEngines: 'throws' }))
   assert.ok(mentions(warns, /android:/, /sdk exploded/))
   assert.deepEqual(sdkRowsOf(app.registry).map((e) => [e.id, e.baseUrl]), [[LLAMA_SDK_ROW.id, NEXT_SDK_URL]])
@@ -569,9 +514,9 @@ test('applier: an SDK read that throws is logged and the start goes on, repairin
 })
 
 test('applier: the scan lookup is never called synchronously (cli.ts declares the scanner after the call)', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   for (const sdkUrl of [SDK_URL, undefined]) {
-    const app = appRegistry(t, configWith([], ''))
+    const app = appAt(t, configWith([], ''))
     let formatOfCalls = 0
     const env: NodeJS.ProcessEnv = { TURBOLLM_ANDROID_NATIVE_LIB_DIR: nativeLibDir([]) }
     if (sdkUrl) env.TURBOLLM_ANDROID_SDK_URL = sdkUrl
@@ -592,11 +537,11 @@ test('applier: the scan lookup is never called synchronously (cli.ts declares th
 })
 
 test('applier: a v1.15.0 LiteRT-LM user gets their .litertlm settings copied onto the LiteRT-LM row, which is active', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   const lib = nativeLibDir([CPU_FILE])
-  const server = bundledRow('lsrv', ANDROID_LITERT_LM_ENGINE_NAME, LITERT_LM_NATIVE_SERVER, 'litert-lm', lib)
+  const server = bundledRow('lsrv', ANDROID_LITERT_LM_ENGINE_NAME, lib, LITERT_LM_NATIVE_SERVER, 'litert-lm')
   const profile = { profile: { ctx: 4096 }, updatedAt: '2026-11-01T00:00:00.000Z' }
-  const app = appRegistry(t, configWith([server], server.id, {
+  const app = appAt(t, configWith([server], server.id, {
     modelProfiles: { [LITERT_LAST]: { [server.id]: profile }, [GGUF_LAST]: { [server.id]: profile } },
     lastLoaded: { modelKey: LITERT_LAST, engineId: server.id },
   }))
@@ -613,37 +558,37 @@ test('applier: a v1.15.0 LiteRT-LM user gets their .litertlm settings copied ont
 })
 
 test('applier MAJ-1: a boot without the SDK records the fallback in config.json, and the SDK\'s return clears it', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   const lib = nativeLibDir([CPU_FILE])
   const path = configWith([LLAMA_SDK_ROW, LITERT_SDK_ROW, cpuEngineIn(lib)], LITERT_SDK_ROW.id, {
     lastLoaded: { modelKey: LITERT_LAST, engineId: LITERT_SDK_ROW.id },
   })
-  await reconcile(appRegistry(t, path), { lib })
+  await reconcile(appAt(t, path), { lib })
   const down = ConfigStore.load(path).snapshot()
   assert.equal(down.activeEngineId, 'cpu')
   assert.deepEqual(down.androidSdkFallback, { from: LITERT_SDK_ROW.id, to: 'cpu' })
 
-  await reconcile(appRegistry(t, path), { lib, sdkUrl: SDK_URL })
+  await reconcile(appAt(t, path), { lib, sdkUrl: SDK_URL })
   const back = ConfigStore.load(path).snapshot()
   assert.equal(back.activeEngineId, LITERT_SDK_ROW.id)
   assert.equal(back.androidSdkFallback, undefined)
 })
 
 test('applier MAJ-1: no fallback is recorded when a pick made meanwhile skips the activation', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   const userPicksLlama = (registry: Registry) => registry.activate(LLAMA_SDK_ROW.id)
   const path = configWith([LLAMA_SDK_ROW, LITERT_SDK_ROW], LITERT_SDK_ROW.id)
-  await reconcile(appRegistry(t, path, userPicksLlama), { lib: nativeLibDir([CPU_FILE]) })
+  await reconcile(appAt(t, path, userPicksLlama), { lib: nativeLibDir([CPU_FILE]) })
   const cfg = ConfigStore.load(path).snapshot()
   assert.equal(cfg.activeEngineId, LLAMA_SDK_ROW.id)
   assert.equal(cfg.androidSdkFallback, undefined)
 })
 
 test('applier m-3: LiteRT-LM unavailable with a .litertlm last model leaves no engine active, said in one warning', async (t) => {
-  const { warns } = quiet(t)
+  const { warns } = quietAndroidLog(t)
   const lib = nativeLibDir([CPU_FILE])
   const lastLoaded = { modelKey: LITERT_LAST, engineId: LITERT_SDK_ROW.id }
-  const app = appRegistry(t, configWith([LLAMA_SDK_ROW, LITERT_SDK_ROW, cpuEngineIn(lib)], LITERT_SDK_ROW.id, { lastLoaded }))
+  const app = appAt(t, configWith([LLAMA_SDK_ROW, LITERT_SDK_ROW, cpuEngineIn(lib)], LITERT_SDK_ROW.id, { lastLoaded }))
   await reconcile(app, { lib, sdkUrl: SDK_URL, sdkEngines: [LLAMA_INFO, { ...LITERT_INFO, available: false }] })
   assert.equal(app.registry.list().activeEngineId, '')
   assert.equal(warns.mock.calls.filter((c) => /no engine is active/.test(String(c.arguments[0]))).length, 1)
@@ -651,17 +596,17 @@ test('applier m-3: LiteRT-LM unavailable with a .litertlm last model leaves no e
 })
 
 test('applier m-3: a boot that leaves an engine active says nothing about it', async (t) => {
-  const { warns } = quiet(t)
+  const { warns } = quietAndroidLog(t)
   const lib = nativeLibDir([CPU_FILE])
-  const app = appRegistry(t, configWith([LLAMA_SDK_ROW, LITERT_SDK_ROW, cpuEngineIn(lib)], LITERT_SDK_ROW.id))
+  const app = appAt(t, configWith([LLAMA_SDK_ROW, LITERT_SDK_ROW, cpuEngineIn(lib)], LITERT_SDK_ROW.id))
   await reconcile(app, { lib, sdkUrl: SDK_URL })
   assert.equal(app.registry.list().activeEngineId, LITERT_SDK_ROW.id)
   assert.equal(mentions(warns, /no engine is active/), false)
 })
 
 test('applier G-9: with the SDK not started and no CPU file, one warning says no engine can run this launch', async (t) => {
-  const { warns } = quiet(t)
-  const app = appRegistry(t, configWith([], ''))
+  const { warns } = quietAndroidLog(t)
+  const app = appAt(t, configWith([], ''))
   await reconcile(app, { lib: nativeLibDir([]) })
   assert.deepEqual(app.registry.list().engines, [])
   assert.equal(warns.mock.callCount(), 1)
@@ -671,13 +616,13 @@ test('applier G-9: with the SDK not started and no CPU file, one warning says no
 // Moved from seed.test.ts (plan §0.7): the Android start's cases, re-expressed against reconcileAndroidEngines.
 
 function cpuEngineIn(lib: string): Engine {
-  return bundledRow('cpu', ANDROID_ENGINE_NAME, CPU_FILE, 'llama-server', lib)
+  return bundledRow('cpu', ANDROID_ENGINE_NAME, lib, CPU_FILE)
 }
 
 test('R-5 superseded (ADR-462, D-17): a first start with the SDK keeps llama-server active and adds the SDK rows', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   const lib = nativeLibDir([CPU_FILE])
-  const app = appRegistry(t, configWith([cpuEngineIn(lib)], 'cpu'))
+  const app = appAt(t, configWith([cpuEngineIn(lib)], 'cpu'))
   await reconcile(app, { lib, sdkUrl: SDK_URL })
   assert.deepEqual(sdkRowsOf(app.registry).map((e) => [e.name, e.baseUrl, e.binPath]), [
     ['llama.cpp (CPU)', SDK_URL, ''],
@@ -688,48 +633,48 @@ test('R-5 superseded (ADR-462, D-17): a first start with the SDK keeps llama-ser
 })
 
 test('android second start: the SDK rows keep their ids and take the new URL', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   const lib = nativeLibDir([CPU_FILE])
   const path = configWith([cpuEngineIn(lib)], 'cpu')
-  const first = appRegistry(t, path)
+  const first = appAt(t, path)
   await reconcile(first, { lib, sdkUrl: SDK_URL })
   const firstIds = sdkRowsOf(first.registry).map((e) => e.id)
-  const app = appRegistry(t, path)
+  const app = appAt(t, path)
   await reconcile(app, { lib, sdkUrl: NEXT_SDK_URL })
   assert.deepEqual(sdkRowsOf(app.registry).map((e) => [e.id, e.baseUrl]), firstIds.map((id) => [id, NEXT_SDK_URL]))
 })
 
 test('android: a user who switched to llama-server keeps it after a restart', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   const lib = nativeLibDir([CPU_FILE])
   const path = configWith([], '')
-  const first = appRegistry(t, path)
+  const first = appAt(t, path)
   await reconcile(first, { lib, sdkUrl: SDK_URL })
   const cpu = first.registry.list().engines.find((e) => e.name === ANDROID_ENGINE_NAME)
   first.registry.activate(cpu?.id ?? 'missing')
-  const app = appRegistry(t, path)
+  const app = appAt(t, path)
   await reconcile(app, { lib, sdkUrl: SDK_URL })
   assert.equal(app.registry.active()?.id, cpu?.id)
 })
 
 test('android without the SDK this launch: no SDK row is registered', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   const lib = nativeLibDir([CPU_FILE])
-  const app = appRegistry(t, configWith([cpuEngineIn(lib)], 'cpu'))
+  const app = appAt(t, configWith([cpuEngineIn(lib)], 'cpu'))
   await reconcile(app, { lib })
   assert.deepEqual(sdkRowsOf(app.registry), [])
   assert.equal(app.registry.active()?.id, 'cpu')
 })
 
 test('android without the SDK this launch: the SDK rows stay, the CPU engine becomes active, said in the log', async (t) => {
-  const { logs } = quiet(t)
+  const { logs } = quietAndroidLog(t)
   const lib = nativeLibDir([CPU_FILE])
   const path = configWith([cpuEngineIn(lib)], 'cpu')
-  const first = appRegistry(t, path)
+  const first = appAt(t, path)
   await reconcile(first, { lib, sdkUrl: SDK_URL })
   const sdkIds = sdkRowsOf(first.registry).map((e) => e.id)
   first.registry.activate(sdkIds[1])
-  const app = appRegistry(t, path)
+  const app = appAt(t, path)
   await reconcile(app, { lib })
   assert.deepEqual(sdkRowsOf(app.registry).map((e) => e.id), sdkIds, 'never deleted')
   assert.equal(app.registry.active()?.id, 'cpu')
@@ -737,8 +682,8 @@ test('android without the SDK this launch: the SDK rows stay, the CPU engine bec
 })
 
 test('android with the SDK and no libllama_server.so: only the SDK rows, LiteRT-LM active, and no warning', async (t) => {
-  const { warns } = quiet(t)
-  const app = appRegistry(t, configWith([], ''))
+  const { warns } = quietAndroidLog(t)
+  const app = appAt(t, configWith([], ''))
   await reconcile(app, { lib: nativeLibDir([]), sdkUrl: SDK_URL })
   assert.deepEqual(app.registry.list().engines.map((e) => e.kind), ['turbollm-sdk', 'turbollm-sdk'])
   assert.equal(app.registry.active()?.sdkEngine?.id, 'litert-lm')
@@ -746,10 +691,10 @@ test('android with the SDK and no libllama_server.so: only the SDK rows, LiteRT-
 })
 
 test('G-7: an active bundled LiteRT-LM server whose file is gone is retired, and the LiteRT-LM SDK row becomes active', async (t) => {
-  const { logs } = quiet(t)
+  const { logs } = quietAndroidLog(t)
   const lib = nativeLibDir([CPU_FILE])
-  const litert = bundledRow('litert', ANDROID_LITERT_LM_ENGINE_NAME, LITERT_LM_NATIVE_SERVER, 'litert-lm', lib)
-  const app = appRegistry(t, configWith([cpuEngineIn(lib), litert], 'litert'))
+  const litert = bundledRow('litert', ANDROID_LITERT_LM_ENGINE_NAME, lib, LITERT_LM_NATIVE_SERVER, 'litert-lm')
+  const app = appAt(t, configWith([cpuEngineIn(lib), litert], 'litert'))
   await reconcile(app, { lib, sdkUrl: SDK_URL })
   assert.equal(app.registry.get('litert'), undefined)
   assert.equal(app.registry.active()?.sdkEngine?.id, 'litert-lm')
@@ -757,33 +702,33 @@ test('G-7: an active bundled LiteRT-LM server whose file is gone is retired, and
 })
 
 test('G-7: an earlier install\'s LiteRT-LM server row is retired too, and without the SDK the CPU engine is active', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   const lib = nativeLibDir([CPU_FILE])
   const oldLib = '/data/app/old/lib/arm64'
-  const stale = bundledRow('litert', ANDROID_LITERT_LM_ENGINE_NAME, LITERT_LM_NATIVE_SERVER, 'litert-lm', oldLib)
-  const app = appRegistry(t, configWith([cpuEngineIn(lib), stale], 'litert'))
+  const stale = bundledRow('litert', ANDROID_LITERT_LM_ENGINE_NAME, oldLib, LITERT_LM_NATIVE_SERVER, 'litert-lm')
+  const app = appAt(t, configWith([cpuEngineIn(lib), stale], 'litert'))
   await reconcile(app, { lib })
   assert.equal(app.registry.get('litert'), undefined)
   assert.equal(app.registry.active()?.id, 'cpu')
 })
 
 test('G-7: a bundled Vulkan engine whose file is gone is retired; the active engine is kept', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   const lib = nativeLibDir([CPU_FILE])
-  const vulkan = bundledRow('vk', ANDROID_VULKAN_ENGINE_NAME, VK_FILE, 'llama-server', lib)
-  const app = appRegistry(t, configWith([cpuEngineIn(lib), vulkan], 'cpu'))
+  const vulkan = bundledRow('vk', ANDROID_VULKAN_ENGINE_NAME, lib, VK_FILE)
+  const app = appAt(t, configWith([cpuEngineIn(lib), vulkan], 'cpu'))
   await reconcile(app, { lib })
   assert.deepEqual(app.registry.list().engines.map((e) => e.id), ['cpu'])
   assert.equal(app.registry.active()?.id, 'cpu')
 })
 
 test('G-7: a user-added LiteRT-LM engine is never retired', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   const lib = nativeLibDir([CPU_FILE])
   const userBin = join(tmpDir('tllm-android-engines-'), 'venv', 'python')
-  const mine = row('mine', 'LiteRT-LM', 'litert-lm', { binPath: userBin })
-  const sameName = row('named', ANDROID_LITERT_LM_ENGINE_NAME, 'litert-lm', { binPath: userBin })
-  const app = appRegistry(t, configWith([cpuEngineIn(lib), mine, sameName], 'mine'))
+  const mine = engineRow('mine', 'LiteRT-LM', 'litert-lm', { binPath: userBin })
+  const sameName = engineRow('named', ANDROID_LITERT_LM_ENGINE_NAME, 'litert-lm', { binPath: userBin })
+  const app = appAt(t, configWith([cpuEngineIn(lib), mine, sameName], 'mine'))
   await reconcile(app, { lib, sdkUrl: SDK_URL })
   assert.equal(app.registry.get('mine')?.binPath, userBin)
   assert.equal(app.registry.get('named')?.binPath, userBin, 'a bundled name on a binary the APK never ships is the user\'s')
@@ -791,9 +736,9 @@ test('G-7: a user-added LiteRT-LM engine is never retired', async (t) => {
 })
 
 test('android: the LiteRT-LM SDK row takes over from an active bundled engine whose file is gone', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   const lib = nativeLibDir([])
-  const app = appRegistry(t, configWith([cpuEngineIn(lib), LEGACY_ROW], 'cpu'))
+  const app = appAt(t, configWith([cpuEngineIn(lib), LEGACY_ROW], 'cpu'))
   await reconcile(app, { lib, sdkUrl: SDK_URL })
   assert.equal(app.registry.active()?.sdkEngine?.id, 'litert-lm')
   assert.equal(sdkRowFor(app.registry, 'llama.cpp-cpu')?.id, LEGACY_ROW.id, 'the M1 row is adopted under its id')
@@ -820,7 +765,7 @@ async function unavailableForOneBoot(t: AndroidTest, opts: { litertActiveAtBoot2
   const lib = nativeLibDir([CPU_FILE])
   const path = configWith([], '')
   const boot = async (engines: SdkEngineInfo[]) => {
-    const app = appRegistry(t, path)
+    const app = appAt(t, path)
     await reconcile(app, { lib, sdkUrl: SDK_URL, sdkEngines: engines })
     return app
   }
@@ -838,7 +783,7 @@ async function unavailableForOneBoot(t: AndroidTest, opts: { litertActiveAtBoot2
 }
 
 test('D-15 applier: a profile saved on the LiteRT-LM row survives a boot without it and applies again under the same id', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   const { litertId, profile, second, third } = await unavailableForOneBoot(t, { litertActiveAtBoot2: false })
 
   assert.equal(sdkRowFor(second.registry, 'litert-lm'), undefined, 'no row while the engine is unavailable (ADR-239)')
@@ -851,7 +796,7 @@ test('D-15 applier: a profile saved on the LiteRT-LM row survives a boot without
 })
 
 test('D-15 rule 4: LiteRT-LM active when it went away → the row reading lastLoaded; back again, the user\'s pick stands', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   const { litertId, second, third } = await unavailableForOneBoot(t, { litertActiveAtBoot2: true })
 
   const llamaId = sdkRowFor(second.registry, 'llama.cpp-cpu')?.id
@@ -861,7 +806,7 @@ test('D-15 rule 4: LiteRT-LM active when it went away → the row reading lastLo
 })
 
 test('D-15: a fourth boot after the return plans nothing new', async (t) => {
-  quiet(t)
+  quietAndroidLog(t)
   const { third } = await unavailableForOneBoot(t, { litertActiveAtBoot2: false })
   const cfg = third.store.snapshot()
   const actions = planAndroidEngines(input({
