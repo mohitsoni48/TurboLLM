@@ -83,7 +83,7 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
     // engine was not expected to run, with advice to activate another engine ("activate the LiteRT-LM engine to load
     // it" for a .litertlm model under KoboldCpp), a choice that is the user's alone. The Models screen and the pickers
     // still hide such a model unless the user shows them all.
-    const inc = manualLoadRefusal(active.kind, entry)
+    const inc = manualLoadRefusal(active, entry)
     if (inc) return err(c, 409, 'engine_model_mismatch', inc.message)
 
     // Side models — embedding and Laya — get their own pool slot via the router (same coexistence rule

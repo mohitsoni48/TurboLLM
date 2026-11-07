@@ -566,8 +566,8 @@ export class ModelRouter {
    *  not be reached again once evicted. With the setting off they keep modelIncompatibility's refusal. */
   private loadRefusal(engine: Engine, entry: ModelEntry, manual?: boolean): Incompatibility | null {
     return manual || this.store.snapshot().showAllEngineModels
-      ? manualLoadRefusal(engine.kind, entry)
-      : modelIncompatibility(engine.kind, entry)
+      ? manualLoadRefusal(engine, entry)
+      : modelIncompatibility(engine, entry)
   }
 
   /** `explicit`: loadExplicit's options, absent for route(). */

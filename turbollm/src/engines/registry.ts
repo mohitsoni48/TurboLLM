@@ -706,6 +706,6 @@ export function unlistedForLoading(
   const memo = { active: once(() => registry.active()), layaEngine: once(() => registry.layaEngine()) }
   return (e) => {
     const engine = engineForModel(memo, e)
-    return engine ? modelIncompatibility(engine.kind, e) : null
+    return engine ? modelIncompatibility(engine, e) : null
   }
 }

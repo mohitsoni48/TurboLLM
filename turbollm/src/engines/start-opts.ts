@@ -7,7 +7,7 @@
 // only `trigger` became a parameter. Pure: it never reads the store or calls getSysInfo(), so a caller
 // gets StartOpts for exactly the config snapshot and hardware it made its decision with.
 import { BUILTIN_MODEL_DEFAULT_CTX, type Config, type Engine, getModelProfile } from '../config/config'
-import { engineAcceptsFormat, type ModelFormat } from './compat'
+import { engineAcceptsFormat, engineFormats, type EngineFormatRef, type ModelFormat } from './compat'
 import { koboldcppProfileToArgs } from './koboldcpp'
 import { litertLmProfileToConfig } from './litert-lm'
 import { litertLmRequestSampling } from './litert-lm-request'
@@ -31,7 +31,7 @@ export interface BuildStartOptsInput {
 }
 
 export function buildStartOpts(input: BuildStartOptsInput): StartOpts {
-  const format = launchFormat(input.engine.kind, input.entry.format)
+  const format = launchFormat(input.engine, input.entry.format)
   if (format === 'litertlm') return buildLitertLmStartOpts(input)
   if (format !== 'gguf') return buildModelDirectoryStartOpts(input)
   return buildGgufStartOpts(input)
@@ -41,11 +41,11 @@ export function buildStartOpts(input: BuildStartOptsInput): StartOpts {
  *  reads. A manual Load starts a model on the selected engine whatever its format (compat.ts manualLoadRefusal): built
  *  for the model's format, a GGUF on vLLM got llama.cpp's flags and a .litertlm under KoboldCpp the LiteRT-LM options,
  *  so the engine failed on arguments it does not take instead of on the file. Never differs for a model the engine
- *  runs, the only kind an automatic load starts. */
-function launchFormat(engineKind: string, format: ModelFormat): ModelFormat {
-  if (engineAcceptsFormat(engineKind, format)) return format
-  if (engineKind === 'litert-lm') return 'litertlm'
-  return engineAcceptsFormat(engineKind, 'gguf') ? 'gguf' : 'mlx'
+ *  runs, the only kind an automatic load starts. The SDK rows (ADR-462) read their own formats, so a GGUF on the
+ *  LiteRT-LM SDK row is built for LiteRT-LM, and a .litertlm on the llama.cpp SDK row for GGUF. */
+export function launchFormat(engine: EngineFormatRef, format: ModelFormat): ModelFormat {
+  if (engineAcceptsFormat(engine, format)) return format
+  return engineFormats(engine)[0] ?? 'mlx'
 }
 
 function buildModelDirectoryStartOpts({ entry, engine, cfg, sys, overrides, trigger }: BuildStartOptsInput): StartOpts {

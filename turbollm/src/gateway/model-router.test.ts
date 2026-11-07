@@ -470,8 +470,8 @@ test('route: a ggmlc GGUF, or a Laya model with no Laya engine, is refused witho
   const layaResult = await r.route(laya.key)
 
   assert.deepEqual([ggmlcResult, layaResult], [
-    { status: 503, message: modelIncompatibility('llama-server', ggmlc)?.message, permanent: true },
-    { status: 503, message: modelIncompatibility('llama-server', laya)?.message, permanent: true },
+    { status: 503, message: modelIncompatibility({ kind: 'llama-server' }, ggmlc)?.message, permanent: true },
+    { status: 503, message: modelIncompatibility({ kind: 'llama-server' }, laya)?.message, permanent: true },
   ])
   assert.match(String('message' in ggmlcResult && ggmlcResult.message), /ggmlc/)
   assert.match(String('message' in layaResult && layaResult.message), /Install Laya/)

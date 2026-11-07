@@ -4,7 +4,7 @@
 import { existsSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { migrateEngineId, type ConfigStore, type Engine, type LastLoaded, type RetiredEngine } from '../config/config'
-import type { ModelFormat } from './compat'
+import { engineFormats, type ModelFormat } from './compat'
 import { LITERT_LM_NATIVE_SERVER, litertLmNativeVersion } from './litert-lm'
 import type { Registry } from './registry'
 import type { SdkEngineInfo } from './sdk-engines'
@@ -199,7 +199,7 @@ function liveBundledRows({ engines, retired }: AndroidEngineInput, rows: Android
   return ANDROID_BUNDLED_ENGINES.flatMap(({ name, kind }): PlannedRow[] => {
     const action = rows.filter(isBundledKeep).find((a) => a.name === name)
     if (!action) return []
-    return [{ ref: bundledRef(action, engines, retired), origin: 'bundled', bundledName: name, formats: kindFormats(kind) }]
+    return [{ ref: bundledRef(action, engines, retired), origin: 'bundled', bundledName: name, formats: engineFormats({ kind }) }]
   })
 }
 
@@ -211,11 +211,11 @@ function bundledRef(action: BundledKeep, engines: Engine[], retired: AndroidEngi
 }
 
 function otherRows({ engines }: AndroidEngineInput): PlannedRow[] {
-  return engines.filter((e) => !isAppOwnedRow(e)).map((e) => ({ ref: e.id, origin: 'other', formats: rowFormats(e) }))
+  return engines.filter((e) => !isAppOwnedRow(e)).map((e) => ({ ref: e.id, origin: 'other', formats: engineFormats(e) }))
 }
 
 function plannedSdkRow(engine: Engine): PlannedRow {
-  return { ref: engine.id, origin: 'sdk', sdkEngineId: engine.sdkEngine?.id, formats: rowFormats(engine) }
+  return { ref: engine.id, origin: 'sdk', sdkEngineId: engine.sdkEngine?.id, formats: engineFormats(engine) }
 }
 
 /** The existing row an upsert lands on, as Registry.upsertSdkEngine finds it. */
@@ -233,20 +233,6 @@ function isUpsert(action: AndroidEngineAction): action is UpsertSdk {
 
 function isBundledKeep(action: AndroidEngineAction): action is BundledKeep {
   return action.kind === 'register-bundled' || action.kind === 'repair-bundled' || action.kind === 'reinstate-bundled'
-}
-
-/** The formats a row reads. TODO(D-8): replaced by compat's engineFormats, which this table mirrors for the kinds an
- *  Android start can hold. */
-function rowFormats(engine: Engine): ModelFormat[] {
-  if (engine.sdkEngine) return engine.sdkEngine.formats
-  return kindFormats(engine.kind)
-}
-
-function kindFormats(kind: string): ModelFormat[] {
-  if (kind === TURBOLLM_SDK_KIND) return ['gguf', 'litertlm']
-  if (kind === 'litert-lm') return ['litertlm']
-  if (kind === 'llama-server') return ['gguf']
-  return []
 }
 
 function activeRow({ engines, activeEngineId }: AndroidEngineInput): Engine | undefined {

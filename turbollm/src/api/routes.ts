@@ -4022,7 +4022,7 @@ function overlayModel(
   // `incompatibleReason` is the short row text for why not (e.g. "Needs vLLM (Linux or WSL2)").
   // A Laya model is checked against the Laya engine it loads on, not the active one (engineForModel).
   const engine = engineForModel(registry, e)
-  const inc = engine ? modelIncompatibility(engine.kind, e) : null
+  const inc = engine ? modelIncompatibility(engine, e) : null
   const compatibleWithActiveEngine = !inc
   const incompatibleReason = inc?.label ?? null
   // Source HF repo: confirmed from download provenance, else inferred from the

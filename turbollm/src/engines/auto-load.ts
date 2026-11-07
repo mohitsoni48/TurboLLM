@@ -180,7 +180,7 @@ function unresolved(reason: AutoLoadSkipReason): LastModelResolution {
  *  engine as a manual Load starts it (compat.ts manualLoadRefusal), and fails there if that engine cannot load it:
  *  once the user shows such models, one is always started on the selected engine. */
 function incompatibilityDetail(engine: Engine, entry: ModelEntry, showAll: boolean): string {
-  const inc = showAll ? manualLoadRefusal(engine.kind, entry) : modelIncompatibility(engine.kind, entry)
+  const inc = showAll ? manualLoadRefusal(engine, entry) : modelIncompatibility(engine, entry)
   if (!inc) return ''
   if (inc.code === 'format') return `format ${entry.format}`
   if (inc.code === 'audio') return 'audio tower not supported'
