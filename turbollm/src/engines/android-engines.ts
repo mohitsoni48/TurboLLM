@@ -151,7 +151,7 @@ function planActivation(input: AndroidEngineInput, rows: AndroidEngineAction[]):
 }
 
 /** The SDK is back: the row active before the fallback, as rule 4 would treat it were it still active, unless the user
- *  picked an engine since. Either way the fallback is over. */
+ *  picked an engine since, or the restore would strand the last model (FD-1). Either way the fallback is over. */
 function planFallbackEnd(
   input: AndroidEngineInput,
   fallback: AndroidSdkFallback,
@@ -162,7 +162,22 @@ function planFallbackEnd(
   if (input.activeEngineId !== fallback.to) return [forget]
   const restored = activationTarget({ ...input, activeEngineId: fallback.from }, rows, live)
     ?? activationOf(live.find((r) => r.ref === fallback.from))
+  if (restored && strandsLastModel(input, live, restored.engineId)) return [forget]
   return [...activationsOf(input, restored), forget]
+}
+
+/** I-5 over the restore: the CPU server runs the last model (one the user loaded on it during the fallback) and the
+ *  earlier row cannot. When the CPU server cannot run it either, the earlier pick returns (MAJ-1 case 8), and a
+ *  lastLoaded of unknown format never blocks it. */
+function strandsLastModel(input: AndroidEngineInput, live: PlannedRow[], target: string): boolean {
+  const lastFormat = lastModelFormat(input)
+  if (lastFormat === undefined) return false
+  const reads = (ref: string) => live.some((r) => r.ref === ref && r.formats.includes(lastFormat))
+  return reads(input.activeEngineId) && !reads(target)
+}
+
+function lastModelFormat({ lastLoaded, formatOf }: AndroidEngineInput): ModelFormat | undefined {
+  return lastLoaded.modelKey ? formatOf(lastLoaded.modelKey) : undefined
 }
 
 type Activation = Omit<Extract<AndroidEngineAction, { kind: 'activate' }>, 'kind'>
@@ -172,7 +187,7 @@ function activationsOf(input: AndroidEngineInput, activation: Activation | undef
 }
 
 function activationTarget(input: AndroidEngineInput, rows: AndroidEngineAction[], live: PlannedRow[]): Activation | undefined {
-  const lastFormat = input.lastLoaded.modelKey ? input.formatOf(input.lastLoaded.modelKey) : undefined
+  const lastFormat = lastModelFormat(input)
   const active = activeRow(input)
   if (!active || isRetiredBy(rows, active.id)) {
     if (!isFreshInstall(input)) return activationOf(rowForLastLoaded(input, live, lastFormat))

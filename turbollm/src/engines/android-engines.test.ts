@@ -371,6 +371,46 @@ test('MAJ-1 8: llama.cpp (CPU) picked by hand with a .litertlm last model goes b
   assert.deepEqual(fallbackActions(back), [...activates(LLAMA_SDK_ROW.id), forgetsFallback])
 })
 
+// FD-1 (fix-delta review, founder Q2, I-5): the restore must not strand a model the user loaded on the CPU server
+// during the fallback. The earlier row returns only when it reads the current lastLoaded's format, or when the CPU
+// server cannot run that model either (MAJ-1 case 8: the user's own pick returns). With no lastLoaded, or one whose
+// format is unknown, it returns as before.
+
+const UNSCANNED_LAST = 'gone|Q4_K_M|9'
+
+test('FD-1: a GGUF loaded on the CPU server during the fallback keeps the CPU server active; the fallback is forgotten', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW],
+    activeEngineId: CPU_ROW.id,
+    lastLoaded: { modelKey: GGUF_LAST, engineId: CPU_ROW.id },
+    sdkFallback: { from: LITERT_SDK_ROW.id, to: CPU_ROW.id },
+    sdk: BOTH_SDK_ENGINES,
+  }))
+  assert.deepEqual(fallbackActions(actions), [forgetsFallback])
+})
+
+test('FD-1: a lastLoaded of unknown format restores the earlier row as before', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW],
+    activeEngineId: CPU_ROW.id,
+    lastLoaded: { modelKey: UNSCANNED_LAST, engineId: CPU_ROW.id },
+    sdkFallback: { from: LITERT_SDK_ROW.id, to: CPU_ROW.id },
+    sdk: BOTH_SDK_ENGINES,
+  }))
+  assert.deepEqual(fallbackActions(actions), [...activates(LITERT_SDK_ROW.id), forgetsFallback])
+})
+
+test('FD-1: a GGUF lastLoaded the earlier llama.cpp (CPU) row reads restores that row', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW],
+    activeEngineId: CPU_ROW.id,
+    lastLoaded: { modelKey: GGUF_LAST, engineId: CPU_ROW.id },
+    sdkFallback: { from: LLAMA_SDK_ROW.id, to: CPU_ROW.id },
+    sdk: BOTH_SDK_ENGINES,
+  }))
+  assert.deepEqual(fallbackActions(actions), [...activates(LLAMA_SDK_ROW.id), forgetsFallback])
+})
+
 test('an active SDK engine that becomes unavailable is replaced by the row that reads lastLoaded', () => {
   const actions = planAndroidEngines(input({
     engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW],
@@ -582,6 +622,25 @@ test('applier MAJ-1: no fallback is recorded when a pick made meanwhile skips th
   const cfg = ConfigStore.load(path).snapshot()
   assert.equal(cfg.activeEngineId, LLAMA_SDK_ROW.id)
   assert.equal(cfg.androidSdkFallback, undefined)
+})
+
+test('applier FD-1: a GGUF loaded on the CPU server while the SDK was down stays runnable when the SDK returns', async (t) => {
+  quietAndroidLog(t)
+  const lib = nativeLibDir([CPU_FILE])
+  const path = configWith([LLAMA_SDK_ROW, LITERT_SDK_ROW, cpuEngineIn(lib)], LITERT_SDK_ROW.id, {
+    lastLoaded: { modelKey: LITERT_LAST, engineId: LITERT_SDK_ROW.id },
+  })
+  await reconcile(appAt(t, path), { lib })
+  ConfigStore.load(path).update((c) => {
+    c.lastLoaded = { modelKey: GGUF_LAST, engineId: 'cpu' }
+  })
+
+  await reconcile(appAt(t, path), { lib, sdkUrl: SDK_URL })
+
+  const back = ConfigStore.load(path).snapshot()
+  assert.equal(back.activeEngineId, 'cpu', 'the row that runs the GGUF lastLoaded')
+  assert.equal(back.androidSdkFallback, undefined)
+  assert.deepEqual(back.lastLoaded, { modelKey: GGUF_LAST, engineId: 'cpu' })
 })
 
 test('applier m-3: LiteRT-LM unavailable with a .litertlm last model leaves no engine active, said in one warning', async (t) => {
