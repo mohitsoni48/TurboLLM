@@ -14,10 +14,7 @@ describe('LOCAL_MCPS', () => {
     expect(engine.desc).toContain('running SearXNG')
     expect(engine.desc).toContain('Markdown')
     expect(engine.desc).not.toMatch(/SSRF-hardened|no query leaves|privacy-first/i)
-    if (engine.cmd.includes('git+')) {
-      expect(engine.desc).toMatch(/\bgit\b/i)
-      expect(engine.cmd).toMatch(/@[0-9a-f]{40}\s+mcp-web-engine$/)
-    }
+    expect(engine.cmd).toMatch(/^uvx mcp-web-engine==\d+\.\d+\.\d+$/)
   })
 
   it('MCP Web Engine explicitly configures search and optional fallback', () => {
