@@ -141,9 +141,10 @@ test('m-2: a pin naming a copied preset moves to its clone, which getModelProfil
   assert.ok(cfg.modelPresets[LITERT_KEY].some((p) => p.id === 'old-fast' && p.engineId === 'old'), 'the original is kept')
 })
 
-test('m-2: a model the filter rejects keeps its pin', () => {
+test('m-2: a model the filter rejects keeps its pin, even with a same-name preset on the new row', () => {
   const cfg = fixture()
   cfg.lastPresetId[GGUF_KEY] = 'old-fast'
+  cfg.modelPresets[GGUF_KEY].push(preset('new', 'fast'))
   migrateEngineId(cfg, 'old', 'new', { copy: true, onlyModel: onlyLitert })
   assert.equal(cfg.lastPresetId[GGUF_KEY], 'old-fast')
 })
@@ -155,9 +156,10 @@ test('m-2: when the new row already has a preset of that name, the pin moves to 
   assert.equal(cfg.lastPresetId[LITERT_KEY], 'new-fast')
 })
 
-test('m-2: a pin naming a preset of another engine stays where it is', () => {
+test('m-2: a pin naming a preset of another engine stays where it is, even with a same-name preset on the new row', () => {
   const cfg = fixture()
   cfg.lastPresetId[LITERT_KEY] = '-any'
+  cfg.modelPresets[LITERT_KEY].push(preset('new', 'any'))
   migrateEngineId(cfg, 'old', 'new', { copy: true })
   assert.equal(cfg.lastPresetId[LITERT_KEY], '-any')
 })
