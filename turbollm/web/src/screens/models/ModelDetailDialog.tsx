@@ -456,7 +456,7 @@ export function ModelDetailDialog({
   const benchDone = !!benchState?.done && benchHere && !benchState.running
   const benchErr = bench.start.error instanceof ApiError ? bench.start.error.message : null
   // The load knobs follow the engine that will load the model (BUG-004), not the model format.
-  const loadMode = loadModeFor(detail ?? {}, activeEngine?.kind)
+  const loadMode = loadModeFor(detail ?? {}, activeEngine)
   const isLlamaCpp = loadMode === 'llamacpp'
   const isMlx = loadMode === 'mlx'
   const isRapidMlx = loadMode === 'rapid-mlx'
