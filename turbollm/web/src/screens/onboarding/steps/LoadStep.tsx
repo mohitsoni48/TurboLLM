@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { AlertTriangle, Check, Download, Loader2, Pause, RotateCw, Terminal } from 'lucide-react'
-import { useDownloadMutations, useDownloads, useModels, useStatus } from '../../../lib/queries'
+import { useDownloadMutations, useDownloads, useEngines, useModels, useStatus } from '../../../lib/queries'
 import { loadModel, track, trackRecovery, trackRecoveryText } from '../../../lib/api'
 import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
 import type { StepComponentProps } from '../OnboardingScreen'
@@ -25,6 +25,7 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
   const downloadMutations = useDownloadMutations()
   const modelsQuery = useModels()
   const statusQuery = useStatus()
+  const preparesOnFirstLoad = useActiveEngineIsInAppLitert()
   const [loadTriggered, setLoadTriggered] = useState(false)
   const [loadFailed, setLoadFailed] = useState(false)
   const [resumeError, setResumeError] = useState<string | null>(null)
@@ -474,7 +475,12 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
           <div className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center">
             {loadedModel ? <Check size={16} className="text-accent" /> : <Loader2 size={16} className={loadTriggered ? 'text-accent animate-spin' : 'text-muted'} />}
           </div>
-          <span className={`text-sm ${loadTriggered ? 'text-ink' : 'text-faint'}`}>Loading into memory</span>
+          <div className="min-w-0 flex-1">
+            <span className={`text-sm ${loadTriggered ? 'text-ink' : 'text-faint'}`}>Loading into memory</span>
+            {preparesOnFirstLoad && (
+              <p className="text-xs text-muted mt-0.5">The first load prepares the model for this phone, so later loads are faster.</p>
+            )}
+          </div>
         </div>
       </div>
 
@@ -497,4 +503,11 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
       )}
     </div>
   )
+}
+
+/** The in-app SDK's LiteRT-LM (ADR-462) prepares a model for the phone on its first load, which makes that load slow. */
+function useActiveEngineIsInAppLitert(): boolean {
+  const { data } = useEngines()
+  const active = data?.engines.find((e) => e.id === data.activeEngineId)
+  return active?.kind === 'turbollm-sdk' && active.sdkEngine?.kind === 'litert-lm'
 }

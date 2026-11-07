@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { afterEach, describe, expect, it, vi, beforeEach } from 'vitest'
 import LoadStep from './LoadStep'
 import type { OnboardingCtx } from '../../../lib/onboarding/types'
 
@@ -34,11 +34,13 @@ const advanceMock = vi.hoisted(() => vi.fn())
 const patchCtxMock = vi.hoisted(() => vi.fn())
 const goToStepMock = vi.hoisted(() => vi.fn())
 const navigateMock = vi.hoisted(() => vi.fn())
+const enginesMock = vi.hoisted(() => ({ data: undefined as { engines: unknown[]; activeEngineId: string } | undefined }))
 
 vi.mock('../../../lib/queries', () => ({
   useDownloads: () => downloadsMock,
   useModels: () => modelsMock,
   useStatus: () => statusMock,
+  useEngines: () => enginesMock,
   useDownloadMutations: () => ({ resume: resumeMock }),
 }))
 vi.mock('../../../lib/api', () => ({
@@ -88,6 +90,40 @@ beforeEach(() => {
   statusMock.data = { model: null }
   statusMock.isSuccess = true
   resumeMock.isPending = false
+})
+
+// ADR-462 (W-4, F-4): LiteRT-LM prepares a model for the phone on its first load, so that load is slow once. The step
+// says so on the in-app LiteRT-LM row only, with no number in it (ADR-338: no speed claims).
+describe('LoadStep — the first-load note on LiteRT-LM', () => {
+  const NOTE = 'The first load prepares the model for this phone, so later loads are faster.'
+  const sdkRow = (id: string, sdkKind: string) =>
+    ({ id, name: id, kind: 'turbollm-sdk', binPath: '', version: 'in-app', capabilities: { kvTypes: [], flags: [] },
+      sdkEngine: { id: sdkKind, kind: sdkKind, formats: [], backends: ['cpu'] } })
+
+  beforeEach(() => {
+    loadModelMock.mockResolvedValue(undefined)
+  })
+
+  afterEach(() => {
+    enginesMock.data = undefined
+  })
+
+  it('says it on the in-app LiteRT-LM row, with no digit', () => {
+    enginesMock.data = { engines: [sdkRow('lit', 'litert-lm')], activeEngineId: 'lit' }
+    renderStep()
+    expect(screen.getByText(NOTE)).toBeTruthy()
+    expect(/\d/.test(NOTE)).toBe(false)
+  })
+
+  it('says nothing of it on any other row', () => {
+    enginesMock.data = { engines: [sdkRow('cpu', 'llama.cpp'), { id: 'srv', name: 'llama-server-android', kind: 'llama-server' }], activeEngineId: 'cpu' }
+    const { unmount } = renderStep()
+    expect(screen.queryByText(NOTE)).toBeNull()
+    unmount()
+    enginesMock.data = { ...enginesMock.data, activeEngineId: 'srv' }
+    renderStep()
+    expect(screen.queryByText(NOTE)).toBeNull()
+  })
 })
 
 describe('LoadStep recovery', () => {
