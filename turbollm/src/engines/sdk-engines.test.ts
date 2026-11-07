@@ -5,7 +5,7 @@ import { test } from 'node:test'
 import { readSdkEngines } from './sdk-engines'
 import { fakeSdk, sdkEnginesReply } from '../test-support/fake-sdk'
 
-const BASE_URL = 'http://127.0.0.1:41000'
+const BASE_URL = 'http://sdk.invalid:1'
 const ENV = { TURBOLLM_ANDROID_SDK_TOKEN: 'tok-123' }
 
 const LLAMA_ENTRY = {
