@@ -639,6 +639,26 @@ test('applier MAJ-1: no fallback is recorded when a pick made meanwhile skips th
   assert.equal(cfg.androidSdkFallback, undefined)
 })
 
+test('applier m-3: LiteRT-LM unavailable with a .litertlm last model leaves no engine active, said in one warning', async (t) => {
+  const { warns } = quiet(t)
+  const lib = nativeLibDir([CPU_FILE])
+  const lastLoaded = { modelKey: LITERT_LAST, engineId: LITERT_SDK_ROW.id }
+  const app = appRegistry(t, configWith([LLAMA_SDK_ROW, LITERT_SDK_ROW, cpuEngineIn(lib)], LITERT_SDK_ROW.id, { lastLoaded }))
+  await reconcile(app, { lib, sdkUrl: SDK_URL, sdkEngines: [LLAMA_INFO, { ...LITERT_INFO, available: false }] })
+  assert.equal(app.registry.list().activeEngineId, '')
+  assert.equal(warns.mock.calls.filter((c) => /no engine is active/.test(String(c.arguments[0]))).length, 1)
+  assert.ok(mentions(warns, /^android: /, /pick one in Engines/))
+})
+
+test('applier m-3: a boot that leaves an engine active says nothing about it', async (t) => {
+  const { warns } = quiet(t)
+  const lib = nativeLibDir([CPU_FILE])
+  const app = appRegistry(t, configWith([LLAMA_SDK_ROW, LITERT_SDK_ROW, cpuEngineIn(lib)], LITERT_SDK_ROW.id))
+  await reconcile(app, { lib, sdkUrl: SDK_URL })
+  assert.equal(app.registry.list().activeEngineId, LITERT_SDK_ROW.id)
+  assert.equal(mentions(warns, /no engine is active/), false)
+})
+
 test('applier G-9: with the SDK not started and no CPU file, one warning says no engine can run this launch', async (t) => {
   const { warns } = quiet(t)
   const app = appRegistry(t, configWith([], ''))

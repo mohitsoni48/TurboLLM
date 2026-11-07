@@ -555,7 +555,13 @@ class AndroidEngineApplier {
   }
 
   private warnWhenNothingCanRun(): void {
-    if (this.input.sdk !== null || this.input.nativeLibFiles.has(SPAWNED_CPU_FILE)) return
+    if (this.input.sdk === null) return this.warnWhenNoEngineShips()
+    if (this.deps.registry.list().activeEngineId !== '') return
+    console.warn('android: no engine is active this launch: no available engine reads the last model\'s format; pick one in Engines')
+  }
+
+  private warnWhenNoEngineShips(): void {
+    if (this.input.nativeLibFiles.has(SPAWNED_CPU_FILE)) return
     console.warn(`android: no engine can run this launch: the in-app SDK did not start and ${SPAWNED_CPU_FILE} is not in this build`)
   }
 
