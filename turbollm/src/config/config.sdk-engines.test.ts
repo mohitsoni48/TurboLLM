@@ -101,3 +101,11 @@ test('a config without androidRetiredEngines loads without one', () => {
 test('the schema version is unchanged by these fields', () => {
   assert.equal(SCHEMA_VERSION, 4)
 })
+
+test('D-15: a retired SDK row remembered under sdk:<id> survives a save and a load', () => {
+  const path = configPath()
+  ConfigStore.load(path).update((c) => {
+    c.androidRetiredEngines = { 'sdk:litert-lm': retiredRow({ id: 'sdk-row', name: 'LiteRT-LM', kind: 'turbollm-sdk' }) }
+  })
+  assert.equal(ConfigStore.load(path).snapshot().androidRetiredEngines?.['sdk:litert-lm']?.id, 'sdk-row')
+})

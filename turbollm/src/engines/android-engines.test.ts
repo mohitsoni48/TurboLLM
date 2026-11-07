@@ -120,7 +120,7 @@ test('the legacy split copy needs an available LiteRT-LM entry', () => {
 test('litert-lm-android registered but its file is gone: retired and remembered, and its settings copied once', () => {
   const actions = planAndroidEngines(input({ engines: [CPU_ROW, LITERT_SERVER_ROW] }))
   assert.deepEqual(ofKind(actions, 'retire', 'copy-state'), [
-    { kind: 'retire', engineId: LITERT_SERVER_ROW.id, remember: true },
+    { kind: 'retire', engineId: LITERT_SERVER_ROW.id, remember: true, key: ANDROID_LITERT_LM_ENGINE_NAME },
     { kind: 'copy-state', from: LITERT_SERVER_ROW.id, to: 'litert-lm', format: 'litertlm' },
   ])
 })
@@ -140,7 +140,7 @@ test('the litert-lm-android copy waits for an available LiteRT-LM SDK entry', ()
     engines: [CPU_ROW, LITERT_SERVER_ROW], sdk: { baseUrl: SDK_URL, engines: [LLAMA_INFO, unavailable] },
   }))
   assert.deepEqual(ofKind(actions, 'copy-state'), [])
-  assert.deepEqual(ofKind(actions, 'retire'), [{ kind: 'retire', engineId: LITERT_SERVER_ROW.id, remember: true }])
+  assert.deepEqual(ofKind(actions, 'retire'), [{ kind: 'retire', engineId: LITERT_SERVER_ROW.id, remember: true, key: ANDROID_LITERT_LM_ENGINE_NAME }])
 })
 
 test('a rollback build that ships litert-lm-android again reinstates the remembered row', () => {
@@ -156,15 +156,15 @@ test('a rollback build that ships litert-lm-android again reinstates the remembe
 
 test('the Vulkan row with its file gone is retired and remembered, with no copy', () => {
   const actions = planAndroidEngines(input({ engines: [CPU_ROW, VK_ROW] }))
-  assert.deepEqual(ofKind(actions, 'retire', 'copy-state'), [{ kind: 'retire', engineId: VK_ROW.id, remember: true }])
+  assert.deepEqual(ofKind(actions, 'retire', 'copy-state'), [{ kind: 'retire', engineId: VK_ROW.id, remember: true, key: ANDROID_VULKAN_ENGINE_NAME }])
 })
 
-test('an SDK row whose engine is no longer listed as available is retired, not remembered', () => {
+test('D-15: an SDK row whose engine is no longer listed as available is retired and remembered as sdk:<id>', () => {
   const unavailable = { ...LITERT_INFO, available: false, reason: 'Disabled for testing (debug build).' }
   const actions = planAndroidEngines(input({
     engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW], sdk: { baseUrl: SDK_URL, engines: [LLAMA_INFO, unavailable] },
   }))
-  assert.deepEqual(ofKind(actions, 'retire'), [{ kind: 'retire', engineId: LITERT_SDK_ROW.id, remember: false }])
+  assert.deepEqual(ofKind(actions, 'retire'), [{ kind: 'retire', engineId: LITERT_SDK_ROW.id, remember: true, key: 'sdk:litert-lm' }])
   assert.deepEqual(ofKind(actions, 'upsert-sdk'), [{ kind: 'upsert-sdk', info: LLAMA_INFO, adoptLegacy: true }])
 })
 
@@ -644,4 +644,78 @@ test('android: the LiteRT-LM SDK row takes over from an active bundled engine wh
   await reconcile(app, { lib, sdkUrl: SDK_URL })
   assert.equal(app.registry.active()?.sdkEngine?.id, 'litert-lm')
   assert.equal(sdkRowFor(app.registry, 'llama.cpp-cpu')?.id, LEGACY_ROW.id, 'the M1 row is adopted under its id')
+})
+
+// D-15 (G-13, plan revision 2a): an SDK engine that becomes unavailable and later returns comes back as the same row,
+// so the settings saved on it apply again (I-3). The row is still removed while it is unavailable (ADR-239).
+
+test('D-15: an SDK engine available again with its row remembered is reinstated, not upserted under a new id', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, CPU_ROW],
+    activeEngineId: LLAMA_SDK_ROW.id,
+    retired: { 'sdk:litert-lm': retiredEntry(LITERT_SDK_ROW) },
+  }))
+  assert.deepEqual(ofKind(actions, 'upsert-sdk', 'reinstate-sdk'), [
+    { kind: 'upsert-sdk', info: LLAMA_INFO, adoptLegacy: true },
+    { kind: 'reinstate-sdk', info: LITERT_INFO },
+  ])
+  assert.deepEqual(activations(actions), [], 'the reinstated row is not activated by itself (I-4)')
+})
+
+/** Three Android starts over one config: both engines, then LiteRT-LM unavailable, then both again. */
+async function unavailableForOneBoot(t: AndroidTest, opts: { litertActiveAtBoot2: boolean }) {
+  const lib = nativeLibDir([CPU_FILE])
+  const path = configWith([], '')
+  const boot = async (engines: SdkEngineInfo[]) => {
+    const app = appRegistry(t, path)
+    await reconcile(app, { lib, sdkUrl: SDK_URL, sdkEngines: engines })
+    return app
+  }
+  const first = await boot([LLAMA_INFO, LITERT_INFO])
+  const litertId = sdkRowFor(first.registry, 'litert-lm')?.id ?? 'missing'
+  const profile = { profile: { ctx: 2048 }, updatedAt: '2026-11-07T00:00:00.000Z' }
+  first.store.update((c) => {
+    c.modelProfiles[LITERT_LAST] = { [litertId]: profile }
+    c.lastLoaded = { modelKey: GGUF_LAST, engineId: litertId }
+    if (!opts.litertActiveAtBoot2) c.activeEngineId = sdkRowFor(first.registry, 'llama.cpp-cpu')?.id ?? ''
+  })
+  const second = await boot([LLAMA_INFO, { ...LITERT_INFO, available: false, reason: 'Disabled for testing (debug build).' }])
+  const third = await boot([LLAMA_INFO, LITERT_INFO])
+  return { litertId, profile, second, third, boot }
+}
+
+test('D-15 applier: a profile saved on the LiteRT-LM row survives a boot without it and applies again under the same id', async (t) => {
+  quiet(t)
+  const { litertId, profile, second, third } = await unavailableForOneBoot(t, { litertActiveAtBoot2: false })
+
+  assert.equal(sdkRowFor(second.registry, 'litert-lm'), undefined, 'no row while the engine is unavailable (ADR-239)')
+  assert.deepEqual(second.store.snapshot().modelProfiles[LITERT_LAST], { [litertId]: profile })
+  assert.equal(second.store.snapshot().androidRetiredEngines?.['sdk:litert-lm']?.id, litertId)
+
+  assert.equal(sdkRowFor(third.registry, 'litert-lm')?.id, litertId)
+  assert.deepEqual(third.store.snapshot().modelProfiles[LITERT_LAST][litertId], profile)
+  assert.equal(third.store.snapshot().androidRetiredEngines?.['sdk:litert-lm'], undefined)
+})
+
+test('D-15 rule 4: LiteRT-LM active when it went away → the row reading lastLoaded; back again, the user\'s pick stands', async (t) => {
+  quiet(t)
+  const { litertId, second, third } = await unavailableForOneBoot(t, { litertActiveAtBoot2: true })
+
+  const llamaId = sdkRowFor(second.registry, 'llama.cpp-cpu')?.id
+  assert.equal(second.registry.active()?.id, llamaId, 'boot 2: the GGUF lastLoaded picks the llama.cpp row')
+  assert.equal(third.registry.active()?.id, llamaId, 'boot 3: the reinstated LiteRT-LM row is not activated by itself')
+  assert.equal(sdkRowFor(third.registry, 'litert-lm')?.id, litertId)
+})
+
+test('D-15: a fourth boot after the return plans nothing new', async (t) => {
+  quiet(t)
+  const { third } = await unavailableForOneBoot(t, { litertActiveAtBoot2: false })
+  const cfg = third.store.snapshot()
+  const actions = planAndroidEngines(input({
+    engines: cfg.engines,
+    activeEngineId: cfg.activeEngineId,
+    lastLoaded: cfg.lastLoaded,
+    retired: cfg.androidRetiredEngines ?? {},
+  }))
+  assert.deepEqual(ofKind(actions, ...STRUCTURAL, 'reinstate-sdk', 'activate'), [])
 })

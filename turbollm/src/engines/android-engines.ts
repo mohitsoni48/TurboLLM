@@ -62,10 +62,11 @@ export interface AndroidEngineInput {
  *  registered this start, its bundled name): a new row's id exists only once the applier has added it. */
 export type AndroidEngineAction =
   | { kind: 'upsert-sdk'; info: SdkEngineInfo; adoptLegacy: boolean }
+  | { kind: 'reinstate-sdk'; info: SdkEngineInfo }
   | { kind: 'repair-sdk-url'; baseUrl: string }
   | { kind: 'register-bundled' | 'repair-bundled'; name: string; file: string }
   | { kind: 'reinstate-bundled'; name: string; file: string }
-  | { kind: 'retire'; engineId: string; remember: boolean }
+  | { kind: 'retire'; engineId: string; remember: boolean; key: string }
   | { kind: 'copy-state'; from: string; to: string; format: ModelFormat }
   | { kind: 'activate'; engineId: string }
 
@@ -78,19 +79,31 @@ export function planAndroidEngines(input: AndroidEngineInput): AndroidEngineActi
 }
 
 /** Rule 1: one upsert per available SDK engine, the first reading GGUF adopting the M1 row; an SDK row whose engine is
- *  no longer available is retired. An unreadable list only repairs the URL: nothing is registered or retired on a
- *  guess. */
-function planSdkRows({ sdk, engines }: AndroidEngineInput): AndroidEngineAction[] {
+ *  no longer available is retired and remembered as `sdk:<id>`, and reinstated under that id when the engine returns
+ *  (D-15, I-3). An unreadable list only repairs the URL: nothing is registered or retired on a guess. */
+function planSdkRows({ sdk, engines, retired }: AndroidEngineInput): AndroidEngineAction[] {
   if (!sdk) return []
   if (!sdk.engines) return [{ kind: 'repair-sdk-url', baseUrl: sdk.baseUrl }]
   const available = sdk.engines.filter((info) => info.available)
   const adopter = available.find((info) => info.formats.includes('gguf'))
-  const upserts: AndroidEngineAction[] = available.map((info) => ({ kind: 'upsert-sdk', info, adoptLegacy: info === adopter }))
+  const keeps = available.map((info): AndroidEngineAction => {
+    if (!sdkRowOfEngine(engines, info.id) && retired[retiredSdkKey(info.id)]) return { kind: 'reinstate-sdk', info }
+    return { kind: 'upsert-sdk', info, adoptLegacy: info === adopter }
+  })
   const availableIds = new Set(available.map((info) => info.id))
-  const retires: AndroidEngineAction[] = engines
+  const retires = engines
     .filter((e) => e.kind === TURBOLLM_SDK_KIND && e.sdkEngine && !availableIds.has(e.sdkEngine.id))
-    .map((e) => ({ kind: 'retire', engineId: e.id, remember: false }))
-  return [...upserts, ...retires]
+    .map((e): AndroidEngineAction => ({ kind: 'retire', engineId: e.id, remember: true, key: retiredSdkKey(e.sdkEngine?.id ?? '') }))
+  return [...keeps, ...retires]
+}
+
+/** The key a retired SDK row is remembered under in androidRetiredEngines, beside the bundled rows' names. */
+function retiredSdkKey(sdkEngineId: string): string {
+  return `sdk:${sdkEngineId}`
+}
+
+function sdkRowOfEngine(engines: Engine[], sdkEngineId: string): Engine | undefined {
+  return engines.find((e) => e.kind === TURBOLLM_SDK_KIND && e.sdkEngine?.id === sdkEngineId)
 }
 
 /** Rule 2: a shipped file is repaired, reinstated under its remembered id, or registered; the app's own row for a file
@@ -98,7 +111,7 @@ function planSdkRows({ sdk, engines }: AndroidEngineInput): AndroidEngineAction[
 function planBundledRows({ engines, retired, nativeLibFiles }: AndroidEngineInput): AndroidEngineAction[] {
   return ANDROID_BUNDLED_ENGINES.flatMap(({ name, file }): AndroidEngineAction[] => {
     const own = ownBundledRow(engines, name, file)
-    if (!nativeLibFiles.has(file)) return own ? [{ kind: 'retire', engineId: own.id, remember: true }] : []
+    if (!nativeLibFiles.has(file)) return own ? [{ kind: 'retire', engineId: own.id, remember: true, key: name }] : []
     if (own) return [{ kind: 'repair-bundled', name, file }]
     if (retired[name]) return [{ kind: 'reinstate-bundled', name, file }]
     return [{ kind: 'register-bundled', name, file }]
@@ -184,12 +197,15 @@ function liveRowsAfter(input: AndroidEngineInput, rows: AndroidEngineAction[]): 
   return [...liveSdkRows(input, rows), ...liveBundledRows(input, rows), ...otherRows(input)]
 }
 
-function liveSdkRows({ sdk, engines }: AndroidEngineInput, rows: AndroidEngineAction[]): PlannedRow[] {
+function liveSdkRows({ sdk, engines, retired }: AndroidEngineInput, rows: AndroidEngineAction[]): PlannedRow[] {
   if (!sdk) return []
   const kept = engines.filter((e) => e.kind === TURBOLLM_SDK_KIND && !isRetiredBy(rows, e.id))
   if (!sdk.engines) return kept.map(plannedSdkRow)
-  const upserted = rows.filter(isUpsert).map((a): PlannedRow => ({
-    ref: rowUpsertedBy(engines, a)?.id ?? a.info.id, origin: 'sdk', sdkEngineId: a.info.id, formats: a.info.formats,
+  const upserted = rows.filter(isSdkKeep).map((a): PlannedRow => ({
+    ref: a.kind === 'reinstate-sdk' ? retired[retiredSdkKey(a.info.id)].id : (rowUpsertedBy(engines, a)?.id ?? a.info.id),
+    origin: 'sdk',
+    sdkEngineId: a.info.id,
+    formats: a.info.formats,
   }))
   const legacyLeft = kept.filter((e) => isLegacySdkRow(e) && !upserted.some((r) => r.ref === e.id))
   return [...upserted, ...legacyLeft.map(plannedSdkRow)]
@@ -220,16 +236,16 @@ function plannedSdkRow(engine: Engine): PlannedRow {
 
 /** The existing row an upsert lands on, as Registry.upsertSdkEngine finds it. */
 function rowUpsertedBy(engines: Engine[], { info, adoptLegacy }: UpsertSdk): Engine | undefined {
-  const sdkRows = engines.filter((e) => e.kind === TURBOLLM_SDK_KIND)
-  return sdkRows.find((e) => e.sdkEngine?.id === info.id) ?? (adoptLegacy ? sdkRows.find(isLegacySdkRow) : undefined)
+  return sdkRowOfEngine(engines, info.id) ?? (adoptLegacy ? engines.find(isLegacySdkRow) : undefined)
 }
 
 type UpsertSdk = Extract<AndroidEngineAction, { kind: 'upsert-sdk' }>
-type BundledKeep = Extract<AndroidEngineAction, { kind: 'register-bundled' | 'repair-bundled' | 'reinstate-bundled' }>
+type SdkKeep = Extract<AndroidEngineAction, { kind: 'upsert-sdk' | 'reinstate-sdk' }>
 
-function isUpsert(action: AndroidEngineAction): action is UpsertSdk {
-  return action.kind === 'upsert-sdk'
+function isSdkKeep(action: AndroidEngineAction): action is SdkKeep {
+  return action.kind === 'upsert-sdk' || action.kind === 'reinstate-sdk'
 }
+type BundledKeep = Extract<AndroidEngineAction, { kind: 'register-bundled' | 'repair-bundled' | 'reinstate-bundled' }>
 
 function isBundledKeep(action: AndroidEngineAction): action is BundledKeep {
   return action.kind === 'register-bundled' || action.kind === 'repair-bundled' || action.kind === 'reinstate-bundled'
@@ -374,6 +390,8 @@ class AndroidEngineApplier {
     switch (action.kind) {
       case 'upsert-sdk':
         return this.upsertSdk(action)
+      case 'reinstate-sdk':
+        return this.reinstateSdk(action.info)
       case 'repair-sdk-url':
         return this.repairSdkUrl(action.baseUrl)
       case 'register-bundled':
@@ -383,7 +401,7 @@ class AndroidEngineApplier {
       case 'reinstate-bundled':
         return this.reinstateBundled(action.name, action.file)
       case 'retire':
-        return this.retire(action.engineId, action.remember)
+        return this.retire(action)
       case 'copy-state':
         return this.copyState(action)
       case 'activate':
@@ -396,6 +414,17 @@ class AndroidEngineApplier {
     const row = this.deps.registry.upsertSdkEngine(info, baseUrl, { adoptLegacy })
     this.rowIds.set(info.id, row.id)
     console.log(`android: in-app engine ${info.name} (${info.id}) at ${baseUrl}`)
+  }
+
+  /** An SDK engine back after a start without it returns as the same row, so its settings apply again (D-15, I-3). It
+   *  is not selected: activation stays with rule 4. */
+  private reinstateSdk(info: SdkEngineInfo): void {
+    const key = retiredSdkKey(info.id)
+    this.deps.registry.reinstate(asEngine(this.retiredEntry(key)), false)
+    const row = this.deps.registry.upsertSdkEngine(info, this.sdkBaseUrl())
+    this.rowIds.set(info.id, row.id)
+    this.forgetRetired(key)
+    console.log(`android: in-app engine ${info.name} (${info.id}) is back under its earlier id`)
   }
 
   private repairSdkUrl(baseUrl: string): void {
@@ -438,10 +467,10 @@ class AndroidEngineApplier {
     this.forgetRetired(name)
   }
 
-  private retire(engineId: string, remember: boolean): void {
+  private retire({ engineId, remember, key }: Extract<AndroidEngineAction, { kind: 'retire' }>): void {
     const row = this.deps.registry.get(engineId)
     if (!row) throw new Error(`engine ${engineId} is no longer registered`)
-    if (remember) this.rememberRetired(row.name, row)
+    if (remember) this.rememberRetired(key, row)
     this.deps.registry.remove(engineId)
     if (this.expectedActive === engineId) this.expectedActive = ''
     console.log(`android: retired engine ${row.name}: it cannot run in this app build or launch`)
@@ -483,24 +512,24 @@ class AndroidEngineApplier {
     return this.input.sdk.baseUrl
   }
 
-  private retiredEntry(name: string): RetiredEngine {
-    const entry = this.deps.store.snapshot().androidRetiredEngines?.[name]
-    if (!entry) throw new Error(`no remembered ${name}`)
+  private retiredEntry(key: string): RetiredEngine {
+    const entry = this.deps.store.snapshot().androidRetiredEngines?.[key]
+    if (!entry) throw new Error(`no remembered ${key}`)
     return entry
   }
 
-  private rememberRetired(name: string, row: Engine): void {
+  private rememberRetired(key: string, row: Engine): void {
     this.deps.store.update((c) => {
       const retired = c.androidRetiredEngines ?? {}
-      const copiedTo = retired[name]?.copiedTo
-      retired[name] = copiedTo === undefined ? { ...row } : { ...row, copiedTo }
+      const copiedTo = retired[key]?.copiedTo
+      retired[key] = copiedTo === undefined ? { ...row } : { ...row, copiedTo }
       c.androidRetiredEngines = retired
     })
   }
 
-  private forgetRetired(name: string): void {
+  private forgetRetired(key: string): void {
     this.deps.store.update((c) => {
-      if (c.androidRetiredEngines) delete c.androidRetiredEngines[name]
+      if (c.androidRetiredEngines) delete c.androidRetiredEngines[key]
     })
   }
 }
