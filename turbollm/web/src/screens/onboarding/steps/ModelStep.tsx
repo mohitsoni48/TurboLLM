@@ -23,7 +23,7 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
   const { patchCtx } = useOnboardingMachine()
   const recommendationQuery = useOnboardingRecommendation(ctx.profile)
   const sysQuery = useSysInfo()
-  const engineFormats = useOnboardingFormats(sysQuery.data)
+  const onboardingTarget = useOnboardingFormats(sysQuery.data)
   const modelsQuery = useModels()
   const downloadMutations = useDownloadMutations()
   const [starting, setStarting] = useState(false)
@@ -84,7 +84,7 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
   //
   // The active engine is waited on too: its format decides the pick (ADR-462), and on a fresh Android install the step
   // can open before LiteRT-LM is activated (see useOnboardingFormats).
-  if (!isPro && (recommendationQuery.isLoading || sysQuery.isLoading || engineFormats.waiting || !ctx.profile)) {
+  if (!isPro && (recommendationQuery.isLoading || sysQuery.isLoading || onboardingTarget.waiting || !ctx.profile)) {
     return (
       <div className="flex items-center justify-center gap-2 text-muted py-8">
         <Loader2 size={20} className="animate-spin" />
@@ -101,7 +101,7 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
   // OOMs — see onboarding-pick.ts's header for the phone case that motivates it. `entry`
   // is passed through untouched whenever it fits, which is every desktop with a card.
   // The pick follows the active engine's format: a LiteRT-LM row is never offered the daemon's GGUF entry.
-  const pick = pickOnboardingModel(entry, sysQuery.data ?? null, engineFormats.formats)
+  const pick = pickOnboardingModel(entry, sysQuery.data ?? null, onboardingTarget.formats)
   const picked = pick.kind === 'pick' ? pick : null
   const sys = sysQuery.data
 
