@@ -149,11 +149,51 @@ test('m-2: a model the filter rejects keeps its pin, even with a same-name prese
   assert.equal(cfg.lastPresetId[GGUF_KEY], 'old-fast')
 })
 
-test('m-2: when the new row already has a preset of that name, the pin moves to that preset', () => {
+test('m-2: when the new row already has a preset of that name and those settings, the pin moves to that preset', () => {
   const cfg = fixture()
   cfg.modelPresets[LITERT_KEY].push(preset('new', 'fast'))
   migrateEngineId(cfg, 'old', 'new', { copy: true, onlyModel: onlyLitert })
   assert.equal(cfg.lastPresetId[LITERT_KEY], 'new-fast')
+})
+
+// FD-3 (fix-delta review): manual presets may share a name on one engine, and a preset of the pinned one's name on the
+// new row may hold other settings. The pin follows the preset it named, never another that merely shares its name.
+
+function withProfile(p: ModelPreset, profile: Record<string, unknown>): ModelPreset {
+  return { ...p, profile }
+}
+
+test('FD-3: two same-name presets on the old row with the second pinned: the pin follows the second one\'s clone', () => {
+  const cfg = fixture()
+  cfg.modelPresets[LITERT_KEY] = [
+    withProfile(preset('old', 'Fast', 'p1'), { ctx: 1 }),
+    withProfile(preset('old', 'Fast', 'p2'), { ctx: 2 }),
+  ]
+  cfg.lastPresetId[LITERT_KEY] = 'p2'
+  migrateEngineId(cfg, 'old', 'new', { copy: true, onlyModel: onlyLitert })
+  assert.deepEqual(getModelProfile(cfg, LITERT_KEY, 'new'), { ctx: 2 })
+  assert.deepEqual(cfg.modelPresets[LITERT_KEY].filter((p) => p.engineId === 'new').map((p) => p.profile), [{ ctx: 1 }, { ctx: 2 }])
+})
+
+test('FD-3: a same-name preset with other settings on the new row is kept, and the pin goes to a clone of its own preset', () => {
+  const cfg = fixture()
+  cfg.modelPresets[LITERT_KEY].push(withProfile(preset('new', 'fast'), { name: 'tuned on new' }))
+  migrateEngineId(cfg, 'old', 'new', { copy: true, onlyModel: onlyLitert })
+  assert.deepEqual(getModelProfile(cfg, LITERT_KEY, 'new'), { name: 'fast' })
+  assert.ok(cfg.modelPresets[LITERT_KEY].some((p) => p.id === 'new-fast' && p.engineId === 'new'), 'the new row keeps its own')
+})
+
+test('FD-3: copying two same-name presets twice adds nothing the second time', () => {
+  const cfg = fixture()
+  cfg.modelPresets[LITERT_KEY] = [
+    withProfile(preset('old', 'Fast', 'p1'), { ctx: 1 }),
+    withProfile(preset('old', 'Fast', 'p2'), { ctx: 2 }),
+  ]
+  cfg.lastPresetId[LITERT_KEY] = 'p2'
+  migrateEngineId(cfg, 'old', 'new', { copy: true, onlyModel: onlyLitert })
+  const once = structuredClone(cfg)
+  migrateEngineId(cfg, 'old', 'new', { copy: true, onlyModel: onlyLitert })
+  assert.deepEqual(cfg, once)
 })
 
 test('m-2: a pin naming a preset of another engine stays where it is, even with a same-name preset on the new row', () => {

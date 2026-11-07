@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import type { LinkGrant, LinkRecord } from '../link/types'
 import type { ChatStoreConfig } from '../chat/store/load-adapter.js'
 import type { ReleaseProvenance } from '../engines/release-install'
@@ -2037,28 +2038,31 @@ function copyEngineSettings(cfg: Config, { oldId, newId, isSelected }: EngineMig
   }
   for (const [modelKey, presets] of Object.entries(cfg.modelPresets)) {
     if (!isSelected(modelKey)) continue
-    copyPresets(presets, oldId, newId)
-    movePinToCopy(cfg, modelKey, { oldId, newId })
+    movePinToCopy(cfg, modelKey, copyPresets(presets, oldId, newId))
   }
 }
 
-/** A clone of each preset tuned on `oldId`, under a new preset id, unless `newId` already has one of that name. */
-function copyPresets(presets: ModelPreset[], oldId: string, newId: string): void {
+/** Each preset tuned on `oldId` gets its copy on `newId`, by source preset id: a clone under a new id, or a preset
+ *  `newId` already has with the same name and the same settings (an earlier copy, or the same tune), which is not
+ *  cloned again. A same-name preset with other settings is never a copy: presets may share a name (FD-3). */
+function copyPresets(presets: ModelPreset[], oldId: string, newId: string): ReadonlyMap<string, string> {
+  const copies = new Map<string, string>()
   for (const p of presets.filter((q) => q.engineId === oldId)) {
-    if (presets.some((q) => q.engineId === newId && q.name === p.name)) continue
-    presets.push({ ...structuredClone(p), id: randomUUID(), engineId: newId })
+    const same = presets.find((q) => q.engineId === newId && q.name === p.name && isDeepStrictEqual(q.profile, p.profile))
+    const copy = same ?? { ...structuredClone(p), id: randomUUID(), engineId: newId }
+    if (!same) presets.push(copy)
+    copies.set(p.id, copy.id)
   }
+  return copies
 }
 
-/** A pin naming a preset tuned on `oldId` moves to `newId`'s preset of the same name: its clone, or the one `newId`
- *  already had. There is one pin per model and getModelProfile applies it only on its preset's engine, so a pin left
- *  on the source stopped applying on the row the user now runs (m-2). */
-function movePinToCopy(cfg: Config, modelKey: string, { oldId, newId }: Pick<EngineMigration, 'oldId' | 'newId'>): void {
-  const presets = cfg.modelPresets[modelKey]
-  const pinned = presets.find((p) => p.id === ownEntry(cfg.lastPresetId, modelKey))
-  if (pinned?.engineId !== oldId) return
-  const copy = presets.find((p) => p.engineId === newId && p.name === pinned.name)
-  if (copy) cfg.lastPresetId[modelKey] = copy.id
+/** A pin naming a preset tuned on `oldId` moves to that preset's own copy on `newId`. There is one pin per model and
+ *  getModelProfile applies it only on its preset's engine, so a pin left on the source stopped applying on the row the
+ *  user now runs (m-2). */
+function movePinToCopy(cfg: Config, modelKey: string, copies: ReadonlyMap<string, string>): void {
+  const pinnedId = ownEntry(cfg.lastPresetId, modelKey)
+  const copyId = pinnedId === undefined ? undefined : copies.get(pinnedId)
+  if (copyId) cfg.lastPresetId[modelKey] = copyId
 }
 
 /** Delete a model's saved profile for one engine only (issue #35). Prunes the per-model
