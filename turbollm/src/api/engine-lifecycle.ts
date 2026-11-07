@@ -15,7 +15,7 @@ import { isLocalOrAuthenticated } from '../auth'
 import type { Deps } from '../deps'
 import type { ModelInfo, StartOpts } from '../engines/manager'
 import { abortAllInFlightChats } from '../chat/chat-routes'
-import { manualLoadRefusal } from '../engines/compat'
+import { manualLoadRefusal, readsOnlyLitertlm } from '../engines/compat'
 import { engineForModel } from '../engines/registry'
 import { buildStartOpts } from '../engines/start-opts'
 import type { LoadProfile } from '../models/profile'
@@ -156,7 +156,7 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
   // A .litertlm loaded by path gets what a library entry with nothing set gets (buildStartOpts): no backend and no
   // context, so the server runs the model on its own, and the performance cores on a big.LITTLE CPU. It got none, and
   // the Manager wrote the CPU backend for it, which a GPU-only bundle cannot run on.
-  if (active.kind === 'litert-lm') {
+  if (readsOnlyLitertlm(active)) {
     const sys = getSysInfo()
     opts.litertLmConfig = litertLmProfileToConfig({ ctx: 0, threads: 0 }, sys.perfCores ? autoThreadCount(sys) : 0)
   }

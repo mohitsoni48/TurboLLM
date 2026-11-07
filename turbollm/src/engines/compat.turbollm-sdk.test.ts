@@ -8,6 +8,7 @@ import {
   engineWithholdsVision,
   manualLoadRefusal,
   modelIncompatibility,
+  readsOnlyLitertlm,
   shapeForEngine,
   type EngineFormatRef,
   type ModelFormat,
@@ -18,6 +19,19 @@ const SDK = 'turbollm-sdk'
 const OTHER_KINDS = [
   'llama-server', 'llamafile', 'koboldcpp', 'mlx', 'rapid-mlx', 'mlx-vlm', 'vllm', 'sglang', 'litert-lm', 'laya',
 ]
+
+test('m-6: readsOnlyLitertlm is a format rule, true only for a row that reads .litertlm and not GGUF', () => {
+  const sdkRow = (id: string, formats: ModelFormat[]): EngineFormatRef =>
+    ({ kind: SDK, sdkEngine: { id, kind: id, formats, backends: [] } }) as EngineFormatRef
+  const table: [string, EngineFormatRef, boolean][] = [
+    ['desktop litert-lm', { kind: 'litert-lm' }, true],
+    ['LiteRT-LM SDK row', sdkRow('litert-lm', ['litertlm']), true],
+    ['llama.cpp SDK row', sdkRow('llama.cpp-cpu', ['gguf']), false],
+    ['M1 legacy SDK row', { kind: SDK }, false],
+    ['llama-server', { kind: 'llama-server' }, false],
+  ]
+  for (const [label, engine, expected] of table) assert.equal(readsOnlyLitertlm(engine), expected, label)
+})
 
 test('engineAcceptsFormat: the in-app SDK engine takes GGUF and .litertlm, not MLX', () => {
   assert.equal(engineAcceptsFormat({ kind: SDK }, 'gguf'), true)

@@ -188,6 +188,13 @@ export function engineFormats(engine: EngineFormatRef): ModelFormat[] {
   return kindFormats(engine.kind)
 }
 
+/** The row is a LiteRT-LM engine by what it reads, not by its kind (architecture §3.5): desktop LiteRT-LM and the
+ *  in-app SDK's LiteRT-LM row. The M1 legacy row, which also reads GGUF, is not. */
+export function readsOnlyLitertlm(engine: EngineFormatRef): boolean {
+  const formats = engineFormats(engine)
+  return formats.includes('litertlm') && !formats.includes('gguf')
+}
+
 function kindFormats(engineKind: string): ModelFormat[] {
   if (MODEL_DIRECTORY_KINDS.has(engineKind)) return ['mlx']
   if (engineKind === 'laya') return []
