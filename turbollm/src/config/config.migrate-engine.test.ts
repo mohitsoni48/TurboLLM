@@ -3,7 +3,9 @@
 // update (update-apply.ts), must stay exactly as it was.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { defaultConfig, migrateEngineId, ownEntry, isUnsafeMapKey, type Config, type ModelPreset } from './config'
+import {
+  defaultConfig, getModelProfile, migrateEngineId, ownEntry, isUnsafeMapKey, type Config, type ModelPreset,
+} from './config'
 
 /** The body of migrateEngineId before D-2, pasted verbatim: the default call must still behave exactly like it. */
 function moveOracle(cfg: Config, oldId: string, newId: string): void {
@@ -109,7 +111,7 @@ test('a second identical copy adds nothing', () => {
   assert.deepEqual(cfg, once)
 })
 
-test('a copy leaves every source entry, lastLoaded and the preset pin as they were', () => {
+test('a copy leaves every source entry and lastLoaded as they were', () => {
   const cfg = fixture()
   const before = fixture()
   migrateEngineId(cfg, 'old', 'new', { copy: true })
@@ -122,7 +124,42 @@ test('a copy leaves every source entry, lastLoaded and the preset pin as they we
     assert.deepEqual(cfg.modelPresets[key].filter((p) => p.engineId !== 'new'), before.modelPresets[key])
   }
   assert.deepEqual(cfg.lastLoaded, before.lastLoaded)
-  assert.deepEqual(cfg.lastPresetId, before.lastPresetId)
+})
+
+// m-2 (stage-6 review): there is one pin per model, and getModelProfile honours it only on the pinned preset's engine.
+// A copy that left the pin on the source made a pinned preset stop applying on the row the user now runs.
+
+const clonedOnNew = (cfg: Config, key: string) => cfg.modelPresets[key].find((p) => p.engineId === 'new' && p.name === 'fast')
+
+test('m-2: a pin naming a copied preset moves to its clone, which getModelProfile then applies on the new row', () => {
+  const cfg = fixture()
+  migrateEngineId(cfg, 'old', 'new', { copy: true, onlyModel: onlyLitert })
+  const clone = clonedOnNew(cfg, LITERT_KEY)
+  assert.ok(clone)
+  assert.equal(cfg.lastPresetId[LITERT_KEY], clone.id)
+  assert.deepEqual(getModelProfile(cfg, LITERT_KEY, 'new'), { name: 'fast' })
+  assert.ok(cfg.modelPresets[LITERT_KEY].some((p) => p.id === 'old-fast' && p.engineId === 'old'), 'the original is kept')
+})
+
+test('m-2: a model the filter rejects keeps its pin', () => {
+  const cfg = fixture()
+  cfg.lastPresetId[GGUF_KEY] = 'old-fast'
+  migrateEngineId(cfg, 'old', 'new', { copy: true, onlyModel: onlyLitert })
+  assert.equal(cfg.lastPresetId[GGUF_KEY], 'old-fast')
+})
+
+test('m-2: when the new row already has a preset of that name, the pin moves to that preset', () => {
+  const cfg = fixture()
+  cfg.modelPresets[LITERT_KEY].push(preset('new', 'fast'))
+  migrateEngineId(cfg, 'old', 'new', { copy: true, onlyModel: onlyLitert })
+  assert.equal(cfg.lastPresetId[LITERT_KEY], 'new-fast')
+})
+
+test('m-2: a pin naming a preset of another engine stays where it is', () => {
+  const cfg = fixture()
+  cfg.lastPresetId[LITERT_KEY] = '-any'
+  migrateEngineId(cfg, 'old', 'new', { copy: true })
+  assert.equal(cfg.lastPresetId[LITERT_KEY], '-any')
 })
 
 test('a move with a filter moves only matching keys, and lastLoaded only when its model matches', () => {

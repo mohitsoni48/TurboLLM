@@ -1992,8 +1992,9 @@ export function migrateModelKey(cfg: Config, oldKey: string, newKey: string): bo
  *  profile for keeps it.
  *
  *  `onlyModel` limits it to the models it accepts. `copy` leaves everything under `oldId` in place and adds a clone
- *  under `newId` instead, never over an entry `newId` already has, and leaves lastLoaded and the preset pins alone: the
- *  Android reconciler copies one row's `.litertlm` settings onto the SDK's LiteRT-LM row this way (ADR-462). */
+ *  under `newId` instead, never over an entry `newId` already has, and leaves lastLoaded alone; a preset pin follows its
+ *  preset to `newId`'s copy. The Android reconciler copies one row's `.litertlm` settings onto the SDK's LiteRT-LM row
+ *  this way (ADR-462). */
 export function migrateEngineId(cfg: Config, oldId: string, newId: string, opts: EngineMigrationOptions = {}): void {
   if (oldId === newId || isUnsafeMapKey(newId)) return
   const isSelected = opts.onlyModel ?? (() => true)
@@ -2035,7 +2036,9 @@ function copyEngineSettings(cfg: Config, { oldId, newId, isSelected }: EngineMig
     byEngine[newId] = structuredClone(entry)
   }
   for (const [modelKey, presets] of Object.entries(cfg.modelPresets)) {
-    if (isSelected(modelKey)) copyPresets(presets, oldId, newId)
+    if (!isSelected(modelKey)) continue
+    copyPresets(presets, oldId, newId)
+    movePinToCopy(cfg, modelKey, { oldId, newId })
   }
 }
 
@@ -2045,6 +2048,17 @@ function copyPresets(presets: ModelPreset[], oldId: string, newId: string): void
     if (presets.some((q) => q.engineId === newId && q.name === p.name)) continue
     presets.push({ ...structuredClone(p), id: randomUUID(), engineId: newId })
   }
+}
+
+/** A pin naming a preset tuned on `oldId` moves to `newId`'s preset of the same name: its clone, or the one `newId`
+ *  already had. There is one pin per model and getModelProfile applies it only on its preset's engine, so a pin left
+ *  on the source stopped applying on the row the user now runs (m-2). */
+function movePinToCopy(cfg: Config, modelKey: string, { oldId, newId }: Pick<EngineMigration, 'oldId' | 'newId'>): void {
+  const presets = cfg.modelPresets[modelKey]
+  const pinned = presets.find((p) => p.id === ownEntry(cfg.lastPresetId, modelKey))
+  if (pinned?.engineId !== oldId) return
+  const copy = presets.find((p) => p.engineId === newId && p.name === pinned.name)
+  if (copy) cfg.lastPresetId[modelKey] = copy.id
 }
 
 /** Delete a model's saved profile for one engine only (issue #35). Prunes the per-model

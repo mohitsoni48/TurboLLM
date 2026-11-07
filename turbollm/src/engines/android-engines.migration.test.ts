@@ -7,7 +7,9 @@ import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { ConfigStore, defaultConfig, type Config, type Engine, type ModelPreset, type ProfileEntry } from '../config/config'
+import {
+  ConfigStore, defaultConfig, getModelProfile, type Config, type Engine, type ModelPreset, type ProfileEntry,
+} from '../config/config'
 import { tmpDir } from '../test-support/tmp'
 import type { ModelFormat } from './compat'
 import { LITERT_LM_NATIVE_SERVER } from './litert-lm'
@@ -51,6 +53,7 @@ const GGUF_TUNE = profileEntry({ ctx: 6144 })
 const LITERT_GPU_TUNE = profileEntry({ ctx: 4096, backend: 'gpu' })
 const LITERT_SMALL_TUNE = profileEntry({ ctx: 2048 })
 const LITERT_CPU_TUNE = profileEntry({ ctx: 4096, backend: 'cpu' })
+const LITERT_PINNED_TUNE = profileEntry({ ctx: 8192, backend: 'gpu' })
 
 /** One Android start, as cli.ts runs it: the files the APK ships, and the SDK's engine list when the app started it. */
 interface AndroidStart {
@@ -96,6 +99,17 @@ test('M-1 case 2: v1.15.0 on litert-lm-android: retired and remembered, .litertl
   assertOriginalsKept(after, before, LITERT_SERVER_ID)
   assert.deepEqual(after.lastLoaded, before.lastLoaded)
   assert.equal(after.activeEngineId, litertId)
+})
+
+test('M-1 case 2 (m-2): the preset pinned on litert-lm-android applies on the LiteRT-LM SDK row after the upgrade', async (t) => {
+  const phone = androidPhone(t, v1150OnLitertServer)
+
+  const after = await phone.start(DEFAULT_APK)
+  const litertId = sdkRowId(after, 'litert-lm')
+
+  assert.deepEqual(getModelProfile(after, LITERT_MODEL, litertId), LITERT_PINNED_TUNE.profile)
+  assert.equal(after.lastPresetId[LITERT_MODEL], presetsOn(after, LITERT_MODEL, litertId)[0].id)
+  assert.deepEqual(presetsOn(after, LITERT_MODEL, LITERT_SERVER_ID).map((p) => p.name), ['Fast GPU'], 'the original stays')
 })
 
 test('M-1 case 3: a rollback build reinstates litert-lm-android under the same id and copies nothing again', async (t) => {
@@ -409,7 +423,7 @@ function v1150OnLlamaServer(nativeLibDir: string): Config {
 }
 
 function v1150OnLitertServer(nativeLibDir: string): Config {
-  const fastGpu = preset('Fast GPU', LITERT_SERVER_ID, LITERT_GPU_TUNE)
+  const fastGpu = preset('Fast GPU', LITERT_SERVER_ID, LITERT_PINNED_TUNE)
   return {
     ...defaultConfig(),
     engines: [
