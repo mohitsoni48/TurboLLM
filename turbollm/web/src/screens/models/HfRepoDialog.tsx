@@ -112,6 +112,8 @@ export function HfRepoContent({
   repo: string | null
   onClose: () => void
   onSearch?: (term: string) => void
+  /** The file to select when the repo opens (a curated Discover row names its bundle). */
+  preselectFile?: string
 }) {
   const detailQ = useHfRepo(repo)
   const sysQ = useSysInfo()

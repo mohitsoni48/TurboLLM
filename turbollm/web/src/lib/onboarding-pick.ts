@@ -173,6 +173,7 @@ function largestThatFits(ladder: readonly CandidateModel[], blessed: CandidateMo
   return { kind: 'none', reason: blessed ? 'too-big-for-hardware' : 'no-candidate' }
 }
 
-function readsOnlyLitert(formats: readonly ModelFormat[]): boolean {
+/** A row that reads .litertlm and no GGUF: LiteRT-LM (ADR-462). */
+export function readsOnlyLitert(formats: readonly ModelFormat[]): boolean {
   return formats.includes('litertlm') && !formats.includes('gguf')
 }

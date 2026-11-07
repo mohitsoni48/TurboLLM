@@ -4,7 +4,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { DiscoverTab } from './DiscoverTab'
-import type { HfSearchCategory, HfSearchItem } from '../../lib/types'
+import type { Engine, HfSearchCategory, HfSearchItem } from '../../lib/types'
+import { LITERT_SMALLEST_PICK, requiredMb } from '../../lib/onboarding-pick'
 
 const CATEGORY_DESCRIPTION = 'Laya and Jev models TurboLLM can run, whichever engine is active'
 
@@ -13,7 +14,10 @@ const state: {
   engineRows: HfSearchItem[]
   categoryRows: HfSearchItem[]
   searchedCategories: (HfSearchCategory | undefined)[]
-} = { sys: desktop(), engineRows: [], categoryRows: [], searchedCategories: [] }
+  engines?: { engines: Engine[]; activeEngineId: string }
+  isDesktop: boolean
+  repoContentProps: { repo: string; preselectFile?: string }[]
+} = { sys: desktop(), engineRows: [], categoryRows: [], searchedCategories: [], isDesktop: true, repoContentProps: [] }
 
 vi.mock('../../lib/queries', () => ({
   useHfSearch: (_q: string, _sort: string, category?: HfSearchCategory) => {
@@ -22,6 +26,7 @@ vi.mock('../../lib/queries', () => ({
     return { data: { results }, isLoading: false, isError: false, error: null, refetch: vi.fn() }
   },
   useSysInfo: () => ({ data: state.sys }),
+  useEngines: () => ({ data: state.engines }),
 }))
 
 vi.mock('../../lib/api', async (importOriginal) => ({
@@ -29,10 +34,15 @@ vi.mock('../../lib/api', async (importOriginal) => ({
   track: vi.fn(),
 }))
 
-vi.mock('../../lib/useIsDesktop', () => ({ useIsDesktop: () => true }))
+vi.mock('../../lib/useIsDesktop', () => ({ useIsDesktop: () => state.isDesktop }))
 vi.mock('./DownloadsPanel', () => ({ DownloadsPanel: () => null }))
 vi.mock('./ImportUrlDialog', () => ({ ImportUrlDialog: () => null }))
-vi.mock('./HfRepoDialog', () => ({ HfRepoContent: ({ repo }: { repo: string }) => <p>Details of {repo}</p> }))
+vi.mock('./HfRepoDialog', () => ({
+  HfRepoContent: (props: { repo: string; preselectFile?: string }) => {
+    state.repoContentProps.push(props)
+    return <p>Details of {props.repo}</p>
+  },
+}))
 
 function desktop() {
   return { os: 'windows', ramMB: 32768, gpus: [{ name: 'RTX', vramMb: 16384 }] }
@@ -63,6 +73,9 @@ beforeEach(() => {
   state.engineRows = [row('unsloth/Qwen3-8B-GGUF')]
   state.categoryRows = [row('convaiinnovations/laya', { runtime: 'laya' }), row('AlexWortega/openjev', { runtime: 'vllm' })]
   state.searchedCategories = []
+  state.engines = undefined
+  state.isDesktop = true
+  state.repoContentProps = []
 })
 
 describe('DiscoverTab — Text classification category', () => {
@@ -136,6 +149,117 @@ describe('DiscoverTab — Text classification category', () => {
     await userEvent.click(categoryToggle())
     await userEvent.click(resultRow('convaiinnovations/laya'))
     expect(screen.getByText('Details of convaiinnovations/laya')).toBeInTheDocument()
+  })
+})
+
+// ADR-462 (W-5): the curated picks follow the active engine's format, and a line under the search box says which
+// format and engine the list is for. A curated LiteRT-LM row opens its repo with the curated bundle preselected, at
+// both places the repo details render (the desktop pane and the phone Sheet, QG-4).
+describe('DiscoverTab — curated picks and the scope line follow the active engine', () => {
+  const engineRow = (over: Partial<Engine> & { id: string; name: string }): Engine =>
+    ({ binPath: '', version: '', capabilities: { kvTypes: [], flags: [] }, ...over })
+  const sdk = (id: string, sdkId: string, name: string, formats: Engine['formats']) =>
+    engineRow({ id, name, kind: 'turbollm-sdk', formats, sdkEngine: { id: sdkId, kind: sdkId, formats: formats ?? [], backends: ['cpu'] } })
+  const SDK_LITERT = sdk('lit', 'litert-lm', 'LiteRT-LM', ['litertlm'])
+  const SDK_LLAMA = sdk('cpu', 'llama.cpp-cpu', 'llama.cpp (CPU)', ['gguf'])
+  const LEGACY = engineRow({ id: 'old', name: 'TurboLLM SDK', kind: 'turbollm-sdk', formats: ['gguf', 'litertlm'] })
+  const LITERT_REPOS = [
+    LITERT_SMALLEST_PICK.repo,
+    'litert-community/gemma-4-E2B-it-litert-lm',
+    'litert-community/gemma-4-E4B-it-litert-lm',
+    'litert-community/Qwen3.5-2B',
+  ]
+  const GGUF_PICK = 'bartowski/Qwen_Qwen3.5-0.8B-GGUF'
+  const onAndroid = (active: Engine, sys = phone()) => {
+    state.sys = sys
+    state.engines = { engines: [SDK_LITERT, SDK_LLAMA, LEGACY], activeEngineId: active.id }
+  }
+  const lastPreselect = () => state.repoContentProps.at(-1)?.preselectFile
+
+  it('pins the LiteRT-LM picks, and no GGUF pick, with LiteRT-LM active on a phone', () => {
+    onAndroid(SDK_LITERT)
+    render(<DiscoverTab />)
+    for (const repo of LITERT_REPOS) expect(screen.getByRole('button', { name: new RegExp(repo) })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: new RegExp(GGUF_PICK) })).not.toBeInTheDocument()
+    expect(screen.getByText('Thinks before it answers')).toBeInTheDocument()
+  })
+
+  it('pins only the LiteRT-LM picks this phone can hold', () => {
+    onAndroid(SDK_LITERT, { os: 'android/arm64', ramMB: 4000, gpus: [] })
+    render(<DiscoverTab />)
+    expect(Math.round(4000 * 0.6) - 1024).toBeGreaterThanOrEqual(requiredMb(LITERT_SMALLEST_PICK.bytes))
+    expect(screen.getByRole('button', { name: new RegExp(LITERT_SMALLEST_PICK.repo) })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /gemma-4-E2B-it-litert-lm/ })).not.toBeInTheDocument()
+  })
+
+  it('pins no curated row on a phone below the smallest pick', () => {
+    onAndroid(SDK_LITERT, { os: 'android/arm64', ramMB: 3000, gpus: [] })
+    render(<DiscoverTab />)
+    expect(screen.queryByText('Good picks for this device')).not.toBeInTheDocument()
+  })
+
+  it('keeps the GGUF picks on the llama.cpp row and on the legacy SDK row', () => {
+    for (const active of [SDK_LLAMA, LEGACY]) {
+      onAndroid(active)
+      const { unmount } = render(<DiscoverTab />)
+      expect(screen.getByRole('button', { name: new RegExp(GGUF_PICK) })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: new RegExp(LITERT_SMALLEST_PICK.repo) })).not.toBeInTheDocument()
+      unmount()
+    }
+  })
+
+  it('says which format and engine the list is for', () => {
+    onAndroid(SDK_LITERT)
+    const { unmount } = render(<DiscoverTab />)
+    expect(screen.getByText('Showing .litertlm models for LiteRT-LM')).toBeInTheDocument()
+    unmount()
+    onAndroid(SDK_LLAMA)
+    render(<DiscoverTab />)
+    expect(screen.getByText('Showing .gguf models for llama.cpp (CPU)')).toBeInTheDocument()
+  })
+
+  it('shows no curated list on a desktop', () => {
+    state.engines = { engines: [SDK_LITERT], activeEngineId: 'lit' }
+    render(<DiscoverTab />)
+    expect(screen.queryByText('Good picks for this device')).not.toBeInTheDocument()
+  })
+
+  it('does not list a curated LiteRT-LM repo twice when it is also trending', () => {
+    onAndroid(SDK_LITERT)
+    state.engineRows = [row(LITERT_REPOS[1]), row('litert-community/Qwen3-0.6B')]
+    render(<DiscoverTab />)
+    expect(screen.getAllByRole('button', { name: /gemma-4-E2B-it-litert-lm/ })).toHaveLength(1)
+    expect(screen.getByRole('button', { name: /litert-community\/Qwen3-0\.6B/ })).toBeInTheDocument()
+  })
+
+  for (const isDesktop of [true, false]) {
+    it(`opens a curated LiteRT-LM row with its bundle preselected (${isDesktop ? 'desktop pane' : 'phone Sheet'})`, async () => {
+      onAndroid(SDK_LITERT)
+      state.isDesktop = isDesktop
+      state.engineRows = [row('litert-community/Qwen3-0.6B')]
+      render(<DiscoverTab />)
+
+      await userEvent.click(screen.getByRole('button', { name: /gemma-4-E2B-it-litert-lm/ }))
+      expect(screen.getByText('Details of litert-community/gemma-4-E2B-it-litert-lm')).toBeInTheDocument()
+      expect(lastPreselect()).toBe('gemma-4-E2B-it.litertlm')
+
+      await userEvent.click(screen.getByRole('button', { name: /litert-community\/Qwen3-0\.6B/ }))
+      expect(screen.getByText('Details of litert-community/Qwen3-0.6B')).toBeInTheDocument()
+      expect(lastPreselect()).toBeUndefined()
+    })
+  }
+
+  it('closing the phone Sheet drops the curated selection', async () => {
+    onAndroid(SDK_LITERT)
+    state.isDesktop = false
+    render(<DiscoverTab />)
+    await userEvent.click(screen.getByRole('button', { name: /gemma-4-E2B-it-litert-lm/ }))
+    expect(lastPreselect()).toBe('gemma-4-E2B-it.litertlm')
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }))
+    expect(screen.queryByText(/Details of/)).not.toBeInTheDocument()
+    state.repoContentProps = []
+    await userEvent.click(screen.getByRole('button', { name: new RegExp(LITERT_SMALLEST_PICK.repo) }))
+    expect(lastPreselect()).toBe(LITERT_SMALLEST_PICK.file)
   })
 })
 

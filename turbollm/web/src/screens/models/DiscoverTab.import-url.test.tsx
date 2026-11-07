@@ -14,6 +14,7 @@ const enqueue = vi.fn()
 vi.mock('../../lib/queries', () => ({
   useHfSearch: () => ({ data: { results: [] }, isLoading: false, isError: false, error: null, refetch: vi.fn() }),
   useSysInfo: () => ({ data: { os: 'android/arm64', ramMB: 7655, gpus: [] } }),
+  useEngines: () => ({ data: undefined }),
   useDownloadMutations: () => ({ enqueue: { mutate: enqueue, isPending: false, error: null, reset: () => {} } }),
 }))
 
