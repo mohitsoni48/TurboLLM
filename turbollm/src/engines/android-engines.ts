@@ -150,8 +150,9 @@ function planActivation(input: AndroidEngineInput, rows: AndroidEngineAction[]):
   return activationsOf(input, activationTarget(input, rows, live))
 }
 
-/** The SDK is back: the row active before the fallback, as rule 4 would treat it were it still active, unless the user
- *  picked an engine since, or the restore would strand the last model (FD-1). Either way the fallback is over. */
+/** The SDK is back: the row active before the fallback, as rule 4 would treat it were it still active, unless the
+ *  selection moved since (a user's pick stands under rule 4; an emptied one is filled by it, FD-2) or the restore would
+ *  strand the last model (FD-1). Either way the fallback is over. */
 function planFallbackEnd(
   input: AndroidEngineInput,
   fallback: AndroidSdkFallback,
@@ -159,7 +160,7 @@ function planFallbackEnd(
   live: PlannedRow[],
 ): AndroidEngineAction[] {
   const forget: AndroidEngineAction = { kind: 'forget-fallback' }
-  if (input.activeEngineId !== fallback.to) return [forget]
+  if (input.activeEngineId !== fallback.to) return [...activationsOf(input, activationTarget(input, rows, live)), forget]
   const restored = activationTarget({ ...input, activeEngineId: fallback.from }, rows, live)
     ?? activationOf(live.find((r) => r.ref === fallback.from))
   if (restored && strandsLastModel(input, live, restored.engineId)) return [forget]

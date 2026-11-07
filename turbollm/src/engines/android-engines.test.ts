@@ -411,6 +411,20 @@ test('FD-1: a GGUF lastLoaded the earlier llama.cpp (CPU) row reads restores tha
   assert.deepEqual(fallbackActions(actions), [...activates(LLAMA_SDK_ROW.id), forgetsFallback])
 })
 
+// FD-2 (fix-delta review): an empty selection is not a pick. With the fallback remembered and nothing active, the
+// SDK's return runs rule 4 as it would without the marker, then forgets the fallback.
+
+test('FD-2: the fallback remembered and nothing active: the SDK\'s return activates the row that reads lastLoaded', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW],
+    activeEngineId: '',
+    lastLoaded: { modelKey: LITERT_LAST, engineId: LITERT_SDK_ROW.id },
+    sdkFallback: { from: LITERT_SDK_ROW.id, to: CPU_ROW.id },
+    sdk: BOTH_SDK_ENGINES,
+  }))
+  assert.deepEqual(fallbackActions(actions), [...activates(LITERT_SDK_ROW.id), forgetsFallback])
+})
+
 test('an active SDK engine that becomes unavailable is replaced by the row that reads lastLoaded', () => {
   const actions = planAndroidEngines(input({
     engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW],
@@ -641,6 +655,44 @@ test('applier FD-1: a GGUF loaded on the CPU server while the SDK was down stays
   assert.equal(back.activeEngineId, 'cpu', 'the row that runs the GGUF lastLoaded')
   assert.equal(back.androidSdkFallback, undefined)
   assert.deepEqual(back.lastLoaded, { modelKey: GGUF_LAST, engineId: 'cpu' })
+})
+
+/** LiteRT-LM active with a .litertlm last model, then one start without the SDK: the CPU row stands in for it. */
+async function afterOneSdkDownBoot(t: AndroidTest) {
+  const lib = nativeLibDir([CPU_FILE])
+  const path = configWith([LLAMA_SDK_ROW, LITERT_SDK_ROW, cpuEngineIn(lib)], LITERT_SDK_ROW.id, {
+    lastLoaded: { modelKey: LITERT_LAST, engineId: LITERT_SDK_ROW.id },
+  })
+  await reconcile(appAt(t, path), { lib })
+  assert.deepEqual(ConfigStore.load(path).snapshot().androidSdkFallback, { from: LITERT_SDK_ROW.id, to: 'cpu' })
+  return { lib, path }
+}
+
+test('applier FD-2: the CPU file missing on a second start without the SDK: the SDK\'s return recovers LiteRT-LM, no false warning', async (t) => {
+  const { warns } = quietAndroidLog(t)
+  const { lib, path } = await afterOneSdkDownBoot(t)
+  await reconcile(appAt(t, path), { lib: nativeLibDir([]) })
+  assert.equal(ConfigStore.load(path).snapshot().activeEngineId, '', 'the CPU row is retired with its file')
+
+  await reconcile(appAt(t, path), { lib, sdkUrl: SDK_URL })
+
+  const back = ConfigStore.load(path).snapshot()
+  assert.equal(back.activeEngineId, LITERT_SDK_ROW.id)
+  assert.equal(back.androidSdkFallback, undefined)
+  assert.equal(mentions(warns, /no engine is active/), false)
+})
+
+test('applier FD-2: the CPU row removed by the user while the SDK was down: the SDK\'s return recovers LiteRT-LM', async (t) => {
+  const { warns } = quietAndroidLog(t)
+  const { lib, path } = await afterOneSdkDownBoot(t)
+  appAt(t, path).registry.remove('cpu')
+
+  await reconcile(appAt(t, path), { lib, sdkUrl: SDK_URL })
+
+  const back = ConfigStore.load(path).snapshot()
+  assert.equal(back.activeEngineId, LITERT_SDK_ROW.id)
+  assert.equal(back.androidSdkFallback, undefined)
+  assert.equal(mentions(warns, /no engine is active/), false)
 })
 
 test('applier m-3: LiteRT-LM unavailable with a .litertlm last model leaves no engine active, said in one warning', async (t) => {
