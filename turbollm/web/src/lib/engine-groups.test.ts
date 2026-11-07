@@ -2,6 +2,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   BUNDLED_ENGINE_TITLES,
+  SDK_ENGINE_TITLES,
+  bundledTitles,
+  engineLabel,
   customSourceIsLive,
   customSourceKey,
   engineGroupKey,
@@ -64,7 +67,8 @@ test('groupLabel reads the Android app\'s own engines by name, not by their regi
     eng({ id: 'a2', name: 'llama-server-android-vulkan', kind: 'llama-server', binPath: '/data/app/lib/arm64/libllama_server_vk.so' }),
     eng({ id: 'a3', name: 'litert-lm-android', kind: 'litert-lm', binPath: '/data/app/lib/arm64/liblitertlm_server.so' }),
   ])
-  assert.deepEqual(groups.map((g) => g.label), ['llama.cpp (CPU)', 'llama.cpp (Vulkan GPU)', 'LiteRT-LM'])
+  // ADR-462: the spawned servers are named as servers, so none shares a label with an in-app SDK engine.
+  assert.deepEqual(groups.map((g) => g.label), ['llama.cpp server (CPU)', 'llama.cpp server (Vulkan GPU)', 'LiteRT-LM server'])
   // Any other user-added engine still reads as its own name.
   assert.equal(groupEngines([userFork])[0].label, 'My Fork')
 })
@@ -73,7 +77,55 @@ test('BUNDLED_ENGINE_TITLES knows only the Android app\'s engines, not names Obj
   for (const name of ['constructor', 'toString', 'hasOwnProperty', '__proto__']) {
     assert.equal(BUNDLED_ENGINE_TITLES[name], undefined, name)
   }
-  assert.equal(BUNDLED_ENGINE_TITLES['litert-lm-android']?.label, 'LiteRT-LM')
+  assert.equal(BUNDLED_ENGINE_TITLES['litert-lm-android']?.label, 'LiteRT-LM server')
+})
+
+const sdkRow = (id: string, sdkId: string, name: string) =>
+  eng({ id, name, kind: 'turbollm-sdk', sdkEngine: { id: sdkId, kind: sdkId, formats: [], backends: ['cpu'] } })
+const sdkLitert = sdkRow('s1', 'litert-lm', 'LiteRT-LM')
+const sdkLlama = sdkRow('s2', 'llama.cpp-cpu', 'llama.cpp (CPU)')
+const serverAndroid = eng({ id: 'a1', name: 'llama-server-android', kind: 'llama-server', binPath: '/data/app/lib/arm64/libllama_server.so' })
+
+test('W-1: the in-app SDK engines are titled by their SDK engine id', () => {
+  assert.deepEqual(SDK_ENGINE_TITLES['litert-lm'], { title: 'LiteRT-LM', detail: 'CPU · GPU', label: 'LiteRT-LM' })
+  assert.deepEqual(SDK_ENGINE_TITLES['llama.cpp-cpu'], { title: 'llama.cpp', detail: 'CPU', label: 'llama.cpp (CPU)' })
+  assert.deepEqual(bundledTitles(sdkLitert), SDK_ENGINE_TITLES['litert-lm'])
+  assert.deepEqual(bundledTitles(sdkLlama), SDK_ENGINE_TITLES['llama.cpp-cpu'])
+})
+
+test('W-1: an SDK engine this web build does not know reads as its row name', () => {
+  const vulkan = sdkRow('s3', 'llama.cpp-vulkan', 'llama.cpp (Vulkan GPU)')
+  assert.deepEqual(bundledTitles(vulkan), { title: 'llama.cpp (Vulkan GPU)', detail: '', label: 'llama.cpp (Vulkan GPU)' })
+  assert.equal(engineLabel(vulkan), 'llama.cpp (Vulkan GPU)')
+})
+
+test('W-1: an SDK id or engine name that Object.prototype holds finds no title', () => {
+  for (const name of ['constructor', 'toString', '__proto__']) {
+    assert.equal(SDK_ENGINE_TITLES[name], undefined, name)
+    assert.equal(bundledTitles(eng({ id: 'x', name })), undefined, name)
+    assert.equal(engineLabel(eng({ id: 'x', name })), name)
+  }
+})
+
+test('W-1: the spawned Android servers are titled as servers', () => {
+  assert.deepEqual(BUNDLED_ENGINE_TITLES['llama-server-android'], {
+    title: 'llama.cpp server', detail: 'CPU · tools, images', label: 'llama.cpp server (CPU)',
+  })
+  assert.equal(BUNDLED_ENGINE_TITLES['llama-server-android-vulkan']?.label, 'llama.cpp server (Vulkan GPU)')
+  assert.equal(BUNDLED_ENGINE_TITLES['litert-lm-android']?.label, 'LiteRT-LM server')
+})
+
+test('W-1: each SDK engine is its own group, keyed by its SDK id', () => {
+  assert.equal(engineGroupKey(sdkLitert), 'sdk:litert-lm')
+  assert.equal(engineGroupKey(sdkLlama), 'sdk:llama.cpp-cpu')
+  const groups = groupEngines([sdkLitert, sdkLlama, serverAndroid])
+  assert.deepEqual(groups.map((g) => g.label), ['LiteRT-LM', 'llama.cpp (CPU)', 'llama.cpp server (CPU)'])
+})
+
+test('W-1: engineLabel names one row: SDK, bundled, or its own name', () => {
+  assert.equal(engineLabel(sdkLitert), 'LiteRT-LM')
+  assert.equal(engineLabel(serverAndroid), 'llama.cpp server (CPU)')
+  assert.equal(engineLabel(userFork), 'My Fork')
 })
 
 test('engineGroupKey detects TurboQuant by path', () => {

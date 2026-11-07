@@ -213,7 +213,7 @@ describe('EnginesScreen — the Android app\'s built-in engines', () => {
     state.activeEngineId = LLAMA_ANDROID.id
     renderScreen()
 
-    const litert = card('LiteRT-LM')
+    const litert = card('LiteRT-LM server')
     expect(within(litert).getByText('Runs .litertlm models once it is selected')).toBeTruthy()
     expect(screen.queryByText(/load on it automatically/)).toBeNull()
     await userEvent.click(within(litert).getByRole('button', { name: 'Use' }))
@@ -225,9 +225,9 @@ describe('EnginesScreen — the Android app\'s built-in engines', () => {
     state.activeEngineId = LITERT_ANDROID.id
     renderScreen()
 
-    const litert = card('LiteRT-LM')
+    const litert = card('LiteRT-LM server')
     expect((within(litert).getByRole('button', { name: 'In use' }) as HTMLButtonElement).disabled).toBe(true)
-    expect(within(card('llama.cpp')).getByRole('button', { name: 'Use' })).toBeTruthy()
+    expect(within(card('llama.cpp server')).getByRole('button', { name: 'Use' })).toBeTruthy()
   })
 
   it('names the built-in engines in the selector, not by their registered names', async () => {
@@ -237,11 +237,11 @@ describe('EnginesScreen — the Android app\'s built-in engines', () => {
 
     const trigger = screen.getByText('Running now').closest('div')!.querySelector('button[aria-haspopup="menu"]')!
     expect(trigger.textContent).toContain('LiteRT-LM')
-    expect(screen.getByText('LiteRT-LM · CPU · GPU')).toBeTruthy()
+    expect(screen.getByText('LiteRT-LM server · CPU · GPU')).toBeTruthy()
     await userEvent.click(trigger)
     const menu = await screen.findByRole('menu')
-    expect(within(menu).getByText('llama.cpp (CPU)')).toBeTruthy()
-    expect(within(menu).getByText('LiteRT-LM')).toBeTruthy()
+    expect(within(menu).getByText('llama.cpp server (CPU)')).toBeTruthy()
+    expect(within(menu).getByText('LiteRT-LM server')).toBeTruthy()
     expect(screen.queryByText(/litert-lm-android|llama-server-android/)).toBeNull()
   })
 })

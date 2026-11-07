@@ -353,11 +353,26 @@ export type EngineCapabilities = {
   flagInfo?: FlagInfo[]
 }
 
+/** A model file format an engine reads (the daemon's compat.ts ModelFormat). */
+export type ModelFormat = 'gguf' | 'mlx' | 'litertlm'
+
+/** Which of the in-app TurboLLM SDK's engines a row of kind 'turbollm-sdk' is (ADR-462), as the SDK reported it. */
+export type SdkEngineDescriptor = {
+  id: string
+  kind: string
+  formats: ModelFormat[]
+  backends: ('cpu' | 'gpu')[]
+}
+
 export type Engine = {
   id: string
   name: string
   binPath: string
   kind?: string
+  /** Set only on an in-app SDK row (kind 'turbollm-sdk'); absent on the pre-ADR-462 single SDK row. */
+  sdkEngine?: SdkEngineDescriptor
+  /** The model formats this row reads, computed by the daemon's engines list so the web never mirrors compat.ts. */
+  formats?: ModelFormat[]
   version: string
   capabilities: EngineCapabilities
   addedAt?: string
