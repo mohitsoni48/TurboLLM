@@ -565,7 +565,11 @@ class AndroidEngineApplier {
   }
 
   private warnWhenNothingCanRun(): void {
-    if (this.input.sdk === null) return this.warnWhenNoEngineShips()
+    if (this.input.sdk === null) this.warnWhenNoEngineShips()
+    else this.warnWhenNoEngineIsActive()
+  }
+
+  private warnWhenNoEngineIsActive(): void {
     if (this.deps.registry.list().activeEngineId !== '') return
     console.warn('android: no engine is active this launch: no available engine reads the last model\'s format; pick one in Engines')
   }
