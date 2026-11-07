@@ -279,6 +279,16 @@ test('with the SDK not started and an SDK row active, the CPU row takes over; wi
   assert.deepEqual(activations(withoutCpu), [])
 })
 
+test('M-1 finding: the M1 legacy row active with a .litertlm last model and the SDK not started: the CPU row takes over', () => {
+  const actions = planAndroidEngines(input({
+    engines: [LEGACY_ROW, CPU_ROW],
+    activeEngineId: LEGACY_ROW.id,
+    lastLoaded: { modelKey: LITERT_LAST, engineId: LEGACY_ROW.id },
+    sdk: null,
+  }))
+  assert.deepEqual(activations(actions), activates(CPU_ROW.id))
+})
+
 test('an active SDK engine that becomes unavailable is replaced by the row that reads lastLoaded', () => {
   const actions = planAndroidEngines(input({
     engines: [LLAMA_SDK_ROW, LITERT_SDK_ROW, CPU_ROW],

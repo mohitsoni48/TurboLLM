@@ -141,7 +141,9 @@ function activationTarget(input: AndroidEngineInput, rows: AndroidEngineAction[]
   if (!active || isRetiredBy(rows, active.id)) {
     return isFreshInstall(input) ? defaultRow(live)?.ref : rowForLastLoaded(input, live, lastFormat)?.ref
   }
-  if (isLegacySdkRow(active) && lastFormat === 'litertlm') return sdkRowOf(live, SDK_LITERT_ENGINE_ID)?.ref
+  if (isLegacySdkRow(active) && lastFormat === 'litertlm' && sdkEngineAvailable(input, SDK_LITERT_ENGINE_ID)) {
+    return sdkRowOf(live, SDK_LITERT_ENGINE_ID)?.ref
+  }
   if (input.sdk === null && active.kind === TURBOLLM_SDK_KIND) return spawnedCpuRow(live)?.ref
   return undefined
 }
