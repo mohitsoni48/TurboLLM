@@ -37,3 +37,18 @@ test('buildModelStatus serves no engine name while nothing is loaded', () => {
 
   assert.deepEqual([engine.servingId, engine.servingKind, engine.servingName], ['', '', ''])
 })
+
+// ADR-462 (plan D-13): a Turbo Link peer reads the host's status through this builder, so with the in-app LiteRT-LM row
+// active and serving, the peer sees "LiteRT-LM", not "TurboLLM SDK". No contract change: it is the row's own name.
+test('buildModelStatus names the in-app LiteRT-LM row by its own name, active and serving', () => {
+  const litertSdkRow = {
+    id: 'sdk-litert', name: 'LiteRT-LM', kind: 'turbollm-sdk',
+    sdkEngine: { id: 'litert-lm', kind: 'litert-lm', formats: ['litertlm'], backends: ['gpu', 'cpu'] },
+  }
+
+  const { engine } = buildModelStatus(depsServing(litertSdkRow, litertSdkRow))
+
+  assert.equal(engine.name, 'LiteRT-LM')
+  assert.equal(engine.servingName, 'LiteRT-LM')
+  assert.equal(engine.kind, 'turbollm-sdk')
+})
