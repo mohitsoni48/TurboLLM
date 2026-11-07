@@ -6,7 +6,7 @@ import { basename, join } from 'node:path'
 import {
   migrateEngineId, type AndroidSdkFallback, type ConfigStore, type Engine, type LastLoaded, type RetiredEngine,
 } from '../config/config'
-import { engineFormats, type ModelFormat } from './compat'
+import { engineFormats, isSdkRow, type ModelFormat } from './compat'
 import { LITERT_LM_NATIVE_SERVER, litertLmNativeVersion } from './litert-lm'
 import type { Registry } from './registry'
 import type { SdkEngineInfo } from './sdk-engines'
@@ -44,7 +44,6 @@ export const ANDROID_BUNDLED_ENGINES: { name: string; file: string; kind: 'llama
 
 /** The SDK engine whose row receives the one settings copy. */
 const SDK_LITERT_ENGINE_ID = 'litert-lm'
-const TURBOLLM_SDK_KIND = 'turbollm-sdk'
 
 export interface AndroidEngineInput {
   engines: Engine[]
@@ -98,7 +97,7 @@ function planSdkRows({ sdk, engines, retired }: AndroidEngineInput): AndroidEngi
   })
   const availableIds = new Set(available.map((info) => info.id))
   const retires = engines
-    .filter((e) => e.kind === TURBOLLM_SDK_KIND && e.sdkEngine && !availableIds.has(e.sdkEngine.id))
+    .filter((e) => isSdkRow(e) && e.sdkEngine && !availableIds.has(e.sdkEngine.id))
     .map((e): AndroidEngineAction => ({ kind: 'retire', engineId: e.id, remember: true, key: retiredSdkKey(e.sdkEngine?.id ?? '') }))
   return [...keeps, ...retires]
 }
@@ -109,7 +108,7 @@ function retiredSdkKey(sdkEngineId: string): string {
 }
 
 function sdkRowOfEngine(engines: Engine[], sdkEngineId: string): Engine | undefined {
-  return engines.find((e) => e.kind === TURBOLLM_SDK_KIND && e.sdkEngine?.id === sdkEngineId)
+  return engines.find((e) => isSdkRow(e) && e.sdkEngine?.id === sdkEngineId)
 }
 
 /** Rule 2: a shipped file is repaired, reinstated under its remembered id, or registered; the app's own row for a file
@@ -174,7 +173,7 @@ function activationTarget(input: AndroidEngineInput, rows: AndroidEngineAction[]
   if (isLegacySdkRow(active) && lastFormat === 'litertlm' && sdkEngineAvailable(input, SDK_LITERT_ENGINE_ID)) {
     return activationOf(sdkRowOf(live, SDK_LITERT_ENGINE_ID))
   }
-  if (input.sdk === null && active.kind === TURBOLLM_SDK_KIND) return activationOf(spawnedCpuRow(live), active.id)
+  if (input.sdk === null && isSdkRow(active)) return activationOf(spawnedCpuRow(live), active.id)
   return undefined
 }
 
@@ -239,7 +238,7 @@ function liveRowsAfter(input: AndroidEngineInput, rows: AndroidEngineAction[]): 
 
 function liveSdkRows({ sdk, engines, retired }: AndroidEngineInput, rows: AndroidEngineAction[]): PlannedRow[] {
   if (!sdk) return []
-  const kept = engines.filter((e) => e.kind === TURBOLLM_SDK_KIND && !isRetiredBy(rows, e.id))
+  const kept = engines.filter((e) => isSdkRow(e) && !isRetiredBy(rows, e.id))
   if (!sdk.engines) return kept.map(plannedSdkRow)
   const upserted = rows.filter(isSdkKeep).map((a): PlannedRow => ({
     ref: a.kind === 'reinstate-sdk' ? retired[retiredSdkKey(a.info.id)].id : (rowUpsertedBy(engines, a)?.id ?? a.info.id),
@@ -296,7 +295,7 @@ function activeRow({ engines, activeEngineId }: AndroidEngineInput): Engine | un
 }
 
 function isAppOwnedRow(engine: Engine): boolean {
-  return engine.kind === TURBOLLM_SDK_KIND
+  return isSdkRow(engine)
     || ANDROID_BUNDLED_ENGINES.some(({ name, file }) => engine.name === name && basename(engine.binPath) === file)
 }
 
@@ -323,7 +322,7 @@ function sdkEngineAvailable({ sdk }: AndroidEngineInput, sdkEngineId: string): b
 }
 
 function isLegacySdkRow(engine: Engine): boolean {
-  return engine.kind === TURBOLLM_SDK_KIND && !engine.sdkEngine
+  return isSdkRow(engine) && !engine.sdkEngine
 }
 
 /** The app's own row for a bundled engine: its bundled name on a binary of the bundled file's name, in this install's
@@ -472,7 +471,7 @@ class AndroidEngineApplier {
 
   private repairSdkUrl(baseUrl: string): void {
     this.deps.store.update((c) => {
-      for (const e of c.engines) if (e.kind === TURBOLLM_SDK_KIND) e.baseUrl = baseUrl
+      for (const e of c.engines) if (isSdkRow(e)) e.baseUrl = baseUrl
     })
     console.log(`android: the in-app SDK's engine list could not be read; its rows keep their engines, at ${baseUrl}`)
   }

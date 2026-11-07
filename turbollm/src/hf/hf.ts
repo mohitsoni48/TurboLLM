@@ -4,7 +4,7 @@
 // degradation. Network/auth failures surface as a typed HfError so routes can map
 // them to a stable error envelope.
 import { quantFromName } from '../gguf/gguf'
-import { readsOnlyLitertlm, type EngineFormatRef } from '../engines/compat'
+import { isSdkRow, readsOnlyLitertlm, type EngineFormatRef } from '../engines/compat'
 import { detectJev } from '../models/jev'
 import { litertlmQuantFromName, litertlmTarget, type LitertlmTarget } from '../models/litertlm'
 import type { TextClassifierRuntime } from '../models/text-classifier'
@@ -80,7 +80,7 @@ const SORT_PARAM: Record<Exclude<HfSortOption, 'best-match'>, string> = {
  *  - litert-lm (`.litertlm` bundles, e.g. the litert-community org)            → litert-lm
  *  Shared by `searchModels` and `browseModels` so the two never drift apart. */
 function libraryFilterFor(engine?: EngineFormatRef): string {
-  if (engine?.kind === 'turbollm-sdk' && engine.sdkEngine) {
+  if (engine && isSdkRow(engine) && engine.sdkEngine) {
     return readsOnlyLitertlm(engine) ? LITERT_LM_FILTER : 'filter=gguf&'
   }
   const engineKind = engine?.kind
@@ -96,7 +96,7 @@ const LITERT_LM_FILTER = 'filter=litert-lm&'
  *  bundles that share the litert-lm facet are dropped: they cannot chat, and that list is the first a new phone user
  *  sees. Vision-language and any-to-any bundles stay (they may answer text). Every other engine's rows are all kept. */
 function chatRowsFor(engine: EngineFormatRef | undefined, rows: RawSearchItem[]): RawSearchItem[] {
-  if (engine?.kind !== 'turbollm-sdk' || !readsOnlyLitertlm(engine)) return rows
+  if (!engine || !isSdkRow(engine) || !readsOnlyLitertlm(engine)) return rows
   return rows.filter((m) => !NON_CHAT_PIPELINES.has(m.pipeline_tag ?? '') && !/embedding/i.test(repoIdOf(m)))
 }
 

@@ -1,7 +1,7 @@
 // The daemon's read of the in-app TurboLLM SDK's engine catalog (ADR-462, architecture §2.4/§3.3). The Android
 // reconciler reads it once per start to decide which SDK rows exist; an unreadable list must never fail the boot, so
 // every failure is null, which the reconciler reads as "change nothing".
-import type { ModelFormat } from './compat'
+import { TURBOLLM_SDK_KIND, type ModelFormat } from './compat'
 import { engineRequestHeaders } from './engine-headers'
 
 export interface SdkEngineInfo {
@@ -28,7 +28,7 @@ export async function readSdkEngines(
 ): Promise<SdkEngineInfo[] | null> {
   try {
     const res = await fetchFn(`${baseUrl}${SDK_ENGINES_PATH}`, {
-      headers: engineRequestHeaders('turbollm-sdk', new Headers(), env),
+      headers: engineRequestHeaders(TURBOLLM_SDK_KIND, new Headers(), env),
       signal: AbortSignal.timeout(READ_BUDGET_MS),
     })
     if (!res.ok) return null

@@ -200,15 +200,16 @@ function kindFormats(engineKind: string): ModelFormat[] {
   if (engineKind === 'laya') return []
   // .litertlm is LiteRT-LM's alone, and LiteRT-LM reads nothing else.
   if (engineKind === 'litert-lm') return ['litertlm']
-  if (engineKind === TURBOLLM_SDK) return ['gguf', 'litertlm']
+  if (engineKind === TURBOLLM_SDK_KIND) return ['gguf', 'litertlm']
   // llama-server / forks, llamafile, koboldcpp — all GGUF.
   return ['gguf']
 }
 
 const MODEL_DIRECTORY_KINDS: ReadonlySet<string> = new Set(['mlx', 'rapid-mlx', 'mlx-vlm', 'vllm', 'sglang'])
 
-function isSdkRow(engine: EngineFormatRef): boolean {
-  return engine.kind === TURBOLLM_SDK
+/** A row of the Android app's in-app TurboLLM SDK (ADR-462). */
+export function isSdkRow(engine: Pick<Engine, 'kind'>): boolean {
+  return engine.kind === TURBOLLM_SDK_KIND
 }
 
 /**
@@ -236,12 +237,12 @@ export function engineRejectsAudioModel(engineKind: string): boolean {
 }
 
 /** The Android app's in-app engine (the TurboLLM SDK), reached over HTTP rather than spawned. */
-const TURBOLLM_SDK = 'turbollm-sdk'
+export const TURBOLLM_SDK_KIND = 'turbollm-sdk'
 
 /** True when requests to `engineKind` must go without tools, tool_choice and a non-text response_format: the SDK
  *  refuses them with a 400 in this version, so every in-app agent turn would fail (ADR-447 point 7's precedent). */
 export function engineWithholdsTools(engineKind: string): boolean {
-  return engineKind === TURBOLLM_SDK
+  return engineKind === TURBOLLM_SDK_KIND
 }
 
 /** True when `engineKind` takes a past turn's reasoning as the message's `reasoning_content` and not folded into its
@@ -249,20 +250,20 @@ export function engineWithholdsTools(engineKind: string): boolean {
  *  Qwen3-0.6B's second turn (QA re-run R3). The SDK reads no such field and leaves the reasoning out, as a LiteRT-LM
  *  conversation's own history does. */
 export function engineTakesReasoningAsField(engineKind: string): boolean {
-  return engineKind === 'litert-lm' || engineKind === TURBOLLM_SDK
+  return engineKind === 'litert-lm' || engineKind === TURBOLLM_SDK_KIND
 }
 
 /** True when `engineKind` cannot read image parts, so an image must be refused or replaced before it is sent. The
  *  SDK has no vision in this version. */
 export function engineWithholdsVision(engineKind: string): boolean {
-  return engineKind === TURBOLLM_SDK
+  return engineKind === TURBOLLM_SDK_KIND
 }
 
 /** True when `engineKind` has no embeddings: the gateway refuses an embeddings request bound for it before routing,
  *  so nothing is loaded or evicted for it, and the router refuses to load an embedding model on it. The SDK has no
  *  embeddings in this version. */
 export function engineWithholdsEmbeddings(engineKind: string): boolean {
-  return engineKind === TURBOLLM_SDK
+  return engineKind === TURBOLLM_SDK_KIND
 }
 
 /** The message of both refusals {@link engineWithholdsEmbeddings} decides: the gateway's (an embeddings request) and
@@ -271,7 +272,7 @@ export const EMBEDDINGS_UNAVAILABLE = 'The TurboLLM SDK engine runs one chat mod
 
 /** True when `engineKind` loads one model at a time, so a second load replaces the first: the SDK. */
 export function engineHoldsOneModel(engineKind: string): boolean {
-  return engineKind === TURBOLLM_SDK
+  return engineKind === TURBOLLM_SDK_KIND
 }
 
 /** The `vision_unavailable` refusal of an image sent to an engine that {@link engineWithholdsVision}. */
@@ -314,7 +315,7 @@ export function engineModelAlias(engineKind: string, modelPath?: string | null):
   // file path), not a name it ignores and not an alias it was launched under.
   if (engineKind === 'litert-lm') return modelPath ?? null
   // The SDK serves the model it loaded from a path, and names it by that path in /v1/models.
-  if (engineKind === TURBOLLM_SDK) return modelPath ?? null
+  if (engineKind === TURBOLLM_SDK_KIND) return modelPath ?? null
   return engineKind === 'mlx' || engineKind === 'vllm' || engineKind === 'sglang' ? ENGINE_MODEL_ALIAS : null
 }
 
@@ -344,7 +345,7 @@ export function engineModelAlias(engineKind: string, modelPath?: string | null):
 export function shapeForEngine<T extends Record<string, unknown>>(engineKind: string, body: T): T {
   applyEngineTokenLimit(engineKind, body)
   if (engineKind === 'litert-lm') shapeLitertLmRequest(body)
-  if (engineKind === TURBOLLM_SDK) capSdkStopList(body)
+  if (engineKind === TURBOLLM_SDK_KIND) capSdkStopList(body)
   return body
 }
 

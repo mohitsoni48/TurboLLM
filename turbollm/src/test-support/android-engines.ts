@@ -8,7 +8,7 @@ import type { ConfigStore, Engine } from '../config/config'
 import {
   ANDROID_BUNDLED_ENGINES, ANDROID_ENGINE_NAME, ANDROID_VULKAN_ENGINE_NAME, reconcileAndroidEngines,
 } from '../engines/android-engines'
-import type { ModelFormat } from '../engines/compat'
+import { isSdkRow, type ModelFormat } from '../engines/compat'
 import { Registry } from '../engines/registry'
 import type { SdkEngineInfo } from '../engines/sdk-engines'
 
@@ -109,7 +109,7 @@ export async function reconcileWith(app: Pick<AndroidApp, 'store' | 'registry'>,
 }
 
 export function sdkRowsOf(registry: Registry): Engine[] {
-  return registry.list().engines.filter((e) => e.kind === 'turbollm-sdk')
+  return registry.list().engines.filter(isSdkRow)
 }
 
 export function sdkRowFor(registry: Registry, sdkEngineId: string): Engine | undefined {

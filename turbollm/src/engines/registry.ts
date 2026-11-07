@@ -7,7 +7,7 @@ import { probe, type ProbeResult } from './probe'
 import type { ReleaseProvenance } from './release-install'
 import { normRepoUrl, sameRepo } from './build-runner'
 import type { ModelEntry } from '../models/scanner'
-import { modelIncompatibility, type Incompatibility } from './compat'
+import { isSdkRow, modelIncompatibility, TURBOLLM_SDK_KIND, type Incompatibility } from './compat'
 import type { SdkEngineInfo } from './sdk-engines'
 
 /** Auto-provisioned official builds live under `<dataDir>/engines/llama.cpp-…/`.
@@ -602,11 +602,14 @@ export class Registry {
  *  Shared between {@link Registry.recordCustomSource}/{@link Registry.forgetCustomSource} and
  *  a live {@link Engine} so the two can be cross-referenced (same shape: sourceRepo?/
  *  sourceBranch?/sourceCommit?/binPath). */
-const TURBOLLM_SDK_KIND = 'turbollm-sdk'
+export function customSourceKey(s: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; binPath: string }): string {
+  if (!s.sourceRepo) return s.binPath
+  return `${normRepoUrl(s.sourceRepo)}#${(s.sourceBranch ?? '').trim().toLowerCase()}#${(s.sourceCommit ?? '').trim().toLowerCase()}`
+}
 
 /** The row for the SDK engine `sdkEngineId`, else (when adopting) the legacy row that names no SDK engine. */
 function findSdkRow(engines: Engine[], sdkEngineId: string, adoptLegacy: boolean): Engine | undefined {
-  const sdkRows = engines.filter((e) => e.kind === TURBOLLM_SDK_KIND)
+  const sdkRows = engines.filter(isSdkRow)
   return sdkRows.find((e) => e.sdkEngine?.id === sdkEngineId) ?? (adoptLegacy ? sdkRows.find((e) => !e.sdkEngine) : undefined)
 }
 
@@ -622,11 +625,6 @@ function pushNewSdkRow(engines: Engine[]): Engine {
   }
   engines.push(row)
   return row
-}
-
-export function customSourceKey(s: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; binPath: string }): string {
-  if (!s.sourceRepo) return s.binPath
-  return `${normRepoUrl(s.sourceRepo)}#${(s.sourceBranch ?? '').trim().toLowerCase()}#${(s.sourceCommit ?? '').trim().toLowerCase()}`
 }
 
 /** True when a saved `capabilities.flags` list was captured by a daemon predating a
