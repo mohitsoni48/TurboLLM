@@ -81,7 +81,7 @@ import { gcAbandonedZipInstalls, installZipEngine, MAX_ZIP_BYTES, packagedAndroi
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
-import { engineWithholdsVision, modelIncompatibility } from '../engines/compat'
+import { engineFormats, engineWithholdsVision, modelIncompatibility } from '../engines/compat'
 import { ScannerError, type ModelEntry } from '../models/scanner'
 import { automaticProfile, configuredCtx, estimateVram, legacySeedProfile, type LoadProfile, resolveProfile, userSetProfile } from '../models/profile'
 import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
@@ -355,7 +355,9 @@ export function registerApi(app: Hono, d: Deps): void {
       .customSources()
       .filter((s) => !liveKeys.has(customSourceKey(s)))
       .map((s) => ({ ...s, binPathExists: existsSync(s.binPath) }))
-    return c.json({ engines, activeEngineId, customDisabled })
+    // Each row's formats, computed here (ADR-462) so the web never mirrors compat.ts: the two in-app SDK rows read
+    // different formats under one kind. Read-only: never written back to config.
+    return c.json({ engines: engines.map((e) => ({ ...e, formats: engineFormats(e) })), activeEngineId, customDisabled })
   })
 
   // ---- engine backends (ADR-025): hardware-aware default + override ----

@@ -627,3 +627,33 @@ for (const [label, bind, requestUrl, base] of [
     assert.match(node, new RegExp(`^TURBOLLM_URL = ${JSON.stringify(base).replace(/[.[\]]/g, '\\$&')}$`, 'm'))
   })
 }
+
+// ADR-462 (plan D-11): each engine row carries the formats it reads, computed by the daemon (compat.ts engineFormats),
+// so the web learns that the two SDK rows read different formats without mirroring compat.ts.
+test('GET /api/v1/engines gives each row its formats, passes the SDK descriptor through, and keeps customDisabled', async () => {
+  const sdkRow = (id: string, name: string, sdkId: string, formats: string[]) => ({
+    id, name, kind: 'turbollm-sdk', binPath: '', version: 'in-app', capabilities: { kvTypes: [], flags: [] }, addedAt: '',
+    sdkEngine: { id: sdkId, kind: sdkId, formats, backends: ['cpu'] },
+  })
+  const litert = sdkRow('litert', 'LiteRT-LM', 'litert-lm', ['litertlm'])
+  const llama = sdkRow('llama', 'llama.cpp (CPU)', 'llama.cpp-cpu', ['gguf'])
+  const server = { id: 'cpu', name: 'llama-server-android', kind: 'llama-server', binPath: '/lib/libllama_server.so', version: 'b1', capabilities: { kvTypes: [], flags: [] }, addedAt: '' }
+  const disabled = { name: 'my build', binPath: join(tmpDir('tllm-engines-list-'), 'gone', 'llama-server'), sourceRepo: 'https://github.com/x/y', addedAt: '' }
+  const d = {
+    store: { snapshot: () => ({}) },
+    registry: { list: () => ({ engines: [litert, llama, server], activeEngineId: 'litert' }), customSources: () => [disabled] },
+  } as unknown as Deps
+  const app = new Hono()
+  registerApi(app, d)
+
+  const body = (await (await app.request('/api/v1/engines')).json()) as {
+    engines: { id: string; formats: string[]; sdkEngine?: unknown }[]
+    activeEngineId: string
+    customDisabled: unknown[]
+  }
+
+  assert.deepEqual(body.engines.map((e) => [e.id, e.formats]), [['litert', ['litertlm']], ['llama', ['gguf']], ['cpu', ['gguf']]])
+  assert.deepEqual(body.engines[0].sdkEngine, litert.sdkEngine)
+  assert.equal(body.activeEngineId, 'litert')
+  assert.deepEqual(body.customDisabled, [{ ...disabled, binPathExists: false }])
+})
