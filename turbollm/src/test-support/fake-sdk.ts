@@ -17,6 +17,11 @@ export function sdkStatus(state: string, extra: Record<string, unknown> = {}): S
   return { status: 200, body: { state, ...extra } }
 }
 
+/** The reply to GET /sdk/v1/engines (ADR-462): the SDK's engine catalog, entries as given. */
+export function sdkEnginesReply(data: unknown[]): SdkReply {
+  return { status: 200, body: { object: 'list', data } }
+}
+
 /** Answers each `"<METHOD> <path>"` route from its own queue of replies (the last one repeats; an unknown route is a
  *  404) and records every request it was sent. */
 export function fakeSdk(routes: Record<string, SdkReply[]>) {
