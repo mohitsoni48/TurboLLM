@@ -170,7 +170,7 @@ function realRouter(manager: Manager): ModelRouter {
   const cfg = defaultConfig()
   cfg.gateway.autoSwap = true
   cfg.gateway.keepN = 1
-  const store = { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } as unknown as ConfigStore
+  const store = { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } as unknown as ConfigStore
   const registry = {
     active: () => ({ id: 'eng1', name: 'vLLM', kind: 'vllm', binPath: 'vllm', capabilities: { kvTypes: [], flags: [] } }),
   } as unknown as Registry
@@ -488,4 +488,35 @@ test("a render that pauses the routine's restore resumes the user's model, which
   assert.equal(st.state, 'running', `got ${st.state} (${st.err?.message ?? ''})`)
   assert.equal(st.model?.key, userModel.key)
   assert.deepEqual(store.snapshot().lastLoaded, { modelKey: userModel.key, engineId: 'fake' })
+})
+
+// Review L1: the router's retryable "every model is generating" and "auto-tune is running" refusals stopped nothing,
+// yet a routine logged them as a failed load (and restored). They are the busy engine a routine skips; the router says
+// so in a structured `reason`, never in text a routine has to match.
+for (const reason of ['busy', 'autotune'] as const) {
+  test(`a swap the router refuses as ${reason} -> skip-busy, nothing restored, fn never called`, async () => {
+    const loadCalls: string[] = []
+    const manager = { status: () => ({ state: 'running', model: { key: 'b' } }), sessionStats: () => ({ activeRequests: 0 }) } as unknown as Manager
+    const modelRouter = {
+      loadExplicit: async (key: string) => { loadCalls.push(key); return { status: 503, message: 'refused', reason } },
+    } as unknown as ModelRouter
+    let called = false
+    const result = await withPinnedModel({ manager, modelRouter }, 'a', async () => { called = true })
+    assert.equal(result.outcome, 'skip-busy')
+    assert.equal(called, false)
+    assert.deepEqual(loadCalls, ['a'], 'nothing was stopped, so nothing is restored')
+  })
+}
+
+// Review M2: the router counts a held gate as a request on its engine; a routine's swap and restore hold the primary's
+// gate themselves (execute.ts), and say so, or keep-N 1 refused every routine swap.
+test('holdsGate: the swap and the restore both tell the router the caller holds the gate', async () => {
+  const seen: unknown[] = []
+  let current = 'b'
+  const manager = { status: () => ({ state: 'running', model: { key: current } }), sessionStats: () => ({ activeRequests: 0 }) } as unknown as Manager
+  const modelRouter = {
+    loadExplicit: async (key: string, _o: unknown, opts?: { holdsGate?: true }) => { seen.push(opts?.holdsGate); current = key; return { target: 'http://x' } },
+  } as unknown as ModelRouter
+  assert.equal((await withPinnedModel({ manager, modelRouter, holdsGate: true }, 'a', async () => {})).outcome, 'ran')
+  assert.deepEqual(seen, [true, true])
 })

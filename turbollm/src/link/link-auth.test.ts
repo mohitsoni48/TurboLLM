@@ -15,7 +15,7 @@ function depsWith(keys: ApiKey[], daemon: { lanBind: boolean; requireApiKey: boo
   // link/experimental-gate.test.ts.
   const cfg = { apiKeys: keys, daemon: { ...daemon, experimental: { turboLink: true } } }
   return {
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
   } as unknown as Deps
 }
 

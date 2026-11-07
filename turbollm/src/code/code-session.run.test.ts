@@ -65,7 +65,7 @@ function harness(base: string, mode: CodeMode, extraDeps: Record<string, unknown
   const run = store.createAgentRun({ convId: conv.id, title: 't', allowedTools: [], repoRoot })
   const d = {
     db: store,
-    store: { dir: () => dataDir, snapshot: () => ({ code: { agentsMdProjectCandidates: [], agentsMdGlobalCandidates: [] }, daemon: { experimental: { routines: false } } }) },
+    store: { dir: () => dataDir, snapshot: () => ({ code: { agentsMdProjectCandidates: [], agentsMdGlobalCandidates: [] }, daemon: { experimental: { routines: false } } }), read: () => ({ code: { agentsMdProjectCandidates: [], agentsMdGlobalCandidates: [] }, daemon: { experimental: { routines: false } } }) },
     manager: {
       status: () => ({ state: 'running', model: { key: 'test-model', name: 'Test', ctx: 8192 } }),
       target: () => base,

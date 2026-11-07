@@ -18,6 +18,7 @@ import { ConversationStore, IN_MEMORY_DATA_DIR } from './db.js'
 import { RequestLog } from '../observability/request-log.js'
 import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
+import { chatRegistries } from '../test-support/chat-registries'
 
 interface EngineRequest { stream: boolean; lastUser: string }
 
@@ -89,8 +90,9 @@ function harness(engineUrl: string, opts: { requestLog?: boolean; titles?: boole
     requestLog: { enabled: opts.requestLog ?? true, captureBodies: false, maxEntries: 500 },
   }
   const d = {
+    ...chatRegistries(),
     db: store,
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
     registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
     modelRouter: { resolveRemoteTarget: () => undefined },

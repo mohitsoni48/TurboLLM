@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { bypassesAuth, isLocalRequest, isLocalOrAuthenticated, isLoopbackBindHost, provisionBootstrapApiKey, provisionTunnelApiKey, verifyPresentedKey, verifyKeyValue, codeAuth, requiredCapability } from './auth'
+import { bypassesAuth, isLocalRequest, isLocalOrAuthenticated, isLoopbackBindHost, provisionBootstrapApiKey, provisionTunnelApiKey, verifyPresentedKey, verifyKeyValue, codeAuth, requiredCapability, resolveKey } from './auth'
 import type { ApiKey } from './config/config'
 import type { Context } from 'hono'
 import type { Deps } from './deps'
@@ -102,7 +102,7 @@ test('bypassesAuth: tunneled + a genuinely remote caller (loopback=false) is sti
 
 function fakeDeps(overrides: { lanBind?: boolean; requireApiKey?: boolean; ingressPort?: number }): Deps {
   return {
-    store: { snapshot: () => ({ daemon: { lanBind: overrides.lanBind ?? false, requireApiKey: overrides.requireApiKey ?? false } } as ReturnType<Deps['store']['snapshot']>) },
+    store: { snapshot: () => ({ daemon: { lanBind: overrides.lanBind ?? false, requireApiKey: overrides.requireApiKey ?? false } } as ReturnType<Deps['store']['snapshot']>), read: () => ({ daemon: { lanBind: overrides.lanBind ?? false, requireApiKey: overrides.requireApiKey ?? false } } as ReturnType<Deps['store']['snapshot']>) },
     remote: overrides.ingressPort !== undefined ? ({ ingressPort: () => overrides.ingressPort } as Deps['remote']) : undefined,
   } as unknown as Deps
 }
@@ -248,7 +248,7 @@ function bootstrapDeps(overrides: { requireApiKey?: boolean; apiKeys?: ApiKey[] 
   }
   const d = {
     store: {
-      snapshot: () => cfg as unknown as ReturnType<Deps['store']['snapshot']>,
+      snapshot: () => cfg as unknown as ReturnType<Deps['store']['snapshot']>, read: () => cfg as unknown as ReturnType<Deps['store']['snapshot']>,
       update: (fn: (c: typeof cfg) => void) => fn(cfg),
     },
   } as unknown as Deps
@@ -338,6 +338,9 @@ function fakeDepsWithKeys(overrides: { lanBind?: boolean; ingressPort?: number; 
   return {
     store: {
       snapshot: () => ({
+        daemon: { lanBind: overrides.lanBind ?? false, requireApiKey: overrides.requireApiKey ?? false },
+        apiKeys,
+      } as unknown as ReturnType<Deps['store']['snapshot']>), read: () => ({
         daemon: { lanBind: overrides.lanBind ?? false, requireApiKey: overrides.requireApiKey ?? false },
         apiKeys,
       } as unknown as ReturnType<Deps['store']['snapshot']>),
@@ -502,7 +505,7 @@ test('verifyKeyValue: lastUsedAt is persisted at most about once a minute, not o
   let writes = 0
   const d = {
     store: {
-      snapshot: () => ({ daemon: { lanBind: false, requireApiKey: false }, apiKeys: [{ ...key }] }),
+      snapshot: () => ({ daemon: { lanBind: false, requireApiKey: false }, apiKeys: [{ ...key }] }), read: () => ({ daemon: { lanBind: false, requireApiKey: false }, apiKeys: [{ ...key }] }),
       update: (fn: (cfg: { apiKeys: typeof key[] }) => void) => { writes++; fn({ apiKeys: [key] }) },
     },
   } as unknown as Deps
@@ -548,4 +551,19 @@ test('isLocalRequest: a .internal or IP-literal Host stays local on a loopback-o
     assert.equal(isLocalOrAuthenticated(fakeContext({ host }), d), true, host)
   }
   assert.equal(isLocalRequest(fakeContext({ host: 'evil.example' }), d), false)
+})
+
+test('resolveKey: finds the presented key without cloning the config (read(), never snapshot())', () => {
+  const d = fakeDepsWithKeys({ hasKey: true, granted: ['models:use'] })
+  d.store.snapshot = () => { throw new Error('resolveKey must not deep-clone the config per request') }
+  const key = resolveKey(fakeContext({ 'x-turbollm-auth': RAW_KEY }), d)
+  assert.equal(key?.id, 'k1')
+  assert.equal(resolveKey(fakeContext({ 'x-turbollm-auth': 'tllm-nope' }), d), undefined)
+})
+
+test('requiredCapability: a chat image is read with what reads the chat (models:use); nothing writes one through it', () => {
+  assert.equal(requiredCapability('GET', '/api/v1/attachments/abc.png'), 'models:use')
+  assert.equal(requiredCapability('HEAD', '/api/v1/attachments/abc.png'), 'models:use')
+  assert.equal(requiredCapability('DELETE', '/api/v1/attachments/abc.png'), null)
+  assert.equal(requiredCapability('GET', '/api/v1/attachmentsX'), null)
 })

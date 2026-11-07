@@ -22,7 +22,8 @@
  * way.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { readFileSync, mkdirSync } from 'node:fs'
+import { writeFileAtomicSync } from '../util/atomic-write'
 import { join } from 'node:path'
 
 /** How many transmissions to retain per bucket. Enough to inspect a long
@@ -58,7 +59,7 @@ function readBucket(path: string): SentEntry[] {
 
 function writeBucket(dataDir: string, path: string, entries: SentEntry[]): void {
   mkdirSync(join(dataDir, 'telemetry'), { recursive: true })
-  writeFileSync(path, JSON.stringify(entries))
+  writeFileAtomicSync(path, JSON.stringify(entries))
 }
 
 /** Read the full log (both buckets merged), newest first. Never throws. */

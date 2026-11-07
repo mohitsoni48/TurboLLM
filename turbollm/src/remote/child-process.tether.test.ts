@@ -17,6 +17,8 @@ import { isGone, killRecorded, pidWrittenTo, record, srcUrl, startStandInDaemon,
 import { tmpDir } from '../test-support/tmp'
 
 const skip = process.platform === 'win32' ? 'POSIX process groups' : false
+/** These run real child processes and SIGKILL a daemon; unmeasured on ubuntu runners, so more than `npm test`'s 60 s per-test default. */
+const SPAWN_TIMEOUT_MS = 180_000
 
 /** A stand-in cloudflared: starts a `sleep` grandchild, writes its pid to `pidFile`, prints a trycloudflare URL
  *  once, and exits at once on SIGTERM. */
@@ -33,7 +35,7 @@ setInterval(() => {}, 1e9)
   return file
 }
 
-test('a daemon SIGKILLed with a tunnel up takes the provider and its grandchild with it', { skip }, async () => {
+test('a daemon SIGKILLed with a tunnel up takes the provider and its grandchild with it', { skip, timeout: SPAWN_TIMEOUT_MS }, async () => {
   const dir = tmpDir('tllm-tunnel-tether-')
   const grandchildFile = join(dir, 'grandchild.pid')
   const provider = providerScript(dir, grandchildFile)
@@ -58,7 +60,7 @@ setInterval(() => {}, 1e9)
   }
 })
 
-test('ChildTunnel.stop(): the provider exits on its SIGTERM, and what it started goes with its group', { skip }, async () => {
+test('ChildTunnel.stop(): the provider exits on its SIGTERM, and what it started goes with its group', { skip, timeout: SPAWN_TIMEOUT_MS }, async () => {
   const dir = tmpDir('tllm-tunnel-stop-')
   const grandchildFile = join(dir, 'grandchild.pid')
   const t = new ChildTunnel(join(dir, 'data'))
@@ -77,7 +79,7 @@ test('ChildTunnel.stop(): the provider exits on its SIGTERM, and what it started
   }
 })
 
-test('reapStaleTunnels kills an orphaned provider\'s whole group when its pidfile says it leads one', { skip }, async () => {
+test('reapStaleTunnels kills an orphaned provider\'s whole group when its pidfile says it leads one', { skip, timeout: SPAWN_TIMEOUT_MS }, async () => {
   const dir = tmpDir('tllm-tunnel-reap-')
   const pidFile = join(dir, 'worker.pid')
   const orphan = spawn('sh', ['-c', `sleep 300 & echo $! > ${pidFile}; wait`], { detached: true, stdio: 'ignore' })
@@ -95,7 +97,7 @@ test('reapStaleTunnels kills an orphaned provider\'s whole group when its pidfil
   }
 })
 
-test('killTrackedTunnelsSync (the exit handler) kills the provider\'s whole group, from its pidfile', { skip }, async () => {
+test('killTrackedTunnelsSync (the exit handler) kills the provider\'s whole group, from its pidfile', { skip, timeout: SPAWN_TIMEOUT_MS }, async () => {
   const dir = tmpDir('tllm-tunnel-exitkill-')
   const grandchildFile = join(dir, 'grandchild.pid')
   const data = join(dir, 'data')
@@ -121,7 +123,7 @@ test('killTrackedTunnelsSync (the exit handler) kills the provider\'s whole grou
   }
 })
 
-test('a daemon SIGKILLed mid-call takes a hanging `tailscale` with it', { skip }, async () => {
+test('a daemon SIGKILLed mid-call takes a hanging `tailscale` with it', { skip, timeout: SPAWN_TIMEOUT_MS }, async () => {
   const dir = tmpDir('tllm-tailscale-tether-')
   const pidFile = join(dir, 'tailscale.pid')
   const bin = join(dir, 'bin')
@@ -145,7 +147,7 @@ await runTailscale(['status', '--json'])
   }
 })
 
-test('a graceful stop still turns Tailscale Serve and Funnel off: stopTethered beside remote.disable() leaves the `off` to it', { skip }, async () => {
+test('a graceful stop still turns Tailscale Serve and Funnel off: stopTethered beside remote.disable() leaves the `off` to it', { skip, timeout: SPAWN_TIMEOUT_MS }, async () => {
   // Both teardowns in cli.ts run `Promise.all([..., remote.disable(), stopTethered(), ...])`. remote.disable()
   // starts the `off` synchronously, so it is a live tethered entry by the time stopTethered looks. It runs to its
   // end because the CLI's kind is 'tunnel', which stopTethered leaves to its owner; under any other kind it would be
@@ -179,7 +181,7 @@ echo "done $*" >> ${JSON.stringify(log)}
   }
 })
 
-test('a graceful stop that comes while a remote Stop is turning Tailscale Serve or Funnel off waits for that `off`', { skip }, async () => {
+test('a graceful stop that comes while a remote Stop is turning Tailscale Serve or Funnel off waits for that `off`', { skip, timeout: SPAWN_TIMEOUT_MS }, async () => {
   // A remote-access Stop, a provider switch, the flag turned off or a restart's teardown runs remote.disable(); a
   // signal's shutdown then runs its own. That second one finds the provider taken and ends at once, so the shutdown
   // used to settle, the 'exit' handler's killTetheredSync (every kind) killed the first one's `off` mid-call, and
@@ -217,7 +219,7 @@ echo "done $*" >> ${JSON.stringify(log)}
   }
 })
 
-test('a graceful stop that comes while a remote Stop is stopping cloudflared lets it exit on its SIGTERM', { skip }, async () => {
+test('a graceful stop that comes while a remote Stop is stopping cloudflared lets it exit on its SIGTERM', { skip, timeout: SPAWN_TIMEOUT_MS }, async () => {
   // The same shape for a child provider (cloudflared, ngrok): the Stop's SIGTERM is under way, the shutdown's own
   // disable() finds the provider taken, and the 'exit' handler's group SIGKILL cut its own exit short.
   const dir = tmpDir('tllm-tunnel-stop-during-stop-')

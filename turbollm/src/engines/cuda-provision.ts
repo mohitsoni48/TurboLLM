@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { downloadFile, extractArchive, renameWithRetry } from './download'
 import { driverMaxCuda } from './nvidia-smi'
+import { API_TIMEOUT_MS, withTimeout } from '../util/fetch-timeout'
 
 const REDIST_BASE = 'https://developer.download.nvidia.com/compute/cuda/redist/'
 
@@ -87,7 +88,7 @@ type RedistManifest = Record<string, undefined | { ['windows-x86_64']?: { relati
 /** Fetch the redist manifest for `version`; null if it doesn't exist (so the caller can
  *  fall back to an older known version). */
 async function fetchManifest(version: string, signal: AbortSignal): Promise<RedistManifest | null> {
-  const res = await fetch(`${REDIST_BASE}redistrib_${version}.json`, { redirect: 'follow', signal })
+  const res = await fetch(`${REDIST_BASE}redistrib_${version}.json`, { redirect: 'follow', signal: withTimeout(signal, API_TIMEOUT_MS) })
   if (!res.ok) return null
   return (await res.json()) as RedistManifest
 }

@@ -230,7 +230,7 @@ function codeRunHarness() {
   const d = {
     db: store,
     manager: { status: () => ({ state: 'running', model: { key: 'test-model' } }) },
-    store: { dir: () => dir, snapshot: () => ({ daemon: { autoGenerateTitles: false } }) },
+    store: { dir: () => dir, snapshot: () => ({ daemon: { autoGenerateTitles: false } }), read: () => ({ daemon: { autoGenerateTitles: false } }) },
   } as unknown as Deps
   const heldTurns: (() => void)[] = []
   const runner = (async () => {

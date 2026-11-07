@@ -20,7 +20,7 @@ function mkDeps(mutate: (cfg: Config) => void = () => {}): Deps {
   mutate(cfg)
   return {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
     db: new Proxy({}, { get: () => () => [] }),
     telemetry: { firstUse: () => {}, useFeature: () => {} },
     scanner: { get: () => undefined, list: () => ({ models: [], scanning: false, lastScanAt: '' }) },

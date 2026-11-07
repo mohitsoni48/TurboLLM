@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import { GenerationGate } from './gate'
+import { EngineGates, GenerationGate } from './gate'
 
 test('GenerationGate: acquire/release round trip — a free gate grants immediately', async () => {
   const gate = new GenerationGate()
@@ -197,4 +197,35 @@ test('GenerationGate: Infinity capacity never queues (an engine that batches for
   assert.equal(gate.stats().queued, 0)
   for (const r of releases) r()
   assert.equal(gate.stats().inFlight, 0)
+})
+
+// ── EngineGates: one gate per engine process (scalability review 1.1) ──────────────────────────
+// keep-N (ADR-060) runs up to four engines at once, each its own process with its own --parallel.
+// One daemon-wide gate sized from the PRIMARY serialized a --parallel 4 pool model behind the
+// primary's traffic, and with an unbounded primary (vLLM/MLX) left a --parallel 1 pool slot ungated.
+test('EngineGates: two engines never share a gate, and each is sized by its own parallelSlots()', async () => {
+  const gates = new EngineGates()
+  const primary = { parallelSlots: () => 1 }
+  const pool = { parallelSlots: () => 2 }
+  assert.notEqual(gates.for(primary), gates.for(pool))
+  assert.equal(gates.for(primary), gates.for(primary), 'the same engine always gets the same gate')
+  assert.equal(gates.for(primary).stats().capacity, 1)
+  assert.equal(gates.for(pool).stats().capacity, 2)
+
+  const heldPrimary = await gates.for(primary).acquire('bg')
+  // The primary is full; the pool engine must still admit immediately, without queueing.
+  const poolRelease = await gates.for(pool).acquire('bg', { timeoutMs: 50 })
+  assert.equal(gates.for(pool).stats().inFlight, 1)
+  assert.equal(gates.for(primary).stats().queued, 0)
+  poolRelease()
+  heldPrimary()
+})
+
+test('EngineGates: an engine that advertises no slot count is unbounded, and capacity is re-read live', () => {
+  const gates = new EngineGates()
+  let slots: number | null = null
+  const engine = { parallelSlots: () => slots }
+  assert.equal(gates.for(engine).stats().capacity, Infinity)
+  slots = 3 // the slot reloaded with a different --parallel
+  assert.equal(gates.for(engine).stats().capacity, 3)
 })

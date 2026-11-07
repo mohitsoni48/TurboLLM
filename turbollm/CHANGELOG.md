@@ -25,6 +25,55 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.15.1] - 2026-11-07
+
+A scalability release: TurboLLM stays responsive with years of chats, many routines, several models and several open
+windows. Nothing changes in how you use it, and existing data is upgraded in place on first start.
+
+### Added
+
+- **Retention** (Settings). Old routine-run chats and old Code sessions are pruned on a schedule, and per-request usage
+  rows older than a retention window are folded into daily totals, so the database stops growing without bound. It is on
+  by default and runs a minute after start. A run you continued, one waiting for an approval, a running one and a Code
+  session whose worktree has unsaved changes are always kept; usage totals do not change.
+- **Chat search finds any part of a word**, and the sidebar and routine run history load in pages as you scroll, so
+  they stay fast with tens of thousands of chats.
+- **Screens update as things happen.** The web app listens to one change stream instead of polling every screen: a
+  rename, a model load, a download or a routine run shows up within a moment, and a hidden tab makes no requests at all.
+  Idle traffic from a focused tab drops from about 72 requests a minute to 14.
+- **Request size cap** (`gateway.maxBodyMb`, default 128 MB). A larger request to `/v1/*` gets a 413 instead of
+  exhausting memory.
+- **A model load that makes no progress for two minutes fails with a Retry button** (`engineLoadStallSeconds`)
+  instead of waiting forever. A load that is still warming up is never cut off.
+
+### Changed
+
+- **Several models at once.** Every engine has its own request queue, an engine that is generating is never unloaded to
+  make room, and a request that arrives while the only engine is busy or auto-tuning gets a retryable 503 with a
+  `Retry-After` header. Engine requests no longer have a 10-connection or 5-minute limit. A new model is placed on the
+  GPU with the most free memory.
+- **New chat images are stored as files** next to the database instead of inside it, so the database stays small, and
+  an image used in two chats is stored once. Images already in your chats stay where they are and keep working.
+- **Streaming follows the client's pace.** A reply to a slow or stalled client no longer fills the daemon's memory; a
+  connection with no reader for two minutes is closed.
+- **Chat, routines and the public API share one generation loop**, so a fix to the loop now reaches all three.
+- **Quieter background work.** Language servers in Code are pooled and exit when a session is archived, terminal output
+  is flow-controlled, and engine logs rotate.
+
+### Fixed
+
+- Stopping or disconnecting an MCP server on Windows left the server process running; it is now ended with its
+  wrapper.
+- Retry after a failed model load could send the wrong model key.
+
+### Discord
+
+- TurboLLM now stays fast with a huge chat history: search finds any part of a word, and long lists load as you scroll.
+- Old routine runs are tidied up automatically, and your usage totals stay exactly the same.
+- Screens update live as models load and downloads progress, and a background tab no longer keeps polling.
+- Running several models is steadier: a model that is answering is never unloaded, and a busy engine asks apps to retry
+  shortly.
+
 ## [1.15.0] - 2026-10-31
 
 ### Added

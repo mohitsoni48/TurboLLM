@@ -1,13 +1,19 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useEffect } from 'react'
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient, type InfiniteData } from '@tanstack/react-query'
 import {
   compactConversation, createConversation, createFolder, deleteConversation, deleteFolder, deleteMemoryFact, deleteMessage, editMessage,
   getConversation, listConversations, listFolders, listMemoryFacts, moveConversationToFolder, regenerate, undoCompaction,
   renameFolder, stopGeneration, updateConversation,
 } from './chat-api'
-import type { Conversation } from './chat-types'
+import type { ConversationPage } from './chat-api'
+import type { Conversation, MemoryFact } from './chat-types'
+import { FIRST_PAGE, flattenPages, nextCursorOf } from './paging'
+import { pollWhileLive } from './live-events'
 
 export const chatKeys = {
   list: (q?: string) => ['conversations', q ?? ''] as const,
+  /** The list's first page alone, which the sidebar polls (useConversationListPoll). */
+  listHead: (q?: string) => ['conversations', q ?? '', 'head'] as const,
   detail: (id: string | null) => ['conversation', id] as const,
   folders: ['folders'] as const,
 }
@@ -19,9 +25,14 @@ export const memoryKeys = {
 /** Auto-memory (Release 3) fact list — fetched regardless of the feature toggle so a user
  *  can review/clean up what's been saved even with extraction turned off. */
 export function useMemoryFacts() {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: memoryKeys.list,
-    queryFn: listMemoryFacts,
+    queryFn: ({ pageParam }) => listMemoryFacts(pageParam),
+    initialPageParam: FIRST_PAGE,
+    getNextPageParam: nextCursorOf,
+    select: (data): { facts: MemoryFact[] } => ({
+      facts: flattenPages<MemoryFact>({ ...data, pages: data.pages.map((p) => ({ items: p.facts })) }),
+    }),
     staleTime: 0,
     retry: false,
   })
@@ -37,22 +48,56 @@ export function useMemoryFactMutations() {
   }
 }
 
+/** The sidebar's list, a page at a time (`fetchNextPage` / `hasNextPage`); consumers still read one flat
+ *  `data.conversations`. A refresh (a mutation's invalidation, or a change the poll below finds) refetches every page
+ *  already loaded, in order, so pages the user scrolled to are neither dropped nor duplicated. A search is answered
+ *  unpaged: its one page has no cursor. */
 export function useConversations(q?: string) {
-  return useQuery({
+  const qc = useQueryClient()
+  useConversationListPoll(q)
+  return useInfiniteQuery({
     queryKey: chatKeys.list(q),
-    queryFn: () => listConversations(q),
+    // The first page through the poll's own query: one request when both want it at once, and the two always agree.
+    queryFn: ({ pageParam }): Promise<ConversationPage> => (pageParam === FIRST_PAGE
+      ? qc.fetchQuery({ queryKey: chatKeys.listHead(q), queryFn: () => listConversations(q, FIRST_PAGE), staleTime: 0 })
+      : listConversations(q, pageParam)),
+    initialPageParam: FIRST_PAGE,
+    getNextPageParam: nextCursorOf,
+    select: (data): { conversations: Conversation[] } => ({
+      conversations: flattenPages<Conversation>({ ...data, pages: data.pages.map((p) => ({ items: p.conversations })) }),
+    }),
     staleTime: 0,
     retry: false,
-    // Same live-sync gap as useConversation below, for the sidebar's list instead of one open
-    // conversation: autoTitle (chat-routes.ts) runs ~1s+ AFTER the SSE stream's 'done' event has
-    // already closed, entirely out-of-band from the response the frontend is watching — nothing
-    // ever told this query the title changed, so the sidebar (and the still-"New chat" active
-    // conversation's header) was stuck showing the old title until a manual reload remounted it
-    // (GitHub: "the auto generated chat title doesn't update until i refresh"). Same 4s cadence
-    // as useConversation's own multi-device poll.
-    refetchInterval: 4000,
+  })
+}
+
+/** Same live-sync gap as useConversation below, for the sidebar's list instead of one open conversation: autoTitle
+ *  (chat-routes.ts) runs ~1s+ AFTER the SSE stream's 'done' event has already closed, entirely out-of-band from the
+ *  response the frontend is watching — nothing ever told the list the title changed, so the sidebar (and the
+ *  still-"New chat" active conversation's header) was stuck showing the old title until a manual reload remounted it
+ *  (GitHub: "the auto generated chat title doesn't update until i refresh"). Same 4s cadence as useConversation's own
+ *  multi-device poll. It reads the first page only (the newest chats, where every change lands, since the list is
+ *  most recently updated first), not every page the user scrolled to: when that page differs from the list's own,
+ *  the list is refreshed. */
+function useConversationListPoll(q?: string) {
+  const qc = useQueryClient()
+  const { data: head } = useQuery({
+    queryKey: chatKeys.listHead(q),
+    queryFn: () => listConversations(q, FIRST_PAGE),
+    staleTime: 0,
+    retry: false,
+    refetchInterval: () => pollWhileLive(4000),
     refetchIntervalInBackground: false,
   })
+  // `head` keeps its identity while the server's answer is unchanged (structural sharing), so this runs on a change.
+  // Not while the list is fetching: its first page is this same answer.
+  useEffect(() => {
+    if (!head || qc.isFetching({ queryKey: chatKeys.list(q), exact: true }) > 0) return
+    const shown = qc.getQueryData<InfiniteData<ConversationPage>>(chatKeys.list(q))?.pages[0]
+    if (shown && JSON.stringify(shown.conversations) !== JSON.stringify(head.conversations)) {
+      void qc.invalidateQueries({ queryKey: chatKeys.list(q), exact: true })
+    }
+  }, [head, q, qc])
 }
 
 export function useFolders() {
@@ -77,7 +122,7 @@ export function useConversation(id: string | null) {
     // (`runningReplyId`): ChatScreen then attaches to the reply's own run, which fans out to every
     // viewer (GET .../stream, chat-runs.ts), and follows it live. Matches the cadence Code's own
     // session list already uses (code-queries.ts, refetchInterval: 5000).
-    refetchInterval: 4000,
+    refetchInterval: () => pollWhileLive(4000),
     refetchIntervalInBackground: false,
   })
 }

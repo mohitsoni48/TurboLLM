@@ -33,7 +33,7 @@ function makeTmpRoot(): string {
 function stubStore(root: string): ConfigStore {
   return {
     dir: () => root,
-    snapshot: () => ({ modelDirs: [root] }),
+    snapshot: () => ({ modelDirs: [root] }), read: () => ({ modelDirs: [root] }),
   } as unknown as ConfigStore
 }
 

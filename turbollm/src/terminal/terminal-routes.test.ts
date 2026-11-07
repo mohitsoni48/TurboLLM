@@ -15,7 +15,7 @@ import http from 'node:http'
 import { createRequire } from 'node:module'
 import { spawnSync } from 'node:child_process'
 import type { AddressInfo } from 'node:net'
-import { buildTerminalLaunchCommand, canSeedFirstMessage, firstMessageSeedProblem, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS, MAX_SEEDED_MESSAGE_BYTES_POSIX, createAgentTerminal, getTerminalManager, isTerminalBackendAvailable, registerTerminalWs, closeTerminalSockets, dropStaleTerminalSockets } from './terminal-routes'
+import { MAX_VIEWER_BUFFERED_BYTES, sendToViewer, buildTerminalLaunchCommand, canSeedFirstMessage, firstMessageSeedProblem, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS, MAX_SEEDED_MESSAGE_BYTES_POSIX, createAgentTerminal, getTerminalManager, isTerminalBackendAvailable, registerTerminalWs, closeTerminalSockets, dropStaleTerminalSockets } from './terminal-routes'
 import { TerminalManager } from './terminal-manager'
 import type { Deps } from '../deps'
 import type { AgentRun } from '../chat/db'
@@ -397,7 +397,7 @@ test('canSeedFirstMessage: an apostrophe is still fine — quoting handles it', 
 // scheduler has released the routine) passes an aborted signal — the CLI must never be launched.
 test('createAgentTerminal: an aborted signal never spawns the terminal', async () => {
   const d = {
-    store: { snapshot: () => ({ daemon: { port: 6996 } }), dir: () => tmpDir('terminal-routes-abort-') },
+    store: { snapshot: () => ({ daemon: { port: 6996 } }), read: () => ({ daemon: { port: 6996 } }), dir: () => tmpDir('terminal-routes-abort-') },
     db: { getConversation: () => undefined, updateAgentRun: () => {} },
   } as unknown as Deps
   const run = { id: 'abort-session', convId: 'c', repoRoot: tmpDir('terminal-routes-abort-repo-'), codeAgent: 'opencode' } as unknown as AgentRun
@@ -422,7 +422,7 @@ test('closeTerminalSockets: an open terminal WebSocket no longer holds the shutd
   t.mock.method(TerminalManager.prototype, 'registerWsListener', () => {})
   t.mock.method(TerminalManager.prototype, 'unregisterWsListener', () => {})
   const d = {
-    store: { snapshot: () => ({ daemon: { port: 6996 } }), dir: () => tmpDir('terminal-routes-ws-close-') },
+    store: { snapshot: () => ({ daemon: { port: 6996 } }), read: () => ({ daemon: { port: 6996 } }), dir: () => tmpDir('terminal-routes-ws-close-') },
   } as unknown as Deps
   const server = http.createServer((_req, res) => res.end())
   registerTerminalWs(server, d)
@@ -460,7 +460,7 @@ test('a terminal WebSocket handshake from another site needs a key; the app\'s o
     apiKeys: [{ id: 'k1', name: 'mine', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null }],
   }
   const d = {
-    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => tmpDir('terminal-routes-ws-origin-') },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => tmpDir('terminal-routes-ws-origin-') },
   } as unknown as Deps
   const server = http.createServer((_req, res) => res.end())
   registerTerminalWs(server, d)
@@ -516,7 +516,7 @@ async function staleHarness(t: import('node:test').TestContext, opts: { listenHo
   const server = http.createServer((_req, res) => res.end())
   let ingressPort: number | undefined
   const d = {
-    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => tmpDir('terminal-routes-ws-stale-') },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => tmpDir('terminal-routes-ws-stale-') },
     remote: { ingressPort: () => ingressPort },
     bindHost: opts.listenHost ?? '127.0.0.1',
   } as unknown as Deps & { bindHost: string }
@@ -612,4 +612,49 @@ test('dropStaleTerminalSockets: a terminal let in on a key is dropped once that 
   } finally {
     h.cleanup()
   }
+})
+
+// ── a slow viewer must not make the daemon buffer without limit ──────────────────────
+function fakeViewer(bufferedAmount: number) {
+  const sent: string[] = []
+  const closed: Array<{ code: number; reason: string }> = []
+  const viewer = {
+    readyState: 1,
+    bufferedAmount,
+    terminated: false,
+    send: (d: string) => { sent.push(d) },
+    // Like ws: a close handshake leaves the socket CLOSING (2) until the peer answers.
+    close: (code: number, reason: string) => { closed.push({ code, reason }); viewer.readyState = 2 },
+    terminate: () => { viewer.terminated = true; viewer.readyState = 3 },
+    sent,
+    closed,
+  }
+  return viewer
+}
+
+test('sendToViewer: a keeping-up viewer gets the data', () => {
+  const ws = fakeViewer(0)
+  sendToViewer(ws, 'out')
+  assert.deepEqual(ws.sent, ['out'])
+  assert.equal(ws.closed.length, 0)
+})
+
+test('sendToViewer: a viewer too far behind is closed (1013, so the client reconnects and gets the replay) and sent nothing more', () => {
+  const ws = fakeViewer(MAX_VIEWER_BUFFERED_BYTES + 1)
+  sendToViewer(ws, 'out')
+  assert.deepEqual(ws.sent, [])
+  assert.deepEqual(ws.closed, [{ code: 1013, reason: 'Too slow, reconnect' }])
+})
+
+test('sendToViewer: a closing viewer whose buffer keeps growing is terminated so the buffer is freed at once', () => {
+  const ws = fakeViewer(MAX_VIEWER_BUFFERED_BYTES + 1)
+  sendToViewer(ws, 'out')
+  assert.equal(ws.terminated, false, 'first over the limit: a close handshake, not a cut')
+  ws.bufferedAmount = MAX_VIEWER_BUFFERED_BYTES + 1000 // still draining, but not past twice the limit
+  sendToViewer(ws, 'out')
+  assert.equal(ws.terminated, false)
+  ws.bufferedAmount = MAX_VIEWER_BUFFERED_BYTES * 2 + 1
+  sendToViewer(ws, 'out')
+  assert.equal(ws.terminated, true)
+  assert.deepEqual(ws.sent, [])
 })

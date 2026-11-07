@@ -31,6 +31,8 @@ import type { CustomChatAgent } from './config/config'
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { registerChatRoutes } from './chat/chat-routes'
+import { ChatTurns } from './chat/chat-turns'
+import { ChatRuns } from './chat/chat-runs'
 import { registerChatAgentRoutes } from './chat/chat-agent-routes'
 import type { AgentToolsStore } from './chat/chat-agent-tools'
 import { registerRoutineRoutes } from './routines/routine-routes'
@@ -78,8 +80,9 @@ function makeDeps(mutate: (cfg: ReturnType<typeof defaultConfig>) => void): { d:
   const cfg = defaultConfig()
   mutate(cfg)
   const d = {
+    chatTurns: new ChatTurns(), chatRuns: new ChatRuns(),
     store: {
-      snapshot: () => cfg,
+      snapshot: () => cfg, read: () => cfg,
       update: (fn: (c: typeof cfg) => void) => fn(cfg),
     },
     // The running provider mirrors the saved one unless a test says otherwise (they can differ).
@@ -995,7 +998,7 @@ function routerWithUnloadedModel(): { router: ModelRouter; loads: unknown[] } {
   } as unknown as Manager
   const entry = { key: 'other-model', name: 'other-model', path: '/m/other.gguf', quant: 'Q4', sizeBytes: 1 } as unknown as ModelEntry
   const scanner = { list: () => ({ models: [entry] }), get: () => undefined } as unknown as Scanner
-  const store = { snapshot: () => ({ ...defaultConfig(), gateway: { autoSwap: true, keepN: 1 } }), update: () => {} }
+  const store = { snapshot: () => ({ ...defaultConfig(), gateway: { autoSwap: true, keepN: 1 } }), read: () => ({ ...defaultConfig(), gateway: { autoSwap: true, keepN: 1 } }), update: () => {} }
   const registry = { active: () => undefined } as unknown as Registry
   return { router: new ModelRouter(store as never, registry, primary, scanner, undefined), loads }
 }
@@ -1108,7 +1111,7 @@ test('a remote token cannot create, list, update, delete or run routines through
 test('a remote token cannot create a chat agent through the chat tools; it can still list them', async () => {
   const { d } = makeDeps(() => {})
   const agents = { customAgents: [] as CustomChatAgent[] }
-  const agentStore = { snapshot: () => agents, update: (fn: (c: typeof agents) => void) => fn(agents) }
+  const agentStore = { snapshot: () => agents, read: () => agents, update: (fn: (c: typeof agents) => void) => fn(agents) }
   const reg = new ToolRegistry({} as never, undefined, undefined, agentStore)
   const app = routineToolsApp(d, reg)
   const call = async (req: typeof tunneledRequest, headers: Record<string, string>, name: string) => {

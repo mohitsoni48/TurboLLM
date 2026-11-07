@@ -2,6 +2,7 @@
 // no inline fetch in components. Errors are normalized to ApiError carrying the
 // daemon's error envelope { code, message } (spec 00 §3).
 
+import type { DaemonSettings, DaemonSettingsPatch, McpServer, SettingsPatchResponse, TelemetryLevel } from '@contract/settings'
 import type {
   BuildPrereqs,
   ChatCompletionResponse,
@@ -628,12 +629,16 @@ export function restartEngine(): Promise<{ ok: true }> {
 }
 
 // ── Engine logs ───────────────────────────────────────────────────────────────
-export function getEngineLogs(tail = 200): Promise<EngineLogs> {
-  return request<EngineLogs>(`/api/v1/engine/logs?tail=${tail}`)
+/** `model`: a pool slot's model key (one of the response's `slots`) to read that slot's log; omitted, the primary's. */
+export function getEngineLogs(tail = 200, model?: string): Promise<EngineLogs> {
+  return request<EngineLogs>(`/api/v1/engine/logs?tail=${tail}${model ? `&model=${encodeURIComponent(model)}` : ''}`)
 }
 
 /** URL for the SSE live log tail (consumed via sse.ts's subscribeSse — not EventSource, which can't send the key). */
 export const engineLogStreamUrl = '/api/v1/engine/logs/stream'
+
+/** The live tail of a pool slot's log (`model`), or of the primary's when there is none. */
+export const engineLogStreamUrlFor = (model: string) => (model ? `${engineLogStreamUrl}?model=${encodeURIComponent(model)}` : engineLogStreamUrl)
 
 // ── Developer request log (issue #211 follow-up) ─────────────────────────────
 export interface RequestLogFilter {
@@ -827,41 +832,12 @@ export function saveBench(): Promise<{ ok: true }> {
 }
 
 // ── Settings (daemon config UI subset) ───────────────────────────────────────
-/** Global model defaults (spec 05 §3): base load values applied to never-seen
- *  models that have no saved per-model profile. */
-export type ModelDefaults = {
-  ctx: number
-  ngl: number
-  imageMaxTokens?: number
-  /** Hard cap on tokens generated per response (0 = unlimited). Applies to in-app
-   *  chat and clamps external (Claude Code) requests too. */
-  maxTokens?: number
-  /** Default K / V cache types for a model with none saved ('' or absent = automatic). */
-  kvTypeK?: string
-  kvTypeV?: string
-}
-
-/** Telemetry consent level (spec 09 §3): off | anonymous benchmarks | + crash. */
-export type TelemetryLevel = 'off' | 'anon' | 'full'
-
-/** ComfyUI GPU coordination (push). When enabled and the gate node is installed in
- *  ComfyUI, TurboLLM unloads the model + blocks loads while ComfyUI renders, then
- *  reloads it when the queue drains. `gatePath` is where the node was installed. */
-export type ComfyUiSettings = {
-  enabled: boolean
-  gatePath: string
-  /** ComfyUI's HTTP origin (e.g. http://127.0.0.1:8188). Used by the REVERSE gate to
-   *  call ComfyUI's native `POST /free` before TurboLLM loads a model (F-011). */
-  url: string
-  /** Reverse gate (F-011): when TurboLLM is about to load a model, first ask ComfyUI to
-   *  free its VRAM. The symmetric counterpart of the forward pause-for-ComfyUI gate. */
-  reverseGate: boolean
-  /** KV prompt-cache persistence (F-014): save the model's prompt cache to disk before a
-   *  ComfyUI-forced unload and restore it on reload, so a long prefix isn't re-prefilled.
-   *  Opt-in; llama.cpp text-only. */
-  cachePersist: boolean
-}
-
+// The GET/PATCH /api/v1/settings types are the daemon's contract (src/contract/settings.ts), derived there from its
+// SETTINGS table; re-exported so callers keep importing them from here.
+export type {
+  ComfyUiSettings, DaemonSettings, DaemonSettingsPatch, McpServer, ModelDefaults, RebindInfo, RemoteAccessSettings, SearchProvider,
+  SettingsPatchResponse, TelemetryLevel, ToolPolicy,
+} from '@contract/settings'
 /** Install the ComfyUI gate node into the given ComfyUI folder (or its custom_nodes
  *  dir). One-time setup; returns where it was written. */
 export function installComfyGate(path: string): Promise<{ ok: boolean; path: string; base: string; note?: string }> {
@@ -878,198 +854,12 @@ export function uninstallComfyGate(): Promise<{ ok: boolean }> {
  *  PUT, a masked value keeps the stored one. */
 export const MCP_ENV_MASK = '••••••••'
 
-export type McpServer = {
-  id: string
-  name: string
-  transport: 'stdio' | 'sse'
-  command?: string
-  args?: string[]
-  /** stdio only. Read back with each value as MCP_ENV_MASK, never the value itself. */
-  env?: Record<string, string>
-  url?: string
-  /** sse only — Bearer token for Authorization header (ADR-124). Write-only: sent on add/edit,
-   *  never returned ('' on edit removes it). */
-  apiKey?: string
-  /** Read-only, from the settings payload: whether a Bearer key is stored. */
-  apiKeySet?: boolean
-  enabled: boolean
-}
-
-export type DaemonSettings = {
-  idleTtlMinutes: number
-  /** Listen port (spec 08 §2). Takes effect on the next daemon restart. */
-  port: number
-  theme: string
-  /** Human-readable name this machine reports to a Turbo Link peer (ADR-376). Empty
-   *  means "use the OS hostname" — the daemon resolves the fallback, never the browser. */
-  machineName: string
-  autoGenerateTitles: boolean
-  /** Release 3: background extraction of durable facts from the user's own chat messages,
-   *  injected into future new conversations. Off by default (opt-in trust surface). */
-  autoMemoryEnabled: boolean
-  openBrowserOnStart: boolean
-  autoLoadOnStart: boolean
-  /** Settings → Models, "Show models for every engine": list every model, not only those the selected engine can run
-   *  (they still load only on it, and fail with its error if it cannot). Off by default; absent from older daemons. */
-  showAllEngineModels?: boolean
-  /** VRAM to keep free during auto-tune's offload search, MB (300–2048, default 1024) — OR 0, an
-   *  explicit opt-in letting the MoE hill-climb spill past all headroom for more t/s. A later
-   *  desktop / ComfyUI VRAM grab can't tip a config tuned with less headroom into a sysmem spill. */
-  vramHeadroomMb: number
-  /** Expose the API on the local network (spec 08 §2). Changing this requires a
-   *  daemon restart to take effect (POST /api/v1/daemon/restart). */
-  lanBind: boolean
-  /** Require an API key for non-loopback requests when LAN-exposed (spec 06 §5).
-   *  Off = open/unauthenticated LAN access. */
-  requireApiKey: boolean
-  telemetryLevel: TelemetryLevel
-  modelDefaults: ModelDefaults
-  /** ComfyUI GPU coordination settings. */
-  comfyui: ComfyUiSettings
-  /** Whether an HF token is stored (spec 10 §4). The token itself is never echoed
-    *  back — write it via {@link saveSettings}'s `hfToken` patch field only. */
-  hfTokenSet: boolean
-  /** Whether a GitHub token is stored (same write-only semantics as HF). */
-  ghTokenSet: boolean
-  /** Gateway intelligence settings (ADR-06x): model auto-swap + keep-N pool. */
-  gateway: { autoSwap: boolean; keepN: number }
-  /** Developer request log (issue #211 follow-up): whether the log captures at all, and
-   *  whether captured entries include full prompt/response TEXT. `captureBodies` defaults off
-   *  — it lives in Settings → Privacy & telemetry, not Developer/Engines, because it's a
-   *  privacy choice: the log itself is always in-memory-only regardless of this flag. */
-  requestLog: { enabled: boolean; captureBodies: boolean }
-  /** Whether a Tavily API key is configured (legacy mirror of `search.tavilyKeySet`). */
-  tavilyKeySet: boolean
-  /** Web-search provider config (F-020). Keys are write-only — only "is it set" booleans
-   *  come back; `searxngUrl` is not a secret so it is echoed. */
-  search: {
-    provider: SearchProvider
-    tavilyKeySet: boolean
-    kagiKeySet: boolean
-    searxngUrl: string
-  }
-  /** MCP server list. */
-  mcp: { servers: McpServer[] }
-  /** Build environment (ADR-100): folders prepended to PATH for compile-from-source so a
-   *  conda-env / custom-path CUDA Toolkit + compiler are found. Not secret — echoed back. */
-  build: { toolchainDirs: string[] }
-  /** Code's AGENTS.md-style standing-context candidate lists (config.ts's CodeConfig) — tried
-   *  in order per side, first EXISTING file wins. Not secret — echoed back.
-   *  defaultAgent: which coding agent new Code sessions launch with (CodeAgentSection.tsx). */
-  code: { agentsMdProjectCandidates: string[]; agentsMdGlobalCandidates: string[]; defaultAgent: 'turbollm' | 'pi' | 'claude' | 'opencode' }
-  /** Tool-call approval gate (F-025): per-tool default policy. Missing tools default
-   *  to 'ask'. Keyed by tool name (e.g. 'run_code', 'mcp__server__tool'). */
-  toolPolicies: Record<string, ToolPolicy>
-  /** Master toggle (Settings → Tool permissions), default off: when true, every tool
-   *  call that would show an "awaiting approval" prompt runs immediately instead.
-   *  Only silences a resolved 'ask' — an explicit 'deny' is still honored. */
-  autoAllowAll: boolean
-  /** How long a chat reply waits for the answers to its tool calls set to Ask, all its calls
-   *  together, in whole minutes (0-1440, default 30); past it they are not run and the reply goes
-   *  on. 0 waits until answered. Optional: a daemon from before the setting does not send it. */
-  chatApprovalWaitMinutes?: number
-  /** Cloud Launch deploy-link settings (ADR-153). The RunPod Template ID the user
-   *  published themselves — not a secret, just an id, echoed back as-is. */
-  cloudDeploy: { runpodTemplateId: string }
-  /** Experimental feature flags (2026-07-14, Settings → Experimental). Off by default for
-   *  new/distributed installs. Code used to be one of these — removed when it graduated to
-   *  generally available (ADR-280). `routines` (2026-08-04) is the newest: Routines never shipped
-   *  outside this gate, so it defaults to off for every install, new or upgraded.
-   *  `turboLink` (2026-08-21, ADR-376) is the newest still: fully built and green, but never
-   *  verified against a real second machine, so it is opt-in. While it is off the Turbo Link
-   *  section does not render, `useLinks`/`useRemoteModels` do not fetch, and every merged
-   *  fleet list falls back to local-only rows with no origin column and no machine filter. */
-  experimental: { memory: boolean; cloudDeploy: boolean; routines: boolean; turboLink: boolean; remoteAccess: boolean }
-  /** Remote access (ADR-422): settings-payload mirror of the daemon's `remoteAccess` config,
-   *  echoed back from `turbollm/src/api/routes.ts`'s `settingsPayload()`. */
-  remoteAccess: RemoteAccessSettings
-}
-
-/** Remote access (ADR-422): the settings-payload mirror of turbollm/src/api/routes.ts's
- *  redacted `remoteAccess` block. Secrets are write-only — the `has*` booleans say whether one
- *  is stored, never what it is, same posture as hfToken/ghTokenSet. `provider` is hand-kept in
- *  sync with `RemoteProviderId` in `./remote-api.ts` rather than imported, to avoid a
- *  settings<->feature-module import cycle (remote-api.ts already imports FROM api.ts). */
-export interface RemoteAccessSettings {
-  enabled: boolean
-  provider: 'cloudflare-quick' | 'cloudflare-named' | 'tailscale-serve' | 'tailscale-funnel' | 'ngrok' | 'custom'
-  ingressPort: number
-  cloudflare: { hasTunnelToken: boolean; hostname: string; accessTeamDomain: string; accessAud: string; requireAccess: boolean }
-  ngrok: { hasAuthtoken: boolean; domain: string }
-  tailscale: { port: number }
-  custom: { publicUrl: string }
-  /** Capability scope minted remote tokens receive (ADR-422 §6.3). Not secret — a capability
-   *  list, not a credential — so it is echoed back as stored, unlike the `has*` secrets above. */
-  tokenGrant: { capabilities: string[]; models?: string[] }
-  lastUrl: string
-}
-
-/** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */
-export type ToolPolicy = 'ask' | 'allow' | 'deny'
-
-export type SearchProvider = 'tavily' | 'kagi' | 'searxng'
-
-/** Settings patch: the persisted {@link DaemonSettings} fields plus a write-only
- *  `hfToken` (spec 10 §4) that sets/clears the stored Hugging Face token. `comfyui`
- *  is patchable per-field (only `enabled` is set here; `gatePath` is owned by the
- *  install endpoints). */
-export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental' | 'code' | 'requestLog' | 'remoteAccess' | 'modelDefaults' | 'gateway'>> & {
-  comfyui?: Partial<ComfyUiSettings>
-  /** Patchable per-field, same reason as `experimental`: routes.ts keeps every member this patch
-   *  leaves out, and Settings' Save sends only the members edited on the page. */
-  modelDefaults?: Partial<ModelDefaults>
-  gateway?: Partial<DaemonSettings['gateway']>
-  /** Patchable per-field — the backend applies each key independently (api/routes.ts), so a
-   *  patch touching only one flag must not be forced to also supply the other. */
-  experimental?: Partial<DaemonSettings['experimental']>
-  /** Patchable per-field, same reason as `experimental` — routes.ts's PATCH handler applies
-   *  each `remoteAccess.*` candidate independently (provider, ingressPort, cloudflare.*,
-   *  ngrok.*, tailscale.port, custom.publicUrl), so a patch touching only the provider must not
-   *  be forced to also resend every secret field. `enabled`/`lastUrl` are excluded too (M5,
-   *  final-review.md): both are runtime-owned by /remote/start and /remote/stop, and the PATCH
-   *  handler silently ignores them, so typing them here as patchable would typecheck a write
-   *  that does nothing. */
-  remoteAccess?: Partial<Omit<RemoteAccessSettings, 'cloudflare' | 'ngrok' | 'tailscale' | 'custom' | 'enabled' | 'lastUrl'>> & {
-    cloudflare?: { tunnelToken?: string; hostname?: string; accessTeamDomain?: string; accessAud?: string; requireAccess?: boolean }
-    ngrok?: { authtoken?: string; domain?: string }
-    tailscale?: { port?: number }
-    custom?: { publicUrl?: string }
-    tokenGrant?: { capabilities?: string[]; models?: string[] }
-  }
-  /** Patchable per-field, same reason as `experimental` — routes.ts applies each candidate list
-   *  independently. */
-  code?: Partial<DaemonSettings['code']>
-  /** Patchable per-field, same reason as `experimental` — the Privacy & telemetry "Log prompts
-   *  and responses" checkbox must be able to flip `captureBodies` without also resending
-   *  `enabled`. */
-  requestLog?: Partial<DaemonSettings['requestLog']>
-  hfToken?: string
-  /** Write-only: set or clear ('') the stored GitHub token. Raises the GitHub API rate limit
-   *  for branch lookups from 60 to 5,000 requests/hour. Never echoed back — read the boolean
-   *  `ghTokenSet` from {@link DaemonSettings} instead. */
-  ghToken?: string
-  /** Write-only: set or clear the Tavily API key (legacy alias for `search.tavilyApiKey`). */
-  tavilyApiKey?: string
-  /** Write-only search-provider patch (F-020). Key/URL fields set or clear ('') the stored value. */
-  search?: {
-    provider?: SearchProvider
-    tavilyApiKey?: string
-    kagiApiKey?: string
-    searxngUrl?: string
-  }
-}
-
 export function getSettings(): Promise<DaemonSettings> {
   return request<DaemonSettings>('/api/v1/settings')
 }
 
-/** A LAN/port change re-points the listener in place (no full restart). Present on a
- *  save that changed `lanBind`/`port`; `portChanged` means the client must hop to the
- *  new port (a LAN-only change is seamless on 127.0.0.1). */
-export type RebindInfo = { portChanged: boolean; port: number; lanBind: boolean }
-
-export function saveSettings(patch: DaemonSettingsPatch): Promise<DaemonSettings & { rebind?: RebindInfo }> {
-  return request<DaemonSettings & { rebind?: RebindInfo }>('/api/v1/settings', { method: 'PATCH', json: patch })
+export function saveSettings(patch: DaemonSettingsPatch): Promise<SettingsPatchResponse> {
+  return request<SettingsPatchResponse>('/api/v1/settings', { method: 'PATCH', json: patch })
 }
 
 export function addMcpServer(server: Omit<McpServer, 'id'>): Promise<McpServer> {

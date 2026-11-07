@@ -30,7 +30,7 @@ function fakeApp(cfg: FakeConfig): { app: Hono; cfg: FakeConfig } {
   const d = {
     version: 'test',
     store: {
-      snapshot: () => cfg,
+      snapshot: () => cfg, read: () => cfg,
       update: (fn: (c: FakeConfig) => void) => fn(cfg),
     },
     manager: { status: () => ({ state: 'stopped', model: null }) },
@@ -153,7 +153,7 @@ test('GET /api/v1/connect/:cli: the snippets carry the port really bound, not da
   const app = new Hono()
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg) },
     manager: { status: () => ({ state: 'stopped', model: null }) },
     bindPort: 7000,
   } as unknown as Deps
@@ -171,7 +171,7 @@ test('GET /api/v1/connect/:cli: on a bind to another loopback address alone the 
     const app = new Hono()
     const d = {
       version: 'test',
-      store: { snapshot: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg) },
+      store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg) },
       manager: { status: () => ({ state: 'stopped', model: null }) },
       bindHost,
       bindPort: 7000,
@@ -191,7 +191,7 @@ test('GET /api/v1/connect/:cli: a cross-site request is refused before it can re
   cfg.apiKeys.push({ id: 'k0', name: 'cli-claude-code', hash: 'h0', prefix: 'tllm-old', createdAt: '', lastUsedAt: null })
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg) },
     manager: { status: () => ({ state: 'stopped', model: null }) },
   } as unknown as Deps
   const app = new Hono()
@@ -272,7 +272,7 @@ async function keysAndTerminal(t: TestContext, cfg: FakeConfig) {
   const app = new Hono()
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg), dir: () => tmpDir('keys-network-terminal-') },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg), dir: () => tmpDir('keys-network-terminal-') },
     manager: { status: () => ({ state: 'stopped', model: null }) },
   } as unknown as Deps
   registerApi(app, d)

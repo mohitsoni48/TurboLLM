@@ -2,6 +2,11 @@
 // in progress must keep it polling — a primary load, and a Laya model's, which loads in its own slot while the
 // primary stays stopped (ADR-443). `false` stops polling.
 import type { DownloadsList, ModelEntry, ModelsList, Status } from './types'
+import { pollWhileLive } from './live-events'
+
+/** With a model loaded the list refetches for its live t/s chip; while the invalidation stream is open the
+ *  daemon announces `models` when a generation ends, so this is only the safety net. */
+const LOADED_MODELS_FALLBACK_POLL_MS = 15_000
 
 /** scanner.ts's SPLIT_RE: `<prefix>-00002-of-00005.gguf`. */
 const SPLIT_RE = /^(.*)-(\d{5})-of-(\d{5})\.gguf$/i
@@ -38,7 +43,7 @@ export function modelsRefetchInterval(
   downloads: DownloadsList | undefined,
 ): number | false {
   if (data?.scanning) return 1200
-  if (data?.models.some((m) => m.loaded)) return 4000
+  if (data?.models.some((m) => m.loaded)) return pollWhileLive(4000, LOADED_MODELS_FALLBACK_POLL_MS)
   if (status?.engine.state === 'starting' || status?.laya?.state === 'starting') return 1000
   // A finished download whose file the scanner hasn't caught up to yet — keep polling until it appears, or this
   // query goes permanently quiet the moment it happens to be asked before a download even starts (empty model dir,

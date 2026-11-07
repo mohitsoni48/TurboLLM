@@ -54,11 +54,12 @@ export function EngineLoadErrorBanner({ status }: { status: Status | undefined }
   if (state !== 'error' || !error || key === dismissedKey) return null
 
   /** Re-attempt the load that just failed. `status.model` is null after a failure, so the
-   *  key comes from `lastLoaded` — the daemon's config-tracked record of what the user
-   *  asked for, which survives the failure. Returns whether it worked, so the recovery
+   *  key is the one the failure names (`error.modelKey`). `lastLoaded` is only the fallback
+   *  for an older daemon: it is recorded once a load succeeds, so after a failed gateway
+   *  auto-swap it still names the previous model. Returns whether it worked, so the recovery
    *  event can report a real `outcome` rather than assuming the click succeeded. */
   async function retryLoad(): Promise<boolean> {
-    const key = status?.lastLoaded
+    const key = error?.modelKey || status?.lastLoaded?.modelKey
     if (!key) return false
     try {
       await loadModel(key)

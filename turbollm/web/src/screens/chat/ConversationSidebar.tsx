@@ -4,6 +4,7 @@ import { Archive, ArchiveRestore, ChevronDown, ChevronLeft, ChevronRight, Circle
 import type { Conversation, Folder } from '../../lib/chat-types'
 import { useConversationMutations, useConversations, useFolders } from '../../lib/chat-queries'
 import { Button } from '../../components/ui/button'
+import { LoadMore } from '../../components/LoadMore'
 import { WorkspaceModeTabs } from '../../components/WorkspaceModeTabs'
 import { Input } from '../../components/ui/input'
 import { toast } from '../../components/ui/sonner'
@@ -716,6 +717,12 @@ export const ConversationSidebar = memo(function ConversationSidebar({
                     recentlyCompleted={recentlyCompletedIds?.has(conv.id)}
                   />
                 ))}
+
+                {/* The daemon sends the newest 200 first. Older chats load on scroll (and by this button).
+                    Search never reaches here: it is answered in full and has no next page. */}
+                {convsQ.hasNextPage && (
+                  <LoadMore label="Load more" auto onLoadMore={() => void convsQ.fetchNextPage()} loading={convsQ.isFetchingNextPage} />
+                )}
               </>
             )}
           </>

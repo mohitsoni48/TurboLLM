@@ -13,7 +13,7 @@ const depsWithKey = (grant: unknown): Deps => {
     createdAt: '2026-09-10T00:00:00Z', lastUsedAt: null,
     ...(grant === undefined ? {} : { grant }),
   } as never)
-  return { store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } } as unknown as Deps
+  return { store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } } as unknown as Deps
 }
 
 test('grantKind: no grant is an ordinary full-access key', () => {

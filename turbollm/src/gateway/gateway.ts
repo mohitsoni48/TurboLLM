@@ -1,12 +1,17 @@
 // Gateway: /v1/* OpenAI-compatible pass-through + Anthropic translation (spec 06).
 import { randomUUID } from 'node:crypto'
-import type { Context, Hono } from 'hono'
+import type { Context, Hono, MiddlewareHandler } from 'hono'
+import { bodyLimit } from 'hono/body-limit'
 import { streamSSE } from 'hono/streaming'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import { createPatch } from 'diff'
 import type { Deps } from '../deps'
+import type { GenerationGate } from '../agents/gate'
+import type { Manager } from '../engines/manager'
+import type { RetryReason } from './model-router'
 import type { ToolCallRecord } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
+import { GATEWAY_MAX_BODY_MB } from '../config/config-bounds'
 import { applyEngineTokenLimit, engineModelAlias, shapeForEngine } from '../engines/compat'
 import { litertLmForcedToolChoiceError, litertLmUnappliedParameters, shapeLitertLmRequest } from '../engines/litert-lm-request'
 import { unlistedForLoading } from '../engines/registry'
@@ -140,7 +145,30 @@ function textClassifierListing(m: ModelEntry): Record<string, string> {
   return kind ? { kind, task: 'text-classification' } : {}
 }
 
-/** Classifies a `d.gate.acquire()` failure into one {status, type, message} shape shared by both
+/** The engine a LOCAL route landed on, which owns the request's bookkeeping (scalability review 1.1, 1.5): a keep-N
+ *  pool slot's own Manager (RouteResult's `manager`), else the primary. Its generation count, stats and live
+ *  progress go on it — counted on the primary, a generating pool slot read as idle to its idle-TTL watchdog and to
+ *  keep-N eviction, either of which could stop it mid-stream, while the primary was kept alive by work it was not
+ *  doing. Its gate is its own, sized by its own `--parallel` (Deps.gateFor): one gate sized from the primary queued a
+ *  pool model behind the primary's traffic, and with an unbounded vLLM/MLX primary left a `--parallel 1` pool slot
+ *  ungated (ADR-315's cap, on the engine it never looked at). `d.gate` where no per-engine gates are wired. A remote
+ *  route touches neither: its callers skip both under `localAccounting` / `!remote`. */
+function servingEngine(d: Deps, route: { manager?: Manager }): { manager: Manager; gate: GenerationGate | undefined } {
+  const manager = route.manager ?? d.manager
+  return { manager, gate: d.gateFor?.(manager) ?? d.gate }
+}
+
+/** Seconds a client waits before retrying a refusal that clears once a reply finishes or a tune ends. */
+const BUSY_RETRY_AFTER_S = 5
+
+/** `Retry-After` on a route refusal that clears by itself once the engines are free (RouteResult's `reason`), as the
+ *  extension API sets it on its own 429s (ext/errors.ts): the SDKs' default backoff spends its retries in about a
+ *  second, long before a reply ends (review L2). Not on ComfyUI's, whose render can run for minutes. */
+function setRetryAfter(c: Context, refusal: { reason?: RetryReason }): void {
+  if (refusal.reason) c.header('Retry-After', String(BUSY_RETRY_AFTER_S))
+}
+
+/** Classifies a `gate.acquire()` failure into one {status, type, message} shape shared by both
  *  the streaming (SSE `error` event, ADR-347 — `status` unused there, a stream is always 200 by
  *  the time it can fail this way) and non-streaming (JSON error response, where `status` is what
  *  the client actually sees) call sites, so `type`/`message` wording can't silently drift between
@@ -175,11 +203,48 @@ function classifyFetchError(e: unknown, ac: AbortController): { status: Contentf
 export interface GatewayOptions {
   pingIntervalMs?: number
   gateAcquireTimeoutMs?: number
+  /** Overrides CLIENT_IDLE_MS, the window a streaming client may go without reading. */
+  clientIdleMs?: number
+}
+
+/** How long a streaming OpenAI client may go without pulling its next chunk before the gateway gives up on it
+ *  (`tapForClient`). Reading is what keeps the engine generating, so a client that stops reading but keeps the
+ *  connection open (paused reader, throttled tab, wedged tunnel with no RST) would otherwise hold the engine slot, the
+ *  gate and the keep-N eviction block until generation ends. Two minutes outlasts any real reader's pause between
+ *  chunks; the engine's own generation stalls (a long prefill) do not count, only the gap on the client's side. */
+const CLIENT_IDLE_MS = 120_000
+
+/** `gateway.maxBodyMb`, read on every /v1 request, so through the non-cloning read() (scalability 1.6). The default is
+ *  generous because base64 vision payloads are large (config-bounds.ts GATEWAY_MAX_BODY_MB). */
+const gatewayMaxBodyMb = (d: Deps): number => d.store.read().gateway?.maxBodyMb ?? GATEWAY_MAX_BODY_MB.default
+
+/** The request-body cap for the gateway's routes (scalability review 4.4): `/v1/*` here, and the Turbo Link chat
+ *  endpoint, which hands its body to the same handler (link/link-routes.ts).
+ *  Each handler buffers its body whole and JSON.parses it synchronously, so over LAN/remote access one huge (or several
+ *  concurrent) body is an OOM or a stalled event loop. bodyLimit refuses on Content-Length and, for a chunked body that
+ *  announces none, counts bytes as they stream in and aborts at the cap — before any handler reads it. The cap is read
+ *  per request so a config edit applies without a restart, and the refusal speaks the protocol of the route it hit
+ *  (Anthropic's envelope on /v1/messages*, OpenAI's elsewhere). */
+export function gatewayBodyLimit(d: Deps): MiddlewareHandler {
+  return (c, next) => {
+    const mb = gatewayMaxBodyMb(d)
+    return bodyLimit({
+      maxSize: mb * 1024 * 1024,
+      onError: (ctx) => {
+        const message = `Request body exceeds the gateway's ${mb} MB limit (gateway.maxBodyMb).`
+        return ctx.req.path.startsWith('/v1/messages')
+          ? ctx.json({ type: 'error', error: { type: 'request_too_large', message } }, 413)
+          : ctx.json({ error: { message, type: 'invalid_request_error', code: 'request_too_large' } }, 413)
+      },
+    })(c, next)
+  }
 }
 
 export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): void {
   const pingIntervalMs = opts.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS
   const gateAcquireTimeoutMs = opts.gateAcquireTimeoutMs ?? 600_000
+  app.use('/v1/*', gatewayBodyLimit(d))
+
   // ── POST /v1/messages — Anthropic translation (spec 06 §2) ───────────────
 
   app.post('/v1/messages', async (c) => {
@@ -232,7 +297,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     const serverTool = isNestedSearchRequest(req.tools) ? findServerTool(req.tools) : null
     if (serverTool?.kind === 'web_search') {
       const query = extractSearchQuery(req)
-      const searchCfg = d.store.snapshot().tools.search
+      const searchCfg = d.store.read().tools.search
       const blocks = await runWebSearchServerTool(query, serverTool, searchCfg)
       const searchModel = req.model ?? 'local'
       if (req.stream) {
@@ -286,7 +351,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     const contentError = anthropicContentError(req)
     if (contentError) return c.json({ type: 'error', error: { type: 'invalid_request_error', message: contentError } }, 400)
     // Enforce the global "max response tokens" cap on external (Claude Code) traffic.
-    const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
+    const maxLimit = d.store.read().modelDefaults.maxTokens ?? 0
     req.max_tokens = clampMaxTokens(req.max_tokens, maxLimit) ?? req.max_tokens
 
     // A text classification model never chats (ADR-434 (f), ADR-444); refuse before route() could auto-swap it in.
@@ -303,6 +368,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       // evicts what was loaded and runs the whole failing load again. Only a refusal a retry cannot help says so: one
       // that clears by itself (a model still loading, ComfyUI's queue, a link still connecting) is left retryable.
       if (routeResult.permanent) c.header('x-should-retry', 'false')
+      setRetryAfter(c, routeResult)
       return c.json(
         { type: 'error', error: { type: 'api_error', message: routeResult.message } },
         routeResult.status,
@@ -313,6 +379,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
      *  router resolved it to an online linked host. Everything below stays structurally
      *  identical — only the URL, the headers and the outbound model id differ. */
     const remote = routeResult.remote
+    const serving = servingEngine(d, routeResult)
 
     const status = d.manager.status()
     // A remote answer must be labelled with the model the CALLER asked for. The local
@@ -450,7 +517,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
      *  local bookkeeping may be written from them (final-review I-1 and I-4).
      *
      *  Three separate ledgers hang off this one flag, and all three were wrong before:
-     *   - `d.manager.generationStart/setLiveGen/recordCompletion` — the peer's engine card
+     *   - `generationStart/setLiveGen/recordCompletion` on the serving engine — the peer's engine card
      *     read "Generating…" while its own engine was idle or stopped, its session t/s
      *     averages were contaminated with another machine's numbers, and (because
      *     `hostIdleState` reads `sessionStats().activeRequests`) a peer that is ALSO a host
@@ -550,12 +617,12 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
             await stream.writeSSE(messageStartEvent(msgId, modelName))
 
             // A REMOTE generation touches no local engine, so it must not take one of this
-            // machine's engine slots (final-review I-3). `d.gate` is sized to the LOCAL
-            // engine's `--parallel` count; on a laptop with a `--parallel 1` model loaded,
+            // machine's engine slots (final-review I-3). The gate is sized to the LOCAL
+            // engine's `--parallel` count (the routed engine's own, `servingEngine`); on a laptop with a `--parallel 1` model loaded,
             // gating remote traffic here serialises the workstation's GPU behind the
             // laptop's own work and, worst case, times out after 600 s while the host sits
             // idle — the exact configuration Turbo Link exists for.
-            if (d.gate && !remote) {
+            if (serving.gate && !remote) {
               try {
                 // Never proceed un-slotted on failure — that would silently breach the very
                 // limit this exists to enforce, and intermittently, which is worse than a clean
@@ -565,7 +632,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
                 // effective engine concurrency by one for its whole remaining life (review-caught,
                 // ADR-347 follow-up).
                 gateRelease = await pingWhilePending(
-                  d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: gateAcquireTimeoutMs }),
+                  serving.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: gateAcquireTimeoutMs }),
                   ping,
                   pingIntervalMs,
                   (release) => release(),
@@ -585,7 +652,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
             // Remote: this machine's engine is not generating anything — see the
             // `localAccounting` note above `callUpstream`.
             if (localAccounting) {
-              d.manager.generationStart()
+              serving.manager.generationStart()
               generationStarted = true
             }
 
@@ -647,7 +714,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
                   // last non-gateway request left behind and a terminal-agent session's stats
                   // row had to divide both token counts by one wall-clock, reading decode ~6x
                   // too low.
-                  d.manager.recordCompletion({
+                  serving.manager.recordCompletion({
                     inputTokens: u.inputTokens, outputTokens: u.outputTokens,
                     promptTps: u.promptTps, genTps: u.genTps,
                   })
@@ -676,7 +743,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
               // so Claude Code traffic shows the same live row as in-app chat.
               onLive: (live) => {
                 if (!localAccounting) return
-                try { d.manager.setLiveGen(live) } catch { /* best-effort */ }
+                try { serving.manager.setLiveGen(live) } catch { /* best-effort */ }
               },
               // Coding-activity attribution for terminal-agent sessions — see
               // observeCodeSessionTurn. Nothing to attribute for any other client.
@@ -695,7 +762,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
             }
           } finally {
             ac.abort() // also tear down the upstream on normal completion / write error
-            if (generationStarted) d.manager.generationEnd()
+            if (generationStarted) serving.manager.generationEnd()
             gateRelease?.()
             // Fallback: if nothing above already finalized the log entry (a client disconnect
             // mid-stream, or an exception `streamToAnthropic`'s own callbacks never got a
@@ -716,9 +783,9 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // idle-connection watchdog to defeat — keeps the original un-pinged gate/fetch sequence. ──
     let gateRelease: (() => void) | null = null
     // Local engine slots are for local work only — see the streaming branch (I-3).
-    if (d.gate && localAccounting) {
+    if (serving.gate && localAccounting) {
       try {
-        gateRelease = await d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: gateAcquireTimeoutMs })
+        gateRelease = await serving.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: gateAcquireTimeoutMs })
       } catch (e) {
         const { status, type, message } = classifyGateError(e)
         finalizeLog({ status, error: { code: type, message } })
@@ -728,8 +795,8 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
 
     // Paired with `endLocalGeneration` below so a remote request never starts, and never
     // ends, a generation on this machine's own manager (I-4).
-    if (localAccounting) d.manager.generationStart()
-    const endLocalGeneration = () => { if (localAccounting) d.manager.generationEnd() }
+    if (localAccounting) serving.manager.generationStart()
+    const endLocalGeneration = () => { if (localAccounting) serving.manager.generationEnd() }
     const requestStart = Date.now()
     let res: Response
     try {
@@ -771,7 +838,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       // the host already recorded this generation behind its façade, and recording it here
       // too is what double-counted every federated generation in `gateway_daily` (I-1).
       if (localAccounting) {
-        recordOpenAiUsage(d, oaiRes, 'anthropic', req.model ?? null, anthropicCodeSessionId, Date.now() - requestStart, anthropicHarness)
+        recordOpenAiUsage(d, serving.manager, oaiRes, 'anthropic', req.model ?? null, anthropicCodeSessionId, Date.now() - requestStart, anthropicHarness)
       }
       // Same coding-activity attribution the streaming branch gets. A non-streaming turn has no
       // per-delta reassembly to do — the engine already hands back whole `arguments` strings —
@@ -854,7 +921,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
   // to avoid — this codebase has already paid once for two implementations of one idea
   // drifting apart (admin probe() vs LinkManager.probeOnce).
 
-  app.all('/v1/*', (c) => gatewayV1Handler(c, d))
+  app.all('/v1/*', (c) => gatewayV1Handler(c, d, { clientIdleMs: opts.clientIdleMs }))
 }
 
 /** Overrides for a caller that is NOT the public /v1/* mount. */
@@ -868,6 +935,8 @@ export interface GatewayV1Options {
    *  the OWNER touching their own machine (host-idle.ts), or one peer's request would
    *  block the next peer's wake for the whole idle grace window. Defaults to 'local'. */
   origin?: 'local' | 'link'
+  /** Test override for CLIENT_IDLE_MS. */
+  clientIdleMs?: number
 }
 
 /** Hop-by-hop headers (RFC 9110 §7.6.1): each describes one connection, the client's to us or ours to the engine,
@@ -937,7 +1006,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // serves a running model before any check). Listed, with its alias, it was a pick the auto-swap refuses with a
   // permanent 503: a .litertlm model under llama.cpp in Claude Code's /model failed every turn.
   if (c.req.method === 'GET' && pathname === '/v1/models') {
-    const cfg = d.store.snapshot()
+    const cfg = d.store.read()
     const autoSwap = cfg.gateway.autoSwap
     const unlisted = unlistedForLoading(cfg.showAllEngineModels, d.registry)
     const running = d.modelRouter.loadedModelKeys()
@@ -1054,6 +1123,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   const routeResult = await d.modelRouter.route(requestedModel, { embeddings: isEmbeddings })
   if ('status' in routeResult) {
     if (routeResult.permanent) c.header('x-should-retry', 'false') // see the identical line in /v1/messages above
+    setRetryAfter(c, routeResult)
     return c.json(
       { error: { message: routeResult.message, type: 'model_not_loaded', code: 'model_not_loaded' } },
       503,
@@ -1062,6 +1132,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   const target = routeResult.target
   /** Turbo Link (ADR-376) — see the identical binding in the /v1/messages handler above. */
   const remote = routeResult.remote
+  const serving = servingEngine(d, routeResult)
 
   // Turbo Link is CHAT-only by design (ADR-376) — the comment below this block used to say
   // a qualified id could never even reach the remote branch for a non-chat endpoint, since
@@ -1150,7 +1221,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // app on another origin that posts its JSON as text/plain, and the daemon relayed the 403.
   if (!remote) for (const h of ['cookie', 'x-turbollm-auth', 'x-turbollm-app', 'origin', 'referer']) headers.delete(h)
 
-  const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
+  const maxLimit = d.store.read().modelDefaults.maxTokens ?? 0
   // Cancel the upstream engine request if the client disconnects (same reason as
   // /v1/messages above) — abandoned OpenAI-protocol requests would otherwise keep
   // generating and occupy engine slots.
@@ -1358,9 +1429,9 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // `!remote` (I-3): the gate is sized to the LOCAL engine's `--parallel` count, and a
   // federated generation touches no local engine. Gating it here throttles the other
   // machine's GPU behind this one's work — on a `--parallel 1` laptop, serially.
-  if (isChat && d.gate && !remote) {
+  if (isChat && serving.gate && !remote) {
     try {
-      chatGateRelease = await d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: 600_000 })
+      chatGateRelease = await serving.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: 600_000 })
     } catch (e) {
       const aborted = (e as Error).message === 'gate_acquire_aborted'
       return c.json(
@@ -1402,6 +1473,17 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     d.requestLog!.finalize(logId, result)
   }
 
+  // Counted as generating from BEFORE the fetch (review H1): llama-server sends no header until a non-stream reply is
+  // generated whole (or, streaming, until prefill ends), so started once fetch() resolved, the engine read idle for
+  // that whole window to keep-N eviction, its pool idle-TTL watchdog and hostIdleState, any of which could stop it
+  // under this request. `!remote`: see the tap below (I-1, I-4). Ended exactly once, on whichever path finishes it.
+  let localGenerating = isChat && !remote
+  if (localGenerating) serving.manager.generationStart()
+  const endLocalGeneration = (): void => {
+    if (!localGenerating) return
+    localGenerating = false
+    serving.manager.generationEnd()
+  }
   const requestStart = Date.now()
   let res: Response
   try {
@@ -1412,6 +1494,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       ? await proxyStream(remote, remotePath, init, ac.signal)
       : await fetch(upstream, init)
   } catch (e) {
+    endLocalGeneration()
     chatGateRelease?.()
     const err = e as Error & { cause?: unknown }
     const isAbort = err.name === 'AbortError' || ac.signal.aborted
@@ -1430,37 +1513,36 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   }
 
   // Best-effort session-stats recording (B4) for OpenAI chat completions, fully
-  // fail-safe and non-intrusive: tee the body so the client still gets the exact
-  // upstream stream/bytes unchanged while we sniff usage off the copy.
+  // fail-safe and non-intrusive: the client still gets the exact upstream stream/bytes
+  // unchanged while we sniff usage off a copy fed only as fast as the client reads (`tapForClient`).
   // `!remote` (I-1, I-4): the HOST recorded this generation behind its façade — through
   // this very function — so recording it again here double-counts every federated
   // generation in `gateway_daily`, and `generationStart()` would light up this machine's
   // engine card (and its `hostIdleState`) for work its own engine is not doing.
   if (res.ok && res.body && isChat && !remote) {
     try {
-      const [a, b] = res.body.tee()
-      // Mark in-flight + publish live token count to the engine card while the teed
-      // copy drains, paired so the counter can't leak. (OpenAI clients don't get the
-      // prefill % — injecting return_progress would pollute their stream.)
-      d.manager.generationStart()
+      const { client: a, tap: b, clientClosed } = tapForClient(res.body, opts.clientIdleMs ?? CLIENT_IDLE_MS)
+      // Still in flight (started before the fetch) while the tap drains, which publishes the live token count to
+      // the engine card. (OpenAI clients don't get the prefill % — injecting return_progress would pollute their stream.)
       // The requester's own `stream` flag decides the drain shape: a non-streaming
       // OpenAI client (common for scripted/extension callers, `stream` false/absent)
       // gets ONE plain JSON body from the engine, not SSE `data:` lines — the SSE
       // parser would silently see no matches and record nothing (GitHub #71: this
       // gap would have made external-client tracking wrong for a common case).
       const drain = parsedBody?.stream === true
-        ? recordOpenAiStreamUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness, logId)
-        : recordOpenAiJsonUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness, logId)
-      // Released when the teed copy finishes draining — i.e. when the engine has actually
+        ? recordOpenAiStreamUsage(d, serving.manager, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness, logId, clientClosed)
+        : recordOpenAiJsonUsage(d, serving.manager, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness, logId)
+      // Released when the tap finishes draining — i.e. when the engine has actually
       // stopped generating, NOT when this handler returns. Returning the streaming Response
       // hands bytes to the client while the engine is still busy, so releasing the slot here
       // would let the next queued request in on top of a still-running generation.
       logFinalized = true // the drain above owns finalizing this entry now, not the fallback below
-      void drain.finally(() => { d.manager.generationEnd(); chatGateRelease?.() })
+      void drain.finally(() => { endLocalGeneration(); chatGateRelease?.() })
       if (injectedUsage) return withoutInjectedUsage(a, res)
       return new Response(a, { status: res.status, headers: relayedHeaders(res) })
     } catch (e) {
       finalizeLog({ status: res.status, error: { code: 'tee_error', message: (e as Error)?.message || 'Failed to tee the response body.' } })
+      endLocalGeneration()
       chatGateRelease?.()
       return new Response(res.body, { status: res.status, headers: relayedHeaders(res) })
     }
@@ -1475,12 +1557,13 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // SAME body to the client unread (the whole point of a pass-through). A status-only message
   // costs nothing to the stream; a detailed one would silently truncate every error response
   // this branch forwards. Same "never touch the client-facing stream" rule the success path
-  // above follows via `tee()` instead.
+  // above follows via `tapForClient()` instead.
   finalizeLog(
     res.ok
       ? { status: res.status, durationMs: Date.now() - requestStart }
       : { status: res.status, error: { code: 'engine_error', message: `Engine returned HTTP ${res.status}.` }, durationMs: Date.now() - requestStart },
   )
+  endLocalGeneration()
   chatGateRelease?.()
   // ── No host filesystem detail crosses the façade (final-review M-6) ───────────────────
   // llama.cpp's error JSON routinely embeds absolute model and binary paths, and this line
@@ -1501,7 +1584,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       asClientStatus(res.status),
     )
   }
-  // A Turbo Link chat stream lands here, not in the tee above: the injection happened on this machine.
+  // A Turbo Link chat stream lands here, not in the tap above: the injection happened on this machine.
   if (injectedUsage && res.ok && res.body) return withoutInjectedUsage(res.body, res)
   if (remote) {
     // fetch has already decoded whatever the host's side compressed (Cloudflare's edge gzips JSON for a client that
@@ -1513,6 +1596,62 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     return new Response(res.body, { status: res.status, headers: relayed })
   }
   return new Response(res.body, { status: res.status, headers: relayedHeaders(res) })
+}
+
+/** Split an engine body into the stream the client gets and a copy for usage parsing, WITHOUT `tee()` (scalability review
+ *  4.5). `tee()` reads the source as fast as its fastest branch: the parsing branch drained the engine whatever the
+ *  client did, so a client that stalled without closing (stalled tunnel, paused reader) never fired an abort, the engine
+ *  generated to max_tokens, the client's branch buffered the lot, and the gate slot stayed held to the end. Here the
+ *  source is read only when the client pulls (highWaterMark 0), and the tap is fed from those same reads, so a stalled
+ *  client stops the engine fetch via TCP backpressure and buffers nothing.
+ *  A client that stays stalled past `idleMs` is cut off like one that left: the engine reader is cancelled (which ends
+ *  the generation), the client's stream errors, and the tap CLOSES (not errors) so the parser still returns what it saw
+ *  and the caller records that partial turn; `clientClosed()` tells it the end was the client's. A source error still
+ *  errors both, so the parser's catch logs it as an engine fault. */
+function tapForClient(body: ReadableStream<Uint8Array>, idleMs: number): { client: ReadableStream<Uint8Array>; tap: ReadableStream<Uint8Array>; clientClosed: () => boolean } {
+  const reader = body.getReader()
+  let tapCtl!: ReadableStreamDefaultController<Uint8Array>
+  const tap = new ReadableStream<Uint8Array>({ start: (ctl) => { tapCtl = ctl } })
+  let clientGone = false
+  let idleTimer: ReturnType<typeof setTimeout> | undefined
+  const stopWaiting = (): void => { clearTimeout(idleTimer); idleTimer = undefined }
+  // The tap is closed at most once, whichever of end / cancel / idle comes first.
+  const clientLeft = (reason: unknown): Promise<void> => {
+    if (clientGone) return Promise.resolve()
+    clientGone = true
+    stopWaiting()
+    tapCtl.close()
+    return reader.cancel(reason)
+  }
+  let clientCtl!: ReadableStreamDefaultController<Uint8Array>
+  const waitForClient = (): void => {
+    idleTimer = setTimeout(() => {
+      const idle = new Error(`Client stopped reading for ${Math.round(idleMs / 1000)}s.`)
+      void clientLeft(idle).catch(() => {})
+      clientCtl.error(idle)
+    }, idleMs)
+    idleTimer.unref() // a body nobody ever reads must not keep the process alive for the window
+  }
+  const client = new ReadableStream<Uint8Array>({
+    start(ctl) { clientCtl = ctl; waitForClient() },
+    async pull(ctl) {
+      stopWaiting()
+      try {
+        const { done, value } = await reader.read()
+        if (clientGone) return
+        if (done) { tapCtl.close(); ctl.close(); return }
+        tapCtl.enqueue(value) // drained eagerly by the parser: never accumulates
+        ctl.enqueue(value)
+        waitForClient()
+      } catch (e) {
+        if (clientGone) return
+        tapCtl.error(e)
+        ctl.error(e)
+      }
+    },
+    cancel: (reason) => clientLeft(reason ?? new Error('Client closed the stream.')),
+  }, { highWaterMark: 0 })
+  return { client, tap, clientClosed: () => clientGone }
 }
 
 /** The client's copy of a streamed chat completion as it would have been without the `stream_options.include_usage`
@@ -1714,6 +1853,18 @@ const pendingCodeToolCalls = new Map<string, Map<string, ToolCallRecord>>()
  *  later calls is never going to be. */
 const MAX_PENDING_PER_SESSION = 256
 
+/** A session's CLI is gone (token revoked), so no later request can confirm what it left pending. */
+function forgetPendingCodeToolCalls(codeSessionId: string): void {
+  pendingCodeToolCalls.delete(codeSessionId)
+}
+sessionAuth.onRevoke(forgetPendingCodeToolCalls)
+
+/** How many Code sessions currently hold pending calls — for tests asserting the map does not grow
+ *  with the number of sessions the daemon has ever seen. */
+export function pendingCodeToolCallSessionCount(): number {
+  return pendingCodeToolCalls.size
+}
+
 /** Observe a turn a Code session's terminal-launched CLI just took: stash its file-touching tool
  *  calls as PENDING (see pendingCodeToolCalls — they are committed only once a later request
  *  confirms the CLI really applied them) and mark the run shipped.
@@ -1737,6 +1888,9 @@ function observeCodeSessionTurn(d: Deps, codeSessionId: string, calls: StreamToo
     const run = d.db.getAgentRun(codeSessionId)
     if (!run) return
 
+    // A request still streaming when its session's token was revoked ends after forgetPendingCodeToolCalls ran: its
+    // calls can never be confirmed, and recording them would re-create the entry that revoke just released.
+    if (!sessionAuth.hasToken(codeSessionId)) return
     let pending = pendingCodeToolCalls.get(codeSessionId)
     for (const call of calls) {
       const name = call.name.toLowerCase()
@@ -1832,6 +1986,7 @@ function commitConfirmedCodeToolCalls(d: Deps, codeSessionId: string, req: Anthr
         if (block.is_error !== true) confirmed.push(record)
       }
     }
+    if (pending.size === 0) pendingCodeToolCalls.delete(codeSessionId)
     if (confirmed.length === 0) return
 
     // Looked up only now, not on entry: a request that confirms nothing must cost this session
@@ -1843,16 +1998,17 @@ function commitConfirmedCodeToolCalls(d: Deps, codeSessionId: string, req: Anthr
 }
 
 // ── session-stats recording helpers (B4) ────────────────────────────────────
+// `engine` in each: the Manager that ran the generation (servingEngine), whose engine card and session stats it is.
 
 /** Record usage from a non-streaming OpenAI completion. Fail-safe. Also persists a durable
  *  `api_usage` row (GitHub #71) — `source`/`modelKey` distinguish gateway (external-client)
  *  traffic from in-app chat, which records into `messages` instead. `codeSessionId`/`durationMs`
  *  (ADR-284) attribute this row to a terminal-agent session for TerminalToolbar.tsx's stats. */
-function recordOpenAiUsage(d: Deps, oai: Record<string, unknown>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, durationMs: number | null = null, harness: string | null = null): void {
+function recordOpenAiUsage(d: Deps, engine: Manager, oai: Record<string, unknown>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, durationMs: number | null = null, harness: string | null = null): void {
   try {
     const usage = oai.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined
     const timings = oai.timings as { prompt_per_second?: number; predicted_per_second?: number } | undefined
-    d.manager.recordCompletion({
+    engine.recordCompletion({
       inputTokens: usage?.prompt_tokens,
       outputTokens: usage?.completion_tokens,
       promptTps: timings?.prompt_per_second,
@@ -1868,17 +2024,17 @@ function recordOpenAiUsage(d: Deps, oai: Record<string, unknown>, source: 'anthr
   } catch { /* swallow — stats are best-effort */ }
 }
 
-/** Drain a teed copy of a NON-streaming OpenAI JSON body (a single response, not SSE) to
+/** Drain the tap copy of a NON-streaming OpenAI JSON body (a single response, not SSE) to
  *  record usage — the `/v1/*` pass-through's counterpart to `recordOpenAiStreamUsage` for
  *  requests where the caller didn't set `stream: true`. Never touches the client-facing
  *  stream; all errors are swallowed. `startedAt` (Date.now() at the ORIGINAL fetch call) —
  *  duration is computed here, at true completion, not at the call site (which fires before
  *  this drain even starts). */
-async function recordOpenAiJsonUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null, harness: string | null = null, logId: string | null = null): Promise<void> {
+async function recordOpenAiJsonUsage(d: Deps, engine: Manager, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null, harness: string | null = null, logId: string | null = null): Promise<void> {
   try {
     const text = await new Response(body).text()
     const oai = JSON.parse(text) as Record<string, unknown>
-    recordOpenAiUsage(d, oai, source, modelKey, codeSessionId, startedAt != null ? Date.now() - startedAt : null, harness)
+    recordOpenAiUsage(d, engine, oai, source, modelKey, codeSessionId, startedAt != null ? Date.now() - startedAt : null, harness)
     // Observe half of coding-activity attribution for OPENAI-protocol harnesses — the counterpart
     // to the Anthropic handler's own observeCodeSessionTurn call. Reuses `openAiToolCalls`, which
     // already existed for that path's OpenAI-shaped responses; nothing is forked.
@@ -1940,10 +2096,10 @@ class StreamingToolCallAccumulator {
   }
 }
 
-/** Drain a teed copy of a streaming OpenAI SSE body to record final usage (B4) plus a
+/** Drain the tap copy of a streaming OpenAI SSE body to record final usage (B4) plus a
  *  durable `api_usage` row (GitHub #71). Never touches the client-facing stream; all
  *  errors are swallowed. `startedAt` — see recordOpenAiJsonUsage's doc comment; same reason. */
-async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null, harness: string | null = null, logId: string | null = null): Promise<void> {
+async function recordOpenAiStreamUsage(d: Deps, engine: Manager, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null, harness: string | null = null, logId: string | null = null, clientClosed: () => boolean = () => false): Promise<void> {
   // Developer request log (issue #211 follow-up): `captureBody` gates only whether the
   // generated text is reassembled; TTFT/finish-reason are cheap enough to always track once
   // `logId` exists.
@@ -1962,16 +2118,20 @@ async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>
       onChunk: (chunk) => {
         const delta = (chunk.choices as Array<{ delta?: { content?: string; reasoning_content?: string } }> | undefined)?.[0]?.delta
         if (delta && (delta.content || delta.reasoning_content)) {
-          try { d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: ++liveOut }) } catch { /* best-effort */ }
+          try { engine.setLiveGen({ phase: 'gen', pct: 0, outputTokens: ++liveOut }) } catch { /* best-effort */ }
         }
         toolCalls?.observe(chunk)
       },
     })
-    const { promptTokens, completionTokens, promptTps, genTps, ttftMs, finishReason, responseText } = result
+    const { promptTokens, promptTps, genTps, ttftMs, finishReason, responseText } = result
+    // A client that left early never saw the engine's final usage chunk: the content deltas counted so far stand in
+    // for the generated tokens (the prompt count is whatever the stream had reported, 0 when nothing yet).
+    const closedEarly = clientClosed()
+    const completionTokens = closedEarly && result.completionTokens === 0 ? liveOut : result.completionTokens
     if (codeSessionId && toolCalls) {
       try { observeCodeSessionTurn(d, codeSessionId, toolCalls.calls()) } catch { /* swallow */ }
     }
-    d.manager.recordCompletion({ inputTokens: promptTokens, outputTokens: completionTokens, promptTps: promptTps ?? 0, genTps: genTps ?? 0 })
+    engine.recordCompletion({ inputTokens: promptTokens, outputTokens: completionTokens, promptTps: promptTps ?? 0, genTps: genTps ?? 0 })
     d.db.recordApiUsage({
       source, modelKey, promptTokens, genTokens: completionTokens,
       codeSessionId, durationMs: startedAt != null ? Date.now() - startedAt : null, harness,
@@ -1981,7 +2141,10 @@ async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>
     })
     if (logId && d.requestLog) {
       d.requestLog.finalize(logId, {
-        status: 200, promptTokens, completionTokens, promptTps, genTps, ttftMs, finishReason,
+        // An interrupted turn (Esc in a client, an idle cut-off) is the client's doing, not an engine fault.
+        status: closedEarly ? null : 200,
+        error: closedEarly ? { code: 'client_closed', message: 'The client closed the stream before the response finished.' } : undefined,
+        promptTokens, completionTokens, promptTps, genTps, ttftMs, finishReason,
         durationMs: startedAt != null ? Date.now() - startedAt : null,
         responseBody: captureBody ? JSON.stringify({ content: responseText }) : undefined,
       })

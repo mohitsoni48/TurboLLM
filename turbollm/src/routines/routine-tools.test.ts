@@ -37,7 +37,7 @@ function raceStore(store: ConversationStore, overrides: Partial<RoutineToolsStor
     listRoutines: store.listRoutines.bind(store),
     updateRoutine: store.updateRoutine.bind(store),
     deleteRoutine: store.deleteRoutine.bind(store),
-    listRoutineRuns: store.listRoutineRuns.bind(store),
+    countRoutineRuns: store.countRoutineRuns.bind(store),
     ...overrides,
   }
 }
@@ -541,6 +541,22 @@ test('execDeleteRoutine: without confirm, previews and deletes nothing', () => {
   const out = execDeleteRoutine({ routineId: r.id }, store)
   assert.match(out, /PREVIEW/)
   assert.ok(store.getRoutine(r.id), 'must not delete without confirm: true')
+})
+
+/** Scalability review 2.5: the preview needs a count, so it must not load every run (with its
+ *  full result and config payloads) just to read .length. */
+test('execDeleteRoutine: the preview counts runs without loading them', () => {
+  const store = freshStore()
+  const r = chatRoutine(store)
+  for (let i = 0; i < 3; i++) store.createRoutineRun({ routineId: r.id, configSnapshot: '{}' })
+  const noLoads = new Proxy(store, {
+    get(target, prop) {
+      if (prop === 'listRoutineRuns') return () => assert.fail('the preview loaded every run')
+      const v = Reflect.get(target, prop) as unknown
+      return typeof v === 'function' ? v.bind(target) : v
+    },
+  })
+  assert.match(execDeleteRoutine({ routineId: r.id }, noLoads), /3 run\(s\)/)
 })
 
 /** Delete's half of the preview-purity guard (see the update_routine counterpart). */

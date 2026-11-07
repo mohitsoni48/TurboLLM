@@ -670,3 +670,36 @@ test('a multibyte character split across two stdout/stderr chunks is decoded who
   assert.equal(result.stdout, '{"result":"5 €"}\n')
   assert.equal(result.stderr, '€')
 })
+
+// Scalability review 3.9: a routine can run ten minutes, and `--verbose` stream-json is chatty.
+test('onStdout receives each chunk as it arrives and stdout is not accumulated', async () => {
+  const child = fakeChild()
+  const seen: string[] = []
+  const resultPromise = runClaudeCliProcess(
+    ['-p'],
+    { cwd: '/repo', env: {}, timeoutMs: 5000, onStdout: (s) => seen.push(s) },
+    () => child,
+    killSpy().spy,
+  )
+  child.stdout.write('{"type":"system"}\n')
+  child.stdout.end('{"type":"result","result":"hi"}\n')
+  child.stderr.end('')
+  child.emit('exit', 0, null)
+
+  const result = await resultPromise
+  assert.equal(seen.join(''), '{"type":"system"}\n{"type":"result","result":"hi"}\n')
+  assert.equal(result.stdout, '', 'what was streamed to the caller is not also held here')
+})
+
+test('stderr keeps only its last 64 KB', async () => {
+  const child = fakeChild()
+  const resultPromise = runClaudeCliProcess(['-p'], { cwd: '/repo', env: {}, timeoutMs: 5000 }, () => child, killSpy().spy)
+  child.stdout.end('')
+  child.stderr.write('A'.repeat(200_000))
+  child.stderr.end('the real error')
+  child.emit('exit', 1, null)
+
+  const result = await resultPromise
+  assert.equal(result.stderr.length, 64 * 1024)
+  assert.ok(result.stderr.endsWith('the real error'), 'the tail survives, the head is dropped')
+})

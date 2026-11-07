@@ -25,7 +25,7 @@ const WIN_KILL = 'a Windows kill helper (taskkill or a WMI walk): bounded, and i
 /** `<file>#<enclosing function>:<callee>` → why it may start a process without the tether. */
 const RAW_SPAWN_SITES: Record<string, string> = {
   // ── Meant to outlive the daemon (the daemon hands over to the user or to its successor) ──
-  'cli.ts#openBrowser:spawn': 'the user\'s browser, which must outlive the daemon',
+  'boot.ts#openBrowser:spawn': 'the user\'s browser, which must outlive the daemon',
   'app-update-apply.ts#spawnUpdateHelper:spawn': 'the self-update helper: it waits for this daemon to exit, then installs and relaunches it',
   'update-helper.mjs#relaunch:spawn': 'runs in the update helper after the daemon has exited: the relaunched daemon',
   'update-helper.mjs#spawnNpm:spawn': 'runs in the update helper after the daemon has exited: npm installs the update',
@@ -65,7 +65,7 @@ const RAW_SPAWN_SITES: Record<string, string> = {
   'terminal/terminal-manager.ts#killShell:spawnSync': WIN_KILL,
 
   // ── Synchronous calls ──
-  'api/routes.ts#git:execFileSync': SYNC,
+  'api/fs-routes.ts#git:execFileSync': SYNC,
   'artifacts/screenshot.ts#chromeCandidates:execFileSync': LOOKUP,
   'engines/download.ts#stripMacOsQuarantine:execFileSync': SYNC,
   'sysinfo/sysinfo.ts#detectGpus:execFileSync': SYNC,

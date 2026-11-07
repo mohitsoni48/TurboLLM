@@ -1,19 +1,18 @@
-// Source-level guard for TurboLLM-Android's app secret across an in-place rebind (cli.ts listen()).
+// Source-level guard for TurboLLM-Android's app secret across an in-place rebind (boot.ts listen()).
 //
-// Why a source scan: cli.ts is top-level module code that boots the real daemon when imported (see
-// cli.lifecycle-wiring.test.ts). A LAN toggle closes the listener and binds again on the same port;
+// Why a source scan: the case is a port another app takes during the rebind, after which the daemon calls
+// process.exit, which a test daemon in the test's own process cannot reach (cli.rebind.test.ts runs this code with
+// exit recorded, for the cases it can stage). A LAN toggle closes the listener and binds again on the same port;
 // in between, another app on the phone can take 127.0.0.1:<port> and collect the app's secret from
 // the WebView's next requests, then let go so the daemon's bind retry succeeds and the stolen secret
 // works. A same-process rebind is never refused on Linux (close() releases the port at once), so on
 // the app a busy port during a rebind can only mean that, and the daemon must stop, not retry.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { daemonSourceInBootOrder } from './test-support/daemon-source'
 
-const HERE = dirname(fileURLToPath(import.meta.url))
-const CLI = readFileSync(join(HERE, 'cli.ts'), 'utf8').replace(/\r\n/g, '\n')
+// cli.ts with bootDaemon's body (boot.ts) in place of its call: the daemon's source in the order it runs.
+const CLI = daemonSourceInBootOrder()
 
 function listenBlock(): string {
   const start = CLI.indexOf('function listen(attempt = 0): void {')

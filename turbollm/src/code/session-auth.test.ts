@@ -77,3 +77,12 @@ test('thinking budget: an unrecognized token returns null, never throws', () => 
   const reg = new SessionAuthRegistry()
   assert.equal(reg.getThinkingBudgetForToken('bogus'), null)
 })
+
+test('revoke notifies registered listeners with the session id', () => {
+  const reg = new SessionAuthRegistry()
+  const seen: string[] = []
+  reg.onRevoke((id) => seen.push(id))
+  reg.mint('s1')
+  reg.revoke('s1')
+  assert.deepEqual(seen, ['s1'])
+})

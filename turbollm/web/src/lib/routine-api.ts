@@ -36,18 +36,22 @@ export function describeRoutineError(e: unknown, fallback: string): string {
 }
 
 async function req<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
+  return (await reqWithHeaders<T>(path, init)).data
+}
+
+async function reqWithHeaders<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<{ data: T; headers: Headers }> {
   const headers: Record<string, string> = { Accept: 'application/json', ...authHeaders(), ...((init?.headers as Record<string, string>) ?? {}) }
   let body = init?.body
   if (init && 'json' in init && init.json !== undefined) { headers['Content-Type'] = 'application/json'; body = JSON.stringify(init.json) }
   const res = await fetch(path, { ...init, headers, body })
-  if (res.status === 204) return undefined as T
+  if (res.status === 204) return { data: undefined as T, headers: res.headers }
   const text = await res.text()
   const data = text ? (() => { try { return JSON.parse(text) } catch { return undefined } })() : undefined
   if (!res.ok) {
     const env = data as { error?: { code?: string; message?: string } } | undefined
     throw new ApiError(env?.error?.code ?? 'http_error', env?.error?.message ?? `Request failed with status ${res.status}.`, res.status)
   }
-  return data as T
+  return { data: data as T, headers: res.headers }
 }
 
 export function listRoutines(): Promise<Routine[]> {
@@ -90,10 +94,21 @@ export function pauseRoutine(id: string): Promise<Routine> {
 export function resumeRoutine(id: string): Promise<Routine> {
   return req(`/api/v1/routines/${encodeURIComponent(id)}/resume`, { method: 'PUT' })
 }
-/** Newest run first — routine-routes.ts serves `db.listRoutineRuns`, which is
- *  `ORDER BY started_at DESC` (chat/db.ts). Callers may take index 0 as "the latest run". */
-export function listRoutineRuns(routineId: string): Promise<RoutineRun[]> {
-  return req(`/api/v1/routines/${encodeURIComponent(routineId)}/runs`)
+/** Newest run first — routine-routes.ts serves `db.listRoutineRunsPage`, `ORDER BY started_at DESC` (chat/db.ts),
+ *  so callers may take index 0 as "the latest run". The daemon's default page is the 50 newest runs, not all of
+ *  them; `limit` asks for fewer (the list screen only needs the newest one). Older runs: {@link listRoutineRunsPage}. */
+export function listRoutineRuns(routineId: string, limit?: number): Promise<RoutineRun[]> {
+  return req(`/api/v1/routines/${encodeURIComponent(routineId)}/runs${limit ? `?limit=${limit}` : ''}`)
+}
+
+/** One page of run history, newest first. The body is a plain array; the cursor for the next (older) page
+ *  arrives in the `X-Next-Cursor` response header and is sent back as `before`. `nextCursor` is null on the
+ *  last page (the header is absent). */
+export interface RoutineRunPage { runs: RoutineRun[]; nextCursor: string | null }
+export async function listRoutineRunsPage(routineId: string, before?: string | null): Promise<RoutineRunPage> {
+  const query = before ? `?before=${encodeURIComponent(before)}` : ''
+  const { data, headers } = await reqWithHeaders<RoutineRun[]>(`/api/v1/routines/${encodeURIComponent(routineId)}/runs${query}`)
+  return { runs: data, nextCursor: headers.get('X-Next-Cursor') }
 }
 /** Manually fires a routine outside its schedule.
  *

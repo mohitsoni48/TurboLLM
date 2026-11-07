@@ -15,7 +15,7 @@ function mkApp(model?: { key: string }) {
   const d = {
     version: 'test',
     store: {
-      snapshot: () => cfg,
+      snapshot: () => cfg, read: () => cfg,
       update: (fn: (c: typeof cfg) => void) => { const work = structuredClone(cfg); fn(work); Object.assign(cfg, work) },
       dir: () => '.',
     },

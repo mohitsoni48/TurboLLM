@@ -87,7 +87,7 @@ function appWithChecker(
   const storeDir = opts.storeDir ?? litertStore()
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => storeDir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => storeDir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     manager: {
       status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }),

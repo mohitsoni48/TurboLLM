@@ -13,6 +13,7 @@ import { lanAuth, provisionRemoteApiKey } from '../auth'
 import { defaultConfig } from '../config/config'
 import type { LinkCapability } from '../link/types'
 import type { Deps } from '../deps'
+import { chatRegistries } from '../test-support/chat-registries'
 
 interface Library {
   conversations?: Record<string, { title: string }>
@@ -34,6 +35,7 @@ interface Running {
 
 function depsWith(library: Library, running: Running = {}, optional = { codeRuns: true, routineScheduler: true }): Deps {
   return {
+    ...chatRegistries(),
     db: {
       getConversation: (id: string) => library.conversations?.[id] ?? null,
       getAgentRun: (id: string) => library.agentRuns?.[id] ?? null,
@@ -52,7 +54,7 @@ function depsWith(library: Library, running: Running = {}, optional = { codeRuns
     // What the route adds for the Android app's poll (downloads, status) reads.
     downloads: { list: () => [] },
     modelRouter: { aliveSlots: () => [], poolModelCount: () => 0 },
-    store: { snapshot: () => ({ apiKeys: [], daemon: {} }) },
+    store: { snapshot: () => ({ apiKeys: [], daemon: {} }), read: () => ({ apiKeys: [], daemon: {} }) },
     ...(optional.codeRuns ? { codeRuns: { activeSessionIds: () => running.codeSessions ?? [] } } : {}),
     ...(optional.routineScheduler ? { routineScheduler: { runningRoutineIds: () => running.routines ?? [] } } : {}),
   } as unknown as Deps
@@ -120,8 +122,15 @@ test('without codeRuns or routineScheduler there are no code or routine items', 
   assert.deepEqual(activeWork(d, noChats), { items: [], waiting: [], engineGenerating: false })
 })
 
-test('the default chat source is the real in-flight chat list (nothing in flight here)', () => {
-  assert.deepEqual(activeWork(depsWith({})), { items: [], waiting: [], engineGenerating: false })
+test("the default chat source is the daemon's own chatTurns: nothing in flight here, then one chat parked on an approval", () => {
+  const d = depsWith({})
+  assert.deepEqual(activeWork(d), { items: [], waiting: [], engineGenerating: false })
+  const ac = new AbortController()
+  d.chatTurns.claim('conv-1', ac, 'reply-1')
+  assert.deepEqual(activeWork(d).items.map((i) => i.id), ['conv-1'])
+  d.chatTurns.setApprovalWait(ac, true, false)
+  const parked = activeWork(d)
+  assert.deepEqual([parked.items.length, parked.waiting.map((i) => i.id)], [0, ['conv-1']])
 })
 
 test('GET /api/v1/activity answers the active work as JSON', async () => {
@@ -165,9 +174,10 @@ function apiDeps(): Deps {
     'laya|q|1': { key: 'laya|q|1', name: 'Laya One', laya: { checkpoints: [] } },
   }
   return {
+    ...chatRegistries(),
     version: 'test',
     bindHost: '0.0.0.0',
-    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '/nonexistent' },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '/nonexistent' },
     manager: {
       currentOpts: () => null,
       restartOpts: () => null,
@@ -311,4 +321,21 @@ test('a chat parked on an approval is not an engine generation, though its turn 
 
   const alsoApi = depsWith({ conversations: { 'chat-2': { title: 'Taxes' } } }, { activeRequests: 2 })
   assert.equal(activeWork(alsoApi, sources).engineGenerating, true, 'an API client\'s request beside it still counts')
+})
+
+// A keep-N pool slot's API traffic is counted on its own Manager (scalability review 1.5), not the primary's.
+test('engineGenerating is true while a pool slot generates and the primary is idle', () => {
+  const d = depsWith({}, { activeRequests: 0 })
+  ;(d.modelRouter as unknown as { poolGenerating: () => boolean }).poolGenerating = () => true
+
+  assert.equal(activeWork(d, noChats).engineGenerating, true)
+})
+
+// A one-shot CLI routine holds its engine between its own requests (Manager.hold, scalability review 4.13): a restart
+// in that gap would kill the CLI's next turn, so the hold is active work, though no request is in flight.
+test('engineGenerating is true while a routine holds the primary between its requests', () => {
+  const d = depsWith({}, { activeRequests: 0 })
+  ;(d.manager as unknown as { hasHolds: () => boolean }).hasHolds = () => true
+
+  assert.equal(activeWork(d, noChats).engineGenerating, true)
 })

@@ -34,6 +34,10 @@ import { resolveServerBinary } from './scan'
 import type { BuildPhase } from './build-state'
 import type { Readable } from 'node:stream'
 import { spawnTethered, tetheredExecFile } from '../util/tether'
+import { withTimeout } from '../util/fetch-timeout'
+
+/** A build patch is a text diff; a download that has not finished in this long is stuck. */
+const PATCH_DOWNLOAD_TIMEOUT_MS = 120_000
 
 // The ldconfig and vswhere probes, tied to the daemon (util/tether.ts): their timeouts are daemon timers.
 const execFileP = tetheredExecFile({ kind: 'probe' })
@@ -1327,7 +1331,7 @@ async function buildFromSource(
     const guard = missingPatchShaError(patchUrl, expectedSha)
     if (guard) throw new Error(guard)
     hooks.log(`Downloading build patch from ${patchUrl} …`)
-    const res = await fetch(patchUrl, { signal })
+    const res = await fetch(patchUrl, { signal: withTimeout(signal, PATCH_DOWNLOAD_TIMEOUT_MS) })
     if (!res.ok) throw new Error(`Failed to download the build patch (HTTP ${res.status} ${res.statusText}) from ${patchUrl}.`)
     const patchBytes = Buffer.from(await res.arrayBuffer())
     const actualSha = sha256Hex(patchBytes)

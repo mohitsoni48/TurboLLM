@@ -12,6 +12,7 @@ import { ComfyGuard } from './comfy-guard'
 import type { FetchImpl } from './comfy-guard'
 import type { StartOpts, Status } from './manager'
 import { tmpDir } from '../test-support/tmp'
+import { COALESCE_WINDOW_MS, eventBus } from '../events/bus'
 
 /** Records the reverse-gate `POST {url}/free` calls so tests can assert on them, and
  *  returns a scripted response. `throws` simulates an unreachable/timed-out ComfyUI. */
@@ -67,7 +68,7 @@ function fakeStore(comfyui: {
 }) {
   const full = { url: '', reverseGate: false, cachePersist: false, ...comfyui }
   return {
-    snapshot: () => ({ comfyui: full, activeEngineId: 'e' }),
+    snapshot: () => ({ comfyui: full, activeEngineId: 'e' }), read: () => ({ comfyui: full, activeEngineId: 'e' }),
     // slot-cache helpers ask the store for the data dir to compute the slot-cache path.
     dir: () => '/tmp/turbollm-test',
   } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
@@ -102,7 +103,7 @@ test('release does not reload the model on an engine the user left during the re
   const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
   let activeEngineId = 'e' // OPTS' engine
   const store = {
-    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }), read: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
     dir: () => '/tmp/turbollm-test',
   } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
   const g = new ComfyGuard(store, mgr as never)
@@ -131,7 +132,7 @@ test('release does not reload the model once the user removed the selected engin
   const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
   let activeEngineId = 'e' // OPTS' engine
   const store = {
-    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }), read: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
     dir: () => '/tmp/turbollm-test',
   } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
   const g = new ComfyGuard(store, mgr as never)
@@ -152,7 +153,7 @@ test('release does not resume a paused load on an engine that is no longer the s
   const { mgr, calls } = fakeManager({ state: 'stopped', opts: null })
   let activeEngineId = 'e'
   const store = {
-    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }), read: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
     dir: () => '/tmp/turbollm-test',
   } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
   const g = new ComfyGuard(store, mgr as never)
@@ -185,7 +186,7 @@ test('modelKeyLoadedOnRelease names no model once the user selects another engin
   const { mgr } = fakeManager({ state: 'running', opts: OPTS('a') })
   let activeEngineId = 'e' // OPTS' engine
   const store = {
-    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }), read: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
     dir: () => '/tmp/turbollm-test',
   } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
   const g = new ComfyGuard(store, mgr as never)
@@ -683,7 +684,7 @@ test("cachePersist: the reload's restore keeps the file a save made during it wr
     return { ok: true, status: 200 }
   }
   const store = {
-    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: true }, activeEngineId: 'e' }),
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: true }, activeEngineId: 'e' }), read: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: true }, activeEngineId: 'e' }),
     dir: () => dataDir,
   } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
   const g = new ComfyGuard(store, mgr as never, undefined, http)
@@ -777,4 +778,22 @@ test('cachePersist: the saved cache is restored only into the model it was saved
   await reload
 
   assert.equal(restores(f.calls).length, 0, "A's cache is not restored into B")
+})
+
+// The status bar explains a paused engine from `comfyui.held`; nothing else announces it turning on or off.
+test('taking and giving back the GPU each announce status', async () => {
+  const heard: string[] = []
+  const unsubscribe = eventBus.subscribe((keys) => heard.push(...keys))
+  try {
+    const { mgr } = fakeManager({ state: 'stopped', opts: null })
+    const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/turbollm_gate' }), mgr as never)
+    await g.acquire()
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50))
+    assert.deepEqual(heard.splice(0), ['status'])
+    await g.release()
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50))
+    assert.deepEqual(heard.splice(0), ['status'])
+  } finally {
+    unsubscribe()
+  }
 })

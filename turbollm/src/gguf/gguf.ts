@@ -2,6 +2,7 @@
 // infos after it — never the tensor data — skipping large arrays (tokenizer vocab) by
 // advancing the file offset rather than materializing them.
 import { closeSync, openSync, readSync } from 'node:fs'
+import { open } from 'node:fs/promises'
 
 export class GgufError extends Error {
   constructor(
@@ -156,13 +157,58 @@ function scalarSize(t: number): number {
   }
 }
 
-// Buffered forward-only reader over a file descriptor.
+/** Where a {@link BufReader}'s bytes come from: up to `n` bytes at file offset `off` (fewer only at the end of the
+ *  file), of which the caller needs at least `need`. */
+type ReadAt = (off: number, n: number, need: number) => Buffer
+
+/** Reads straight from an open file, synchronously. */
+function fdSource(fd: number): ReadAt {
+  return (off, n) => {
+    const tmp = Buffer.alloc(n)
+    return tmp.subarray(0, readSync(fd, tmp, 0, n, off))
+  }
+}
+
+/** The parse needs `need` bytes at file offset `off`, which no window of a {@link windowSource} holds; `n` is how many
+ *  it would like to read there. */
+class NeedMore extends Error {
+  constructor(
+    readonly off: number,
+    readonly need: number,
+    readonly n: number,
+  ) {
+    super('GGUF header read needs more bytes')
+  }
+}
+
+/** A stretch of the file already read: `eof` when the file ends with it. */
+interface Window {
+  start: number
+  bytes: Buffer
+  eof: boolean
+}
+
+/** Reads from windows of the file already in memory, throwing {@link NeedMore} for bytes none holds, so an async
+ *  caller can read just that stretch and parse again. Bytes the parse skips are in no window. */
+function windowSource(windows: Window[]): ReadAt {
+  return (off, n, need) => {
+    for (const w of windows) {
+      const end = w.start + w.bytes.length
+      if (off < w.start || off > end) continue
+      if (!w.eof && end - off < need) continue
+      return w.bytes.subarray(off - w.start, Math.min(off - w.start + n, w.bytes.length))
+    }
+    throw new NeedMore(off, need, n)
+  }
+}
+
+// Buffered forward-only reader over a ReadAt source.
 class BufReader {
   private buf = Buffer.alloc(0)
   private pos = 0
   private fileOff = 0
   constructor(
-    private fd: number,
+    private read: ReadAt,
     private chunk = 1 << 22, // 4 MB
   ) {}
 
@@ -170,10 +216,9 @@ class BufReader {
     if (this.buf.length - this.pos >= need) return
     const remaining = this.buf.subarray(this.pos)
     const toRead = Math.max(this.chunk, need - remaining.length)
-    const tmp = Buffer.alloc(toRead)
-    const r = readSync(this.fd, tmp, 0, toRead, this.fileOff + this.buf.length)
+    const got = this.read(this.fileOff + this.buf.length, toRead, need - remaining.length)
     this.fileOff += this.pos
-    this.buf = Buffer.concat([remaining, tmp.subarray(0, r)])
+    this.buf = Buffer.concat([remaining, got])
     this.pos = 0
     if (this.buf.length < need) throw new GgufError('truncated', 'Unexpected EOF in GGUF header.')
   }
@@ -198,6 +243,16 @@ class BufReader {
   /** The file offset of the next byte to read. */
   offset(): number {
     return this.fileOff + this.pos
+  }
+  /** Skips `count` length-prefixed strings (an array's elements: the vocab and merges that dominate a header)
+   *  without a BigInt or a string per element. */
+  skipStrings(count: number): void {
+    for (let i = 0; i < count; i++) {
+      this.fill(8)
+      const len = this.buf.readUInt32LE(this.pos) + this.buf.readUInt32LE(this.pos + 4) * 4294967296
+      this.pos += 8
+      this.skip(len)
+    }
   }
   skip(n: number): void {
     const buffered = this.buf.length - this.pos
@@ -239,7 +294,7 @@ function skipValue(r: BufReader, t: number): void {
     const elemType = r.u32()
     const count = r.u64()
     if (elemType === T_STRING) {
-      for (let i = 0; i < count; i++) r.skip(r.u64())
+      r.skipStrings(count)
     } else {
       r.skip(count * scalarSize(elemType))
     }
@@ -302,115 +357,154 @@ function readBoolArray(r: BufReader, t: number): boolean[] {
 export function parseGguf(path: string): GgufMeta {
   const fd = openSync(path, 'r')
   try {
-    const r = new BufReader(fd)
-    if (r.u32() !== MAGIC) throw new GgufError('not_gguf', 'Not a GGUF file.')
-    const version = r.u32()
-    if (version !== 2 && version !== 3) throw new GgufError('bad_version', `Unsupported GGUF version ${version}.`)
-    const tensorCount = r.u64()
-    const kvCount = r.u64()
-    let alignment = DEFAULT_ALIGNMENT
-
-    const m: Partial<GgufMeta> = { hasChatTemplate: false }
-    // key_length/value_length are usually equal (both = the real per-head dim); tracked
-    // separately since a GGUF can in principle declare only one.
-    let keyLength: number | undefined
-    let valueLength: number | undefined
-    // Same pairing for the sliding-window variants of those two keys.
-    let keyLengthSwa: number | undefined
-    let valueLengthSwa: number | undefined
-    for (let i = 0; i < kvCount; i++) {
-      const key = r.str()
-      const t = r.u32()
-      if (key === 'general.architecture') m.arch = String(readScalar(r, t))
-      else if (key === 'general.name') {
-        const v = String(readScalar(r, t))
-        if (!BOGUS_GENERAL_NAMES.has(v.toLowerCase())) m.name = v
-      }
-      else if (key === 'general.file_type') m.quant = FTYPE[Number(readScalar(r, t))] ?? ''
-      else if (key === 'general.size_label') m.sizeLabel = String(readScalar(r, t))
-      else if (key === 'general.alignment') alignment = Number(readScalar(r, t))
-      else if (key.endsWith('.context_length')) m.nativeCtx = readNumberOrMax(r, t)
-      else if (key.endsWith('.block_count')) m.blockCount = readNumberOrMax(r, t)
-      else if (key.endsWith('.embedding_length')) m.embedLen = readNumberOrMax(r, t)
-      else if (key.endsWith('.attention.head_count_kv')) {
-        // Scalar on most architectures, a per-layer array on Gemma 4's 26B-A4B. Keep the
-        // max as the scalar `headCountKv` (unchanged behaviour) and additionally retain
-        // the array, since collapsing [8,8,8,8,8,2,…] to 8 assigns the global layers 4x
-        // the KV heads they actually use.
-        const kv = readNumberList(r, t)
-        m.headCountKv = maxOf(kv.values)
-        if (kv.isArray) m.headCountKvPerLayer = kv.values
-      }
-      else if (key.endsWith('.attention.key_length')) keyLength = readNumberOrMax(r, t)
-      else if (key.endsWith('.attention.value_length')) valueLength = readNumberOrMax(r, t)
-      else if (key.endsWith('.attention.key_length_swa')) keyLengthSwa = readNumberOrMax(r, t)
-      else if (key.endsWith('.attention.value_length_swa')) valueLengthSwa = readNumberOrMax(r, t)
-      else if (key.endsWith('.attention.sliding_window')) m.slidingWindow = readNumberOrMax(r, t)
-      else if (key.endsWith('.attention.sliding_window_pattern')) m.slidingWindowPattern = readBoolArray(r, t)
-      else if (key.endsWith('.full_attention_interval')) m.fullAttentionInterval = readNumberOrMax(r, t)
-      else if (key.endsWith('.ssm.inner_size')) m.ssmInnerSize = readNumberOrMax(r, t)
-      else if (key.endsWith('.ssm.state_size')) m.ssmStateSize = readNumberOrMax(r, t)
-      else if (key.endsWith('.ssm.conv_kernel')) m.ssmConvKernel = readNumberOrMax(r, t)
-      else if (key.endsWith('.expert_count')) m.expertCount = readNumberOrMax(r, t)
-      else if (key.endsWith('.nextn_predict_layers')) m.nextnLayers = readNumberOrMax(r, t)
-      else if (key === 'tokenizer.chat_template') {
-        m.hasChatTemplate = true
-        // A single string value (spec 04 §3) — cheap to materialize (tens of KB at most)
-        // and read for capability flags, unlike the vocab/merges arrays this parser
-        // otherwise skips without materializing.
-        const template = t === T_STRING ? String(readScalar(r, t)) : (skipValue(r, t), '')
-        if (template.includes('reasoning_effort')) m.reasoningEffort = true
-      } else {
-        skipValue(r, t)
-      }
-    }
-
-    // The tensor infos: name, dims, type, offset (relative to the data section). A file cut off
-    // inside them throws 'truncated' here, as one cut off inside the KV block always did.
-    let tensorsEnd = 0
-    let known = Number.isInteger(alignment) && alignment > 0 && (alignment & (alignment - 1)) === 0
-    for (let i = 0; i < tensorCount; i++) {
-      r.skip(r.u64()) // name
-      const nDims = r.u32()
-      if (nDims > MAX_DIMS) {
-        known = false
-        break
-      }
-      let elements = 1
-      for (let d = 0; d < nDims; d++) elements *= r.u64()
-      const size = TYPE_SIZES[r.u32()]
-      const offset = r.u64()
-      if (!size || elements % size[0] !== 0) known = false
-      else tensorsEnd = Math.max(tensorsEnd, offset + (elements / size[0]) * size[1])
-    }
-    const dataStart = Math.ceil(r.offset() / alignment) * alignment
-
-    return {
-      arch: m.arch ?? 'unknown',
-      name: m.name ?? '',
-      quant: m.quant ?? '',
-      sizeLabel: m.sizeLabel ?? '',
-      nativeCtx: m.nativeCtx ?? 0,
-      blockCount: m.blockCount ?? 0,
-      embedLen: m.embedLen ?? 0,
-      headCountKv: m.headCountKv ?? 0,
-      headDim: keyLength ?? valueLength ?? 0,
-      expertCount: m.expertCount ?? 0,
-      nextnLayers: m.nextnLayers ?? 0,
-      hasChatTemplate: m.hasChatTemplate ?? false,
-      reasoningEffort: m.reasoningEffort ?? false,
-      slidingWindow: m.slidingWindow ?? 0,
-      slidingWindowPattern: m.slidingWindowPattern ?? [],
-      headDimSwa: keyLengthSwa ?? valueLengthSwa ?? 0,
-      headCountKvPerLayer: m.headCountKvPerLayer ?? [],
-      fullAttentionInterval: m.fullAttentionInterval ?? 0,
-      ssmInnerSize: m.ssmInnerSize ?? 0,
-      ssmStateSize: m.ssmStateSize ?? 0,
-      ssmConvKernel: m.ssmConvKernel ?? 0,
-      dataEnd: tensorCount === 0 ? r.offset() : known ? dataStart + tensorsEnd : 0,
-    }
+    return parseHeader(new BufReader(fdSource(fd)))
   } finally {
     closeSync(fd)
+  }
+}
+
+/** The most bytes {@link parseGgufAsync} reads of one file. A real header (with a 150k-token vocabulary) is a few MB;
+ *  a file that wants more is not one a model scan should hold memory for. */
+export const MAX_ASYNC_HEADER_READ = 256 * 1024 * 1024
+
+/** {@link parseGguf} without blocking the event loop: the header's bytes are read with async file reads, so a slow
+ *  disk or NAS stalls only this call. It parses from the windows read so far and, when the parse needs bytes no
+ *  window holds, reads just those (at the offset it reached, so what the parse skips is never read) and parses
+ *  again, within `maxRead` bytes. */
+export async function parseGgufAsync(path: string, maxRead = MAX_ASYNC_HEADER_READ): Promise<GgufMeta> {
+  const fh = await open(path, 'r')
+  try {
+    const windows: Window[] = []
+    let budget = maxRead
+    for (;;) {
+      try {
+        return parseHeader(new BufReader(windowSource(windows)))
+      } catch (e) {
+        if (!(e instanceof NeedMore)) throw e
+        if (e.need > budget) throw new GgufError('too_large', 'GGUF header is too large to read.')
+        const want = Math.min(e.n, budget)
+        const bytes = Buffer.alloc(want)
+        let have = 0
+        while (have < want) {
+          const { bytesRead } = await fh.read(bytes, have, want - have, e.off + have)
+          if (bytesRead === 0) break
+          have += bytesRead
+        }
+        budget -= have
+        windows.push({ start: e.off, bytes: bytes.subarray(0, have), eof: have < want })
+      }
+    }
+  } finally {
+    await fh.close()
+  }
+}
+
+function parseHeader(r: BufReader): GgufMeta {
+  if (r.u32() !== MAGIC) throw new GgufError('not_gguf', 'Not a GGUF file.')
+  const version = r.u32()
+  if (version !== 2 && version !== 3) throw new GgufError('bad_version', `Unsupported GGUF version ${version}.`)
+  const tensorCount = r.u64()
+  const kvCount = r.u64()
+  let alignment = DEFAULT_ALIGNMENT
+
+  const m: Partial<GgufMeta> = { hasChatTemplate: false }
+  // key_length/value_length are usually equal (both = the real per-head dim); tracked
+  // separately since a GGUF can in principle declare only one.
+  let keyLength: number | undefined
+  let valueLength: number | undefined
+  // Same pairing for the sliding-window variants of those two keys.
+  let keyLengthSwa: number | undefined
+  let valueLengthSwa: number | undefined
+  for (let i = 0; i < kvCount; i++) {
+    const key = r.str()
+    const t = r.u32()
+    if (key === 'general.architecture') m.arch = String(readScalar(r, t))
+    else if (key === 'general.name') {
+      const v = String(readScalar(r, t))
+      if (!BOGUS_GENERAL_NAMES.has(v.toLowerCase())) m.name = v
+    }
+    else if (key === 'general.file_type') m.quant = FTYPE[Number(readScalar(r, t))] ?? ''
+    else if (key === 'general.size_label') m.sizeLabel = String(readScalar(r, t))
+    else if (key === 'general.alignment') alignment = Number(readScalar(r, t))
+    else if (key.endsWith('.context_length')) m.nativeCtx = readNumberOrMax(r, t)
+    else if (key.endsWith('.block_count')) m.blockCount = readNumberOrMax(r, t)
+    else if (key.endsWith('.embedding_length')) m.embedLen = readNumberOrMax(r, t)
+    else if (key.endsWith('.attention.head_count_kv')) {
+      // Scalar on most architectures, a per-layer array on Gemma 4's 26B-A4B. Keep the
+      // max as the scalar `headCountKv` (unchanged behaviour) and additionally retain
+      // the array, since collapsing [8,8,8,8,8,2,…] to 8 assigns the global layers 4x
+      // the KV heads they actually use.
+      const kv = readNumberList(r, t)
+      m.headCountKv = maxOf(kv.values)
+      if (kv.isArray) m.headCountKvPerLayer = kv.values
+    }
+    else if (key.endsWith('.attention.key_length')) keyLength = readNumberOrMax(r, t)
+    else if (key.endsWith('.attention.value_length')) valueLength = readNumberOrMax(r, t)
+    else if (key.endsWith('.attention.key_length_swa')) keyLengthSwa = readNumberOrMax(r, t)
+    else if (key.endsWith('.attention.value_length_swa')) valueLengthSwa = readNumberOrMax(r, t)
+    else if (key.endsWith('.attention.sliding_window')) m.slidingWindow = readNumberOrMax(r, t)
+    else if (key.endsWith('.attention.sliding_window_pattern')) m.slidingWindowPattern = readBoolArray(r, t)
+    else if (key.endsWith('.full_attention_interval')) m.fullAttentionInterval = readNumberOrMax(r, t)
+    else if (key.endsWith('.ssm.inner_size')) m.ssmInnerSize = readNumberOrMax(r, t)
+    else if (key.endsWith('.ssm.state_size')) m.ssmStateSize = readNumberOrMax(r, t)
+    else if (key.endsWith('.ssm.conv_kernel')) m.ssmConvKernel = readNumberOrMax(r, t)
+    else if (key.endsWith('.expert_count')) m.expertCount = readNumberOrMax(r, t)
+    else if (key.endsWith('.nextn_predict_layers')) m.nextnLayers = readNumberOrMax(r, t)
+    else if (key === 'tokenizer.chat_template') {
+      m.hasChatTemplate = true
+      // A single string value (spec 04 §3) — cheap to materialize (tens of KB at most)
+      // and read for capability flags, unlike the vocab/merges arrays this parser
+      // otherwise skips without materializing.
+      const template = t === T_STRING ? String(readScalar(r, t)) : (skipValue(r, t), '')
+      if (template.includes('reasoning_effort')) m.reasoningEffort = true
+    } else {
+      skipValue(r, t)
+    }
+  }
+
+  // The tensor infos: name, dims, type, offset (relative to the data section). A file cut off
+  // inside them throws 'truncated' here, as one cut off inside the KV block always did.
+  let tensorsEnd = 0
+  let known = Number.isInteger(alignment) && alignment > 0 && (alignment & (alignment - 1)) === 0
+  for (let i = 0; i < tensorCount; i++) {
+    r.skip(r.u64()) // name
+    const nDims = r.u32()
+    if (nDims > MAX_DIMS) {
+      known = false
+      break
+    }
+    let elements = 1
+    for (let d = 0; d < nDims; d++) elements *= r.u64()
+    const size = TYPE_SIZES[r.u32()]
+    const offset = r.u64()
+    if (!size || elements % size[0] !== 0) known = false
+    else tensorsEnd = Math.max(tensorsEnd, offset + (elements / size[0]) * size[1])
+  }
+  const dataStart = Math.ceil(r.offset() / alignment) * alignment
+
+  return {
+    arch: m.arch ?? 'unknown',
+    name: m.name ?? '',
+    quant: m.quant ?? '',
+    sizeLabel: m.sizeLabel ?? '',
+    nativeCtx: m.nativeCtx ?? 0,
+    blockCount: m.blockCount ?? 0,
+    embedLen: m.embedLen ?? 0,
+    headCountKv: m.headCountKv ?? 0,
+    headDim: keyLength ?? valueLength ?? 0,
+    expertCount: m.expertCount ?? 0,
+    nextnLayers: m.nextnLayers ?? 0,
+    hasChatTemplate: m.hasChatTemplate ?? false,
+    reasoningEffort: m.reasoningEffort ?? false,
+    slidingWindow: m.slidingWindow ?? 0,
+    slidingWindowPattern: m.slidingWindowPattern ?? [],
+    headDimSwa: keyLengthSwa ?? valueLengthSwa ?? 0,
+    headCountKvPerLayer: m.headCountKvPerLayer ?? [],
+    fullAttentionInterval: m.fullAttentionInterval ?? 0,
+    ssmInnerSize: m.ssmInnerSize ?? 0,
+    ssmStateSize: m.ssmStateSize ?? 0,
+    ssmConvKernel: m.ssmConvKernel ?? 0,
+    dataEnd: tensorCount === 0 ? r.offset() : known ? dataStart + tensorsEnd : 0,
   }
 }
 

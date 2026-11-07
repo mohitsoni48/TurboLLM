@@ -31,7 +31,7 @@ function makeDeps(): { d: Deps; store: ConversationStore; dir: string } {
     // autoGenerateTitles: false — this test verifies reconnect/queue mechanics, not auto-title
     // (which pump() now also fires post-run, see code-run-manager.ts); off keeps it a no-op
     // here instead of also needing a fetch mock for the title-generation completions call.
-    store: { dir: () => dir, snapshot: () => ({ daemon: { autoGenerateTitles: false } }) },
+    store: { dir: () => dir, snapshot: () => ({ daemon: { autoGenerateTitles: false } }), read: () => ({ daemon: { autoGenerateTitles: false } }) },
   } as unknown as Deps
   return { d, store, dir }
 }
@@ -297,7 +297,7 @@ test('POST /stop also removes the queued follow-ups\' messages: the next turn do
   const routeDeps = {
     ...d,
     manager: { status: () => ({ state: 'running', model: { key: 'test-model' } }), target: () => ({ host: '127.0.0.1', port: 1 }) },
-    store: { ...d.store, snapshot: () => ({ daemon: { autoGenerateTitles: false }, code: { defaultAgent: 'turbollm' } }) },
+    store: { ...d.store, snapshot: () => ({ daemon: { autoGenerateTitles: false }, code: { defaultAgent: 'turbollm' } }), read: () => ({ daemon: { autoGenerateTitles: false }, code: { defaultAgent: 'turbollm' } }) },
   } as unknown as Deps
   const histories: Record<string, string[]> = {}
   const steered: string[] = []
@@ -673,7 +673,7 @@ test('a re-run of a message (no content) is sent the history before the question
   const routeDeps = {
     ...d,
     manager: { status: () => ({ state: 'running', model: { key: 'test-model' } }), target: () => ({ host: '127.0.0.1', port: 1 }) },
-    store: { ...d.store, snapshot: () => ({ daemon: { autoGenerateTitles: false }, code: { defaultAgent: 'turbollm' } }) },
+    store: { ...d.store, snapshot: () => ({ daemon: { autoGenerateTitles: false }, code: { defaultAgent: 'turbollm' } }), read: () => ({ daemon: { autoGenerateTitles: false }, code: { defaultAgent: 'turbollm' } }) },
   } as unknown as Deps
   const turns: Array<{ task: string; history: string[] }> = []
   let releaseFirst: (() => void) | undefined

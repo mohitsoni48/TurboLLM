@@ -33,7 +33,7 @@ function mkDeps(bindHost: string): Deps {
   const cfg = defaultConfig() // requireApiKey: true, lanBind: false — a plain `--addr <ip>:<port>`
   return {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '.' },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '.' },
     db,
     telemetry: { firstUse: () => {}, useFeature: () => {} },
     bindHost,

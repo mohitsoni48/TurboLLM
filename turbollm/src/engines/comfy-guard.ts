@@ -28,6 +28,7 @@ import { existsSync } from 'node:fs'
 import type { ConfigStore, Engine } from '../config/config'
 import { LoadPausedError, type Manager, type StartOpts } from './manager'
 import { cacheEligible, restoreSlot, SAVE_CAP_MS, saveSlot, slotCacheDir, slotCacheKey, TTL_MS } from './slot-cache'
+import { emitInvalidation } from '../events/bus'
 
 /** The subset of the global `fetch` the reverse gate needs. Injectable so tests can
  *  assert the call without hitting the network (production defaults to global fetch). */
@@ -163,6 +164,12 @@ export class ComfyGuard {
     return this.enabled() && this.held
   }
 
+  /** Whether ComfyUI holds the GPU, as /status shows it (`comfyui.held`): announced, since nothing else says so. */
+  private holdGpu(held: boolean): void {
+    this.held = held
+    emitInvalidation('status')
+  }
+
   /** ComfyUI is starting/continuing a render: free the GPU and block loads. Resolves
    *  once VRAM is actually free, so the caller (ComfyUI) can safely begin executing.
    *  Idempotent — repeated calls just refresh the crash-recovery lease. */
@@ -230,7 +237,7 @@ export class ComfyGuard {
       // reloads it on demand, which takes auto-swap on and a caller allowed to load models. Otherwise
       // it stays unloaded after the render until the user loads it again.
       await this.stopPoolSlots?.()
-      this.held = true
+      this.holdGpu(true)
     })()
     try {
       await this.acquiring
@@ -249,7 +256,7 @@ export class ComfyGuard {
     this.clearLease()
     this.lastSignalAt = Date.now()
     if (!this.held && !this.suspended) return Promise.resolve()
-    this.held = false
+    this.holdGpu(false)
     const opts = this.suspended
     const report = this.suspendedLoad
     this.suspended = null

@@ -3,7 +3,7 @@
 // resume (.part + Range), max 2 concurrent, disk-space pre-check, manifest
 // persistence across daemon restarts, and a scan trigger on completion. Fail-safe:
 // a failed job sets status='error' with a message and never crashes the daemon.
-import { createHash } from 'node:crypto'
+import { createHash, type Hash } from 'node:crypto'
 import {
   closeSync,
   createReadStream,
@@ -22,13 +22,15 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import type { ConfigStore } from '../config/config'
+import { DOWNLOAD_CONCURRENCY } from '../config/config-bounds'
 import { ggufCutShort } from '../gguf/gguf'
 import type { HfModelFiles } from '../hf/hf'
 import { httpGet, type DownloadGet } from './http-get'
+import { emitInvalidation } from '../events/bus'
 
 export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'done' | 'error' | 'cancelled'
 
@@ -100,7 +102,14 @@ export interface ProvenanceEntry {
   at: string
 }
 
-const MAX_CONCURRENT = 2
+/** Files downloading at once when `downloadConcurrency` is unset (spec 10): the config default, config-bounds.ts. */
+const MAX_CONCURRENT = DOWNLOAD_CONCURRENCY.default
+/** Resume prefixes read from disk at once: resuming many paused rows would otherwise open a read stream per row. */
+const MAX_PREFIX_HASHES = 2
+
+/** While other files of a multi-file download are still in flight, a finished file's rescan of the model folders is
+ *  held back this long (one rescan covers every file finished by then). The last file to finish rescans at once. */
+export const RESCAN_INTERVAL_MS = 15_000
 
 /** How long a downloading row may receive no bytes before {@link DownloadManager.list} reads its
  *  speed as 0. The speed is measured over at least 500 ms as bytes arrive, so a few seconds of
@@ -121,6 +130,11 @@ export function setDownloadGetForTests(get: DownloadGet): void {
 /** Statuses whose record still owns its .part (writing it, or able to resume from it) — the
  *  same set {@link DownloadManager.liveAt} treats as live. */
 const LIVE: DownloadStatus[] = ['queued', 'downloading', 'paused']
+
+/** How many finished rows (done, cancelled) the manager keeps for the Downloads panel. Past it the oldest
+ *  go when the next row is created; a daemon up for weeks otherwise held every download it ever ran, and
+ *  list()/pump() walked them all on every poll. Queued, downloading and paused rows are never dropped. */
+export const MAX_TERMINAL_RECORDS = 200
 
 /** The most files a whole-folder download's `folder` may list. The web sends a model folder's
  *  own files (a repo's root components, or one checkpoint's): tens, or a few hundred for the
@@ -175,7 +189,14 @@ export class DownloadError extends Error {
 }
 
 export class DownloadManager {
+  /** Every row, in creation order (a Map iterates in insertion order and rows are only ever added at the end, so
+   *  list() needs no sort). */
   private records = new Map<string, DownloadRecord>()
+  /** The rows that are or were live (queued/downloading/paused) at each dest, keyed by {@link destKey}: liveAt's
+   *  lookup, which a 4096-file folder download made once per file against every row. A dest can have several (an
+   *  errored row resumed next to a paused one), so each is a set. Rows are added where they become live (commit,
+   *  resume, restore) and removed by {@link forget}; one that stopped being live is checked for at lookup. */
+  private liveByDest = new Map<string, Set<DownloadRecord>>()
   private controllers = new Map<string, AbortController>()
   /** Each row's run() until it has returned, which is after its write stream has closed the
    *  .part (pipeline() settles only once every stream has): what {@link dropPart} waits on. */
@@ -186,6 +207,11 @@ export class DownloadManager {
   private nextSeq = 0
   /** When each row being streamed last received body bytes (Date.now()), for list()'s stall check. */
   private lastDataAt = new Map<string, number>()
+  /** Each queued resume's .part prefix, hashed while the row waits (see {@link startPrefixHash}): `done` flips when the
+   *  hash has settled, `hash` is null when it could not be taken (run() then hashes the prefix itself). */
+  private prefixHashes = new Map<string, { done: boolean; bytes: number; hash: Hash | null }>()
+  /** The held-back rescan of {@link requestRescan}, or null when none is pending. */
+  private rescanTimer: ReturnType<typeof setTimeout> | null = null
 
   /** Optional observer for a download's terminal outcome, wired in cli.ts to
    *  the `model_downloaded` event (spec 23 §4 — promoted out of
@@ -248,7 +274,7 @@ export class DownloadManager {
         r.bytesPerSec = 0
       }
     }
-    return [...this.records.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    return [...this.records.values()]
   }
 
   /** Enqueue a download. Validates the target + disk space, persists, then kicks the
@@ -412,10 +438,33 @@ export class DownloadManager {
    *  system compares names, {@link sameDest}), if any — the guard against two concurrent writers
    *  corrupting one file. Terminal records (done/cancelled/error) don't block a fresh attempt. */
   private liveAt(dest: string): DownloadRecord | undefined {
-    for (const r of this.records.values()) {
-      if (sameDest(r.dest, dest) && (r.status === 'queued' || r.status === 'downloading' || r.status === 'paused')) return r
+    for (const r of this.liveByDest.get(destKey(dest)) ?? []) {
+      if (LIVE.includes(r.status) && sameDest(r.dest, dest)) return r
     }
     return undefined
+  }
+
+  /** Record `rec` as holding its dest (see {@link liveByDest}). */
+  private indexLive(rec: DownloadRecord): void {
+    const key = destKey(rec.dest)
+    const rows = this.liveByDest.get(key)
+    if (rows) rows.add(rec)
+    else this.liveByDest.set(key, new Set([rec]))
+  }
+
+  /** Drop the oldest done and cancelled rows beyond {@link MAX_TERMINAL_RECORDS}. An errored row stays: it still
+   *  owns a .part that resume() can continue and that forget() would orphan on disk. */
+  private trimTerminal(): void {
+    const droppable = (r: DownloadRecord) => r.status === 'done' || r.status === 'cancelled'
+    let excess = -MAX_TERMINAL_RECORDS
+    for (const r of this.records.values()) if (droppable(r)) excess++
+    if (excess <= 0) return
+    for (const r of this.records.values()) {
+      if (excess === 0) break
+      if (!droppable(r)) continue
+      this.forget(r)
+      excess--
+    }
   }
 
   /** What is left to fetch of the whole-folder download `folder` names: the total of its files
@@ -488,8 +537,10 @@ export class DownloadManager {
         createdAt: new Date().toISOString(),
       }
       this.records.set(id, rec)
+      this.indexLive(rec)
       created.push(rec)
     }
+    this.trimTerminal()
     this.persist()
     this.pump()
     return created
@@ -562,6 +613,7 @@ export class DownloadManager {
     if (!rec) return false
     this.controllers.get(id)?.abort()
     this.controllers.delete(id)
+    this.prefixHashes.delete(id)
     if (rec.status !== 'done') {
       rec.status = 'cancelled'
       rec.bytesPerSec = 0
@@ -632,8 +684,11 @@ export class DownloadManager {
     if (this.sharesDest(rec, ['queued', 'downloading'])) {
       throw new DownloadError('download_in_progress', 'Another download is already writing this file.')
     }
+    // Its unwritten bytes were claimed by nobody while it was paused: they must still fit beside the live rows.
+    this.assertDisk(dirname(rec.dest), Math.max(0, rec.total - rec.received), rec)
     rec.status = 'queued'
     rec.error = null
+    this.indexLive(rec)
     this.persist()
     this.pump()
     return true
@@ -646,10 +701,20 @@ export class DownloadManager {
     this.controllers.get(id)?.abort()
     this.controllers.delete(id)
     if (rec.status !== 'done') this.dropPart(rec)
-    this.records.delete(id)
+    this.forget(rec)
     this.persist()
     this.pump()
     return true
+  }
+
+  /** Drop a row and what indexes it. */
+  private forget(rec: DownloadRecord): void {
+    this.records.delete(rec.id)
+    this.lastDataAt.delete(rec.id)
+    this.prefixHashes.delete(rec.id)
+    const key = destKey(rec.dest)
+    const rows = this.liveByDest.get(key)
+    if (rows?.delete(rec) && rows.size === 0) this.liveByDest.delete(key)
   }
 
   /** Delete the .part of a row being cancelled or removed, unless another live row holds the
@@ -690,9 +755,12 @@ export class DownloadManager {
       : (cfg.modelDirs[0] ?? '')
   }
 
-  /** Disk-space guard (spec 10 §6): require free ≥ size × 1.1. Best-effort — skips
-   *  the check (does not block) when free space can't be determined. */
-  private assertDisk(dir: string, size: number): void {
+  /** Disk-space guard (spec 10 §6): require free ≥ size × 1.1, after the bytes every OTHER queued or downloading row
+   *  on the same volume still has to write: two shards that each fit alone would otherwise start together and fill
+   *  the disk (and with it the config and SQLite writes beside the models). `self` is the row being checked at run
+   *  start, which is not its own competitor. Best-effort — skips the check (does not block) when free space can't be
+   *  determined. */
+  private assertDisk(dir: string, size: number, self?: DownloadRecord): void {
     let free: number
     try {
       const st = statfsSync(dir)
@@ -700,24 +768,52 @@ export class DownloadManager {
     } catch {
       return // can't measure → don't block
     }
+    free -= this.unwrittenOnVolume(dir, self)
     const need = size * 1.1
     if (free < need) {
       throw new DownloadError(
         'insufficient_disk',
-        `Not enough free disk space: need ~${gb(need)} GB, only ${gb(free)} GB free.`,
+        `Not enough free disk space: need ~${gb(need)} GB, only ${gb(Math.max(0, free))} GB free.`,
       )
     }
   }
 
+  /** What the queued and downloading rows other than `self` still have to write to the volume holding `dir`. */
+  private unwrittenOnVolume(dir: string, self?: DownloadRecord): number {
+    const volume = volumeOf(dir)
+    const volumes = new Map<string, string>() // per folder: a 4096-file folder has a few folders, not 4096 stats
+    let bytes = 0
+    for (const r of this.records.values()) {
+      if (r === self || (r.status !== 'queued' && r.status !== 'downloading')) continue
+      const folder = dirname(r.dest)
+      let v = volumes.get(folder)
+      if (v === undefined) volumes.set(folder, (v = volumeOf(folder)))
+      if (v === volume) bytes += Math.max(0, r.total - r.received)
+    }
+    return bytes
+  }
+
+  /** Files downloading at once: `downloadConcurrency` (config-bounds.ts), read per pump so a changed value applies to the next start. */
+  private maxConcurrent(): number {
+    const n = this.store.read().downloadConcurrency
+    return typeof n === 'number' && Number.isInteger(n) && n >= DOWNLOAD_CONCURRENCY.min && n <= DOWNLOAD_CONCURRENCY.max
+      ? n
+      : MAX_CONCURRENT
+  }
+
   /** Start queued jobs up to the concurrency cap. */
   private pump(): void {
-    if (this.activeCount() >= MAX_CONCURRENT) return
-    for (const rec of this.list()) {
-      if (this.activeCount() >= MAX_CONCURRENT) break
+    const cap = this.maxConcurrent()
+    if (this.activeCount() >= cap) return
+    for (const rec of this.records.values()) {
+      if (this.activeCount() >= cap) break
       // Not while a run of this row is still ending (paused, then resumed before its aborted
       // stream closed the .part): two runs would append to one file. That run's own pump()
       // starts it once it has ended.
       if (rec.status === 'queued' && !this.controllers.has(rec.id)) {
+        // A resume's checksum covers the prefix already on disk: hashed first, while the row waits, so a large .part
+        // is not read while holding a slot. The row is picked up again when the hash settles.
+        if (this.startPrefixHash(rec)) continue
         const run = this.run(rec)
         this.runs.set(rec.id, run)
         const ended = (): void => {
@@ -726,6 +822,44 @@ export class DownloadManager {
         void run.then(ended, ended)
       }
     }
+  }
+
+  /** True while `rec`'s .part prefix is still being hashed (started here on the first call) and the row must wait: only a
+   *  row with a sha256 and a non-empty .part has one. It hashes the first `bytes` of a file nothing writes while its row
+   *  is queued; run() uses the hash only when the .part is still exactly that long. */
+  private startPrefixHash(rec: DownloadRecord): boolean {
+    if (!rec.sha256) return false
+    const known = this.prefixHashes.get(rec.id)
+    if (known) return !known.done
+    if (this.hashingCount() >= MAX_PREFIX_HASHES) return true // waits its turn; the hash that ends pumps again
+    const part = `${rec.dest}.part`
+    let bytes = 0
+    try {
+      bytes = statSync(part).size
+    } catch {
+      return false
+    }
+    if (bytes === 0) return false
+    const entry = { done: false, bytes, hash: null as Hash | null }
+    this.prefixHashes.set(rec.id, entry)
+    const hash = createHash('sha256')
+    void (async () => {
+      try {
+        for await (const chunk of createReadStream(part, { end: bytes - 1 })) hash.update(chunk as Buffer)
+        entry.hash = hash
+      } catch {
+        /* unreadable now: run() hashes (and reports) it itself */
+      }
+      entry.done = true
+      this.pump()
+    })()
+    return true
+  }
+
+  private hashingCount(): number {
+    let n = 0
+    for (const h of this.prefixHashes.values()) if (!h.done) n++
+    return n
   }
 
   private async run(rec: DownloadRecord): Promise<void> {
@@ -751,8 +885,11 @@ export class DownloadManager {
       // (streamed, never buffered whole): a stale or corrupt prefix then fails the checksum
       // instead of being spliced onto the new bytes and accepted as done. Done BEFORE the
       // request so a large prefix never holds an open response idle.
+      const prefix = this.prefixHashes.get(rec.id)
+      this.prefixHashes.delete(rec.id)
       let hash = rec.sha256 ? createHash('sha256') : null
-      if (hash && startAt > 0) {
+      if (hash && prefix?.hash && prefix.bytes === startAt) hash = prefix.hash // hashed while the row was queued
+      else if (hash && startAt > 0) {
         for await (const chunk of createReadStream(part, { end: startAt - 1 })) {
           if (ac.signal.aborted) break // cancelled mid-hash: the GET below rejects with AbortError
           hash.update(chunk as Buffer)
@@ -901,7 +1038,7 @@ export class DownloadManager {
       // unavailable (sizes 0), both skip the enqueue-time check. Verifying the remaining
       // bytes here fails a too-large download cleanly (status=error) before writing any,
       // instead of silently filling the disk.
-      if (clen > 0) this.assertDisk(dirname(part), clen)
+      if (clen > 0) this.assertDisk(dirname(part), clen, rec)
 
       const verifyHash = hash !== null
 
@@ -998,6 +1135,9 @@ export class DownloadManager {
       this.settle(rec.status === 'cancelled' ? 'cancelled' : 'fail')
     } finally {
       this.lastDataAt.delete(rec.id)
+      this.prefixHashes.delete(rec.id)
+      // The file that ends a group by failing or being cancelled still owes the rescan the finished ones held back.
+      if (this.rescanTimer && !this.hasUnsettledWork()) this.flushRescan()
       this.pump()
     }
   }
@@ -1012,12 +1152,32 @@ export class DownloadManager {
     this.controllers.delete(rec.id)
     this.recordProvenance(rec)
     this.persist()
+    this.requestRescan()
+    this.settle('ok')
+  }
+
+  /** Ask for the library rescan a finished file needs. Alone (no other file queued or downloading) it runs at once; mid
+   *  way through a multi-file download (up to MAX_FOLDER_FILES files, or split shards) it is held back to one per
+   *  {@link RESCAN_INTERVAL_MS}, and the last file to settle flushes it: a full walk of every model folder per file
+   *  was O(files x library). */
+  private requestRescan(): void {
+    if (this.hasUnsettledWork()) this.rescanTimer ??= setTimeout(() => this.flushRescan(), RESCAN_INTERVAL_MS).unref()
+    else this.flushRescan()
+  }
+
+  private flushRescan(): void {
+    if (this.rescanTimer) clearTimeout(this.rescanTimer)
+    this.rescanTimer = null
     try {
       this.onComplete()
     } catch {
       /* scan trigger is best-effort */
     }
-    this.settle('ok')
+  }
+
+  private hasUnsettledWork(): boolean {
+    for (const r of this.records.values()) if (r.status === 'queued' || r.status === 'downloading') return true
+    return false
   }
 
   /** Append a completed download to the permanent provenance list, keyed by dest
@@ -1054,8 +1214,10 @@ export class DownloadManager {
   }
 
   /** Write the in-flight/queued manifest so jobs survive a daemon restart. Done
-   *  rows are dropped from the manifest (the file is on disk and scanned). */
+   *  rows are dropped from the manifest (the file is on disk and scanned). Every record state change
+   *  persists, so this is also where the downloads list is announced as changed (review 4.14). */
   private persist(): void {
+    emitInvalidation('downloads')
     const entries: ManifestEntry[] = []
     for (const r of this.records.values()) {
       if (r.status === 'done' || r.status === 'cancelled') continue
@@ -1088,7 +1250,9 @@ export class DownloadManager {
     } catch {
       return
     }
-    for (const e of parsed.entries ?? []) {
+    // The manifest is written in creation order; sorted once here so a hand-edited or old one still lists oldest first.
+    const entries = [...(parsed.entries ?? [])].sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    for (const e of entries) {
       let received = 0
       try {
         const p = `${e.dest}.part`
@@ -1096,7 +1260,7 @@ export class DownloadManager {
       } catch {
         /* ignore */
       }
-      this.records.set(e.id, {
+      const rec: DownloadRecord = {
         id: e.id,
         name: e.name,
         repo: e.repo,
@@ -1111,9 +1275,16 @@ export class DownloadManager {
         validator: e.validator,
         fileVersion: e.fileVersion,
         createdAt: e.createdAt,
-      })
+      }
+      this.records.set(e.id, rec)
+      this.indexLive(rec)
     }
   }
+}
+
+/** The key {@link DownloadManager.liveAt}'s index holds a dest under: the name as {@link sameDest} compares it. */
+function destKey(dest: string): string {
+  return foldsCase(dest) ? dest.toLowerCase() : dest
 }
 
 /** True when two destinations name one file on this platform's file system. Windows and
@@ -1192,6 +1363,24 @@ function writeFileAtomic(path: string, data: string): void {
     /* unsupported here */
   } finally {
     if (dir !== undefined) closeSync(dir)
+  }
+}
+
+/** Which volume `path` is on: the device id of the nearest ancestor that exists (a folder not yet made, or one removed
+ *  since, is on its parent's volume, and must compare equal to a folder there that does exist), else (nothing exists, a
+ *  platform without device ids) the drive root, so two folders on one Windows drive still compare equal. */
+function volumeOf(path: string): string {
+  let current = resolve(path)
+  for (;;) {
+    try {
+      const dev = statSync(current).dev
+      if (dev) return String(dev)
+    } catch {
+      /* not there yet */
+    }
+    const parent = dirname(current)
+    if (parent === current) return parse(current).root.toLowerCase()
+    current = parent
   }
 }
 

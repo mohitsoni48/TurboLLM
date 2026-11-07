@@ -21,7 +21,7 @@ function tempDir(): string {
 
 function makeTelemetry(dir: string): Emitter {
   const cfg = { telemetry: { level: 'full' as const, machineId: '55555555-5555-5555-5555-555555555555' } }
-  const store = { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) }
+  const store = { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) }
   return new Emitter({ dataDir: dir, store: store as never, version: '1.11.0', os: 'win32/x64' })
 }
 
@@ -30,7 +30,7 @@ function fakeDeps(telemetry: Emitter): { deps: Deps; recorded: Array<Record<stri
   const deps = {
     scanner: { list: () => ({ models: LIBRARY, scanning: false, lastScanAt: '' }) },
     modelRouter: { targetEntry: () => undefined, route: async () => ({ target: 'http://engine.invalid.local:1' }) },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }) },
     manager: {
       status: () => ({ state: 'running', model: { name: 'Qwen3 8B', key: 'qwen3-8b|Q4|123' } }),
       target: () => 'http://engine.invalid.local:1',

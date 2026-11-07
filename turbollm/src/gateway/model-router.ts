@@ -2,16 +2,18 @@
 // When a /v1/* request includes a `model` field, the router resolves it against
 // the local model library and loads (or swaps to) that model automatically.
 // Inspired by llama-swap; operates on the existing Manager + Scanner primitives.
+import { join } from 'node:path'
 import { Manager, type StartOpts } from '../engines/manager'
 import type { ConfigStore, Engine, LastLoaded } from '../config/config'
 import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import type { ComfyGuard } from '../engines/comfy-guard'
-import type { LoadProfile } from '../models/profile'
+import { placeOnFreeVram, type LoadProfile } from '../models/profile'
 import { manualLoadRefusal, modelIncompatibility, refusedOnEveryEngine, type Incompatibility } from '../engines/compat'
 import { engineForModel } from '../engines/registry'
-import { buildStartOpts } from '../engines/start-opts'
-import { getSysInfo } from '../sysinfo/sysinfo'
+import { buildStartOpts, gpuBlockUserSet } from '../engines/start-opts'
+import { getSysInfo, type SysInfo } from '../sysinfo/sysinfo'
+import { type GpuUse, readGpuUse } from './gpu-use'
 import { parseRemoteId } from '../link/model-id'
 import type { RemoteCatalog } from '../link/remote-catalog'
 import { modelLoadsRefused } from '../auth'
@@ -36,6 +38,9 @@ export const AUTOMATIC_LOAD_HINT =
  *  routine's swap and restore, the boot resume) is refused for such a model before anything is unloaded, unless
  *  Settings shows every engine's models (showAllEngineModels): then each one is started as a manual load is. */
 export interface LoadExplicitOpts {
+  /** The caller holds one slot of the primary's gate itself (a routine's swap and restore, routines/execute.ts):
+   *  eviction does not count that hold as a request on the primary, or keep-N 1 refused every routine swap. */
+  holdsGate?: true
   restoreAfter?: RouteResult
   runningOnly?: boolean
   manual?: true
@@ -54,6 +59,12 @@ export type RouteResult =
       engineKind?: string
       modelPath?: string
       modelName?: string
+      /** The pool slot's own Manager when `target` is an extra pool slot; absent for the primary (and remote), which
+       *  the gateway reads as `d.manager`, as above. The request's generation count, stats, live progress and gate
+       *  belong to the engine that runs it (scalability review 1.1, 1.5): counted on the primary, a generating pool
+       *  slot read as idle to its own idle-TTL watchdog, which could stop it mid-stream, and evictChatLru could not
+       *  tell it was busy. */
+      manager?: Manager
       /** Set on a loadExplicit() result whose load recorded its model as config.lastLoaded: the value that record
        *  replaced and the one it wrote. A routine's restore hands its swap's result back (LoadExplicitOpts.restoreAfter)
        *  to undo that record. Absent: a fast path, a Laya model, an embedding model in a pool slot, a route() load. */
@@ -68,12 +79,32 @@ export type RouteResult =
        *  these. Absent, the refusal may clear by itself (a load in progress, ComfyUI's queue, a link still connecting)
        *  or costs nothing to repeat, so the client's own retry policy applies. */
       permanent?: true
+      /** Why a retryable refusal will clear, for a caller that acts on it rather than relaying it (a routine skips a
+       *  busy engine instead of failing): 'busy', every engine it could unload is generating; 'autotune', a tune is
+       *  running. Absent: any other refusal (a ComfyUI render's is still known by its message, as it always was). */
+      reason?: RetryReason
     }
+
+export type RetryReason = 'busy' | 'autotune'
 
 interface PoolSlot {
   manager: Manager
   modelKey: string
   lastUsedMs: number
+}
+
+/** What the router reads of an engine's GenerationGate. Structural, so this module never imports the gate's. */
+interface GateLoad {
+  stats(): { inFlight: number; queued: number }
+}
+
+/** An occupied engine keep-N eviction may stop. `modelKey`: the pool slot's, absent for the primary. `side`: it runs
+ *  an embedding or Laya model, which takes no chat slot. */
+interface EvictionCandidate {
+  manager: Manager
+  lastUsedMs: number
+  modelKey?: string
+  side: boolean
 }
 
 const UNLOADED_WHILE_LOADING = 'The model was unloaded while it was loading.'
@@ -126,6 +157,10 @@ export class ModelRouter {
   /** Promise chain that serialises swap operations so concurrent requests for
    *  different models queue rather than race. */
   private swapChain: Promise<void> = Promise.resolve()
+  /** Auto-tune (BenchRunner), set in cli.ts by setAutoTune. Absent: nothing is tuning. */
+  private autoTune?: { isRunning(): boolean }
+  /** Each engine's GenerationGate (EngineGates, via Deps.gateFor), set in cli.ts by setGates. Absent: no gates. */
+  private gateFor?: (engine: Manager) => GateLoad
 
   constructor(
     private store: ConfigStore,
@@ -139,7 +174,28 @@ export class ModelRouter {
     private catalog?: RemoteCatalog,
     /** Builds the Manager for a new pool slot; a parameter only so a test can watch what it loads. */
     private newSlotManager: () => Manager = () => new Manager(store, { poolSlot: true }),
+    /** The cards' current use, read right before a default-profile pool-slot load (placeOnFreeVram); a parameter only so
+     *  a test can fake the reading. Null: unreadable, or not trustworthy for this engine (gpu-use.ts). `fresh`: not the
+     *  cached reading. */
+    private gpuUse: (engine: Engine, fresh?: boolean) => Promise<GpuUse | null> = (engine, fresh) => readGpuUse(engine, join(store.dir(), 'engines', 'build'), fresh),
+    /** The machine's hardware, for the profiles a load is built from; a parameter only so a test can fake the cards. */
+    private sysInfo: () => SysInfo = getSysInfo,
   ) {}
+
+  /** Wire auto-tune, which doLoad waits for: between two probes the primary reads 'stopped', so a load took it and the
+   *  next probe's start failed, scored as a crash, and one into a pool slot added its VRAM to the probe's reading
+   *  (scalability review 1.7). A setter, as ComfyGuard's are: BenchRunner is built before the router, and neither
+   *  module imports the other. */
+  setAutoTune(autoTune: { isRunning(): boolean }): void {
+    this.autoTune = autoTune
+  }
+
+  /** Wire the per-engine gates, which isGenerating reads: a request queued on, or holding, an engine's gate has not
+   *  reached generationStart yet, so without them eviction read that engine as idle, reused its Manager for another
+   *  model, and the gate then released its waiters onto a stale target (review M2). A setter, as setAutoTune is. */
+  setGates(gateFor: (engine: Manager) => GateLoad): void {
+    this.gateFor = gateFor
+  }
 
   /** Route a request to the correct model target URL.
    *  - If autoSwap is off: returns whatever the primary manager has loaded, except that an embeddings request
@@ -147,7 +203,7 @@ export class ModelRouter {
    *  - If the requested model is already loaded: returns its target immediately.
    *  - Otherwise: loads the model (swapping / evicting LRU as needed) and waits. */
   async route(requestedModel: string, request?: { embeddings?: boolean }): Promise<RouteResult> {
-    const cfg = this.store.snapshot()
+    const cfg = this.store.read()
 
     // Turbo Link (ADR-376). A qualified `<machine>/<model>` id is resolved here and
     // NOWHERE ELSE, and it must FAIL LOUDLY rather than degrade to a local model.
@@ -199,7 +255,7 @@ export class ModelRouter {
   async routeTo(entry: ModelEntry): Promise<RouteResult> {
     const alive = this.routeResolved(entry)
     if (alive) return alive
-    if (!this.store.snapshot().gateway.autoSwap) {
+    if (!this.store.read().gateway.autoSwap) {
       return { status: 503, message: `'${entry.name}' is not loaded. Load it from Models, or turn on auto-swap.` }
     }
     if (modelLoadsRefused()) return this.notLoadedForCaller(entry)
@@ -218,7 +274,7 @@ export class ModelRouter {
    *  entry. */
   targetEntry(requested: string, request?: { embeddings?: boolean }): ModelEntry | undefined {
     if (this.resolveRemote(requested)) return undefined
-    if (!this.store.snapshot().gateway.autoSwap || !requested.trim()) {
+    if (!this.store.read().gateway.autoSwap || !requested.trim()) {
       return this.runningWithoutSwap(requested, request) ?? this.primaryEntry()
     }
     return this.resolveEntry(requested) ?? this.primaryEntry()
@@ -255,6 +311,21 @@ export class ModelRouter {
       slots.push({ modelKey: load.modelKey, state: load.cancelled ? 'stopping' : 'starting', primary: false, lastUsedMs: load.startedMs })
     }
     return slots
+  }
+
+  /** The engine log of every alive pool slot (never the primary), for GET /api/v1/engine/logs?model=. The key is the
+   *  only thing a caller names; the path comes from the slot's own manager. */
+  slotLogs(): { modelKey: string; logPath: string }[] {
+    const logs: { modelKey: string; logPath: string }[] = []
+    for (const slot of this.extraSlots.values()) {
+      const logPath = slot.manager.logPath()
+      if (this.isOccupied(slot.manager.status().state) && logPath) logs.push({ modelKey: slot.modelKey, logPath })
+    }
+    for (const load of this.layaLoads.values()) {
+      const logPath = load.manager.logPath()
+      if (logPath) logs.push({ modelKey: load.modelKey, logPath })
+    }
+    return logs
   }
 
   /** How many models are loaded beside the primary (GET /api/v1/status's `poolModels`): the alive pool slots, and a
@@ -565,7 +636,7 @@ export class ModelRouter {
    *  routine's swap and restore refused a model the user had shown, and a hand-loaded model that ran fine there could
    *  not be reached again once evicted. With the setting off they keep modelIncompatibility's refusal. */
   private loadRefusal(engine: Engine, entry: ModelEntry, manual?: boolean): Incompatibility | null {
-    return manual || this.store.snapshot().showAllEngineModels
+    return manual || this.store.read().showAllEngineModels
       ? manualLoadRefusal(engine.kind, entry)
       : modelIncompatibility(engine.kind, entry)
   }
@@ -596,6 +667,10 @@ export class ModelRouter {
     if (this.comfy?.isBlocked()) {
       return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
     }
+    // Checked under the swap lock, like the render above, and as retryable: it clears when the tune ends.
+    if (this.autoTune?.isRunning()) {
+      return { status: 503, message: `Auto-tune is running, so '${entry.name}' cannot be loaded until it finishes. Try again when it is done.`, reason: 'autotune' }
+    }
 
     const engine = engineForModel(this.registry, entry)
     if (!engine) return { status: 503, message: 'No active engine. Set one up in TurboLLM.' }
@@ -608,13 +683,30 @@ export class ModelRouter {
       return { status: 503, message, permanent: true }
     }
 
-    const opts = this.buildOpts(entry, engine, overrides)
+    let opts = this.buildOpts(entry, engine, overrides)
     if (!opts) return { status: 503, message: 'Model is incomplete or unreadable.' }
 
-    const keepN = Math.max(1, this.store.snapshot().gateway.keepN)
+    const keepN = Math.max(1, this.store.read().gateway.keepN)
+    const ownHolds = explicit?.holdsGate ? 1 : 0
     // Side models (embedding, Laya) don't consume a chat slot — they get their own implicit slot
     // so a loaded chat model is never evicted just because a side model is requested.
-    const needsNewSlot = isSideModel(entry) || this.chatSlotCount() < keepN
+    let needsNewSlot = isSideModel(entry) || this.chatSlotCount() < keepN
+    let replaceAfterEviction: (() => Promise<void>) | undefined
+    // A chat model joining engines that already hold VRAM (scalability review 4.7): its default profile sized against
+    // empty cards, so it is placed where there is room, or an idle LRU engine goes first when there is none.
+    if (needsNewSlot && !isSideModel(entry) && this.chatSlotCount() > 0) {
+      const placed = await this.placeOnFreeVram(entry, engine, opts, overrides)
+      if (placed === 'nofit') {
+        needsNewSlot = false
+        // The idle engine that goes frees its card: placed again once it has stopped, from a fresh reading, and the
+        // default profile stays when even that does not fit (never a second eviction).
+        const loadOpts = opts
+        replaceAfterEviction = async () => {
+          const again = await this.placeOnFreeVram(entry, engine, loadOpts, overrides, true)
+          if (again && again !== 'nofit') Object.assign(loadOpts, again)
+        }
+      } else if (placed) opts = placed
+    }
     // A Laya model never takes the primary, even an empty one: the chat screen shows and talks to whatever the
     // primary holds, and a Laya engine answers only /v1/systemone.
     const targetManager = entry.laya
@@ -623,7 +715,15 @@ export class ModelRouter {
         ? (this.manager.status().state === 'stopped' || this.manager.status().state === 'error'
             ? this.manager
             : this.newSlotManager())
-        : this.evictChatLru()
+        : this.evictChatLru(ownHolds)
+    // The pool is full and every engine in it is generating: stopping one would kill a live stream (review 1.4). A
+    // retry is what clears it, once a reply finishes, like a model that is still loading, so it is not permanent.
+    if (!targetManager) {
+      return { status: 503, message: `Every loaded model is generating, so none can be unloaded for '${entry.name}' yet. Try again when a reply finishes.`, reason: 'busy' }
+    }
+    // An occupied target is an eviction's victim, idle when picked; Manager.load stops it only after the global load
+    // lock, and a request routed to it meanwhile would die with it (review M1). Re-checked there, before the stop.
+    const victimBusy = (): boolean => this.isOccupied(targetManager.status().state) && this.isGenerating(targetManager, ownHolds)
 
     // A Laya load takes 10-20 s, and /status must say it is loading for all of it: it is tracked while it is in
     // flight. A pool slot itself is registered only once its load has succeeded, as it always was — registering it
@@ -632,12 +732,29 @@ export class ModelRouter {
     this.loadingKey = entry.key
     this.loadingSlot = targetManager === this.manager ? undefined : { manager: targetManager, engineId: opts.engine.id }
     try {
-      return await this.loadInto(entry, engine, opts, targetManager, inFlight, explicit !== undefined)
+      return await this.loadInto(entry, engine, opts, targetManager, inFlight, explicit !== undefined, victimBusy, replaceAfterEviction)
     } finally {
       this.loadingKey = undefined
       this.loadingSlot = undefined
       if (inFlight && this.layaLoads.get(entry.key) === inFlight) this.layaLoads.delete(entry.key)
     }
+  }
+
+  /** StartOpts for a default profile that loads on the card(s) with room for it; 'nofit' when none has; undefined to load as
+   *  built. Only an automatic llama-server profile whose gpu block the user did not set (gpuUserSet, ADR-060), and only
+   *  when the cards' use is readable and its card numbers are the engine's (gpuUse: bounded, cached, null otherwise), so a
+   *  failed or untrustworthy reading leaves today's behaviour. Never with ComfyUI's integration on: its resident models
+   *  would read as used (they are freed only by the load's own hook, after this), so an idle model would be evicted for
+   *  memory the load frees anyway, and two models could evict each other in turn. `fresh`: a reading after an eviction. */
+  private async placeOnFreeVram(entry: ModelEntry, engine: Engine, opts: StartOpts, overrides?: Partial<LoadProfile>, fresh = false): Promise<StartOpts | 'nofit' | undefined> {
+    if (entry.format !== 'gguf' || engine.kind !== 'llama-server' || !opts.profile) return undefined
+    if (this.store.snapshot().comfyui.enabled) return undefined
+    if (gpuBlockUserSet({ entry, engine, cfg: this.store.snapshot(), sys: this.sysInfo(), overrides })) return undefined
+    const use = await this.gpuUse(engine, fresh).catch(() => null)
+    if (!use) return undefined
+    const fit = placeOnFreeVram(opts.profile, entry, use.sys, use.usedMb)
+    if (fit.kind === 'nofit') return 'nofit'
+    return fit.kind === 'place' ? this.buildOpts(entry, engine, { ...overrides, gpu: fit.gpu }, use.sys) ?? undefined : undefined
   }
 
   /** The load itself, and what follows it. A Laya load (`inFlight`) stays tracked until this returns, so a cancelled
@@ -650,20 +767,30 @@ export class ModelRouter {
     targetManager: Manager,
     inFlight: LayaLoad | undefined,
     explicit = false,
+    victimBusy: () => boolean = () => false,
+    /** Runs once the victim of an eviction has stopped, before the spawn: it may change `opts` (the object load() holds). */
+    afterVictimStopped?: () => Promise<void>,
   ): Promise<RouteResult> {
     // Single chokepoint (rule 3): load() stops whatever this slot held, runs the
     // reverse gate (free ComfyUI VRAM), spawns, and waits for readiness — all under
     // the global load lock, so concurrent swaps can't spin up two engines at once.
     let comfyRefused = false
+    let victimRefused = false
     // The primary's next load is this one, so a gateway load a render refused or killed before is not what release()
     // brings up any more.
     if (targetManager === this.manager) this.pausedGatewayLoad = undefined
     try {
       await targetManager.load(opts, {
+        beforeStop: () => {
+          if (!victimBusy()) return
+          victimRefused = true
+          throw new Error('busy')
+        },
         beforeStart: async () => {
           // Ejected while it waited for the gate: never spawn an engine for it.
           if (inFlight?.cancelled) throw new Error(UNLOADED_WHILE_LOADING)
           try {
+            await afterVictimStopped?.()
             await (this.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve())
           } catch (e) {
             comfyRefused = true
@@ -685,6 +812,10 @@ export class ModelRouter {
         },
       })
     } catch (e) {
+      // Nothing was stopped: the victim, and every request on it, run on. Retryable as doLoad's own busy refusal.
+      if (victimRefused) {
+        return { status: 503, message: `The model that would be unloaded for '${entry.name}' started generating, so it cannot be unloaded yet. Try again when a reply finishes.`, reason: 'busy' }
+      }
       if (inFlight?.cancelled) {
         await this.stopCancelled(targetManager)
         return { status: 503, message: UNLOADED_WHILE_LOADING, permanent: true }
@@ -803,7 +934,7 @@ export class ModelRouter {
   private undoSwapRecord(swap: RouteResult): void {
     const record = 'target' in swap ? swap.lastLoaded : undefined
     if (!record) return
-    const now = this.store.snapshot().lastLoaded
+    const now = this.store.read().lastLoaded
     if (now.modelKey !== record.recorded.modelKey || now.engineId !== record.recorded.engineId) return
     this.store.update(x => { x.lastLoaded = { ...record.replaced } })
   }
@@ -812,7 +943,9 @@ export class ModelRouter {
    *  none of this: the gateway's fallback already reads the primary. */
   private served(manager: Manager, target: string): Extract<RouteResult, { target: string }> {
     const opts = manager.currentOpts()
-    return opts ? { target, engineKind: opts.engine.kind, modelPath: opts.modelPath, modelName: opts.model.name } : { target }
+    return opts
+      ? { target, manager, engineKind: opts.engine.kind, modelPath: opts.modelPath, modelName: opts.model.name }
+      : { target, manager }
   }
 
   /** A slot counts as occupied while 'stopping' too, not just 'running'/'starting' —
@@ -870,44 +1003,65 @@ export class ModelRouter {
     return (primaryAlive && !primaryEmbed ? 1 : 0) + extraChat
   }
 
-  /** Evict the least-recently-used occupied chat (non-embedding) slot. Embedding
+  /** Evict the least-recently-used occupied chat (non-embedding) slot that is not generating. Embedding
    *  slots are skipped; if every occupied slot is an embedding model the true LRU is
-   *  used as a fallback so we never deadlock. */
-  private evictChatLru(): Manager {
+   *  used as a fallback so we never deadlock (an embedding slot never counts against keep-N, so
+   *  taking one while a chat slot is merely busy would load past the cap).
+   *
+   *  A slot with a generation in flight is never the one evicted (scalability review 1.4): ranked by
+   *  lastUsedMs alone — the time a request was ROUTED, not when its reply ends — the least-recently
+   *  routed engine was stopped under a long stream still running on it. The count is the slot's own
+   *  (its gateway requests are counted on the engine that serves them, RouteResult's `manager`).
+   *  undefined when every candidate is generating: nothing is stopped, and doLoad refuses the load
+   *  with a retryable 503, which clears once a reply finishes. Nothing at all occupied falls back to
+   *  the primary, as before. */
+  private evictChatLru(ownHolds = 0): Manager | undefined {
+    const occupied = this.evictionCandidates()
+    const chat = occupied.filter((c) => !c.side)
+    const pool = chat.length > 0 ? chat : occupied
+    if (pool.length === 0) return this.manager
+    // Strict `<` over the primary-first list: the primary wins a tie, as it always did.
+    const lru = pool
+      .filter((c) => !this.isGenerating(c.manager, ownHolds))
+      .reduce<EvictionCandidate | undefined>((best, c) => (!best || c.lastUsedMs < best.lastUsedMs ? c : best), undefined)
+    if (lru?.modelKey) this.extraSlots.delete(lru.modelKey) // not dropSlot: the load takes this manager over (loadingSlot)
+    return lru?.manager
+  }
+
+  /** Every occupied engine evictChatLru may stop, the primary first. */
+  private evictionCandidates(): EvictionCandidate[] {
+    const out: EvictionCandidate[] = []
     const ms = this.manager.status()
-    const primaryAlive = this.isOccupied(ms.state)
-    const primaryEmbed = primaryAlive && !!ms.model &&
-      this.isSideModelKey(ms.model.key)
-
-    let lruManager: Manager = this.manager
-    let lruTime = (primaryAlive && !primaryEmbed) ? this.primaryLastUsed : Infinity
-    let lruKey: string | null = null
-
+    if (this.isOccupied(ms.state)) {
+      out.push({ manager: this.manager, lastUsedMs: this.primaryLastUsed, side: !!ms.model && this.isSideModelKey(ms.model.key) })
+    }
     for (const slot of this.extraSlots.values()) {
-      const slotEmbed = this.isSideModelKey(slot.modelKey)
-      if (this.isOccupied(slot.manager.status().state) && !slotEmbed && slot.lastUsedMs < lruTime) {
-        lruTime = slot.lastUsedMs
-        lruManager = slot.manager
-        lruKey = slot.modelKey
-      }
+      if (!this.isOccupied(slot.manager.status().state)) continue
+      out.push({ manager: slot.manager, lastUsedMs: slot.lastUsedMs, modelKey: slot.modelKey, side: this.isSideModelKey(slot.modelKey) })
     }
+    return out
+  }
 
-    // Fallback: all alive slots are embedding models — evict true LRU.
-    if (lruTime === Infinity) {
-      lruTime = primaryAlive ? this.primaryLastUsed : Infinity
-      lruManager = this.manager
-      lruKey = null
-      for (const slot of this.extraSlots.values()) {
-        if (this.isOccupied(slot.manager.status().state) && slot.lastUsedMs < lruTime) {
-          lruTime = slot.lastUsedMs
-          lruManager = slot.manager
-          lruKey = slot.modelKey
-        }
-      }
-    }
+  /** A generation is in flight on `manager`'s engine (Manager.generationStart: a gateway request, a chat or Code
+   *  turn, an extension call), or chat work holds it with none in flight (Manager.holdsEngine, the primary's only: a
+   *  compaction, a tool-approval wait, a reply's title or memory call), which an eviction would fail just the same. */
+  private isGenerating(manager: Manager, ownHolds = 0): boolean {
+    return (manager.sessionStats().activeRequests ?? 0) > 0 || !!manager.holdsEngine?.() || !!manager.isHeld?.() || this.gateBusy(manager, ownHolds)
+  }
 
-    if (lruKey !== null) this.extraSlots.delete(lruKey) // not dropSlot: the load takes this manager over (loadingSlot)
-    return lruManager
+  /** A request holds `manager`'s gate or waits on it (setGates): one admitted, or about to be, onto this engine.
+   *  `ownHolds`: the primary's gate slots the caller itself holds (LoadExplicitOpts.holdsGate), not counted. */
+  private gateBusy(manager: Manager, ownHolds = 0): boolean {
+    const load = this.gateFor?.(manager).stats()
+    const own = manager === this.manager ? ownHolds : 0
+    return !!load && load.inFlight - own + load.queued > 0
+  }
+
+  /** A pool slot (not the primary) has a generation in flight. The primary's own count no longer includes the pool's
+   *  gateway traffic (RouteResult's `manager`), so anything that has to know the whole machine is idle — the auto
+   *  updater, which stops the pool slots on the engine it updates; Turbo Link's wake gate — reads this beside it. */
+  poolGenerating(): boolean {
+    return [...this.extraSlots.values()].some((slot) => this.isGenerating(slot.manager))
   }
 
   /** PUBLIC view of `resolveRemote` — "does this id name a linked machine, and if so what
@@ -1006,10 +1160,10 @@ export class ModelRouter {
   /** Gateway loads build their StartOpts through the one shared builder (start-opts.ts), like the
    *  manual Load and the boot resume, so a Jev model's launch flags and a pinned port reach
    *  auto-swap loads too. doLoad has already checked compatibility (a manual load's only for a Laya model). */
-  private buildOpts(entry: ModelEntry, engine: Engine, overrides?: Partial<LoadProfile>): StartOpts | null {
+  private buildOpts(entry: ModelEntry, engine: Engine, overrides?: Partial<LoadProfile>, sys: SysInfo = this.sysInfo()): StartOpts | null {
     if (entry.incomplete || entry.parseError) return null
     return buildStartOpts({
-      entry, engine, cfg: this.store.snapshot(), sys: getSysInfo(), overrides, trigger: 'gateway_switch',
+      entry, engine, cfg: this.store.snapshot(), sys, overrides, trigger: 'gateway_switch',
     })
   }
 

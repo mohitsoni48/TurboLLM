@@ -209,6 +209,58 @@ test('createLatchingReader: a success resets the failure counter', async () => {
   assert.equal(sampled, 6)
 })
 
+const timeoutError = () => Object.assign(new Error('timed out'), { killed: true, signal: 'SIGTERM' })
+const oneGpu = [{ id: '0', name: 'g', utilPct: 1, vramUsedMb: 1, vramTotalMb: 2, vramSharedMb: null }]
+
+test('createLatchingReader: timeouts never latch — a slow nvidia-smi on a busy box keeps being retried (ADR-349)', async () => {
+  let sampled = 0
+  let slow = true
+  const r = createLatchingReader('busy', async () => {
+    sampled++
+    if (slow) throw timeoutError()
+    return oneGpu
+  })
+
+  for (let i = 0; i < 200; i++) await r.read() // far more than 3 failures' worth of ticks
+  assert.ok(sampled > 3, 'it must keep trying after three timeouts')
+  slow = false
+  let got: GpuSample[] | null = null
+  for (let i = 0; i < 40 && !got; i++) got = await r.read() // the backoff is capped at 30 ticks
+  assert.ok(got, 'usage comes back once nvidia-smi answers in time')
+})
+
+test('createLatchingReader: timeouts back off — skipped ticks do not spawn, capped at 30', async () => {
+  let sampled = 0
+  const r = createLatchingReader('busy', async () => {
+    sampled++
+    throw timeoutError()
+  })
+
+  for (let i = 0; i < 100; i++) await r.read() // well past the ramp-up
+  assert.ok(sampled < 15, 'ticks are skipped while backing off, not spawned every second')
+  const before = sampled
+  for (let i = 0; i < 62; i++) await r.read()
+  const probes = sampled - before
+  assert.ok(probes >= 2 && probes <= 3, 'at the 30-tick cap a probe lands about every 31 ticks, got ' + probes)
+})
+
+test('createLatchingReader: a success after timeouts resets the backoff', async () => {
+  let sampled = 0
+  let mode: 'timeout' | 'ok' = 'timeout'
+  const r = createLatchingReader('busy', async () => {
+    sampled++
+    if (mode === 'timeout') throw timeoutError()
+    return oneGpu
+  })
+  for (let i = 0; i < 6; i++) await r.read()
+  mode = 'ok'
+  for (let i = 0; i < 40 && !(await r.read()); i++) { /* wait out the backoff */ }
+  const before = sampled
+  await r.read()
+  await r.read()
+  assert.equal(sampled - before, 2, 'sampled every tick again after a success')
+})
+
 test('pickReader: a CPU-only box gets the null reader, not a doomed vendor probe', async () => {
   const r = pickReader(sysWith())
   assert.equal(r.kind, 'null')

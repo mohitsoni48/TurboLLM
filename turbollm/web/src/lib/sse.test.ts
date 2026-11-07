@@ -173,6 +173,22 @@ describe('subscribeSse', () => {
     close()
   })
 
+  // The invalidation stream (live-events.ts) lengthens the app's polls only while it is really open, so it needs to
+  // hear when an open stream ends, not just when one opens.
+  it('calls onClose once for each stream that opened and then ended, and not for one that never opened', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(ok(['event: entry\ndata: 1\n\n']))
+      .mockImplementation(async () => new Response('{}', { status: 502 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const seen: string[] = []
+    const close = tail('/s', (m) => seen.push(m.data), { onOpen: () => seen.push('open'), onClose: () => seen.push('closed') })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(seen).toEqual(['open', '1', 'closed'])
+    await vi.advanceTimersByTimeAsync(9000)
+    expect(seen).toEqual(['open', '1', 'closed'])
+    close()
+  })
+
   // The engine-log tail resumes from this id: a reopened stream that did not send it started from
   // "now", and the lines written while it reconnected were lost.
   it('a reopened stream sends the id of the last message that had one as Last-Event-ID, as EventSource does', async () => {

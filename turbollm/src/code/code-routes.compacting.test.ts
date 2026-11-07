@@ -68,7 +68,7 @@ function makeApp(base: string) {
     version: 'test',
     store: {
       dir: () => dataDir,
-      snapshot: () => ({ code: { defaultAgent: 'turbollm', agentsMdProjectCandidates: [], agentsMdGlobalCandidates: [] }, daemon: { experimental: { routines: false } } }),
+      snapshot: () => ({ code: { defaultAgent: 'turbollm', agentsMdProjectCandidates: [], agentsMdGlobalCandidates: [] }, daemon: { experimental: { routines: false } } }), read: () => ({ code: { defaultAgent: 'turbollm', agentsMdProjectCandidates: [], agentsMdGlobalCandidates: [] }, daemon: { experimental: { routines: false } } }),
     },
     manager: {
       status: () => ({ state: 'running', model: { key: 'test-model', name: 'Test', ctx: 8192 } }),

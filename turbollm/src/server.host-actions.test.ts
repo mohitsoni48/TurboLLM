@@ -17,6 +17,7 @@ import { availableBackends } from './engines/download'
 import { BuildState } from './engines/build-state'
 import { Scanner, type ModelEntry } from './models/scanner'
 import { tmpDir } from './test-support/tmp'
+import { chatRegistries } from './test-support/chat-registries'
 
 const INGRESS_PORT = 6997
 const SERVE_HOST = 'box.tail1234.ts.net'
@@ -29,11 +30,12 @@ function mkDeps(mutate: (cfg: Config) => void = () => {}): { d: Deps; cfg: Confi
   const dir = tmpDir('host-actions-')
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
     db: new Proxy({}, { get: () => () => [] }),
     telemetry: { firstUse: () => {}, useFeature: () => {} },
     manager: { status: () => ({ state: 'stopped', model: null }), currentOpts: () => null },
     registry: { list: () => ({ engines: [] }), active: () => undefined, customSources: () => [] },
+    ...chatRegistries(),
     remote: {
       ingressPort: () => INGRESS_PORT,
       activeProvider: () => cfg.remoteAccess.provider,

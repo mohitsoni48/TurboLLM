@@ -68,7 +68,7 @@ function harness(o: Opts = {}): Harness {
   }
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, dir: () => dataDir },
+    store: { snapshot: () => cfg, read: () => cfg, dir: () => dataDir },
     manager: {
       status: () => ({ state: o.runningBinPath || o.serving ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }),
       currentOpts: () => {

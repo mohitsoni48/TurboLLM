@@ -36,3 +36,33 @@ test('a genuinely reworded duplicate is still caught via word overlap', () => {
     true,
   )
 })
+
+// Scalability review 2.10: extraction compares each new fact against a bounded window of the
+// most recent facts, not every fact ever stored, so its cost stops growing with the table.
+test('extraction dedupes against the recent window and never loads every fact', async () => {
+  const { ConversationStore, IN_MEMORY_DATA_DIR } = await import('./db.js')
+  const { extractMemoryFacts, MEMORY_DEDUPE_WINDOW } = await import('./memory.js')
+  const store = new ConversationStore(IN_MEMORY_DATA_DIR)
+  const realFetch = globalThis.fetch
+  try {
+    store.addMemoryFact({ factText: 'I work as a nurse' })
+    const windows: number[] = []
+    const db = new Proxy(store, {
+      get(target, prop) {
+        if (prop === 'listMemoryFacts') return () => assert.fail('extraction loaded every fact')
+        if (prop === 'recentMemoryFactTexts') return (n: number) => { windows.push(n); return target.recentMemoryFactTexts(n) }
+        const v = Reflect.get(target, prop) as unknown
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    })
+    globalThis.fetch = (async () => new Response(JSON.stringify({ choices: [{ message: { content: '- I work as a nurse\n- I live in Pune' } }] }))) as typeof fetch
+    const d = { db, manager: { status: () => ({ state: 'running' }) } } as unknown as Parameters<typeof extractMemoryFacts>[0]
+    await extractMemoryFacts(d, 'conv-1', 'I work as a nurse and I live in Pune these days', { modelField: 'm', modelName: 'm', ctxMax: 4096, target: 'http://engine.invalid' } as unknown as Parameters<typeof extractMemoryFacts>[3])
+
+    assert.deepEqual(windows, [MEMORY_DEDUPE_WINDOW])
+    assert.deepEqual(store.listMemoryFacts().map((f) => f.factText).sort(), ['I live in Pune', 'I work as a nurse'])
+  } finally {
+    globalThis.fetch = realFetch
+    store.close()
+  }
+})

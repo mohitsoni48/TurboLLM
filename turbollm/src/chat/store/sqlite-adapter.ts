@@ -85,3 +85,19 @@ export function openSqlDb(path: string): SqlDb {
   const { DatabaseSync } = requireSync('node:sqlite') as typeof import('node:sqlite')
   return new DatabaseSync(path) as unknown as SqlDb
 }
+
+/** Runs `fn` as one write transaction on `db`: all of what it wrote, or none of it. `fn` must be
+ *  synchronous, so nothing else on this connection can run inside it. */
+export function inTransaction<T>(db: SqlDb, fn: () => T): T {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const out = fn()
+    db.exec('COMMIT')
+    return out
+  } catch (e) {
+    // SQLite has already rolled back after some errors (SQLITE_FULL, SQLITE_IOERR); a second
+    // ROLLBACK would then throw and hide the error that failed the operation.
+    try { db.exec('ROLLBACK') } catch { /* already rolled back */ }
+    throw e
+  }
+}

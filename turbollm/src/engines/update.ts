@@ -33,6 +33,7 @@ import type { ReleaseProvenance } from './release-install'
 
 export { parseGitRepo } from './github-repo'
 import { parseGitRepo } from './github-repo'
+import { API_TIMEOUT_MS, withTimeout } from '../util/fetch-timeout'
 
 // ─── Layer 1a: version/tag comparison (pure) ─────────────────────────────────
 
@@ -285,7 +286,7 @@ export async function fetchLatest(src: ResolvedSource, signal?: AbortSignal): Pr
   if (src.source === 'pip') {
     const res = await fetch(`https://pypi.org/pypi/${src.ref}/json`, {
       headers: { Accept: 'application/json', 'User-Agent': 'turbollm' },
-      signal,
+      signal: withTimeout(signal, API_TIMEOUT_MS),
     })
     if (!res.ok) throw new Error(`pypi query failed: HTTP ${res.status}`)
     const data = (await res.json()) as { info?: { version?: string } }

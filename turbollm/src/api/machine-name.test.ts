@@ -58,7 +58,7 @@ function mkApp(cfg: Record<string, unknown>) {
   const app = new Hono()
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '.' },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '.' },
     manager: { status: () => ({ state: 'stopped', model: null }) },
   } as unknown as Deps
   registerApi(app, d)
@@ -112,7 +112,7 @@ function linkApp(machineName?: string) {
   })
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
   } as unknown as Deps
   const app = new Hono()
   registerLinkApi(app, d)

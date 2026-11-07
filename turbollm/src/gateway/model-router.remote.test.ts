@@ -37,7 +37,7 @@ function mkRouter(opts: {
   // injected by property assignment (as the brief specifies) so this suite needs no
   // network; the trailing constructor parameter is what production wiring uses.
   const r = new ModelRouter(
-    { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) } as never,
+    { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) } as never,
     {} as never,
     manager as never,
     scanner as never,

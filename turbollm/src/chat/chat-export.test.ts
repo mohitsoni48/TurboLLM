@@ -138,7 +138,7 @@ test('buildSnapshot: persona is "default" when toolPolicy is absent', () => {
 })
 
 test('buildSnapshot: settings_snapshot reflects config values', () => {
-  const cfg = makeCfg({ gateway: { keepN: 3, autoSwap: false }, tools: { tavily: { apiKey: 'KEY' } } })
+  const cfg = makeCfg({ gateway: { keepN: 3, autoSwap: false, maxBodyMb: 128 }, tools: { tavily: { apiKey: 'KEY' } } })
   const snap = buildSnapshot(makeConv(), cfg, VERSION, EXPORTED_AT, 'debug')
   assert.equal(snap.settings_snapshot.keepN, 3)
   assert.equal(snap.settings_snapshot.autoSwap, false)

@@ -75,7 +75,7 @@ export interface RoutineToolsStore {
   listRoutines: ConversationStore['listRoutines']
   updateRoutine: ConversationStore['updateRoutine']
   deleteRoutine: ConversationStore['deleteRoutine']
-  listRoutineRuns: ConversationStore['listRoutineRuns']
+  countRoutineRuns: ConversationStore['countRoutineRuns']
 }
 
 /** Trigger an already-confirmed routine to run immediately. Injected rather than hardcoded so this
@@ -366,7 +366,7 @@ export function execDeleteRoutine(args: Record<string, unknown>, store: RoutineT
   if (!id) return 'Error: routineId is required.'
   const existing = store.getRoutine(id)
   if (!existing) return `Error: no routine with id "${id}".`
-  const runCount = store.listRoutineRuns(id).length
+  const runCount = store.countRoutineRuns(id)
 
   if (args.confirm !== true) {
     return `PREVIEW (not deleted) — routine "${id}" ("${existing.prompt}") has ${runCount} run(s) in its ` +

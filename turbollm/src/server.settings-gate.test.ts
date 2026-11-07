@@ -36,7 +36,7 @@ function mkDeps(mutate: (cfg: Config) => void = () => {}): { d: Deps; cfg: Confi
   requestLog.finalize(id, { status: 200, responseBody: '{"content":"done"}' })
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
     db: new Proxy({}, { get: () => () => [] }),
     telemetry: { firstUse: () => {}, useFeature: () => {} },
     manager: { status: () => ({ state: 'stopped', model: null }) },
@@ -127,6 +127,15 @@ const HOST_ONLY: [string, (cfg: Config) => unknown][] = [
   // Capture on records the host's Code prompts for the caller to read; the log off blinds the owner.
   ['requestLog.captureBodies', (cfg) => ({ requestLog: { captureBodies: !cfg.requestLog.captureBodies } })],
   ['requestLog.enabled', (cfg) => ({ requestLog: { enabled: !cfg.requestLog.enabled } })],
+  // Lowering a limit (or switching the sweep on after it was off) deletes data on the next sweep: only the host may.
+  ['retention.enabled', (cfg) => ({ retention: { enabled: !cfg.retention.enabled } })],
+  ['retention.apiUsageRawDays', () => ({ retention: { apiUsageRawDays: 31 } })],
+  ['retention.routineRunsKept', () => ({ retention: { routineRunsKept: 10 } })],
+  // Tier 4's runtime limits, exposed by scalability item 5.3: raising what the gateway buffers, how many files download
+  // at once, or switching the load stall watch off is the host's call.
+  ['gateway.maxBodyMb', () => ({ gateway: { maxBodyMb: 4096 } })],
+  ['downloadConcurrency', () => ({ downloadConcurrency: 8 })],
+  ['engineLoadStallSeconds', () => ({ engineLoadStallSeconds: 0 })],
 ]
 
 /** Every host-only change is refused (and nothing changes); a cosmetic one and an echo are not.

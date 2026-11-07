@@ -9,6 +9,7 @@ import type { CodeSessionFilter, CodeStatsRange } from './code-types'
 import type { ReasoningEffort } from '../components/ReasoningEffortSelect'
 import { ApiError } from './api'
 import { toast } from '../components/ui/sonner'
+import { pollWhileLive } from './live-events'
 
 export const codeKeys = {
   list: (filter: CodeSessionFilter = 'active') => ['code-sessions', filter] as const,
@@ -36,7 +37,7 @@ export function useCodeSessions(filter: CodeSessionFilter = 'active') {
     queryFn: () => listCodeSessions(filter),
     staleTime: 0,
     retry: false,
-    refetchInterval: 5000,
+    refetchInterval: () => pollWhileLive(5000),
     refetchIntervalInBackground: false,
   })
 }
@@ -103,7 +104,7 @@ export function useCodeSession(id: string | null) {
     // detailQ.data?.running changing, and refetchOnWindowFocus alone only catches it on
     // blur/refocus, never on a second monitor / never-blurred tab. Plain polling, matching the
     // cadence useCodeSessions already uses for the sidebar list.
-    refetchInterval: 6000,
+    refetchInterval: () => pollWhileLive(6000),
     refetchIntervalInBackground: false,
   })
 }

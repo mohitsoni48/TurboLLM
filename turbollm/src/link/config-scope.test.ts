@@ -350,6 +350,22 @@ test('a block write REPLACES the block, dropping optional leaves', () => {
   assert.equal(applyScopedPatch(cfg, { modelDefaults: { ctx: 8192 } }).ok, false)
 })
 
+test('a peer can set the gateway leaves but never change or reset the host-only maxBodyMb', () => {
+  const cfg = { gateway: { autoSwap: false, keepN: 1, maxBodyMb: 512 } } as never
+  const gateway = () => (cfg as unknown as { gateway: unknown }).gateway
+
+  assert.equal(isWritablePath('gateway'), false, 'a whole-block write would replace maxBodyMb')
+  assert.equal(isWritablePath('gateway.maxBodyMb'), false)
+  const block = applyScopedPatch(cfg, { gateway: { autoSwap: true, keepN: 2 } })
+  assert.equal(block.ok, false)
+  if (!block.ok) assert.deepEqual(block.rejected, ['gateway'])
+  assert.equal(applyScopedPatch(cfg, { 'gateway.maxBodyMb': 1 }).ok, false)
+  assert.deepEqual(gateway(), { autoSwap: false, keepN: 1, maxBodyMb: 512 })
+
+  assert.equal(applyScopedPatch(cfg, { 'gateway.autoSwap': true, 'gateway.keepN': 2 }).ok, true)
+  assert.deepEqual(gateway(), { autoSwap: true, keepN: 2, maxBodyMb: 512 })
+})
+
 // ── Review finding 7: allowlist lookups can never hit a prototype member. ────────────────
 
 test('a prototype-member name is rejected, never resolved against the allowlist', () => {

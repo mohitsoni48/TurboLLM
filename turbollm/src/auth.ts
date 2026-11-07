@@ -28,7 +28,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { getConnInfo } from '@hono/node-server/conninfo'
 import type { Context, MiddlewareHandler } from 'hono'
 import { requestId as requestIdMiddleware } from 'hono/request-id'
-import type { ApiKey } from './config/config'
+import type { ApiKey, DeepReadonly } from './config/config'
 import type { Deps } from './deps'
 import { extError, requestId as makeRequestId } from './ext/errors'
 import { hasCapability } from './link/capabilities'
@@ -145,7 +145,7 @@ export function isLoopbackBindHost(host: string): boolean {
  *  successful bind, so an in-place rebind keeps this current. Read this, never `lanBind`, for
  *  an auth decision. */
 export function isLanExposed(d: Deps): boolean {
-  if (d.store.snapshot().daemon.lanBind) return true
+  if (d.store.read().daemon.lanBind) return true
   return d.bindHost !== undefined && !isLoopbackBindHost(d.bindHost)
 }
 
@@ -238,7 +238,7 @@ function hostHeaderName(host: string): string {
  *  name, which a custom tunnel the user still runs into the ingress carries on every request.
  *  No URL, no trust. */
 function namesServedHost(host: string | undefined, d: Deps): boolean {
-  const ra = d.store.snapshot().remoteAccess
+  const ra = d.store.read().remoteAccess
   const url = d.remote?.url?.() || (ra?.lastUrlProvider === 'tailscale-serve' ? ra.lastUrl : '')
   // A DNS name and an optional port, nothing the URL parser would read as userinfo or a path.
   if (!host || !url || !/^[a-z0-9.-]+(:\d+)?$/i.test(host.trim())) return false
@@ -652,11 +652,11 @@ export function isLocalOrAuthenticated(c: Context, d: Deps): boolean {
  *  "WHICH key is this?", which Turbo Link needs because the capability grant lives on
  *  the record. Same hash comparison, same best-effort usage bump — deliberately not a
  *  second credential path. */
-export function resolveKey(c: Context, d: Deps): ApiKey | undefined {
+export function resolveKey(c: Context, d: Deps): DeepReadonly<ApiKey> | undefined {
   const raw = presentedKey(c)
   if (!raw) return undefined
   const hash = hashKey(raw)
-  const match = d.store.snapshot().apiKeys.find((k) => k.hash === hash)
+  const match = d.store.read().apiKeys.find((k) => k.hash === hash)
   if (!match) return undefined
   touchLastUsed(d, match)
   return match
@@ -671,7 +671,7 @@ const LAST_USED_RESOLUTION_MS = 60_000
 
 /** Best-effort lastUsedAt bump (spec 06 §5), skipped while the stored value is recent. A
  *  value in the future (clock moved back) counts as stale, so it cannot freeze. */
-function touchLastUsed(d: Deps, match: ApiKey): void {
+function touchLastUsed(d: Deps, match: DeepReadonly<ApiKey>): void {
   const last = match.lastUsedAt ? Date.parse(match.lastUsedAt) : NaN
   if (Number.isFinite(last) && Math.abs(Date.now() - last) < LAST_USED_RESOLUTION_MS) return
   try {
@@ -704,7 +704,7 @@ function touchLastUsed(d: Deps, match: ApiKey): void {
  *  (`ext/auth.ts`'s resolveTenantFromKey) comparing hashes with no idea this rule existed,
  *  because it landed on main independently. Any NEW code that resolves a presented key to a
  *  stored record must call this — do not re-derive `!!key.grant` in a third place. */
-export function isFacadeOnlyKey(key: Pick<ApiKey, 'grant'>): boolean {
+export function isFacadeOnlyKey(key: DeepReadonly<Pick<ApiKey, 'grant'>>): boolean {
   return !!key.grant
 }
 
@@ -727,7 +727,7 @@ export function keyTenant(key: Pick<ApiKey, 'tenant'>): string {
  *  terminal, and got every Turbo Link capability. lanAuth still lets it through to
  *  `/api/ext/v1` (verifyKeyValue's `ext` flag), as a backend on another machine reaches that
  *  API over the LAN or a tunnel. */
-export function isExtOnlyKey(key: Pick<ApiKey, 'tenant'>): boolean {
+export function isExtOnlyKey(key: DeepReadonly<Pick<ApiKey, 'tenant'>>): boolean {
   return keyTenant(key) !== 'local'
 }
 
@@ -765,7 +765,7 @@ async function lanRefusal(c: Context, status: 401 | 403, code: 'unauthorized' | 
  *  A grant with no `kind` is a LINK grant: every grant minted before ADR-422 was minted for
  *  a Turbo Link peer, and reading absent as anything else would silently widen tokens
  *  already in the field. */
-export function grantKind(key: Pick<ApiKey, 'grant'>): 'none' | 'link' | 'remote' {
+export function grantKind(key: DeepReadonly<Pick<ApiKey, 'grant'>>): 'none' | 'link' | 'remote' {
   if (!key.grant) return 'none'
   return key.grant.kind === 'remote' ? 'remote' : 'link'
 }
@@ -804,6 +804,9 @@ export function requiredCapability(method: string, path: string): LinkCapability
   if (path.startsWith('/api/v1/downloads')) return read ? 'downloads:read' : 'downloads:write'
   if (path.startsWith('/api/v1/settings')) return read ? 'config:read' : 'config:write'
   if (path === '/api/v1/status') return 'config:read'
+  // The invalidation stream (events-routes.ts) carries keys only, but which conversations and models change
+  // when is activity on the host: held to what /status is. Read-only surface.
+  if (path === '/api/v1/events') return read ? 'config:read' : null
   // ADR-434 (i)(3): the work a model load would interrupt (chat titles, Code sessions, routine
   // names). Only a caller that may load models needs the confirmation this feeds, and routine
   // names are not a `models:use` read. Read-only surface: a write maps to nothing.
@@ -824,6 +827,8 @@ export function requiredCapability(method: string, path: string): LinkCapability
   if (path === '/api/v1/memory' || path.startsWith('/api/v1/memory/')) return 'models:use'
   if (path === '/api/v1/folders' || path.startsWith('/api/v1/folders/')) return 'models:use'
   if (path === '/api/v1/conversations' || path.startsWith('/api/v1/conversations/')) return 'models:use'
+  // A chat image (chat-routes.ts): read with what reads the conversation naming it. Read-only surface.
+  if (path.startsWith('/api/v1/attachments/')) return read ? 'models:use' : null
   // The text classification playground's run (api/systemone-job.ts): /v1/systemone as a job the page can leave, so
   // held to what /v1/* is. GET reads the last answer, so it takes the same capability as asking: a token that may
   // not ask may not read what someone else asked either.
@@ -863,7 +868,7 @@ export function mayAlsoRead(c: Context, d: Deps, path: string): boolean {
 export function verifyKeyValue(key: string, d: Deps, opts?: { ingress?: boolean; ext?: boolean }): boolean {
   if (!key) return false
   const hash = hashKey(key)
-  const cfg = d.store.snapshot()
+  const cfg = d.store.read()
   const match = cfg.apiKeys.find((k) => k.hash === hash)
   if (!match) return false
   // Before the lastUsedAt bump on purpose: a refused credential must leave no trace of a
@@ -884,7 +889,7 @@ export function verifyKeyValue(key: string, d: Deps, opts?: { ingress?: boolean;
 
 /** {@link verifyKeyValue}'s rule for a stored key it matched, shared with
  *  {@link keyHashStillAccepted} so a re-check cannot drift from it. */
-function acceptedHere(match: ApiKey, opts?: { ingress?: boolean; ext?: boolean }): boolean {
+function acceptedHere(match: DeepReadonly<ApiKey>, opts?: { ingress?: boolean; ext?: boolean }): boolean {
   // A grant only as the ADR-422 exception (see verifyKeyValue).
   if (isFacadeOnlyKey(match) && !(opts?.ingress === true && grantKind(match) === 'remote')) return false
   // An External Chat API tenant key ({@link isExtOnlyKey}) likewise, except where lanAuth judges
@@ -898,7 +903,7 @@ function acceptedHere(match: ApiKey, opts?: { ingress?: boolean; ext?: boolean }
  *  terminal's WebSocket, an SSE stream), so it can be dropped once its key is revoked. No
  *  lastUsedAt bump: nothing is being used. */
 export function keyHashStillAccepted(hash: string, d: Deps, opts?: { ingress?: boolean; ext?: boolean }): boolean {
-  const match = d.store.snapshot().apiKeys.find((k) => k.hash === hash)
+  const match = d.store.read().apiKeys.find((k) => k.hash === hash)
   return !!match && acceptedHere(match, opts)
 }
 
@@ -977,7 +982,7 @@ export function lanAuth(d: Deps): MiddlewareHandler {
       return c.json({ error: { code: 'forbidden', message } }, 403)
     }
 
-    const daemon = d.store.snapshot().daemon
+    const daemon = d.store.read().daemon
     const tunneled = isTunneled(c, d)
     // A loopback connection whose Host names some other machine (DNS rebinding — see
     // hostNamesThisMachine) gets no loopback trust: it is judged exactly like a LAN request on
@@ -1052,7 +1057,7 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // (requireAccess on) or take an Access JWT in its place on the quick tunnel (off). The saved
     // one only while no provider is recorded on a live ingress (disable() drops it before the
     // tunnel has stopped), so `requireAccess` never lapses in that moment.
-    const ra = d.store.snapshot().remoteAccess
+    const ra = d.store.read().remoteAccess
     if (
       isTunneled(c, d) &&
       (d.remote?.activeProvider?.() ?? ra.provider) === 'cloudflare-named' &&
@@ -1313,7 +1318,7 @@ export function endLanTurns(d: Deps): number {
  *  requirement on. */
 export function endStaleStreams(d: Deps): number {
   let ended = 0
-  const keyRequired = d.store.snapshot().daemon.requireApiKey
+  const keyRequired = d.store.read().daemon.requireApiKey
   for (const s of heldStreams) {
     const keyOk = s.keyHash !== undefined && keyHashStillAccepted(s.keyHash, d, s.admission.by === 'key' ? s.admission : undefined)
     if (keyOk || (s.admission.by === 'open' && !keyRequired)) continue

@@ -1,14 +1,16 @@
 // Model discovery (A3, spec 04): scan model directories for GGUFs, parse their
 // headers, group split/mmproj files, and expose a rich model list. Path-cached.
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { readdir, realpath, stat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { migrateModelKey, type ConfigStore } from '../config/config'
-import { GgufError, type GgufMeta, parseGguf, quantFromName } from '../gguf/gguf'
+import { GgufError, type GgufMeta, parseGgufAsync, quantFromName } from '../gguf/gguf'
+import { writeFileAtomicSync } from '../util/atomic-write'
 import { CoalescedRunner } from '../util/coalesced-runner'
 import { detectJev, type JevInfo } from './jev'
 import { isLayaModelDir, layaEntryFor, type LayaInfo } from './laya'
 import { hasLitertlmMagic, isLitertlmFileName, litertlmEntryFor, litertlmHeaderFromFile, type LitertlmSampler } from './litertlm'
+import { emitInvalidation } from '../events/bus'
 
 export interface ModelEntry {
   key: string
@@ -389,9 +391,13 @@ export class Scanner {
     const dirs = this.store.snapshot().modelDirs
     const scan: ScanResult = { ggufs: [], mlxDirs: [], layaDirs: [], litertlms: [] }
     const roots = new Map<string, string>()
+    // Roots whose listing succeeded: only their files are known to be present or gone.
+    const walkedRoots: string[] = []
     for (const dir of dirs) {
       try {
         const real = await realpath(dir)
+        await readdir(dir)
+        walkedRoots.push(resolve(dir))
         if (!roots.has(real)) roots.set(real, resolve(dir))
       } catch { /* missing / inaccessible root */ }
     }
@@ -405,11 +411,22 @@ export class Scanner {
       litertlmEntryFor(f.path, dirname(f.path), f.size, f.mtime, await litertlmHeaderFromFile(f.path))))
     this.entries = [...gguf, ...mlx, ...laya, ...litertlm].sort((a, b) => a.name.localeCompare(b.name))
     this.lastScanAt = new Date().toISOString()
+    this.pruneCache(gguf, walkedRoots)
     this.saveCache()
     // One config write for the whole scan (see `entryFor`), not one per affected model.
     if (this.pendingKeyMigrations.length > 0) {
       const pairs = this.pendingKeyMigrations
       this.store.update((cfg) => { for (const [oldKey, newKey] of pairs) migrateModelKey(cfg, oldKey, newKey) })
+    }
+    emitInvalidation('models')
+  }
+
+  /** Drop cache rows of files this scan did not see. A row under a root that was not walked (missing or
+   *  unmounted for now) stays: the folder may come back, and its headers need not be re-parsed. */
+  private pruneCache(seen: ModelEntry[], walkedRoots: string[]): void {
+    const seenPaths = new Set(seen.map((e) => e.path))
+    for (const key of this.cache.keys()) {
+      if (!seenPaths.has(key) && walkedRoots.some((root) => isWithin(root, key))) this.cache.delete(key)
     }
   }
 
@@ -504,7 +521,7 @@ export class Scanner {
       meta = cached.meta
     } else {
       try {
-        meta = parseGguf(path)
+        meta = await parseGgufAsync(path)
         this.cache.set(path, { size: sizeBytes, mtime: mtimeMs, meta })
       } catch (e) {
         parseError = e instanceof GgufError ? e.message : (e as Error).message
@@ -610,7 +627,7 @@ export class Scanner {
     const entries: Record<string, CacheRow> = {}
     for (const [k, v] of this.cache) entries[k] = v
     try {
-      writeFileSync(this.cachePath, JSON.stringify({ version: CACHE_VERSION, entries }))
+      writeFileAtomicSync(this.cachePath, JSON.stringify({ version: CACHE_VERSION, entries }))
     } catch {
       /* cache is a pure accelerator */
     }

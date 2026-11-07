@@ -1,4 +1,5 @@
 // turbollm/src/routines/execute.test.ts
+import { inspect } from 'node:util'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
@@ -17,7 +18,7 @@ import type { RoutineRunStatus } from './schema'
 import { tmpDir } from '../test-support/tmp'
 import { realEngineSetUp } from '../test-support/stand-in-engine'
 import { TerminalManager } from '../terminal/terminal-manager'
-import { isTerminalBackendAvailable, getTerminalManager } from '../terminal/terminal-routes'
+import { isTerminalBackendAvailable, getTerminalManager } from '../terminal/terminal-service'
 import { PTYSession } from '../terminal/pty-session'
 
 const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
@@ -31,6 +32,7 @@ function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gat
   const manager = {
     status: () => ({ state: 'running', model: current ? { key: current } : null }),
     sessionStats: () => ({ activeRequests: opts.activeRequests ?? 0 }),
+    hold: () => () => {}, // a one-shot CLI routine holds the engine for its run (holdEngine)
     target: () => 'http://engine.invalid.local:1',
     currentOpts: () => null,
   } as unknown as Manager
@@ -42,7 +44,7 @@ function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gat
     db, manager, modelRouter,
     registry: { active: () => ({ kind: 'llama-server' }) },
     store: {
-      snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 }, daemon: { port: 6996 } }),
+      snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 }, daemon: { port: 6996 } }), read: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 }, daemon: { port: 6996 } }),
       // Only ever read by TerminalManager's constructor (orphan-safety pidfile dir) when
       // runCliInteractiveBranch's `getTerminalManager(d)` builds the module singleton for the
       // first time in this process — a real tmp dir keeps that harmless in tests that never
@@ -1258,7 +1260,7 @@ async function keepN2ChatRoutine(t: Parameters<typeof realEngineSetUp>[0], reply
   // 8081+ walk instead.
   const routineTarget = async () => {
     const r = await set.modelRouter.loadExplicit(set.routineModel.key, undefined, { runningOnly: true })
-    assert.ok('target' in r && r.engineKind, `the routine's model is not in a pool slot: ${JSON.stringify(r)}`)
+    assert.ok('target' in r && r.engineKind, `the routine's model is not in a pool slot: ${inspect(r, { depth: 2 })}`)
     assert.notEqual(r.target, set.manager.target(), 'the pool slot is not the primary')
     return `${r.target}/v1/chat/completions`
   }
