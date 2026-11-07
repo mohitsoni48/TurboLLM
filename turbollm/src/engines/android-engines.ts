@@ -50,7 +50,7 @@ export interface AndroidEngineInput {
   activeEngineId: string
   lastLoaded: LastLoaded
   /** cfg.androidRetiredEngines */
-  retired: Record<string, Engine & { copiedTo?: string }>
+  retired: Record<string, RetiredEngine>
   /** Which ANDROID_BUNDLED_ENGINES files exist in nativeLibraryDir. */
   nativeLibFiles: ReadonlySet<string>
   /** null: the app did not start the SDK this launch. `engines` null: its list could not be read. */
@@ -92,14 +92,22 @@ function planSdkRows({ sdk, engines, retired }: AndroidEngineInput): AndroidEngi
   const available = sdk.engines.filter((info) => info.available)
   const adopter = available.find((info) => info.formats.includes('gguf'))
   const keeps = available.map((info): AndroidEngineAction => {
-    if (!sdkRowOfEngine(engines, info.id) && retired[retiredSdkKey(info.id)]) return { kind: 'reinstate-sdk', info }
+    if (!existingSdkRow(engines, info.id) && retired[retiredSdkKey(info.id)]) return { kind: 'reinstate-sdk', info }
     return { kind: 'upsert-sdk', info, adoptLegacy: info === adopter }
   })
   const availableIds = new Set(available.map((info) => info.id))
   const retires = engines
-    .filter((e) => isSdkRow(e) && e.sdkEngine && !availableIds.has(e.sdkEngine.id))
-    .map((e): AndroidEngineAction => ({ kind: 'retire', engineId: e.id, remember: true, key: retiredSdkKey(e.sdkEngine?.id ?? '') }))
+    .filter(isNamedSdkRow)
+    .filter((e) => !availableIds.has(e.sdkEngine.id))
+    .map((e): AndroidEngineAction => ({ kind: 'retire', engineId: e.id, remember: true, key: retiredSdkKey(e.sdkEngine.id) }))
   return [...keeps, ...retires]
+}
+
+/** An SDK row that names its SDK engine: every row but the M1 legacy one. */
+type NamedSdkRow = Engine & Required<Pick<Engine, 'sdkEngine'>>
+
+function isNamedSdkRow(engine: Engine): engine is NamedSdkRow {
+  return isSdkRow(engine) && engine.sdkEngine !== undefined
 }
 
 /** The key a retired SDK row is remembered under in androidRetiredEngines, beside the bundled rows' names. */
@@ -107,7 +115,7 @@ function retiredSdkKey(sdkEngineId: string): string {
   return `sdk:${sdkEngineId}`
 }
 
-function sdkRowOfEngine(engines: Engine[], sdkEngineId: string): Engine | undefined {
+function existingSdkRow(engines: Engine[], sdkEngineId: string): Engine | undefined {
   return engines.find((e) => isSdkRow(e) && e.sdkEngine?.id === sdkEngineId)
 }
 
@@ -171,7 +179,7 @@ function activationTarget(input: AndroidEngineInput, rows: AndroidEngineAction[]
     return activationOf(defaultRow(live), input.sdk === null ? FRESH_INSTALL_FALLBACK : undefined)
   }
   if (isLegacySdkRow(active) && lastFormat === 'litertlm' && sdkEngineAvailable(input, SDK_LITERT_ENGINE_ID)) {
-    return activationOf(sdkRowOf(live, SDK_LITERT_ENGINE_ID))
+    return activationOf(plannedSdkRowFor(live, SDK_LITERT_ENGINE_ID))
   }
   if (input.sdk === null && isSdkRow(active)) return activationOf(spawnedCpuRow(live), active.id)
   return undefined
@@ -207,12 +215,12 @@ function rowForLastLoaded(
 /** The fresh-install default (founder Q2): the SDK's LiteRT-LM row, else the first SDK row reading GGUF, else the
  *  spawned CPU row. */
 function defaultRow(live: PlannedRow[]): PlannedRow | undefined {
-  return sdkRowOf(live, SDK_LITERT_ENGINE_ID)
+  return plannedSdkRowFor(live, SDK_LITERT_ENGINE_ID)
     ?? live.find((r) => r.origin === 'sdk' && r.formats.includes('gguf'))
     ?? spawnedCpuRow(live)
 }
 
-function sdkRowOf(live: PlannedRow[], sdkEngineId: string): PlannedRow | undefined {
+function plannedSdkRowFor(live: PlannedRow[], sdkEngineId: string): PlannedRow | undefined {
   return live.find((r) => r.origin === 'sdk' && r.sdkEngineId === sdkEngineId)
 }
 
@@ -275,7 +283,7 @@ function plannedSdkRow(engine: Engine): PlannedRow {
 
 /** The existing row an upsert lands on, as Registry.upsertSdkEngine finds it. */
 function rowUpsertedBy(engines: Engine[], { info, adoptLegacy }: UpsertSdk): Engine | undefined {
-  return sdkRowOfEngine(engines, info.id) ?? (adoptLegacy ? engines.find(isLegacySdkRow) : undefined)
+  return existingSdkRow(engines, info.id) ?? (adoptLegacy ? engines.find(isLegacySdkRow) : undefined)
 }
 
 type UpsertSdk = Extract<AndroidEngineAction, { kind: 'upsert-sdk' }>
@@ -295,8 +303,7 @@ function activeRow({ engines, activeEngineId }: AndroidEngineInput): Engine | un
 }
 
 function isAppOwnedRow(engine: Engine): boolean {
-  return isSdkRow(engine)
-    || ANDROID_BUNDLED_ENGINES.some(({ name, file }) => engine.name === name && basename(engine.binPath) === file)
+  return isSdkRow(engine) || ANDROID_BUNDLED_ENGINES.some(({ name, file }) => isOwnBundledRow(engine, name, file))
 }
 
 /** The litert-lm-android row whose settings still need the copy: retired by this plan, or remembered and not copied. */
@@ -328,7 +335,11 @@ function isLegacySdkRow(engine: Engine): boolean {
 /** The app's own row for a bundled engine: its bundled name on a binary of the bundled file's name, in this install's
  *  nativeLibraryDir or an earlier one (a reinstall moves it). A user's engine of the same kind is never it. */
 function ownBundledRow(engines: Engine[], name: string, file: string): Engine | undefined {
-  return engines.find((e) => e.name === name && basename(e.binPath) === file)
+  return engines.find((e) => isOwnBundledRow(e, name, file))
+}
+
+function isOwnBundledRow(engine: Engine, name: string, file: string): boolean {
+  return engine.name === name && basename(engine.binPath) === file
 }
 
 export interface AndroidEngineDeps {
@@ -598,7 +609,14 @@ class AndroidEngineApplier {
 type CopyState = Extract<AndroidEngineAction, { kind: 'copy-state' }>
 
 const NO_SELECTION = { fillEmptySelection: false }
-const SPAWNED_CPU_FILE = ANDROID_BUNDLED_ENGINES[0].file
+const SPAWNED_CPU_FILE = bundledFileOf(ANDROID_ENGINE_NAME)
+
+/** Looked up by name: the list's order is the planner's preference, not which engine is which. */
+function bundledFileOf(name: string): string {
+  const bundled = ANDROID_BUNDLED_ENGINES.find((b) => b.name === name)
+  if (!bundled) throw new Error(`${name} is not a bundled engine`)
+  return bundled.file
+}
 
 function isLitertServer(name: string): boolean {
   return ANDROID_BUNDLED_ENGINES.some((b) => b.name === name && b.kind === 'litert-lm')
@@ -616,9 +634,11 @@ function asEngine({ copiedTo, ...engine }: RetiredEngine): Engine {
 function bundledLitertVersion(name: string, binPath: string, onRecord?: string): Promise<string> {
   return litertLmNativeVersion(binPath).catch((err) => {
     console.warn(`android: ${name} --version failed (${messageOf(err)}); registering anyway`)
-    return onRecord || 'litert-lm (bundled)'
+    return onRecord || UNKNOWN_BUNDLED_LITERT_VERSION
   })
 }
+
+const UNKNOWN_BUNDLED_LITERT_VERSION = 'litert-lm (bundled)'
 
 function messageOf(e: unknown): string {
   return e instanceof Error ? e.message : String(e)

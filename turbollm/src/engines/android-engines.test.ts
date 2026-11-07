@@ -610,7 +610,7 @@ test('applier G-9: with the SDK not started and no CPU file, one warning says no
   await reconcile(app, { lib: nativeLibDir([]) })
   assert.deepEqual(app.registry.list().engines, [])
   assert.equal(warns.mock.callCount(), 1)
-  assert.ok(mentions(warns, /android:/, /no engine/i))
+  assert.ok(mentions(warns, /android:/, /no engine/i, /libllama_server\.so is not in this build/), 'it names the CPU file')
 })
 
 // Moved from seed.test.ts (plan §0.7): the Android start's cases, re-expressed against reconcileAndroidEngines.
