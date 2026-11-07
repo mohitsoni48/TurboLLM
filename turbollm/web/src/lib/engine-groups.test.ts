@@ -1,8 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  ANDROID_CPU_SERVER_NAME,
   BUNDLED_ENGINE_TITLES,
   SDK_ENGINE_TITLES,
+  isSdkLitertRow,
+  isSdkRow,
+  readsOnlyLitert,
   bundledTitles,
   engineLabel,
   customSourceIsLive,
@@ -85,6 +89,37 @@ const sdkRow = (id: string, sdkId: string, name: string) =>
 const sdkLitert = sdkRow('s1', 'litert-lm', 'LiteRT-LM')
 const sdkLlama = sdkRow('s2', 'llama.cpp-cpu', 'llama.cpp (CPU)')
 const serverAndroid = eng({ id: 'a1', name: 'llama-server-android', kind: 'llama-server', binPath: '/data/app/lib/arm64/libllama_server.so' })
+
+// Q-1 (stage-6 review): "is this the LiteRT-LM row" is asked two ways, and each has one helper. By format
+// (readsOnlyLitert) for what loads on it, by identity (isSdkLitertRow) for which card it is. A second LiteRT SDK row
+// (a future NPU one) reads like LiteRT-LM but is not the LiteRT-LM row.
+const npuRow = eng({
+  id: 's3', name: 'LiteRT-LM (NPU)', kind: 'turbollm-sdk', formats: ['litertlm'],
+  sdkEngine: { id: 'litert-npu', kind: 'litert-lm', formats: ['litertlm'], backends: ['gpu'] },
+})
+
+test('Q-1: the LiteRT-LM predicates, by format and by identity', () => {
+  const table: [string, Engine, { sdk: boolean; litertRow: boolean; readsOnlyLitert: boolean }][] = [
+    ['SDK LiteRT-LM', { ...sdkLitert, formats: ['litertlm'] }, { sdk: true, litertRow: true, readsOnlyLitert: true }],
+    ['hypothetical SDK NPU row', npuRow, { sdk: true, litertRow: false, readsOnlyLitert: true }],
+    ['SDK llama.cpp', { ...sdkLlama, formats: ['gguf'] }, { sdk: true, litertRow: false, readsOnlyLitert: false }],
+    ['M1 legacy SDK row', eng({ id: 'm1', kind: 'turbollm-sdk', formats: ['gguf', 'litertlm'] }), { sdk: true, litertRow: false, readsOnlyLitert: false }],
+    ['desktop LiteRT-LM', eng({ id: 'd', kind: 'litert-lm', formats: ['litertlm'] }), { sdk: false, litertRow: false, readsOnlyLitert: true }],
+    ['llama-server', eng({ id: 'l', kind: 'llama-server', formats: ['gguf'] }), { sdk: false, litertRow: false, readsOnlyLitert: false }],
+  ]
+  for (const [label, e, expected] of table) {
+    assert.deepEqual(
+      { sdk: isSdkRow(e), litertRow: isSdkLitertRow(e), readsOnlyLitert: readsOnlyLitert(e.formats ?? []) },
+      expected,
+      label,
+    )
+  }
+})
+
+test('Q-16: the spawned CPU server\'s titles are keyed by its one named constant', () => {
+  assert.equal(ANDROID_CPU_SERVER_NAME, 'llama-server-android')
+  assert.equal(BUNDLED_ENGINE_TITLES[ANDROID_CPU_SERVER_NAME]?.label, 'llama.cpp server (CPU)')
+})
 
 test('W-1: the in-app SDK engines are titled by their SDK engine id', () => {
   assert.deepEqual(SDK_ENGINE_TITLES['litert-lm'], { title: 'LiteRT-LM', detail: 'CPU · GPU', label: 'LiteRT-LM' })

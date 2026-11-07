@@ -19,6 +19,7 @@
  *  mocks. The budget math itself is NOT re-implemented; `fitBudgetMb` is the one source of
  *  truth for "how much model can this machine hold", Android carve-out included. */
 
+import { isSdkRow, readsOnlyLitert } from './engine-groups'
 import { fitBudgetMb, type FitHardware } from './vram'
 import type { Engine, ModelFormat } from './types'
 
@@ -91,7 +92,7 @@ export function onboardingFormats(engines: Engine[], activeEngineId: string, and
 }
 
 function isInAppLitertRow(e: Engine): boolean {
-  return e.kind === 'turbollm-sdk' && (e.formats ?? []).includes('litertlm')
+  return isSdkRow(e) && readsOnlyLitert(e.formats ?? [])
 }
 
 export type OnboardingPick =
@@ -171,9 +172,4 @@ function largestThatFits(ladder: readonly CandidateModel[], blessed: CandidateMo
   const fallback = [...ladder].filter((c) => fitsBudget(c, budgetMb)).sort((a, b) => a.bytes - b.bytes).pop()
   if (fallback) return asPick(fallback, 'small-device', budgetMb)
   return { kind: 'none', reason: blessed ? 'too-big-for-hardware' : 'no-candidate' }
-}
-
-/** A row that reads .litertlm and no GGUF: LiteRT-LM (ADR-462). */
-export function readsOnlyLitert(formats: readonly ModelFormat[]): boolean {
-  return formats.includes('litertlm') && !formats.includes('gguf')
 }

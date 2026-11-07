@@ -4,6 +4,7 @@ import { AlertTriangle, Check, Download, Loader2, Pause, RotateCw, Terminal } fr
 import { useDownloadMutations, useDownloads, useEngines, useModels, useStatus } from '../../../lib/queries'
 import { loadModel, track, trackRecovery, trackRecoveryText } from '../../../lib/api'
 import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
+import { isSdkRow, readsOnlyLitert } from '../../../lib/engine-groups'
 import type { StepComponentProps } from '../OnboardingScreen'
 
 /** Step 5 — Load (spec 25 §4). Real progress: polls the actual download
@@ -509,5 +510,5 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
 function useActiveEngineIsInAppLitert(): boolean {
   const { data } = useEngines()
   const active = data?.engines.find((e) => e.id === data.activeEngineId)
-  return active?.kind === 'turbollm-sdk' && active.sdkEngine?.kind === 'litert-lm'
+  return !!active && isSdkRow(active) && readsOnlyLitert(active.formats ?? [])
 }

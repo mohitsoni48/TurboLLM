@@ -201,7 +201,7 @@ describe('EnginesScreen — the engine running the model, when it is not the act
 // way to pick it.
 describe('EnginesScreen — the Android app\'s built-in engines', () => {
   const LLAMA_ANDROID = engine({ id: 'llama-a', name: 'llama-server-android', kind: 'llama-server', binPath: '/data/app/lib/arm64/libllama_server.so' })
-  const LITERT_ANDROID = engine({ id: 'litert-a', name: 'litert-lm-android', kind: 'litert-lm', binPath: '/data/app/lib/arm64/liblitertlm_server.so', version: '0.8.0' })
+  const LITERT_ANDROID = engine({ id: 'litert-a', name: 'litert-lm-android', kind: 'litert-lm', binPath: '/data/app/lib/arm64/liblitertlm_server.so', version: '0.8.0', formats: ['litertlm'] })
   const androidApp = () => {
     state.sys = { os: 'android/android', cpu: '', cores: 8, ramMB: 8000, gpus: [], bundledEnginesOnly: true }
     state.engines = [LLAMA_ANDROID, LITERT_ANDROID]

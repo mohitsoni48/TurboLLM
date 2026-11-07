@@ -96,9 +96,12 @@ beforeEach(() => {
 // says so on the in-app LiteRT-LM row only, with no number in it (ADR-338: no speed claims).
 describe('LoadStep — the first-load note on LiteRT-LM', () => {
   const NOTE = 'The first load prepares the model for this phone, so later loads are faster.'
-  const sdkRow = (id: string, sdkKind: string) =>
-    ({ id, name: id, kind: 'turbollm-sdk', binPath: '', version: 'in-app', capabilities: { kvTypes: [], flags: [] },
-      sdkEngine: { id: sdkKind, kind: sdkKind, formats: [], backends: ['cpu'] } })
+  // `formats` as the daemon's engines list computes them for every row (routes.ts, engineFormats).
+  const sdkRow = (id: string, sdkKind: string) => {
+    const formats = sdkKind === 'litert-lm' ? ['litertlm'] : ['gguf']
+    return { id, name: id, kind: 'turbollm-sdk', binPath: '', version: 'in-app', capabilities: { kvTypes: [], flags: [] },
+      formats, sdkEngine: { id: sdkKind, kind: sdkKind, formats, backends: ['cpu'] } }
+  }
 
   beforeEach(() => {
     loadModelMock.mockResolvedValue(undefined)

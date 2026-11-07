@@ -5,7 +5,26 @@
 // than one installed variant, surface a second "version" dropdown to pick the build.
 //
 // Pure + framework-free so it is unit-testable on its own (imported by EnginesScreen).
-import type { CustomEngineSource, Engine } from './types'
+import type { CustomEngineSource, Engine, ModelFormat } from './types'
+
+/** A row of the Android app's in-app TurboLLM SDK (ADR-462). */
+export function isSdkRow(e: Pick<Engine, 'kind'>): boolean {
+  return e.kind === 'turbollm-sdk'
+}
+
+/** The SDK's LiteRT-LM row itself, by identity: which card and catalog copy it is. What loads on a row is asked by
+ *  format instead ({@link readsOnlyLitert}). */
+export function isSdkLitertRow(e: Pick<Engine, 'kind' | 'sdkEngine'>): boolean {
+  return isSdkRow(e) && e.sdkEngine?.id === 'litert-lm'
+}
+
+/** A row that reads .litertlm and no GGUF: LiteRT-LM by what it loads (ADR-462), on desktop or in the app. */
+export function readsOnlyLitert(formats: readonly ModelFormat[]): boolean {
+  return formats.includes('litertlm') && !formats.includes('gguf')
+}
+
+/** The spawned CPU llama.cpp server the Android app registers for itself (engines/android-engines.ts). */
+export const ANDROID_CPU_SERVER_NAME = 'llama-server-android'
 
 /** Official llama.cpp builds auto-downloaded by TurboLLM live in
  *  `<config>/engines/llama.cpp-<tag>-<backend>/`. Matches EnginesScreen.isOfficialLlama. */
@@ -60,7 +79,7 @@ export function customSourceIsLive(source: CustomEngineSource, liveEngines: Engi
  *  engines share their kind; TurboQuant builds share `'turboquant'`; everything else is a
  *  distinct user-added engine (`'user:'+id`). */
 export function engineGroupKey(e: Engine): string {
-  if (e.kind === 'turbollm-sdk' && e.sdkEngine) return `sdk:${e.sdkEngine.id}`
+  if (isSdkRow(e) && e.sdkEngine) return `sdk:${e.sdkEngine.id}`
   if (isOfficialLlama(e.binPath)) {
     const backend = parseLlamaBuild(e.binPath)?.backend
     return backend ? `official-llama-${backend}` : 'official-llama'
@@ -100,7 +119,7 @@ function titlesByName(titles: Record<string, EngineTitles>): Readonly<Record<str
 
 /** The spawned servers say "server", so none shares a label with an in-app SDK engine (ADR-462). */
 export const BUNDLED_ENGINE_TITLES = titlesByName({
-  'llama-server-android': { title: 'llama.cpp server', detail: 'CPU · tools, images', label: 'llama.cpp server (CPU)' },
+  [ANDROID_CPU_SERVER_NAME]: { title: 'llama.cpp server', detail: 'CPU · tools, images', label: 'llama.cpp server (CPU)' },
   'llama-server-android-vulkan': { title: 'llama.cpp server', detail: 'Vulkan GPU', label: 'llama.cpp server (Vulkan GPU)' },
   'litert-lm-android': { title: 'LiteRT-LM server', detail: 'CPU · GPU', label: 'LiteRT-LM server' },
 })
@@ -117,7 +136,7 @@ type TitledEngine = Pick<Engine, 'name' | 'kind' | 'sdkEngine'>
  *  know reads as the row's name, so a new SDK engine needs no web release), a spawned server by its registered name.
  *  Undefined for any other engine. */
 export function bundledTitles(e: TitledEngine): EngineTitles | undefined {
-  if (e.kind === 'turbollm-sdk' && e.sdkEngine) {
+  if (isSdkRow(e) && e.sdkEngine) {
     return SDK_ENGINE_TITLES[e.sdkEngine.id] ?? { title: e.name, detail: '', label: e.name }
   }
   return BUNDLED_ENGINE_TITLES[e.name]

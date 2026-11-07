@@ -106,10 +106,14 @@ import { EngineStatusHeader } from './engines/EngineStatusHeader'
 import { EngineLogPanel } from './engines/EngineLogPanel'
 import { LlamaCppBackendRows } from './engines/ManagedEngines'
 import {
+  ANDROID_CPU_SERVER_NAME,
   bundledTitles,
   customSourceKey,
   groupEngines,
+  isSdkLitertRow,
+  isSdkRow,
   memberToActivate,
+  readsOnlyLitert,
   repoSlug,
   variantLabel,
   type EngineGroup,
@@ -131,7 +135,7 @@ const isOfficialLlama = (binPath: string) => /[\\/]engines[\\/]llama\.cpp-/.test
  *  showed the wrong catalog card as active. */
 export function catalogIdFor(e: Engine, catalog?: Pick<CatalogEngine, 'id' | 'releaseEngineId'>[]): string {
   // An in-app SDK row takes the curated copy of the runtime it really is (ADR-462).
-  if (e.kind === 'turbollm-sdk') return e.sdkEngine?.kind === 'litert-lm' ? 'litert-lm' : 'llama.cpp'
+  if (isSdkRow(e)) return isSdkLitertRow(e) ? 'litert-lm' : 'llama.cpp'
   if (e.kind === 'mlx') return 'mlx'
   if (e.kind === 'mlx-vlm') return 'mlx-vlm'
   if (e.kind === 'vllm') return 'vllm'
@@ -2174,20 +2178,18 @@ function BundledEngineGallery({ list, activeEngine }: { list: EnginesList | unde
   )
 }
 
-const isSdkRow = (e: Engine) => e.kind === 'turbollm-sdk'
-
 /** The default engine first (ADR-462): the SDK's LiteRT-LM, then its other engines, then the spawned servers in
  *  the order the daemon lists them. */
 function inBundledCardOrder(engines: Engine[]): Engine[] {
-  const rank = (e: Engine) => (!isSdkRow(e) ? 2 : e.sdkEngine?.id === 'litert-lm' ? 0 : 1)
+  const rank = (e: Engine) => (!isSdkRow(e) ? 2 : isSdkLitertRow(e) ? 0 : 1)
   return [...engines].sort((a, b) => rank(a) - rank(b))
 }
 
 /** One line under a Built-in card. The llama.cpp server says why it is there only beside the in-app engines, which
  *  do not run tools, image input or embeddings yet; it states a fact, not advice prompted by an error. */
 function bundledCardFooter(e: Engine, sdkRegistered: boolean): string {
-  if (e.formats?.includes('litertlm') ?? e.kind === 'litert-lm') return 'Runs .litertlm models once it is selected'
-  if (e.name === 'llama-server-android' && sdkRegistered) {
+  if (readsOnlyLitert(e.formats ?? [])) return 'Runs .litertlm models once it is selected'
+  if (e.name === ANDROID_CPU_SERVER_NAME && sdkRegistered) {
     return "Use this one for tools, image input and embeddings. The in-app engines don't run them yet."
   }
   return 'Updates with the app'
