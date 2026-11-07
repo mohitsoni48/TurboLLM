@@ -36,7 +36,8 @@ const goToStepMock = vi.hoisted(() => vi.fn())
 const navigateMock = vi.hoisted(() => vi.fn())
 const enginesMock = vi.hoisted(() => ({ data: undefined as { engines: unknown[]; activeEngineId: string } | undefined }))
 
-vi.mock('../../../lib/queries', () => ({
+vi.mock('../../../lib/queries', async (importOriginal) => ({
+  activeEngineOf: (await importOriginal<typeof import('../../../lib/queries')>()).activeEngineOf,
   useDownloads: () => downloadsMock,
   useModels: () => modelsMock,
   useStatus: () => statusMock,

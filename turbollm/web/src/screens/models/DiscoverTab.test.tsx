@@ -19,7 +19,8 @@ const state: {
   repoContentProps: { repo: string; preselectFile?: string }[]
 } = { sys: desktop(), engineRows: [], categoryRows: [], searchedCategories: [], isDesktop: true, repoContentProps: [] }
 
-vi.mock('../../lib/queries', () => ({
+vi.mock('../../lib/queries', async (importOriginal) => ({
+  activeEngineOf: (await importOriginal<typeof import('../../lib/queries')>()).activeEngineOf,
   useHfSearch: (_q: string, _sort: string, category?: HfSearchCategory) => {
     state.searchedCategories.push(category)
     const results = category ? state.categoryRows : state.engineRows

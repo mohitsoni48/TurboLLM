@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { AlertTriangle, Check, Download, Loader2, Pause, RotateCw, Terminal } from 'lucide-react'
-import { useDownloadMutations, useDownloads, useEngines, useModels, useStatus } from '../../../lib/queries'
+import { activeEngineOf, useDownloadMutations, useDownloads, useEngines, useModels, useStatus } from '../../../lib/queries'
 import { loadModel, track, trackRecovery, trackRecoveryText } from '../../../lib/api'
 import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
 import { isSdkRow, readsOnlyLitert } from '../../../lib/engine-groups'
@@ -508,7 +508,6 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
 
 /** The in-app SDK's LiteRT-LM (ADR-462) prepares a model for the phone on its first load, which makes that load slow. */
 function useActiveEngineIsInAppLitert(): boolean {
-  const { data } = useEngines()
-  const active = data?.engines.find((e) => e.id === data.activeEngineId)
+  const active = activeEngineOf(useEngines().data)
   return !!active && isSdkRow(active) && readsOnlyLitert(active.formats ?? [])
 }

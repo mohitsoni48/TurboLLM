@@ -11,7 +11,7 @@ import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, ty
 import { Link2, Lock, Search } from 'lucide-react'
 import { ApiError, track } from '../../lib/api'
 import { textClassificationRuntimeLabel } from '../../lib/model-kind'
-import { useEngines, useHfSearch, useSysInfo } from '../../lib/queries'
+import { activeEngineOf, useEngines, useHfSearch, useSysInfo } from '../../lib/queries'
 import type { Engine, HfSearchCategory, HfSearchItem, HfSortOption, ModelFormat, TextClassificationRuntime } from '../../lib/types'
 import { fitBudgetMb, searchRowFitsHardware } from '../../lib/vram'
 import { LITERT_SMALLEST_PICK, requiredMb } from '../../lib/onboarding-pick'
@@ -190,7 +190,7 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
   // models, so they have no place above the Text classification category either.
   const android = isAndroidOs(sys?.os ?? '')
   const enginesList = useEngines().data
-  const activeEngine = enginesList?.engines.find((e) => e.id === enginesList.activeEngineId)
+  const activeEngine = activeEngineOf(enginesList) ?? undefined
   const curatedList = curatedPicksFor(activeEngine?.formats ?? ['gguf'])
   const scope = android && !category ? scopeLine(activeEngine) : null
   const showCurated = !searching && !category && android
