@@ -409,8 +409,8 @@ export const LOCAL_MCPS: LocalEntry[] = [
     id: 'mcp-web-engine',
     name: 'MCP Web Engine',
     cat: 'Search',
-    desc: 'Local MCP tools for search, public-page fetch and Markdown extraction. Requires a running SearXNG instance; its upstream engines may receive queries. Optional DuckDuckGo fallback is off by default. Separate from the built-in search provider.',
-    cmd: 'uvx --from git+https://github.com/Arbolencio/mcp-web-engine.git@9b23a615451dd985ff10d4f7719b73e86c8763cc mcp-web-engine',
+    desc: 'Local MCP tools for search, public-page fetch and Markdown extraction. Requires uv, git and a running SearXNG instance; its upstream engines may receive queries. Optional DuckDuckGo fallback is off by default. Separate from the built-in search provider.',
+    cmd: 'uvx --from git+https://github.com/Arbolencio/mcp-web-engine.git@735080cdee77ec183ffaed4a06d595aaf91eee5f mcp-web-engine',
     uvx: true,
     envs: [
       { key: 'SEARXNG_URL', desc: 'Your running SearXNG JSON search endpoint, e.g. http://127.0.0.1:8080/search', required: true },
