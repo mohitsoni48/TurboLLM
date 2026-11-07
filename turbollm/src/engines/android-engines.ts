@@ -1,10 +1,12 @@
 // The Android app's engine rows (ADR-462, architecture §3.4): one row per engine the in-app TurboLLM SDK reports, the
 // spawned engines the APK ships in nativeLibraryDir, and the one settings copy between them. planAndroidEngines is a
 // pure planner over the rows, the remembered retired rows, the shipped files and the SDK's engine list.
-import { basename } from 'node:path'
-import type { Engine, LastLoaded } from '../config/config'
+import { existsSync } from 'node:fs'
+import { basename, join } from 'node:path'
+import { migrateEngineId, type ConfigStore, type Engine, type LastLoaded, type RetiredEngine } from '../config/config'
 import type { ModelFormat } from './compat'
-import { LITERT_LM_NATIVE_SERVER } from './litert-lm'
+import { LITERT_LM_NATIVE_SERVER, litertLmNativeVersion } from './litert-lm'
+import type { Registry } from './registry'
 import type { SdkEngineInfo } from './sdk-engines'
 
 /** Fixed identity for the CPU llama.cpp server the Android app ships and registers for itself. There is no "add engine"
@@ -286,4 +288,262 @@ function isLegacySdkRow(engine: Engine): boolean {
  *  nativeLibraryDir or an earlier one (a reinstall moves it). A user's engine of the same kind is never it. */
 function ownBundledRow(engines: Engine[], name: string, file: string): Engine | undefined {
   return engines.find((e) => e.name === name && basename(e.binPath) === file)
+}
+
+export interface AndroidEngineDeps {
+  registry: Registry
+  store: Pick<ConfigStore, 'snapshot' | 'update'>
+  env: NodeJS.ProcessEnv
+  readSdk: (baseUrl: string, env: NodeJS.ProcessEnv) => Promise<SdkEngineInfo[] | null>
+  /** The boot scan's format lookup. Called only after the first await: cli.ts declares the scanner after this call. */
+  formatOf: () => Promise<FormatLookup>
+}
+
+type FormatLookup = (modelKey: string) => ModelFormat | undefined
+
+/** One Android start's engine rows: reads the SDK's engine list and the boot scan, plans, and applies the plan in
+ *  order. A no-op outside the packaged app, where it returns before any await. Never throws: every step logs its own
+ *  failure with the `android:` prefix and the start goes on. */
+export async function reconcileAndroidEngines(deps: AndroidEngineDeps): Promise<void> {
+  const nativeLibDir = deps.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+  if (!nativeLibDir) return
+  try {
+    const sdk = await sdkThisLaunch(deps)
+    const formatOf = await scanLookup(deps)
+    const input = androidEngineInput(deps.store, { nativeLibDir, sdk, formatOf })
+    await new AndroidEngineApplier(deps, input, nativeLibDir).apply(planAndroidEngines(input))
+  } catch (e) {
+    console.warn(`android: could not reconcile the engines (${messageOf(e)})`)
+  }
+}
+
+/** The SDK this launch: null when the app did not start it; its list null when that list could not be read. */
+async function sdkThisLaunch({ env, readSdk }: AndroidEngineDeps): Promise<AndroidEngineInput['sdk']> {
+  const baseUrl = env.TURBOLLM_ANDROID_SDK_URL
+  if (!baseUrl) return null
+  try {
+    return { baseUrl, engines: await readSdk(baseUrl, env) }
+  } catch (e) {
+    console.warn(`android: could not read the in-app SDK's engines (${messageOf(e)}); its rows are kept as they are`)
+    return { baseUrl, engines: null }
+  }
+}
+
+async function scanLookup({ formatOf }: AndroidEngineDeps): Promise<FormatLookup> {
+  try {
+    return await formatOf()
+  } catch (e) {
+    console.warn(`android: the model scan could not be read (${messageOf(e)}); no model's format is known`)
+    return () => undefined
+  }
+}
+
+function androidEngineInput(
+  store: AndroidEngineDeps['store'],
+  launch: { nativeLibDir: string; sdk: AndroidEngineInput['sdk']; formatOf: FormatLookup },
+): AndroidEngineInput {
+  const cfg = store.snapshot()
+  return {
+    engines: cfg.engines,
+    activeEngineId: cfg.activeEngineId,
+    lastLoaded: cfg.lastLoaded,
+    retired: cfg.androidRetiredEngines ?? {},
+    nativeLibFiles: shippedFiles(launch.nativeLibDir),
+    sdk: launch.sdk,
+    formatOf: launch.formatOf,
+  }
+}
+
+function shippedFiles(nativeLibDir: string): ReadonlySet<string> {
+  return new Set(ANDROID_BUNDLED_ENGINES.map((b) => b.file).filter((file) => existsSync(join(nativeLibDir, file))))
+}
+
+/** Carries out one start's plan against the registry and the config, one action at a time, each in its own try. */
+class AndroidEngineApplier {
+  /** A plan's reference to a row it creates (an SDK engine id, a bundled name) → that row's id. */
+  private readonly rowIds = new Map<string, string>()
+  /** The selection as this start left it. Any other selection at activation time is the user's, made meanwhile. */
+  private expectedActive: string
+
+  constructor(
+    private readonly deps: AndroidEngineDeps,
+    private readonly input: AndroidEngineInput,
+    private readonly nativeLibDir: string,
+  ) {
+    this.expectedActive = input.activeEngineId
+  }
+
+  async apply(actions: AndroidEngineAction[]): Promise<void> {
+    for (const action of actions) {
+      try {
+        await this.carryOut(action)
+      } catch (e) {
+        console.warn(`android: could not ${action.kind} (${messageOf(e)})`)
+      }
+    }
+    this.warnWhenNothingCanRun()
+  }
+
+  private carryOut(action: AndroidEngineAction): Promise<void> | void {
+    switch (action.kind) {
+      case 'upsert-sdk':
+        return this.upsertSdk(action)
+      case 'repair-sdk-url':
+        return this.repairSdkUrl(action.baseUrl)
+      case 'register-bundled':
+        return this.registerBundled(action.name, action.file)
+      case 'repair-bundled':
+        return this.repairBundled(action.name, action.file)
+      case 'reinstate-bundled':
+        return this.reinstateBundled(action.name, action.file)
+      case 'retire':
+        return this.retire(action.engineId, action.remember)
+      case 'copy-state':
+        return this.copyState(action)
+      case 'activate':
+        return this.activate(action.engineId)
+    }
+  }
+
+  private upsertSdk({ info, adoptLegacy }: UpsertSdk): void {
+    const baseUrl = this.sdkBaseUrl()
+    const row = this.deps.registry.upsertSdkEngine(info, baseUrl, { adoptLegacy })
+    this.rowIds.set(info.id, row.id)
+    console.log(`android: in-app engine ${info.name} (${info.id}) at ${baseUrl}`)
+  }
+
+  private repairSdkUrl(baseUrl: string): void {
+    this.deps.store.update((c) => {
+      for (const e of c.engines) if (e.kind === TURBOLLM_SDK_KIND) e.baseUrl = baseUrl
+    })
+    console.log(`android: the in-app SDK's engine list could not be read; its rows keep their engines, at ${baseUrl}`)
+  }
+
+  private async registerBundled(name: string, file: string): Promise<void> {
+    const binPath = join(this.nativeLibDir, file)
+    const added = isLitertServer(name)
+      ? this.deps.registry.addLitertLm(name, binPath, await bundledLitertVersion(name, binPath), NO_SELECTION)
+      : (await this.deps.registry.add(name, binPath, undefined, NO_SELECTION)).engine
+    this.rowIds.set(name, added.id)
+    console.log(`android: registered bundled engine ${name} at ${binPath}`)
+  }
+
+  private async repairBundled(name: string, file: string): Promise<void> {
+    const own = ownBundledRow(this.deps.registry.list().engines, name, file)
+    if (!own) throw new Error(`${name} is no longer registered`)
+    const binPath = join(this.nativeLibDir, file)
+    const version = isLitertServer(name) ? await bundledLitertVersion(name, binPath, own.version) : own.version
+    if (own.binPath === binPath && own.version === version) return
+    await this.deps.registry.repairBinPath(own.id, binPath, isLitertServer(name) ? version : undefined)
+    console.log(`android: repaired bundled engine ${name} → ${binPath}`)
+  }
+
+  /** The row a rollback build ships again comes back under its remembered id, with the settings still keyed on it. */
+  private async reinstateBundled(name: string, file: string): Promise<void> {
+    const remembered = asEngine(this.retiredEntry(name))
+    this.deps.registry.reinstate(remembered, false)
+    this.rowIds.set(name, remembered.id)
+    console.log(`android: reinstated bundled engine ${name} under its earlier id`)
+    try {
+      await this.repairBundled(name, file)
+    } catch (e) {
+      console.warn(`android: could not repair ${name} (${messageOf(e)})`)
+    }
+    this.forgetRetired(name)
+  }
+
+  private retire(engineId: string, remember: boolean): void {
+    const row = this.deps.registry.get(engineId)
+    if (!row) throw new Error(`engine ${engineId} is no longer registered`)
+    if (remember) this.rememberRetired(row.name, row)
+    this.deps.registry.remove(engineId)
+    if (this.expectedActive === engineId) this.expectedActive = ''
+    console.log(`android: retired engine ${row.name}: it cannot run in this app build or launch`)
+  }
+
+  /** Copies `from`'s settings for models of `format` onto `to`'s row, once (the source keeps its own). */
+  private copyState({ from, to, format }: CopyState): void {
+    const toId = this.rowIdOf(to)
+    const isOfFormat = (modelKey: string) => this.input.formatOf(modelKey) === format
+    this.deps.store.update((c) => {
+      migrateEngineId(c, from, toId, { copy: true, onlyModel: isOfFormat })
+      const litertServer = c.androidRetiredEngines?.[ANDROID_LITERT_LM_ENGINE_NAME]
+      if (litertServer?.id === from) litertServer.copiedTo = toId
+    })
+    console.log(`android: copied the ${format} model settings of engine ${from} onto ${toId}`)
+  }
+
+  private activate(ref: string): void {
+    const engineId = this.rowIdOf(ref)
+    if (this.deps.registry.list().activeEngineId !== this.expectedActive) {
+      console.log(`android: skipped activating ${ref}: an engine was picked meanwhile`)
+      return
+    }
+    this.deps.registry.activate(engineId)
+    console.log(`android: ${this.deps.registry.get(engineId)?.name ?? engineId} is the active engine`)
+  }
+
+  private warnWhenNothingCanRun(): void {
+    if (this.input.sdk !== null || this.input.nativeLibFiles.has(SPAWNED_CPU_FILE)) return
+    console.warn(`android: no engine can run this launch: the in-app SDK did not start and ${SPAWNED_CPU_FILE} is not in this build`)
+  }
+
+  private rowIdOf(ref: string): string {
+    return this.rowIds.get(ref) ?? ref
+  }
+
+  private sdkBaseUrl(): string {
+    if (!this.input.sdk) throw new Error('the in-app SDK did not start this launch')
+    return this.input.sdk.baseUrl
+  }
+
+  private retiredEntry(name: string): RetiredEngine {
+    const entry = this.deps.store.snapshot().androidRetiredEngines?.[name]
+    if (!entry) throw new Error(`no remembered ${name}`)
+    return entry
+  }
+
+  private rememberRetired(name: string, row: Engine): void {
+    this.deps.store.update((c) => {
+      const retired = c.androidRetiredEngines ?? {}
+      const copiedTo = retired[name]?.copiedTo
+      retired[name] = copiedTo === undefined ? { ...row } : { ...row, copiedTo }
+      c.androidRetiredEngines = retired
+    })
+  }
+
+  private forgetRetired(name: string): void {
+    this.deps.store.update((c) => {
+      if (c.androidRetiredEngines) delete c.androidRetiredEngines[name]
+    })
+  }
+}
+
+type CopyState = Extract<AndroidEngineAction, { kind: 'copy-state' }>
+
+const NO_SELECTION = { fillEmptySelection: false }
+const SPAWNED_CPU_FILE = ANDROID_BUNDLED_ENGINES[0].file
+
+function isLitertServer(name: string): boolean {
+  return ANDROID_BUNDLED_ENGINES.some((b) => b.name === name && b.kind === 'litert-lm')
+}
+
+/** A remembered row as the engine row it was, without the reconciler's own bookkeeping. */
+function asEngine({ copiedTo, ...engine }: RetiredEngine): Engine {
+  void copiedTo
+  return engine
+}
+
+/** The bundled LiteRT-LM server's runtime version, from its own --version, refreshed every start (an app update can ship
+ *  a newer runtime at the same path). A failed probe keeps the version on record, or a placeholder, and never costs the
+ *  engine: it ships in the APK. */
+function bundledLitertVersion(name: string, binPath: string, onRecord?: string): Promise<string> {
+  return litertLmNativeVersion(binPath).catch((err) => {
+    console.warn(`android: ${name} --version failed (${messageOf(err)}); registering anyway`)
+    return onRecord || 'litert-lm (bundled)'
+  })
+}
+
+function messageOf(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
 }

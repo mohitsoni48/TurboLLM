@@ -61,7 +61,7 @@ test('the model dir is seeded before the boot scan, and the boot scan starts bef
 
 // QA F4 (B-19): the Android engine repair and registration is kept as a promise and handed to auto-load, so the first
 // launch after an upgrade plans on the engine that setup activates, not the removed row it replaces.
-const KEEP_ANDROID_ENGINE_SETUP = 'const androidEngineSetup = ensureAndroidBundledEngine(registry)'
+const KEEP_ANDROID_ENGINE_SETUP = 'const androidEngineSetup = reconcileAndroidEngines('
 const AUTO_LOAD_GETS_ENGINE_SETUP = /void runAutoLoad\(\{[\s\S]*?\bengineSetup: androidEngineSetup\b[\s\S]*?\}\)/
 
 test('auto-load is handed the Android engine setup promise', () => {

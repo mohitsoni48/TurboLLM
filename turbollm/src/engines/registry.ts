@@ -327,33 +327,6 @@ export class Registry {
     return this.store.snapshot().engines.filter((e) => e.kind === TURBOLLM_SDK_KIND)
   }
 
-  /** Register the Android app's in-app engine (kind='turbollm-sdk'), an HTTP server at `baseUrl` with no binary.
-   *  There is only ever one, so a second registration repairs it in place: its URL changes every app launch.
-   *  Unlike the other kinds it never selects itself; the Android seed decides that. Its bearer token is minted per
-   *  app process and read from the environment at call time, so it is never stored here. */
-  addTurbollmSdk(name: string, baseUrl: string): Engine {
-    const eng: Engine = {
-      id: randomUUID(),
-      name: name.trim() || 'TurboLLM SDK',
-      binPath: '',
-      kind: 'turbollm-sdk',
-      version: 'in-app',
-      baseUrl,
-      capabilities: { kvTypes: [], flags: [] },
-      addedAt: new Date().toISOString(),
-    }
-    this.store.update((c) => {
-      const existing = c.engines.find((e) => e.kind === 'turbollm-sdk')
-      if (existing) {
-        existing.baseUrl = baseUrl
-        eng.id = existing.id
-      } else {
-        c.engines.push(eng)
-      }
-    })
-    return eng
-  }
-
   /** Register a llamafile engine (kind='llamafile'). binPath is the single llamafile
    *  executable; it runs as llama.cpp's server (launched with --server --no-webui) and
    *  accepts the standard llama.cpp profile flags. */

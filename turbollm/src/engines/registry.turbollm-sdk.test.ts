@@ -1,5 +1,5 @@
-// The in-app SDK engine is registered by the Android seed, which alone decides whether it becomes the active engine
-// (plan D-8). Registering it must therefore never select it, and the per-process bearer token must never be stored.
+// The in-app SDK engines are registered by the Android reconciler, which alone decides whether one becomes the active
+// engine (ADR-462). Registering it must therefore never select it, and the per-process bearer token must never be stored.
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -32,56 +32,24 @@ function emptyRegistry(): Registry {
   return new Registry(store)
 }
 
-test('addTurbollmSdk registers an in-app engine at its base URL with no binary', () => {
-  const { reg } = registryWithLlamaCpp()
-  const eng = reg.addTurbollmSdk('TurboLLM SDK', SDK_URL)
-  assert.equal(eng.kind, 'turbollm-sdk')
-  assert.equal(eng.name, 'TurboLLM SDK')
-  assert.equal(eng.baseUrl, SDK_URL)
-  assert.equal(eng.binPath, '')
-  assert.equal(eng.version, 'in-app')
-  assert.deepEqual(reg.get(eng.id)?.baseUrl, SDK_URL)
-})
-
-test('addTurbollmSdk leaves the active engine as it was', () => {
-  const { reg } = registryWithLlamaCpp()
-  reg.addTurbollmSdk('TurboLLM SDK', SDK_URL)
-  assert.equal(reg.list().activeEngineId, 'llama')
-})
-
-test('addTurbollmSdk does not select itself even when no engine is active', () => {
-  const reg = emptyRegistry()
-  reg.addTurbollmSdk('TurboLLM SDK', SDK_URL)
-  assert.equal(reg.list().activeEngineId, '')
-})
-
-test('addTurbollmSdk stores no token in config', () => {
-  const { reg, store } = registryWithLlamaCpp()
-  const eng = reg.addTurbollmSdk('TurboLLM SDK', SDK_URL)
-  const stored = store.snapshot().engines.find((e) => e.id === eng.id)
-  assert.deepEqual(
-    Object.keys(stored ?? {}).filter((key) => /token|auth|bearer|secret/i.test(key)),
-    [],
-  )
-})
-
-test('addTurbollmSdk again keeps one SDK engine and adopts the new URL', () => {
-  const { reg } = registryWithLlamaCpp()
-  const first = reg.addTurbollmSdk('TurboLLM SDK', SDK_URL)
-  const again = reg.addTurbollmSdk('TurboLLM SDK', 'http://sdk-next.invalid:1')
-  assert.equal(again.id, first.id)
-  const sdkEngines = reg.list().engines.filter((e) => e.kind === 'turbollm-sdk')
-  assert.deepEqual(sdkEngines.map((e) => e.baseUrl), ['http://sdk-next.invalid:1'])
-})
-
-// ADR-462: one row per SDK engine, keyed by kind 'turbollm-sdk' + sdkEngine.id (plan D-4). The addTurbollmSdk cases
-// above are ported one-for-one below; they go when addTurbollmSdk does (D-7).
+// ADR-462: one row per SDK engine, keyed by kind 'turbollm-sdk' + sdkEngine.id (plan D-4). The first five cases are the
+// former single-row registration's cases (M1), ported one-for-one.
 
 const LLAMA_INFO: SdkEngineInfo = {
   id: 'llama.cpp-cpu', name: 'llama.cpp (CPU)', kind: 'llama.cpp', formats: ['gguf'], backends: ['cpu'], available: true,
 }
 const LITERT_INFO: SdkEngineInfo = {
   id: 'litert-lm', name: 'LiteRT-LM', kind: 'litert-lm', formats: ['litertlm'], backends: ['gpu', 'cpu'], available: true,
+}
+
+/** The M1 build's single SDK row, which names no SDK engine. */
+function addLegacySdkRow(reg: Registry): Engine {
+  const legacy: Engine = {
+    id: 'm1', name: 'TurboLLM SDK', binPath: '', kind: 'turbollm-sdk', version: 'in-app', baseUrl: SDK_URL,
+    capabilities: { kvTypes: [], flags: [] }, addedAt: '',
+  }
+  reg.reinstate(legacy, false)
+  return legacy
 }
 
 function sdkRows(reg: Registry): Engine[] {
@@ -146,7 +114,7 @@ test('upsertSdkEngine again keeps one row per SDK engine id and repairs its URL'
 
 test('a legacy SDK row is adopted under its id when adoptLegacy is set', () => {
   const reg = emptyRegistry()
-  const legacy = reg.addTurbollmSdk('TurboLLM SDK', SDK_URL)
+  const legacy = addLegacySdkRow(reg)
   const adopted = reg.upsertSdkEngine(LLAMA_INFO, 'http://sdk-next.invalid:1', { adoptLegacy: true })
   assert.equal(adopted.id, legacy.id)
   assert.deepEqual(sdkRows(reg).map((e) => [e.id, e.name, e.sdkEngine?.id, e.baseUrl]), [
@@ -156,7 +124,7 @@ test('a legacy SDK row is adopted under its id when adoptLegacy is set', () => {
 
 test('without adoptLegacy a legacy SDK row is left alone and a new row is made', () => {
   const reg = emptyRegistry()
-  const legacy = reg.addTurbollmSdk('TurboLLM SDK', SDK_URL)
+  const legacy = addLegacySdkRow(reg)
   const fresh = reg.upsertSdkEngine(LITERT_INFO, SDK_URL)
   assert.notEqual(fresh.id, legacy.id)
   const legacyNow = reg.get(legacy.id)
