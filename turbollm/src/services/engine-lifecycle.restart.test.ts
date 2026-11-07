@@ -13,6 +13,7 @@ import type { Engine } from '../config/config'
 import type { Deps } from '../deps'
 import { freePort, realEngineSetUp } from '../test-support/stand-in-engine'
 import { registerApi } from '../api/routes'
+import { ChatTurns } from '../chat/chat-turns'
 
 const skip = process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary'
 
@@ -37,7 +38,7 @@ async function setUp(t: { after: (fn: () => unknown) => void }) {
   const app = new Hono()
   registerApi(app, {
     version: 'test', store: h.store, registry: h.registry, scanner: h.scanner, manager: h.manager, modelRouter: h.modelRouter,
-    bench: { isRunning: () => false, cancel: () => {}, waitIdle: () => Promise.resolve() },
+    bench: { isRunning: () => false, cancel: () => {}, waitIdle: () => Promise.resolve() }, chatTurns: new ChatTurns(),
   } as unknown as Deps)
   const post = async (path: string, body: unknown = {}) =>
     (await app.request(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })).status

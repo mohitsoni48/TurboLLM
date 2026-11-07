@@ -171,7 +171,9 @@ test(
       const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('still pending after 5 s')), 5000) })
       await assert.rejects(Promise.race([call, late]), /MCP server disconnected/)
       assert.equal(procOf(), null, 'the broken server is dropped, so the next call spawns a fresh one')
-      assert.equal(server.killed, true)
+      // Ended as a tree (killTetheredTree), which does not set `killed`: what matters is that it is gone.
+      if (server.exitCode === null && server.signalCode === null) await new Promise((r) => { server.once('exit', r); setTimeout(r, 5000).unref() })
+      assert.ok(server.exitCode !== null || server.signalCode !== null, 'the broken server is ended, not left running')
       assert.deepEqual(uncaught, [])
     } finally {
       clearTimeout(timer)

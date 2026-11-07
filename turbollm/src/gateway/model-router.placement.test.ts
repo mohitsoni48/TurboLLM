@@ -66,7 +66,7 @@ function setup(readings: Reading | Reading[], opts: { modelProfiles?: unknown; p
   let reads = 0
   const fresh_: boolean[] = []
   const gpuUse = async (_engine: Engine, fresh = false) => { fresh_.push(fresh); const usedMb = seq[Math.min(reads++, seq.length - 1)]; return usedMb ? { sys: TWO_24, usedMb } : null }
-  const r = new ModelRouter(store, registry, primary.manager, scanner, undefined, undefined, () => fresh.manager, gpuUse)
+  const r = new ModelRouter(store, registry, primary.manager, scanner, undefined, undefined, () => fresh.manager, gpuUse, () => TWO_24)
   ;(r as unknown as { extraSlots: Map<string, unknown> }).extraSlots = new Map([['model-b', { manager: slot.manager, modelKey: 'model-b', lastUsedMs: Date.now() }]])
   ;(r as unknown as { primaryLastUsed: number }).primaryLastUsed = 1
   return { r, primary, slot, fresh, reads: () => reads, freshReads: () => fresh_ }

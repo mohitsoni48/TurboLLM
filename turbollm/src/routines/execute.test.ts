@@ -1,4 +1,5 @@
 // turbollm/src/routines/execute.test.ts
+import { inspect } from 'node:util'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
@@ -1259,7 +1260,7 @@ async function keepN2ChatRoutine(t: Parameters<typeof realEngineSetUp>[0], reply
   // 8081+ walk instead.
   const routineTarget = async () => {
     const r = await set.modelRouter.loadExplicit(set.routineModel.key, undefined, { runningOnly: true })
-    assert.ok('target' in r && r.engineKind, `the routine's model is not in a pool slot: ${JSON.stringify(r)}`)
+    assert.ok('target' in r && r.engineKind, `the routine's model is not in a pool slot: ${inspect(r, { depth: 2 })}`)
     assert.notEqual(r.target, set.manager.target(), 'the pool slot is not the primary')
     return `${r.target}/v1/chat/completions`
   }

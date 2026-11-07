@@ -76,7 +76,7 @@ test("the daemon's chat store announces its writes on the invalidation bus", asy
   const d = await bootTestDaemon()
   try {
     const heard = new Set<string>()
-    t.after(eventBus.subscribe((keys) => keys.forEach((k) => heard.add(k))))
+    t.after(eventBus.subscribe((keys) => { for (const k of keys) heard.add(k) }))
     const conv = d.deps.db.createConversation({ title: 'wired' })
     await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50))
     assert.ok(heard.has(`conversation:${conv.id}`), `heard ${[...heard].join(', ')}`)

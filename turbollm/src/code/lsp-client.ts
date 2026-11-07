@@ -94,7 +94,7 @@ function resolveFallbackTsserverPath(): Promise<string | null> {
   return cachedTsserverPath
 }
 
-/** `promise`'s result, or `onTimeout` after `ms` — with the timer cleared (and unref'd) once either settles, so a fast
+/** `promise`'s result, or `onTimeout` after `ms` â€” with the timer cleared (and unref'd) once either settles, so a fast
  *  answer does not leave a 60 s timer pinned to the event loop. */
 async function raceWithTimeout<T, U>(promise: Promise<T>, ms: number, onTimeout: U): Promise<T | U> {
   let timer: ReturnType<typeof setTimeout> | undefined

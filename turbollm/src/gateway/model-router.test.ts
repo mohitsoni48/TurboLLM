@@ -8,6 +8,7 @@
 // registry/scanner/comfy are unused by these paths and cast through. The private extraSlots
 // map is seeded directly via a typed cast — the same "reach into internals for a unit test"
 // shape other tests use — since there's no public seeder that doesn't drive a real load.
+import { inspect } from 'node:util'
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { readdirSync, readFileSync } from 'node:fs'
@@ -1271,11 +1272,11 @@ for (const [label, autoSwap, loadEmbedding] of [
     t.after(() => modelRouter.stopPoolSlotsOnEngine('fake', { force: true }))
     store.update((c) => { c.gateway.autoSwap = autoSwap; c.autoLoadOnStart = true })
     const chat = await modelRouter.loadExplicit(userModel.key)
-    assert.ok('target' in chat, JSON.stringify(chat))
+    assert.ok('target' in chat, inspect(chat, { depth: 2 }))
 
     const embedding = await loadEmbedding(modelRouter, embedModel.key)
 
-    assert.ok('target' in embedding, JSON.stringify(embedding))
+    assert.ok('target' in embedding, inspect(embedding, { depth: 2 }))
     assert.equal('target' in embedding && embedding.lastLoaded, undefined, 'nothing recorded, so nothing for a restore to undo')
     assert.deepEqual(modelRouter.aliveSlots().map((s) => [s.modelKey, s.primary]), [[userModel.key, true], [embedModel.key, false]])
     assert.deepEqual(store.snapshot().lastLoaded, { modelKey: userModel.key, engineId: 'fake' })
@@ -1310,7 +1311,7 @@ test('an embedding model loaded with nothing else running takes the primary and 
 
   const embedding = await modelRouter.loadExplicit(embedModel.key)
 
-  assert.ok('target' in embedding, JSON.stringify(embedding))
+  assert.ok('target' in embedding, inspect(embedding, { depth: 2 }))
   assert.deepEqual(modelRouter.aliveSlots().map((s) => [s.modelKey, s.primary]), [[embedModel.key, true]])
   assert.deepEqual(store.snapshot().lastLoaded, { modelKey: embedModel.key, engineId: 'fake' })
 })

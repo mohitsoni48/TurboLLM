@@ -178,6 +178,8 @@ export class ModelRouter {
      *  a test can fake the reading. Null: unreadable, or not trustworthy for this engine (gpu-use.ts). `fresh`: not the
      *  cached reading. */
     private gpuUse: (engine: Engine, fresh?: boolean) => Promise<GpuUse | null> = (engine, fresh) => readGpuUse(engine, join(store.dir(), 'engines', 'build'), fresh),
+    /** The machine's hardware, for the profiles a load is built from; a parameter only so a test can fake the cards. */
+    private sysInfo: () => SysInfo = getSysInfo,
   ) {}
 
   /** Wire auto-tune, which doLoad waits for: between two probes the primary reads 'stopped', so a load took it and the
@@ -747,7 +749,7 @@ export class ModelRouter {
   private async placeOnFreeVram(entry: ModelEntry, engine: Engine, opts: StartOpts, overrides?: Partial<LoadProfile>, fresh = false): Promise<StartOpts | 'nofit' | undefined> {
     if (entry.format !== 'gguf' || engine.kind !== 'llama-server' || !opts.profile) return undefined
     if (this.store.snapshot().comfyui.enabled) return undefined
-    if (gpuBlockUserSet({ entry, engine, cfg: this.store.snapshot(), sys: getSysInfo(), overrides })) return undefined
+    if (gpuBlockUserSet({ entry, engine, cfg: this.store.snapshot(), sys: this.sysInfo(), overrides })) return undefined
     const use = await this.gpuUse(engine, fresh).catch(() => null)
     if (!use) return undefined
     const fit = placeOnFreeVram(opts.profile, entry, use.sys, use.usedMb)
@@ -1158,7 +1160,7 @@ export class ModelRouter {
   /** Gateway loads build their StartOpts through the one shared builder (start-opts.ts), like the
    *  manual Load and the boot resume, so a Jev model's launch flags and a pinned port reach
    *  auto-swap loads too. doLoad has already checked compatibility (a manual load's only for a Laya model). */
-  private buildOpts(entry: ModelEntry, engine: Engine, overrides?: Partial<LoadProfile>, sys: SysInfo = getSysInfo()): StartOpts | null {
+  private buildOpts(entry: ModelEntry, engine: Engine, overrides?: Partial<LoadProfile>, sys: SysInfo = this.sysInfo()): StartOpts | null {
     if (entry.incomplete || entry.parseError) return null
     return buildStartOpts({
       entry, engine, cfg: this.store.snapshot(), sys, overrides, trigger: 'gateway_switch',

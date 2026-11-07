@@ -81,7 +81,12 @@ jobs:
         run: |
           files=$(npx tsx src/test-support/list-shard.ts "$SHARD") || exit 1
           [ -n "$files" ] || { echo "empty shard $SHARD"; exit 1; }
-          npx tsx --test --test-timeout=60000 $files
+          # cli.keeper.test.ts boots real daemons in a pty and takes minutes as a whole: its file gets the long timeout
+          # (as in the process-tether job), every other file the short one.
+          slow=$(printf '%s\n' $files | grep -E '^src/cli\.keeper\.test\.ts$' || true)
+          fast=$(printf '%s\n' $files | grep -v -E '^src/cli\.keeper\.test\.ts$')
+          npx tsx --test --test-timeout=60000 $fast
+          [ -z "$slow" ] || npx tsx --test --test-timeout=600000 $slow
         working-directory: turbollm
 
   # A Windows smoke subset of the unit tests: the code that spawns through cmd.exe and the job sentinel, where a

@@ -17,6 +17,7 @@ import type { ModelEntry, Scanner } from '../models/scanner'
 import { freePort, realEngineSetUp } from '../test-support/stand-in-engine'
 import { tmpDir } from '../test-support/tmp'
 import { ModelRouter } from './model-router'
+import { ChatTurns } from '../chat/chat-turns'
 
 /** A stand-in llama-server: notes each spawn in $SPAWN_LOG, answers /health on --port once 1 s has passed (the model
  *  "loads"), and exits at once on SIGTERM. It binds the port it is handed, so setUp pins that port to a free ephemeral
@@ -413,7 +414,7 @@ test('a manual Load made while release() resumes a paused gateway load stays the
   store.update((c) => { c.gateway.autoSwap = true })
   const d = {
     store, registry, scanner, manager, modelRouter, comfy: guard,
-    bench: { cancel: () => {}, waitIdle: () => Promise.resolve() },
+    bench: { cancel: () => {}, waitIdle: () => Promise.resolve() }, chatTurns: new ChatTurns(),
   } as unknown as Deps
   const app = new Hono()
   app.post('/start', async (c) => startEngine(c, d, await c.req.json<EngineStartBody>()))

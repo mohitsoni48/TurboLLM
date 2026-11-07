@@ -89,6 +89,9 @@ test('afterReplyCall counts the chat until its call settles, as the idle watchdo
 
 test('turnsEnded resolves at once when idle, waits for a running turn, and gives up after its bound', async () => {
   const turns = new ChatTurns()
+  // turnsEnded's own timer is unref'd (it must not hold a stopping daemon up): without a handle of the test's own,
+  // a Linux event loop with nothing else to wait on exits while the bound is still counting.
+  const keepAlive = setInterval(() => {}, 1_000)
   await turns.turnsEnded()
   let end!: () => void
   const turn = new Promise<void>((resolve) => { end = resolve })
@@ -104,6 +107,7 @@ test('turnsEnded resolves at once when idle, waits for a running turn, and gives
   await waiting
   assert.equal(ended, true)
   turns.untrackTurn(turn)
+  clearInterval(keepAlive)
 })
 
 test('saveRunningReplies runs each registered save until it is removed', () => {

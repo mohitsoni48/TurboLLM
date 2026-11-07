@@ -11,7 +11,7 @@ import { tmpDir } from '../test-support/tmp'
 function listen(t: TestContext): () => string[] {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const heard = new Set<string>()
-  t.after(eventBus.subscribe((keys) => keys.forEach((k) => heard.add(k))))
+  t.after(eventBus.subscribe((keys) => { for (const k of keys) heard.add(k) }))
   return () => {
     t.mock.timers.tick(COALESCE_WINDOW_MS)
     const keys = [...heard].sort()

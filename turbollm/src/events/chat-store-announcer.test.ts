@@ -11,7 +11,7 @@ function observed(t: TestContext) {
   const db = announceChatStoreChanges(new ConversationStore(IN_MEMORY_DATA_DIR), bus)
   t.after(() => db.close())
   const heard = new Set<string>()
-  bus.subscribe((keys) => keys.forEach((k) => heard.add(k)))
+  bus.subscribe((keys) => { for (const k of keys) heard.add(k) })
   const drain = (): string[] => {
     t.mock.timers.tick(10)
     const keys = [...heard].sort()

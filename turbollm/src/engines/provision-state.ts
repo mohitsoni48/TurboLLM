@@ -81,7 +81,7 @@ export class ProvisionState {
   }
 
   private announceSettled(): void {
-    SETTLED_KEYS.forEach((key) => this.announce(key))
+    for (const key of SETTLED_KEYS) this.announce(key)
   }
 
   /** Optional observer for the terminal outcome, wired in cli.ts to the

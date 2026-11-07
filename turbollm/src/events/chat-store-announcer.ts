@@ -175,5 +175,5 @@ function whenWritten(result: unknown, announce: (written: unknown) => void): unk
 }
 
 function emitAll(bus: EventBus, keys: readonly string[]): void {
-  keys.forEach((key) => bus.emit(key))
+  for (const key of keys) bus.emit(key)
 }
