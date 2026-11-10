@@ -68,6 +68,8 @@ test('install: downloads, verifies, unpacks Deno and writes the marker last', as
   assert.equal(v.job.state, 'idle')
   assert.equal(readFileSync(rt.denoPath(), 'utf8'), '#!fake deno')
   assert.ok(existsSync(join(rt.pyodideDir(), 'numpy.whl')))
+  // Without it Deno refuses pyodide.asm.js (found by the first real run).
+  assert.deepEqual(JSON.parse(readFileSync(join(rt.pyodideDir(), 'package.json'), 'utf8')), { type: 'commonjs' })
   assert.ok(existsSync(join(rt.dir(), RUNTIME_MARKER)))
   assert.ok(!existsSync(join(rt.dir(), 'deno.zip')))
   await new Promise((r) => setTimeout(r, 200)) // the stage is removed in the background
@@ -111,6 +113,19 @@ test('install: a server announcing another size is refused before the body is re
   const { rt } = runtime({ fetchImpl: lying })
   await rt.install()
   assert.equal(rt.view().job.error?.code, 'size_mismatch')
+})
+
+// jsdelivr serves pyodide.asm.wasm brotli-compressed: Content-Length is the compressed size, the body fetch returns is
+// the decoded file. Found by the first install against the real CDN.
+test('install: a compressed response declaring its compressed length still installs', async () => {
+  const fx = fixture()
+  const compressed = (async (input: string | URL | Request) => {
+    const res = await fx.fetchImpl(input)
+    return new Response(res.body, { headers: { 'content-length': '3', 'content-encoding': 'br' } })
+  }) as typeof fetch
+  const { rt } = runtime({ fetchImpl: compressed })
+  await rt.install()
+  assert.deepEqual(rt.view().installed, { deno: DENO_VERSION, pyodide: PYODIDE_VERSION })
 })
 
 test('install: a body running past its pinned size is cut off', async () => {

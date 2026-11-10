@@ -193,6 +193,8 @@ export class SandboxRuntime {
         await fetchFile(f, join(pyDir, f.path))
       }
       throwIfAborted(signal)
+      // Deno reads pyodide.asm.js as an ES module unless the folder says otherwise, and it is CommonJS.
+      writeFileSync(join(pyDir, 'package.json'), '{"type":"commonjs"}\n')
       writeFileSync(join(out, RUNTIME_MARKER), JSON.stringify({ deno: DENO_VERSION, pyodide: PYODIDE_VERSION } satisfies Marker))
       // An older or half-removed runtime moves aside first, so the rename below never lands inside it.
       if (existsSync(this.dir())) renameSync(this.dir(), join(runtimes, `${TRASH_PREFIX}${randomUUID().slice(0, 8)}`))
@@ -218,12 +220,15 @@ export class SandboxRuntime {
 }
 
 /** A fetch that refuses a body other than the pinned size: a declared length that differs is refused before a byte is
- *  written, and a body that runs past it is cut off, so a wrong file can never fill the disk before its hash fails. */
+ *  written, and a body that runs past it is cut off, so a wrong file can never fill the disk before its hash fails.
+ *  A compressed response (jsdelivr sends the .wasm with Content-Encoding) declares its compressed length while fetch
+ *  hands over the decoded bytes, so only an uncompressed length is compared; the cap and the hash cover the rest. */
 function exactSize(fetchImpl: typeof fetch, f: RuntimeFile): typeof fetch {
   return async (input, init) => {
     const res = await fetchImpl(input, init)
     const declared = res.headers.get('content-length')
-    if (declared !== null && Number(declared) !== f.size) {
+    const encoding = (res.headers.get('content-encoding') ?? 'identity').toLowerCase()
+    if (declared !== null && encoding === 'identity' && Number(declared) !== f.size) {
       await res.body?.cancel()
       throw new SandboxRuntimeError('size_mismatch', `${f.path}: expected ${f.size} bytes, the server announced ${declared}.`)
     }
