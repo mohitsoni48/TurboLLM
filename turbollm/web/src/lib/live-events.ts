@@ -55,6 +55,7 @@ const FAMILY_TARGETS: Record<string, InvalidateQueryFilters[]> = {
   engines: [byPrefix('engines'), byPrefix('engine-updates')],
   'code-sessions': [byPrefix('code-sessions'), byPrefix('code-session')],
   settings: [byPrefix('settings')],
+  sandboxRuntime: [byPrefix('sandbox-runtime')],
 }
 
 /** Keys naming one entity: `<scope>:<id>`, onto that entity's own queries. */
