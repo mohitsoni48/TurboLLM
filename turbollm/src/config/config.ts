@@ -194,6 +194,12 @@ export interface ExperimentalFeatures {
    *  supervisor does not run. Deliberately does NOT gate Phase 1's ingress listener or
    *  `--tunnel`, both of which must keep working for every install. */
   remoteAccess: boolean
+  /** Master gate for the Python sandbox (GitHub #52): Pyodide inside Deno with no network, no env and no write
+   *  access, downloaded once (about 75 MB) into `<config dir>/runtimes/sandbox/`. Off for every install, new or
+   *  upgraded, and never on Android (Deno has no Android build; `sandbox/gate.ts` refuses there whatever this
+   *  says). When off, the runtime routes other than reading its state refuse with a typed code. Turning it off
+   *  keeps the downloaded runtime; Remove in Settings deletes it. */
+  sandbox: boolean
 }
 export interface Telemetry {
   level: string
@@ -805,7 +811,7 @@ export function defaultConfig(): Config {
       theme: 'system',
       autoGenerateTitles: true,
       autoMemoryEnabled: false,
-      experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false },
+      experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false, sandbox: false },
     },
     telemetry: { level: 'full', machineId: '' },
     apiKeys: [],
@@ -1575,6 +1581,8 @@ function normalize(c: Config): void {
     // presence would silently enable an unverified cross-machine feature on upgrade.
     turboLink: ex.turboLink === true,
     remoteAccess: ex.remoteAccess === true,
+    // `sandbox` (2026-11-10, GitHub #52): new, so there is no earlier opt-in to carry forward.
+    sandbox: ex.sandbox === true,
   }
   // Telemetry level (spec 09 §3): the UI exposes 'off' | 'anon' | 'full'. Migrate
   // legacy/unknown values safely → 'off' (the conservative, opt-in default).

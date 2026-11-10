@@ -7,7 +7,7 @@ import userEvent from '@testing-library/user-event'
 import { ExperimentalSection } from './ExperimentalSection'
 
 const save = { mutate: vi.fn(), isPending: false }
-const settings = { experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false } }
+const settings = { experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false, sandbox: false } }
 
 vi.mock('../../lib/queries', () => ({
   useSettings: () => ({ query: { data: settings }, save }),
@@ -15,7 +15,7 @@ vi.mock('../../lib/queries', () => ({
 
 beforeEach(() => {
   save.mutate.mockClear()
-  settings.experimental = { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false }
+  settings.experimental = { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false, sandbox: false }
 })
 
 describe('ExperimentalSection', () => {
@@ -68,7 +68,7 @@ describe('ExperimentalSection', () => {
   })
 
   it('reflects the flag being already on', () => {
-    settings.experimental = { memory: false, cloudDeploy: false, routines: false, turboLink: true, remoteAccess: false }
+    settings.experimental = { memory: false, cloudDeploy: false, routines: false, turboLink: true, remoteAccess: false, sandbox: false }
     render(<ExperimentalSection />)
     const rows = screen.getAllByRole('checkbox') as HTMLInputElement[]
     expect(rows[rows.length - 1].checked).toBe(true)

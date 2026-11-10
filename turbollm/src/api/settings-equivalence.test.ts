@@ -22,6 +22,8 @@ const GOLDEN = join(import.meta.dirname, 'fixtures', 'settings-golden.json')
 const WRITE = process.env.TURBOLLM_SETTINGS_GOLDEN === 'write'
 /** Top-level payload keys added after the recording. */
 const NEW_KEYS = ['downloadConcurrency', 'engineLoadStallSeconds']
+/** `experimental` flags added after the recording, dropped from the payload and from the config hash alike. */
+const NEW_EXPERIMENTAL = ['sandbox']
 
 type Remote = 'none' | 'off' | 'on'
 
@@ -57,8 +59,18 @@ function mkDeps(cfg: Config, remote: Remote) {
 
 const hash = (v: unknown) => createHash('sha256').update(JSON.stringify(v)).digest('hex').slice(0, 16)
 
+function withoutNewExperimental(experimental: unknown): unknown {
+  if (!experimental || typeof experimental !== 'object') return experimental
+  return Object.fromEntries(Object.entries(experimental).filter(([k]) => !NEW_EXPERIMENTAL.includes(k)))
+}
+
 function withoutNewKeys(payload: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(payload).filter(([k]) => !NEW_KEYS.includes(k)))
+  const kept = Object.fromEntries(Object.entries(payload).filter(([k]) => !NEW_KEYS.includes(k)))
+  return 'experimental' in kept ? { ...kept, experimental: withoutNewExperimental(kept.experimental) } : kept
+}
+
+function configAsRecorded(c: Config): unknown {
+  return { ...c, daemon: { ...c.daemon, experimental: withoutNewExperimental(c.daemon.experimental) } }
 }
 
 // ── configs the GET payload is pinned over ──
@@ -70,7 +82,7 @@ function richConfig(): Config {
   c.daemon.machineName = 'rig'
   c.daemon.lanBind = true
   c.daemon.requireApiKey = false
-  c.daemon.experimental = { memory: true, cloudDeploy: true, routines: true, turboLink: false, remoteAccess: true }
+  c.daemon.experimental = { memory: true, cloudDeploy: true, routines: true, turboLink: false, remoteAccess: true, sandbox: false }
   c.vramHeadroomMb = 0
   c.telemetry.level = 'anon'
   c.modelDefaults = { ...c.modelDefaults, ctx: 32768, ngl: 40, kvTypeK: 'q8_0', kvTypeV: 'q8_0' }
@@ -256,7 +268,7 @@ async function runPatch(body: unknown, config: () => Config, remote: Remote, hos
     status: res.status,
     ...(res.status === 200 ? {} : { error: json.error }),
     body: hash(withoutNewKeys(json)),
-    config: hash(after()),
+    config: hash(configAsRecorded(after())),
     calls,
   }
 }

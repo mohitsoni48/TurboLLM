@@ -58,10 +58,10 @@ function FeatureRow({
  *  saved links and granted tokens stay in config, untouched, for when it goes back on. */
 export function ExperimentalSection() {
   const { query: settingsQ, save } = useSettings()
-  const experimental = settingsQ.data?.experimental ?? { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false }
+  const experimental = settingsQ.data?.experimental ?? { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false, sandbox: false }
   const busy = save.isPending
 
-  const setFlag = (key: 'memory' | 'cloudDeploy' | 'routines' | 'turboLink' | 'remoteAccess', value: boolean) => {
+  const setFlag = (key: 'memory' | 'cloudDeploy' | 'routines' | 'turboLink' | 'remoteAccess' | 'sandbox', value: boolean) => {
     save.mutate(
       { experimental: { [key]: value } },
       { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update experimental setting.') },
