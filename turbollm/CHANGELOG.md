@@ -33,9 +33,11 @@ Voice: talk to a model and have it read its answers back, all on your machine.
     in the chat box, where you can fix it before sending. *Settings → Voice* sets it up: on Windows and Linux one click
     installs whisper.cpp's own release build (checked against a pinned checksum); on macOS, where whisper.cpp publishes
     no build, it uses the one Homebrew installs (`brew install whisper.cpp`); anywhere, you can point it at a
-    `whisper-server` of your own. Then download a model (Base is a good start; Tiny to Large v3 Turbo are listed, and a
-    ggml file you put in the models folder yourself is offered too). whisper runs on the CPU unless you turn the GPU
-    option on, starts when you first record, and stops again after ten minutes unused.
+    `whisper-server` of your own. The Android app has whisper.cpp built in (compiled from the same release), so there
+    is nothing to install on a phone. Then download a model (Base is a good start, and its compact build on a phone;
+    Tiny to Large v3 Turbo are listed, and a ggml file you put in the models folder yourself is offered too). whisper
+    runs on the CPU unless you turn the GPU option on, starts when you first record, and stops again after ten minutes
+    unused.
   - **Models that hear audio.** A model that takes audio as input (Voxtral, Ultravox, Qwen-Omni and others on
     llama.cpp, found from the engine's own `/props`; a LiteRT-LM bundle with an audio encoder in the Android app) can
     be sent the recording as it is, so it hears your voice, not only your words. With both available TurboLLM asks
@@ -45,7 +47,15 @@ Voice: talk to a model and have it read its answers back, all on your machine.
     in its place.
 - **Read aloud.** A speaker button on every reply reads it in your device's own voice, skipping code blocks and
   markup. *Settings → Voice* picks the voice and speed, and can read replies out as they are written: every reply, or
-  only the replies to messages you spoke. Only voices that work offline are offered.
+  only the replies to messages you spoke.
+  - **In the reply's language.** The language of a reply is worked out on your device and it is read by a voice for
+    that language: an answer in Spanish gets a Spanish voice, a Japanese sentence in an English answer a Japanese one,
+    whichever language your system is set to. A voice you pick is used for its own language. *Settings → Voice* lists
+    the languages your device can read; when a reply is in one it has no voice for, TurboLLM says so once and reads on
+    with the voice it has (in the Android app, **Get voices** opens the speech engine's downloads).
+  - **Offline voices by default.** Only voices that speak on your device are used. **Allow online voices** lets a
+    voice made on its maker's servers fill in for a language your device lacks; the text of the reply is sent there,
+    so it is off until you turn it on.
 - **Speech-to-text API.** `POST /v1/audio/transcriptions` and `/v1/audio/translations`, in the shape of OpenAI's
   Whisper API (`response_format` json, text, srt, vtt or verbose_json; `language`, `prompt`, `temperature`), answered
   by whisper.cpp once it is set up. Until then these paths go to the engine as before.

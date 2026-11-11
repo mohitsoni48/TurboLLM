@@ -271,11 +271,13 @@ the detail:
   **microphone** in the chat box records a message and stops by itself when you finish speaking;
   [whisper.cpp](https://github.com/ggml-org/whisper.cpp) turns it into text you can read and fix
   before sending. *Settings → Voice* sets it up: one click installs whisper.cpp's own build on
-  Windows and Linux (on macOS it uses Homebrew's `whisper.cpp`), and you pick a model to download.
+  Windows and Linux (on macOS it uses Homebrew's `whisper.cpp`; the Android app has it built
+  in), and you pick a model to download.
   A model that **hears audio** (Voxtral, Ultravox, Qwen-Omni, a LiteRT-LM bundle with an audio
   encoder) can be sent the recording itself instead, so it hears your voice and not only your
   words: TurboLLM asks which you want, once or every time. **Read aloud** on any reply speaks it
-  in your device's own voice, and replies can be read out as they are written.
+  in your device's own voice, picking one for the language the reply is written in, and replies
+  can be read out as they are written.
 - **Markdown + syntax-highlighted code** with one-click copy — plus **inline Unicode charts**
   the model draws when a comparison, trend, or hierarchy is genuinely worth a visual.
 - **Live artifacts** — `html`, `svg`, and `mermaid` replies render as **sandboxed, offline
@@ -736,7 +738,8 @@ choice.** That's not a promise you have to take on faith: the client is source-a
 claim is checkable against the actual code that ships.
 
 Voice is no exception: a recording is turned into text by whisper.cpp on your machine, or handed to
-the model you loaded, and replies are read aloud by voices that run on your own device.
+the model you loaded, and replies are read aloud by voices that run on your own device (an online
+voice is used only if you allow it in *Settings → Voice*).
 
 **Telemetry defaults to on** (Usage + benchmarks + crash reports), so setup problems and
 real-hardware speed get found and fixed — verifiable telemetry only helps if enough people are
