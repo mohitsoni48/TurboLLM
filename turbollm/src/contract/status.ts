@@ -77,6 +77,9 @@ export type LoadedModel = {
   quant: string
   ctx: number
   vision: boolean
+  /** The model takes audio as input: a recording can be sent to it as it is, not only as its transcript. Absent from
+   *  daemons that predate voice input. */
+  audio?: boolean
   loadElapsedMs?: number
 }
 

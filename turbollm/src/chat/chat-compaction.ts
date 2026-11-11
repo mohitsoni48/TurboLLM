@@ -18,6 +18,7 @@
 // noUnusedLocals: true, so importing them before anything in the file uses them would fail
 // Task 2's OWN typecheck step. Keep this file's imports exactly matched to what's actually
 // referenced at the end of whichever task last touched it.
+import { audioAttachmentFormat, isAudioAttachment } from './attachments.js'
 import type { Conversation, ConversationStore, Message } from './db.js'
 import { estimateTokens } from '../ext/context-limit.js'
 import { callChatUpstream, resolveChatUpstream, type ChatUpstream } from './chat-upstream.js'
@@ -154,17 +155,39 @@ function effectiveTailText(preserveThinking: boolean, m: Message): string {
 }
 
 /** A user turn as the engine receives it: the attached documents' text folded ahead of the
- *  typed text, images as multimodal parts. Shared by POST /messages (a new turn) and
+ *  typed text, then its attachments as multimodal parts, an image as `image_url` and a voice clip as
+ *  `input_audio` (attachments.ts tells them apart). Shared by POST /messages (a new turn) and
  *  buildEngineMessages (the turn /continue answers again — Regenerate, edit-and-resend), so a
- *  re-answered turn carries exactly what its first send did. */
-export function userTurnContent(text: string, docContext: string | undefined, images: string[]): unknown {
+ *  re-answered turn carries exactly what its first send did. A clip's `data` is the attachment string
+ *  here; AttachmentStore.resolveMedia makes it the base64 an engine reads. */
+export function userTurnContent(text: string, docContext: string | undefined, attachments: string[]): unknown {
   const fullContent = docContext ? (text ? `${docContext}\n\n${text}` : docContext) : text
-  return images.length
+  return attachments.length
     ? [
         ...(fullContent ? [{ type: 'text', text: fullContent }] : []),
-        ...images.map((url) => ({ type: 'image_url', image_url: { url } })),
+        ...attachments.map(mediaPart),
       ]
     : fullContent
+}
+
+function mediaPart(attachment: string): unknown {
+  const format = audioAttachmentFormat(attachment)
+  return format === null
+    ? { type: 'image_url', image_url: { url: attachment } }
+    : { type: 'input_audio', input_audio: { data: attachment, format } }
+}
+
+/** What stands in for a voice message in a prompt that cannot carry its audio. */
+export const VOICE_MESSAGE_PLACEHOLDER = '[Voice message]'
+
+/** An earlier user turn that was spoken, as it is resent. Images and documents of earlier turns are not resent (their
+ *  turn's text and the reply to them carry the conversation on), but a voice message may have no text at all: resent
+ *  as text alone, every spoken turn would reach the model empty and the conversation would be the assistant talking to
+ *  itself. So an engine that hears gets the clips again, and one that does not gets a placeholder where there is no
+ *  typed text, which keeps the turn from being an empty message (several chat templates refuse one). */
+function spokenTurnContent(text: string, clips: string[], hearsAudio: boolean): unknown {
+  if (hearsAudio) return userTurnContent(text, undefined, clips)
+  return text || VOICE_MESSAGE_PLACEHOLDER
 }
 
 /** A message as buildEngineMessages sends it: `reasoning_content` is a past turn's reasoning, for an engine whose
@@ -184,9 +207,12 @@ export type EngineMessage = { role: string; content: unknown; reasoning_content?
  *  Qwen3-0.6B) a folded block of about 100 tokens of reasoning added about 100 prompt tokens on Qwen3-0.6B,
  *  gemma-3-270m-it and LFM2.5-VL-450M, and as reasoning_content none. LFM2.5's template reads reasoning_content and
  *  applies its own preserve_thinking (the chat's preserve_thinking kwarg, which the Android app's server passes to the
- *  template). */
+ *  template).
+ *
+ *  `hearsAudio` (the turn's upstream takes audio input): earlier voice messages are resent with their clips; see
+ *  spokenTurnContent. */
 export function buildEngineMessages(
-  conv: Conversation, activeMessages: Message[], answeringUserMessageId?: string, opts: { reasoningField?: boolean } = {},
+  conv: Conversation, activeMessages: Message[], answeringUserMessageId?: string, opts: { reasoningField?: boolean; hearsAudio?: boolean } = {},
 ): EngineMessage[] {
   const { summary, rest } = resolveCompactionCut(conv, activeMessages)
   const out: EngineMessage[] = []
@@ -204,11 +230,14 @@ export function buildEngineMessages(
       out.push({ role: m.role, content: m.content, reasoning_content: m.reasoning })
       continue
     }
+    if (m.id === answeringUserMessageId) {
+      out.push({ role: m.role, content: userTurnContent(m.content, m.docContext, m.attachments) })
+      continue
+    }
+    const clips = m.role === 'user' ? (m.attachments ?? []).filter(isAudioAttachment) : []
     out.push({
       role: m.role,
-      content: m.id === answeringUserMessageId
-        ? userTurnContent(m.content, m.docContext, m.attachments)
-        : effectiveTailText(!!conv.preserveThinking, m),
+      content: clips.length ? spokenTurnContent(m.content, clips, !!opts.hearsAudio) : effectiveTailText(!!conv.preserveThinking, m),
     })
   }
   return out

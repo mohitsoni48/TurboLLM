@@ -10,7 +10,8 @@ import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import type { EmitSink } from './emit-sink.js'
 import type { ChatRun, ChatRunMeta } from './chat-runs.js'
 import type { ChatTurns } from './chat-turns.js'
-import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent, type EngineMessage } from './chat-compaction.js'
+import { isAudioAttachment } from './attachments.js'
+import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent, VOICE_MESSAGE_PLACEHOLDER, type EngineMessage } from './chat-compaction.js'
 
 import type { ConversationStore, Message, PageOpts, ToolCallRecord } from './db'
 import { InvalidCursorError } from './db'
@@ -176,6 +177,23 @@ function forClient(messages: Message[]): Message[] {
     const { docContext: _docText, ...rest } = m
     return rest
   })
+}
+
+/** A message may carry this many voice clips: the page sends one per recording, and a handful is already minutes. */
+const MAX_VOICE_CLIPS = 8
+/** A clip's data URL may be this long: about 32 MB of audio, a quarter of an hour of the WAV the page records. Past
+ *  it the request is a file upload, not a voice message, and every later turn would resend it. */
+const MAX_VOICE_CLIP_CHARS = 44 * 1024 * 1024
+
+/** Why a message's `audio` is refused, or null. Each clip is a `data:audio/wav` or `data:audio/mpeg` URL (what the
+ *  engines that hear audio decode), or the reference of a clip already stored. */
+export function voiceClipsRefusal(audio: string[]): string | null {
+  if (audio.length > MAX_VOICE_CLIPS) return `A message can carry at most ${MAX_VOICE_CLIPS} voice clips.`
+  for (const clip of audio) {
+    if (!isAudioAttachment(clip)) return 'Each audio entry must be a WAV or MP3 clip as a data: URL.'
+    if (clip.length > MAX_VOICE_CLIP_CHARS) return 'A voice clip can be at most 32 MB.'
+  }
+  return null
 }
 
 /** Edit-and-resend's branch (GitHub #52): the question `msg` and everything after it are frozen,
@@ -361,7 +379,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     return c.json({ ...shown, messages: forClient(shown.messages ?? []), ...d.chatTurns.slotState(conv.id) })
   })
 
-  // A chat image (attachments.ts), for the web UI to show. Under /api/v1 like the conversation that names it, so
+  // A chat image or voice clip (attachments.ts), for the web UI to show or play. Under /api/v1 like the conversation that names it, so
   // lanAuth admits the same callers, and a remote-access token needs models:use (auth.ts requiredCapability). The id
   // is checked against the one shape the store writes, so it can only name a file in the attachments folder. Its
   // name is the hash of its bytes, so it never changes: cacheable for good.
@@ -521,25 +539,31 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/messages', async (c) => {
     const convId = c.req.param('id')
-    const b = await body<{ content?: string; images?: string[]; docContext?: string; textAttachments?: string[]; thinkingBudget?: number; reasoningEffort?: string; model?: string }>(c)
+    const b = await body<{ content?: string; images?: string[]; audio?: string[]; docContext?: string; textAttachments?: string[]; thinkingBudget?: number; reasoningEffort?: string; model?: string }>(c)
     // Trimmed here and in resolveChatUpstream (the model): anything but a string threw, a bare 500.
     const notString = nonStringField(b, ['content', 'model'])
     if (notString) return err(c, 400, 'invalid_input', `${notString} must be a string.`)
     const content = (b.content ?? '').trim()
     const images = b.images ?? []
+    // Voice clips, for a model that hears audio: sent to it as they are, where the page would otherwise have had
+    // whisper turn them into `content` first.
+    const audio = b.audio ?? []
     const textAttachments = b.textAttachments ?? []
     // Checked before anything is stored: a string passed the emptiness check below on its own
     // .length and was saved on the user row, which then broke the chat's view and every resend.
     const isStrings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string')
-    if (!isStrings(images) || !isStrings(textAttachments) || (b.docContext != null && typeof b.docContext !== 'string'))
-      return err(c, 400, 'invalid_input', 'images and textAttachments must be arrays of strings, and docContext a string.')
-    // A message is valid if it has typed text OR carries an image or file
-    // attachment — image-only / file-only sends are allowed.
-    if (!content && images.length === 0 && textAttachments.length === 0)
-      return err(c, 400, 'invalid_input', 'Type a message or attach an image or file.')
-    // Each image to its file before the row names it (attachments.ts); the engine is sent data URLs (below).
+    if (!isStrings(images) || !isStrings(audio) || !isStrings(textAttachments) || (b.docContext != null && typeof b.docContext !== 'string'))
+      return err(c, 400, 'invalid_input', 'images, audio and textAttachments must be arrays of strings, and docContext a string.')
+    const audioRefusal = voiceClipsRefusal(audio)
+    if (audioRefusal) return err(c, 400, 'invalid_input', audioRefusal)
+    // A message is valid if it has typed text OR carries an image, a voice clip or a file
+    // attachment — image-only / voice-only / file-only sends are allowed.
+    if (!content && images.length === 0 && audio.length === 0 && textAttachments.length === 0)
+      return err(c, 400, 'invalid_input', 'Type a message, record one, or attach an image or file.')
+    // Each image and clip to its file before the row names it (attachments.ts); the engine is sent the bytes (below).
     // Before the conversation is read and the busy check, so nothing they decide goes stale across this await.
-    const storedImages = await db.attachments.save(images)
+    const media = [...images, ...audio]
+    const storedMedia = await db.attachments.save(media)
 
     const conv = db.getConversation(convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
@@ -552,14 +576,19 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const resolved = resolveChatUpstream(d, b.model)
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
     const upstream = resolved.upstream
+    // Refused here rather than left to the engine, which answers audio it cannot take with an opaque 500 after the
+    // turn is already on the page. The composer only offers "send as audio" for a model that hears, so this is a
+    // model swapped between the recording and the send, or an API caller.
+    if (audio.length > 0 && !upstream.hearsAudio)
+      return err(c, 409, 'audio_unsupported', `${upstream.modelName} cannot take audio. Convert the recording to text and send that.`)
 
     const busy = inflightRefusal(c, d, convId, 'A generation is already running for this conversation.')
     if (busy) return busy
 
-    // Persist user message — only the typed text is stored as content; images are
+    // Persist user message — only the typed text is stored as content; images and voice clips are
     // kept in attachments (the full doc context is folded into the engine prompt below,
     // and kept in docContext so /continue can send this turn again with it).
-    const userMsg = db.addMessage(convId, 'user', content, { attachments: storedImages, textAttachments, docContext: b.docContext })
+    const userMsg = db.addMessage(convId, 'user', content, { attachments: storedMedia, textAttachments, docContext: b.docContext })
 
     // Create a placeholder assistant message
     db.addMessage(convId, 'assistant', '', { stats: { aborted: false } })
@@ -591,12 +620,12 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // summary + cut when one is resolvable; a plain passthrough when not).
       // setAsideFrozenCut: a cut left behind on another branch is not this branch's summary.
       const allMsgs = (conv.messages ?? []).filter(m => m.id !== assistantMsg.id)
-      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, undefined, { reasoningField: reasoningAsField(d, upstream) })
-      // Fold any attached document text into the prompt; attach images as multimodal parts.
-      engineMessages.push({ role: 'user', content: userTurnContent(content, b.docContext, images) })
-      // Every stored reference as its data URL, as /continue does: the history's, and this turn's when a caller sent
+      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, undefined, { reasoningField: reasoningAsField(d, upstream), hearsAudio: upstream.hearsAudio })
+      // Fold any attached document text into the prompt; attach images and voice clips as multimodal parts.
+      engineMessages.push({ role: 'user', content: userTurnContent(content, b.docContext, media) })
+      // Every stored reference as its bytes, as /continue does: the history's, and this turn's when a caller sent
       // references it was shown (`attachment:<id>`) rather than the image itself. No engine understands a reference.
-      await db.attachments.resolveImages(engineMessages)
+      await db.attachments.resolveMedia(engineMessages)
 
       await runGeneration(d, sink, { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), userText: content, isCodeAuthorized })
     })
@@ -711,9 +740,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // `lastUser` is the turn being answered: it goes out with its images and documents, as
       // POST /messages first sent it — the text alone is not what the user asked about.
       const allMsgs = (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id)
-      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id, { reasoningField: reasoningAsField(d, upstream) })
-      // Its stored images as the data URLs the first send carried (a local engine and a Turbo Link host alike).
-      await db.attachments.resolveImages(engineMessages)
+      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id, { reasoningField: reasoningAsField(d, upstream), hearsAudio: upstream.hearsAudio })
+      // Its stored images and clips as the bytes the first send carried (a local engine and a Turbo Link host alike).
+      await db.attachments.resolveMedia(engineMessages)
 
       await runGeneration(d, sink, { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), replacedId: replaced?.role === 'assistant' ? replaced.id : undefined, edited, isCodeAuthorized })
     })
@@ -1304,7 +1333,17 @@ export async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx)
  *  about you" block next to one short user turn often titled the chat off THAT instead of what
  *  was actually asked (GitHub: "gets title based on memory and not based on msg I send"). */
 export function recentTitleTurns(messages: { role: string; content: unknown }[], n = 2): { role: string; content: unknown }[] {
-  return messages.filter((m) => m.role !== 'system').slice(-n)
+  return messages.filter((m) => m.role !== 'system').slice(-n).map(withoutVoiceClips)
+}
+
+/** A turn as the title request carries it: without its voice clips. The title is written from the reply, which is in
+ *  the request too, so hearing the question again buys nothing and costs a second pass over its audio. A turn that
+ *  was only a clip is named as one rather than sent empty. */
+function withoutVoiceClips(m: { role: string; content: unknown }): { role: string; content: unknown } {
+  if (!Array.isArray(m.content)) return m
+  const parts = (m.content as Array<{ type?: unknown }>).filter((part) => part?.type !== 'input_audio')
+  if (parts.length === m.content.length) return m
+  return { ...m, content: parts.length > 0 ? parts : VOICE_MESSAGE_PLACEHOLDER }
 }
 
 async function autoTitle(

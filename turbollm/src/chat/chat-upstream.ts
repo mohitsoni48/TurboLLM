@@ -45,6 +45,10 @@ export interface ChatUpstream {
   /** The LOCAL active engine's kind, which shapes the outbound body (applyEngineTokenLimit). Ignored
    *  for a remote turn: the host shapes the request for its own engine. */
   engineKind?: string
+  /** The model takes audio input, so a voice message may go to it as audio (its `input_audio` parts) rather than as
+   *  its transcript. Known only for the local primary engine (the manager's status); a Turbo Link host's model and a
+   *  pool slot's are taken not to, and a recording for them is transcribed first. */
+  hearsAudio?: boolean
   /** The library key of the local model this upstream serves, when it is not the primary's (a routine's pool slot):
    *  what a LiteRT-LM round reads the model's tool support from. Unset: the primary's loaded model. */
   libraryKey?: string
@@ -122,6 +126,7 @@ export function resolveChatUpstream(d: Deps, requestedModel?: string): ChatUpstr
       ctxMax: ms.model.ctx ?? DEFAULT_CTX,
       target,
       engineKind,
+      ...(ms.model.audio === true ? { hearsAudio: true } : {}),
     },
   }
 }
