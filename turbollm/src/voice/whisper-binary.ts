@@ -43,8 +43,8 @@ const RELEASE_ASSETS: Readonly<Record<string, ReleaseAsset>> = {
  *  folder to be runnable there at all. */
 export const ANDROID_WHISPER_SERVER = 'libwhisper_server.so'
 
-/** The Android app's GPU build of the same server, beside it when the app was built with one (TurboLLM-Android,
- *  -PturbollmWhisperVulkan=true): whisper-server with ggml's Vulkan backend linked in. A second file, so that a
+/** The Android app's GPU build of the same server, beside it unless the app was built without one (TurboLLM-Android,
+ *  -PturbollmWhisperVulkan=false): whisper-server with ggml's Vulkan backend linked in. A second file, so that a
  *  Vulkan driver that takes the process down takes only this one, and the CPU server is still there to go back to. */
 export const ANDROID_WHISPER_SERVER_GPU = 'libwhisper_server_vk.so'
 

@@ -37,8 +37,8 @@ Voice: talk to a model and have it read its answers back, all on your machine.
     is nothing to install on a phone. Then download a model (Base is a good start, and its compact build on a phone;
     Tiny to Large v3 Turbo are listed, and a ggml file you put in the models folder yourself is offered too). whisper
     runs on the CPU unless you turn the GPU option on, starts when you first record, and stops again after ten minutes
-    unused. In the Android app the GPU option is there when the app was built with its GPU server (a second, Vulkan
-    build of whisper-server, opt-in at build time); if the phone's graphics driver cannot run it, the recording is
+    unused. The Android app carries a GPU server too (a second, Vulkan build of whisper-server, for Android 9 and
+    later), so the option is there as well; if the phone's graphics driver cannot run it, the recording is
     transcribed on the CPU instead and *Settings → Voice* says why.
   - **Models that hear audio.** A model that takes audio as input (Voxtral, Ultravox, Qwen-Omni and others on
     llama.cpp, found from the engine's own `/props`; a LiteRT-LM bundle with an audio encoder in the Android app) can
