@@ -53,7 +53,7 @@ function status(o: { server?: Partial<VoiceStatus['stt']['server']> } & Partial<
   return {
     stt: {
       available: false, state: 'stopped', error: null,
-      server: { source: null, version: '', installable: false, hint: null, customMissing: false, installing: null, installError: null, ...server },
+      server: { source: null, version: '', installable: false, hint: null, customMissing: false, gpu: true, gpuError: null, installing: null, installError: null, ...server },
       model: 'tiny',
       models: [model('tiny', { installed: true }), model('base', { recommended: true }), model('small')],
       downloading: null, downloadError: null,
@@ -434,30 +434,65 @@ describe('VoiceSection read aloud', () => {
 describe('VoiceSection in the Android app', () => {
   const gpu = () => screen.queryByRole('checkbox', { name: /Use the GPU/ })
   const own = () => screen.queryByRole('button', { name: 'Use my own whisper-server' })
+  const VULKAN = /Runs whisper on the phone.s GPU through Vulkan\./
+  const DESKTOP = /Faster with the larger models, but it takes video memory from the chat model\./
 
-  it('hides the GPU and own-binary choices for the bundled server', () => {
+  it('hides the own-binary choice for the bundled server and for the android hint', () => {
     voice.data = status({ server: { source: 'bundled' } })
+    const a = render(<VoiceSection />)
+    expect(own()).toBeNull()
+    a.unmount()
+    voice.data = status({ server: { hint: 'android', gpu: false } })
     render(<VoiceSection />)
-    expect(gpu()).toBeNull()
     expect(own()).toBeNull()
   })
 
-  it('hides them for the android hint too', () => {
-    voice.data = status({ server: { hint: 'android' } })
+  it('hides the GPU row for a bundled server that cannot use the GPU', () => {
+    voice.data = status({ server: { source: 'bundled', gpu: false } })
     render(<VoiceSection />)
     expect(gpu()).toBeNull()
-    expect(own()).toBeNull()
   })
 
-  it('shows them for a managed install', () => {
-    voice.data = status({ server: { source: 'managed', version: 'b1' } })
+  it('shows the GPU row with the Vulkan description for a bundled server that can, and saves the choice', async () => {
+    voice.data = status({ server: { source: 'bundled', gpu: true } })
+    render(<VoiceSection />)
+    const box = gpu() as HTMLInputElement
+    expect(box).toBeTruthy()
+    expect(box.checked).toBe(false)
+    expect(screen.getByText(VULKAN)).toBeTruthy()
+    expect(screen.queryByText(DESKTOP)).toBeNull()
+    await userEvent.click(box)
+    expect(save.mutate.mock.calls[0][0]).toEqual({ speechToText: { gpu: true } })
+  })
+
+  it('shows the GPU row with the video-memory description for a desktop install that can use it', () => {
+    voice.data = status({ server: { source: 'managed', version: 'b1', gpu: true } })
     render(<VoiceSection />)
     expect(gpu()).toBeTruthy()
+    expect(screen.getByText(DESKTOP)).toBeTruthy()
+    expect(screen.queryByText(VULKAN)).toBeNull()
     expect(own()).toBeTruthy()
   })
 
+  it.each(['managed', 'system', 'custom', 'bundled', null] as const)('has no GPU row when the server cannot use it (source %s)', (source) => {
+    voice.data = status({ server: { source, gpu: false } })
+    render(<VoiceSection />)
+    expect(gpu()).toBeNull()
+  })
+
+  it('shows why the GPU was given up on, under the row, and nothing when there is no reason', () => {
+    const why = 'whisper could not run on this device\'s GPU (boom). Speech-to-text is using the CPU.'
+    voice.data = status({ server: { source: 'bundled', gpu: true, gpuError: why } })
+    const a = render(<VoiceSection />)
+    expect(screen.getByText(why)).toBeTruthy()
+    a.unmount()
+    voice.data = status({ server: { source: 'bundled', gpu: true, gpuError: null } })
+    render(<VoiceSection />)
+    expect(screen.queryByText(/could not run on this device/)).toBeNull()
+  })
+
   it('keeps "Use my own whisper-server" for a bundled server when a path was saved, so it can be cleared', () => {
-    voice.data = status({ server: { source: 'bundled' } })
+    voice.data = status({ server: { source: 'bundled', gpu: false } })
     settings.speechToText = { model: '', language: 'auto', serverPath: '/old/ws', gpu: false }
     render(<VoiceSection />)
     expect(own()).toBeTruthy()

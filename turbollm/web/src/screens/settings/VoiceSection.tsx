@@ -132,8 +132,10 @@ function SpeechToText() {
   } else {
     const { server } = stt
     const draft = pathDraft ?? savedPath
-    // The Android app runs the whisper-server it was built with and no other (it may only execute its own files), on
-    // the CPU: the two choices below are not its to offer. A path saved before stays, so it can be cleared.
+    // The Android app runs the whisper-server it was built with and no other (it may only execute its own files), so
+    // a server of the user's own is not its to offer; a path saved before stays, so it can be cleared. The GPU is
+    // offered where the daemon says the option does something: in the app, only when it was built with its GPU
+    // server.
     const inApp = server.source === 'bundled' || server.hint === 'android'
     const open = binOpen ?? (savedPath !== '' || server.customMissing)
     body = (
@@ -215,14 +217,17 @@ function SpeechToText() {
           </select>
         </SelectRow>
 
-        {!inApp && (
+        {server.gpu && (
           <CheckRow
             title="Use the GPU"
-            description="Faster with the larger models, but it takes video memory from the chat model. Leave off unless transcription feels slow."
+            description={inApp
+              ? 'Runs whisper on the phone\u2019s GPU through Vulkan. It helps most with the larger models, and not every phone\u2019s graphics driver manages it: if it cannot start, the CPU is used.'
+              : 'Faster with the larger models, but it takes video memory from the chat model. Leave off unless transcription feels slow.'}
             checked={saved?.gpu ?? false}
             onChange={(gpu) => patch({ gpu })}
           />
         )}
+        {server.gpuError && <div className="pb-3 text-[12px]" style={ERR}>{server.gpuError}</div>}
 
         {(!inApp || savedPath !== '') && <Collapsible open={open} onOpenChange={setBinOpen} className="border-t border-border py-3">
           <CollapsibleTrigger className="group flex items-center gap-1.5 text-[13px] font-medium text-ink">

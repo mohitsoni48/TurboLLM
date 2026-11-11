@@ -166,7 +166,7 @@ describe('voiceInProgress', () => {
       state: over.state ?? 'ready',
       error: null,
       server: {
-        source: 'managed', version: 'b1', installable: true, hint: null, customMissing: false,
+        source: 'managed', version: 'b1', installable: true, hint: null, customMissing: false, gpu: true, gpuError: null,
         installing: over.installing ? { phase: 'downloading', pct: 0.5 } : null, installError: null,
       },
       model: 'base',
