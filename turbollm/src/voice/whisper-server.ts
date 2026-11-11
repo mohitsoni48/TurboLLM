@@ -9,7 +9,7 @@
 // The server binds 127.0.0.1 on a port the OS picks. It has no authentication and answers any origin, which is why
 // nothing but this daemon is ever told that port: the page and API clients reach it through the daemon's own routes.
 import type { ChildProcess } from 'node:child_process'
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { dirname, join } from 'node:path'
 import { RotatingLogStream, readTail } from '../engines/engine-log'
@@ -45,6 +45,10 @@ const HEALTH_POLL_MS = 150
 /** whisper-server gets this long to exit on SIGTERM before it is killed. */
 const STOP_GRACE_MS = 3000
 const LOG_MAX_BYTES = 5 * 1024 * 1024
+/** How much of a starting server's output is kept in memory, to say why a start failed. */
+const RECENT_LINES = 40
+/** How long a process that has exited is given to hand over the last of its output. */
+const LAST_WORDS_MS = 400
 
 export class WhisperStartError extends Error {
   constructor(message: string, readonly logTail: string[]) {
@@ -181,6 +185,16 @@ export class WhisperServer {
     )
     child.stdout?.pipe(log, { end: false })
     child.stderr?.pipe(log, { end: false })
+    // The last lines it wrote, kept here as well as in the log: a process that dies while starting has usually just
+    // said why, and the log file may not have those lines yet when its exit is seen (and is emptied by the next
+    // start, which for the Android app's GPU server follows at once, on the CPU one).
+    const recent: string[] = []
+    const remember = (chunk: Buffer): void => {
+      recent.push(...chunk.toString('utf8').split(/\r?\n/).filter((line) => line.trim() !== ''))
+      if (recent.length > RECENT_LINES) recent.splice(0, recent.length - RECENT_LINES)
+    }
+    child.stdout?.on('data', remember)
+    child.stderr?.on('data', remember)
     log.once('error', () => {
       child.stdout?.resume()
       child.stderr?.resume()
@@ -201,6 +215,11 @@ export class WhisperServer {
         resolve()
       })
     })
+    /** Resolves once an exited process's output has all arrived, or it has had long enough to hand it over. */
+    const lastWords = new Promise<void>((resolve) => {
+      child.once('close', () => resolve())
+      void exited.then(() => sleep(LAST_WORDS_MS)).then(resolve)
+    })
     void exited.then(() => {
       log.end()
       // An exit nobody asked for (a crash, the user killing it): the next transcription starts a fresh one.
@@ -213,9 +232,13 @@ export class WhisperServer {
     const running: Running = { child, launch, exited, port: null, stopping: false }
     this.running = running
     try {
-      await this.waitReady(port, exited, () => spawnError, () => exitCode)
+      await this.waitReady(port, exited, () => spawnError, () => exitCode, async () => {
+        await lastWords
+        return recent.length > 0 ? recent.slice(-20) : readTail(this.logPath, 20)
+      })
     } catch (e) {
       if (this.running === running) this.running = null
+      if (!running.stopping) this.keepFailedStart(launch, args, recent)
       // The start failed, unless stop() ended it on purpose. Told apart by the flag, not by `running` having been
       // cleared: a process that dies while loading is cleared by its own exit before this runs, and that is exactly
       // the failure to show (a model file whisper cannot read).
@@ -234,6 +257,7 @@ export class WhisperServer {
    *  from /health means a transcription will be answered. */
   private async waitReady(
     port: number, exited: Promise<void>, spawnError: () => Error | null, exitCode: () => number | null | undefined,
+    tailOf: () => Promise<string[]>,
   ): Promise<number> {
     const deadline = Date.now() + this.startTimeoutMs
     let gone = false
@@ -242,7 +266,7 @@ export class WhisperServer {
       if (gone) {
         const e = spawnError()
         if (e) throw new WhisperStartError(`whisper-server could not be started: ${e.message}`, [])
-        const tail = readTail(this.logPath, 20)
+        const tail = await tailOf()
         throw new WhisperStartError(startFailureMessage(exitCode(), tail), tail)
       }
       if (await healthy(port)) return port
@@ -253,6 +277,17 @@ export class WhisperServer {
         )
       }
       await Promise.race([sleep(HEALTH_POLL_MS), exited])
+    }
+  }
+
+  /** What a start that failed was started with and said, in a file of its own beside the log: the log itself is
+   *  emptied by the next start. Best-effort. */
+  private keepFailedStart(launch: WhisperLaunch, args: string[], recent: string[]): void {
+    try {
+      const path = join(dirname(this.logPath), 'whisper-server.failed.log')
+      writeFileSync(path, [`[turbollm] ${new Date().toISOString()} this start failed: ${launch.binPath} ${args.join(' ')}`, ...recent, ''].join('\n'))
+    } catch {
+      /* a full or read-only disk: the reason is still in the error */
     }
   }
 

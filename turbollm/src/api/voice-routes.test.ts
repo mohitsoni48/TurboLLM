@@ -12,7 +12,7 @@ function status(downloading: string | null = null): VoiceStatus {
   return {
     stt: {
       available: true, state: 'stopped', error: null,
-      server: { source: 'managed', version: 'b1', installable: true, hint: null, customMissing: false, installing: null, installError: null },
+      server: { source: 'managed', version: 'b1', installable: true, hint: null, customMissing: false, gpu: true, gpuError: null, installing: null, installError: null },
       model: 'base', models: [],
       downloading: downloading ? { phase: 'downloading', pct: 0.5, model: downloading } : null,
       downloadError: null,

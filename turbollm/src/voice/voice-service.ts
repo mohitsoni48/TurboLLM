@@ -100,6 +100,10 @@ export class VoiceService {
   private downloadError: { model: string; message: string } | null = null
   /** The last transcription's failure, shown until one succeeds. A failed start is the server's own error(). */
   private lastError: string | null = null
+  /** Why the Android app's GPU server was given up on. Set once it fails to start or dies mid-transcription; the CPU
+   *  server is used from then on, until the daemon restarts or the GPU option is switched off (and on again): a
+   *  driver that crashed once would crash on every recording. */
+  private gpuFailure: string | null = null
 
   constructor(deps: VoiceServiceDeps) {
     this.deps = deps
@@ -111,6 +115,7 @@ export class VoiceService {
 
   status(): VoiceStatus {
     const cfg = this.store.read().speechToText
+    if (!cfg.gpu) this.gpuFailure = null
     const server = this.resolveServer()
     const models = this.models()
     const model = activeModel(models, cfg.model)
@@ -125,6 +130,9 @@ export class VoiceService {
         installable: hint === null,
         hint,
         customMissing: !server.ok && server.reason === 'custom_missing',
+        // The app's own build is CPU-only unless its GPU twin was built in; any other whisper-server is asked.
+        gpu: server.ok ? server.source !== 'bundled' || server.gpuPath !== undefined : hint !== 'android',
+        gpuError: this.gpuFailure,
         installing: this.installJob ? { phase: this.installJob.phase, pct: this.installJob.pct } : null,
         installError: this.installError,
       },
@@ -152,7 +160,7 @@ export class VoiceService {
     } catch {
       return
     }
-    this.server.use(launch, async () => {}).catch(() => {})
+    this.useServer(launch, async () => {}).catch(() => {})
   }
 
   /** The transcript of `audio` as text, for the chat box. */
@@ -181,12 +189,12 @@ export class VoiceService {
     if (format === 'verbose_json') form.append('no_language_probabilities', 'true')
 
     try {
-      const answer = await this.server.use(launch, async (port) => {
+      const answer = await this.useServer(launch, async (port) => {
         const res = await (this.deps.fetch ?? fetch)(`http://127.0.0.1:${port}/inference`, {
           method: 'POST', body: form, signal: withTimeout(signal, TRANSCRIBE_TIMEOUT_MS),
         })
         return { status: res.status, body: await res.text() }
-      })
+      }, signal)
       if (answer.status !== 200) throw refusalFrom(answer.status, answer.body)
       this.setLastError(null)
       return { contentType: CONTENT_TYPES[format], body: format === 'json' ? tidyJson(answer.body) : answer.body }
@@ -211,13 +219,36 @@ export class VoiceService {
     const model = activeModel(this.models(), cfg.model)
     if (!model) throw new VoiceError(503, 'stt_unavailable', 'Speech-to-text has no model yet. Download one in Settings → Voice.')
     const threads = whisperThreads({ perfCores: (this.deps.perfCores ?? (() => getSysInfo().perfCores))() })
+    if (!cfg.gpu) this.gpuFailure = null
+    // The Android app's server is a pair: a CPU build, and where the app was built with one a Vulkan build to run
+    // instead when the GPU is asked for. Without the second (or once it has failed) the option changes nothing, so it
+    // must not make a different launch either.
+    const pair = server.source === 'bundled'
+    const gpuBuild = pair && cfg.gpu && this.gpuFailure === null ? server.gpuPath : undefined
     return {
-      binPath: server.path,
+      binPath: gpuBuild ?? server.path,
       modelPath: this.modelPath(model),
-      // The build inside the Android app has no GPU backend: the option, saved from another machine's habits, would
-      // only make it a different launch.
-      gpu: cfg.gpu && server.source !== 'bundled',
+      gpu: pair ? gpuBuild !== undefined : cfg.gpu,
       ...(threads ? { threads } : {}),
+    }
+  }
+
+  /** Run `work` on the server for `launch`. When that is the Android app's GPU build and it cannot start, or stops
+   *  answering mid-way, the work is done on the CPU build instead, and so is everything after it: Vulkan on phones is
+   *  a driver lottery, and a recording must not be lost to it. */
+  private async useServer<T>(launch: WhisperLaunch, work: (port: number) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    try {
+      return await this.server.use(launch, work)
+    } catch (e) {
+      const server = this.resolveServer()
+      const onGpuBuild = server.ok && server.gpuPath !== undefined && launch.binPath === server.gpuPath
+      // A start that failed, or a connection that broke (the process died). Not the caller leaving, and not whisper
+      // taking long: neither says the GPU build is at fault.
+      const serverFailed = e instanceof WhisperStartError || (e instanceof TypeError && !signal?.aborted)
+      if (!onGpuBuild || !serverFailed) throw e
+      this.gpuFailure = `whisper could not run on this device's GPU (${messageOf(e)}). Speech-to-text is using the CPU.`
+      announce()
+      return await this.server.use(this.launch(), work)
     }
   }
 

@@ -66,6 +66,12 @@ export type SttStatus = {
     hint: SttInstallHint | null
     /** A path is saved in Settings but no file is there. */
     customMissing: boolean
+    /** Whether `speechToText.gpu` can do anything here. False in the Android app unless it was built with its GPU
+     *  server (a second, Vulkan build of whisper-server); true elsewhere, where the whisper-server found decides. */
+    gpu: boolean
+    /** Why the Android app's GPU server was given up on, as a sentence: it could not start, or stopped while
+     *  transcribing, and the CPU one has been used since. null while it has not failed. */
+    gpuError: string | null
     installing: SttProgress | null
     installError: string | null
   }

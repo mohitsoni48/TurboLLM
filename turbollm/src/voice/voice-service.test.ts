@@ -6,7 +6,7 @@ import { defaultConfig, type ConfigStore } from '../config/config'
 import type { SttModel } from '../contract/voice'
 import { tmpDir } from '../test-support/tmp'
 import { VoiceError, VoiceService, activeModel, type VoiceServiceDeps } from './voice-service'
-import { ANDROID_WHISPER_SERVER, whisperModelsDir, type ResolvedWhisperServer } from './whisper-binary'
+import { ANDROID_WHISPER_SERVER, ANDROID_WHISPER_SERVER_GPU, whisperModelsDir, type ResolvedWhisperServer } from './whisper-binary'
 import { WHISPER_MODELS } from './whisper-catalog'
 import { WhisperStartError, whisperServerArgs, type WhisperLaunch, type WhisperServer } from './whisper-server'
 
@@ -776,4 +776,202 @@ test('liveDownload counts a negative progress as nothing received, and is null a
   r.service.cancelModelDownload()
   await waitFor('the download to end', () => r.service.status().stt.downloading === null)
   assert.equal(r.service.liveDownload(), null)
+})
+
+// ── the Android app's GPU build, and falling back from it ──
+
+/** A WhisperServer double whose `use` is `handler`'s: it is told each launch and the work, so a test can fail one
+ *  launch and run another. Every launch it sees is recorded. */
+function scriptedServer(handler: <T>(launch: WhisperLaunch, work: (port: number) => Promise<T>) => Promise<T>) {
+  const launches: WhisperLaunch[] = []
+  const server = {
+    state: () => 'stopped' as const,
+    error: () => null,
+    launch: () => null,
+    async use<T>(launch: WhisperLaunch, work: (port: number) => Promise<T>): Promise<T> {
+      launches.push(launch)
+      return handler(launch, work)
+    },
+    async stop() {},
+    async shutdown() {},
+  }
+  return { server: server as unknown as WhisperServer, launches }
+}
+
+/** The Android app with its CPU server, and its Vulkan one beside it when `vk`. `onUse` decides each launch's fate. */
+function gpuRig(vk: boolean, onUse?: <T>(launch: WhisperLaunch, work: (port: number) => Promise<T>) => Promise<T>, answer: () => Response = () => Response.json({ text: 'hi' })) {
+  const nativeDir = tmpDir('tllm-native-')
+  writeFileSync(join(nativeDir, ANDROID_WHISPER_SERVER), 'elf')
+  if (vk) writeFileSync(join(nativeDir, ANDROID_WHISPER_SERVER_GPU), 'elf')
+  const scripted = scriptedServer(onUse ?? ((_l, work) => work(PORT)))
+  const r = rig({
+    resolve: undefined, platform: 'android', arch: 'arm64', env: { TURBOLLM_ANDROID_NATIVE_LIB_DIR: nativeDir },
+    fetch: (async () => answer()) as unknown as typeof fetch,
+  }, { ...scripted, calls: [] })
+  installModel(r, 'ggml-base.bin')
+  r.cfg.speechToText.model = 'base'
+  r.cfg.speechToText.serverPath = ''
+  return { ...r, launches: scripted.launches, cpu: join(nativeDir, ANDROID_WHISPER_SERVER), vkPath: join(nativeDir, ANDROID_WHISPER_SERVER_GPU) }
+}
+
+test('status gpu: Android bundled is true only with the Vulkan build, no bundled server is false, desktop is true', () => {
+  assert.equal(gpuRig(false).service.status().stt.server.gpu, false)
+  assert.equal(gpuRig(true).service.status().stt.server.gpu, true)
+
+  // The Android app with nothing bundled (hint 'android').
+  const empty = tmpDir('tllm-native-')
+  const none = rig({ resolve: undefined, platform: 'android', arch: 'arm64', env: { TURBOLLM_ANDROID_NATIVE_LIB_DIR: empty } })
+  assert.equal(none.service.status().stt.server.source, null)
+  assert.equal(none.service.status().stt.server.gpu, false)
+
+  for (const source of ['managed', 'system', 'custom'] as const) {
+    const r = rig({ resolve: () => ({ ok: true, path: BIN, source, version: '' }) })
+    assert.equal(r.service.status().stt.server.gpu, true, source)
+  }
+  assert.equal(rig({ resolve: () => ({ ok: false, reason: 'none' }) }).service.status().stt.server.gpu, true)
+  assert.equal(gpuRig(true).service.status().stt.server.gpuError, null)
+})
+
+test('launch on the Android pair: the option off or no Vulkan build is the CPU launch, the option with it is the Vulkan one', async () => {
+  const off = gpuRig(true)
+  off.cfg.speechToText.gpu = false
+  await off.service.transcribe(AUDIO)
+  assert.equal(off.launches[0].binPath, off.cpu)
+  assert.equal(off.launches[0].gpu, false)
+
+  const noVk = gpuRig(false)
+  noVk.cfg.speechToText.gpu = true
+  await noVk.service.transcribe(AUDIO)
+  assert.equal(noVk.launches[0].binPath, noVk.cpu)
+  assert.equal(noVk.launches[0].gpu, false)
+  // The option changes nothing without the second build, so it must not make a different launch either.
+  const noVkOff = gpuRig(false)
+  noVkOff.cfg.speechToText.gpu = false
+  await noVkOff.service.transcribe(AUDIO)
+  assert.deepEqual({ ...noVk.launches[0], binPath: '', modelPath: '' }, { ...noVkOff.launches[0], binPath: '', modelPath: '' })
+  assert.equal(noVk.launches[0].binPath.endsWith(ANDROID_WHISPER_SERVER), true)
+
+  const on = gpuRig(true)
+  on.cfg.speechToText.gpu = true
+  await on.service.transcribe(AUDIO)
+  assert.equal(on.launches[0].binPath, on.vkPath)
+  assert.equal(on.launches[0].gpu, true)
+  assert.ok(!whisperServerArgs(on.launches[0], PORT).includes('-ng'))
+})
+
+test('on desktop the launch uses the one binary and the GPU option as saved', async () => {
+  for (const gpu of [true, false]) {
+    const r = transcribeRig()
+    r.cfg.speechToText.gpu = gpu
+    await r.service.transcribe(AUDIO)
+    assert.equal(r.launches[0].binPath, BIN)
+    assert.equal(r.launches[0].gpu, gpu)
+  }
+})
+
+/** A `use` that fails launches on `binPath` with `error`, and runs the work for the rest. */
+function failingGpu(vkPath: () => string, error: () => unknown) {
+  return <T,>(launch: WhisperLaunch, work: (port: number) => Promise<T>): Promise<T> =>
+    launch.binPath === vkPath() ? Promise.reject(error()) : work(PORT)
+}
+
+test('a GPU build that fails to start falls back to the CPU build, says why in status, and is not tried again', async () => {
+  let vk = ''
+  const r = gpuRig(true, failingGpu(() => vk, () => new WhisperStartError('vulkan device lost', [])))
+  vk = r.vkPath
+  r.cfg.speechToText.gpu = true
+  const out = await r.service.transcribe(AUDIO)
+  assert.deepEqual(JSON.parse(out.body), { text: 'hi' })
+  assert.deepEqual(r.launches.map((l) => [l.binPath, l.gpu]), [[r.vkPath, true], [r.cpu, false]])
+  const { server } = r.service.status().stt
+  assert.match(server.gpuError ?? '', /GPU/)
+  assert.match(server.gpuError ?? '', /vulkan device lost/)
+
+  await r.service.transcribe(AUDIO)
+  assert.deepEqual(r.launches.slice(2).map((l) => l.binPath), [r.cpu])
+})
+
+test('a connection that broke (the process died mid-request) on the GPU build also falls back', async () => {
+  let vk = ''
+  const r = gpuRig(true, failingGpu(() => vk, () => new TypeError('fetch failed')))
+  vk = r.vkPath
+  r.cfg.speechToText.gpu = true
+  assert.deepEqual(JSON.parse((await r.service.transcribe(AUDIO)).body), { text: 'hi' })
+  assert.deepEqual(r.launches.map((l) => l.binPath), [r.vkPath, r.cpu])
+  assert.match(r.service.status().stt.server.gpuError ?? '', /fetch failed/)
+})
+
+test('whisper refusing the audio on the GPU build is not a fallback: it surfaces and the GPU build stays in use', async () => {
+  const r = gpuRig(true, undefined, () => new Response('Invalid request', { status: 400 }))
+  r.cfg.speechToText.gpu = true
+  await assert.rejects(r.service.transcribe(AUDIO), (e: unknown) => e instanceof VoiceError && e.status === 400)
+  assert.equal(r.service.status().stt.server.gpuError, null)
+  await assert.rejects(r.service.transcribe(AUDIO), VoiceError)
+  assert.deepEqual(r.launches.map((l) => l.binPath), [r.vkPath, r.vkPath])
+})
+
+test('an aborted caller with a TypeError, and a TimeoutError, are not GPU failures', async () => {
+  let vk = ''
+  const ac = new AbortController()
+  const r = gpuRig(true, failingGpu(() => vk, () => { ac.abort(); return new TypeError('fetch failed') }))
+  vk = r.vkPath
+  r.cfg.speechToText.gpu = true
+  await assert.rejects(r.service.transcribe(AUDIO, {}, ac.signal), TypeError)
+  assert.equal(r.launches.length, 1)
+  assert.equal(r.service.status().stt.server.gpuError, null)
+
+  const t = gpuRig(true, failingGpu(() => t.vkPath, () => new DOMException('slow', 'TimeoutError')))
+  t.cfg.speechToText.gpu = true
+  await assert.rejects(t.service.transcribe(AUDIO), (e: unknown) => e instanceof VoiceError && e.status === 502)
+  assert.equal(t.launches.length, 1)
+  assert.equal(t.service.status().stt.server.gpuError, null)
+  assert.equal(t.launches[0].binPath, t.vkPath)
+})
+
+test('a failure on the CPU build after a fallback is thrown as usual, with no further attempt', async () => {
+  let vk = ''
+  const r = gpuRig(true, (launch) => Promise.reject(new WhisperStartError(launch.binPath === vk ? 'gpu boom' : 'cpu boom', [])))
+  vk = r.vkPath
+  r.cfg.speechToText.gpu = true
+  await assert.rejects(r.service.transcribe(AUDIO), (e: unknown) => e instanceof VoiceError && e.code === 'stt_start_failed' && /cpu boom/.test(e.message))
+  assert.deepEqual(r.launches.map((l) => l.binPath), [r.vkPath, r.cpu])
+})
+
+test('warm() on a GPU build that fails to start falls back to the CPU build and records why', async () => {
+  let vk = ''
+  const r = gpuRig(true, failingGpu(() => vk, () => new WhisperStartError('no vulkan', [])))
+  vk = r.vkPath
+  r.cfg.speechToText.gpu = true
+  r.service.warm()
+  await waitFor('the fallback launch', () => r.launches.length === 2)
+  assert.deepEqual(r.launches.map((l) => l.binPath), [r.vkPath, r.cpu])
+  assert.match(r.service.status().stt.server.gpuError ?? '', /no vulkan/)
+})
+
+test('switching the GPU option off clears the failure, and back on tries the GPU build again', async () => {
+  let vk = ''
+  const r = gpuRig(true, failingGpu(() => vk, () => new WhisperStartError('driver', [])))
+  vk = r.vkPath
+  r.cfg.speechToText.gpu = true
+  await r.service.transcribe(AUDIO)
+  assert.notEqual(r.service.status().stt.server.gpuError, null)
+  r.cfg.speechToText.gpu = false
+  assert.equal(r.service.status().stt.server.gpuError, null)
+  r.cfg.speechToText.gpu = true
+  r.launches.length = 0
+  await r.service.transcribe(AUDIO)
+  assert.deepEqual(r.launches.map((l) => l.binPath), [r.vkPath, r.cpu])
+})
+
+test('on desktop a start failure is not retried: it propagates as before', async () => {
+  const scripted = scriptedServer(() => Promise.reject(new WhisperStartError('cannot start', [])))
+  const r = rig({
+    fetch: (async () => Response.json({ text: 'x' })) as unknown as typeof fetch,
+  }, { ...scripted, calls: [] })
+  installModel(r, 'ggml-base.bin')
+  r.cfg.speechToText.model = 'base'
+  r.cfg.speechToText.gpu = true
+  await assert.rejects(r.service.transcribe(AUDIO), (e: unknown) => e instanceof VoiceError && e.code === 'stt_start_failed')
+  assert.equal(scripted.launches.length, 1)
+  assert.equal(r.service.status().stt.server.gpuError, null)
 })

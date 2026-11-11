@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import type { ChildProcess } from 'node:child_process'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { tmpDir } from '../test-support/tmp'
@@ -411,4 +413,113 @@ test('shutdown stops the server for good: a later ensure rejects and starts noth
   await assert.rejects(server.ensure(launch), (e: unknown) => e instanceof WhisperStartError && /shutting down/.test(e.message))
   assert.equal(spawns.length, 1)
   assert.equal(server.state(), 'stopped')
+})
+
+// ── a failed start keeps its reason ──
+// whisper-server says why it cannot start (a GPU driver it cannot use, a model it cannot read) on its last lines and
+// exits at once. The failure has to carry those lines every time, and outlive the next start, which empties the log.
+
+/** A rig whose process is a script written to the temp dir (`script` is read at each spawn, so a test can swap it). */
+function scriptRig() {
+  const dir = tmpDir('tllm-whisper-script-')
+  let script = ''
+  const server = new WhisperServer({
+    dataDir: dir,
+    spawn: (_bin, args, options, tether) => spawnTethered(process.execPath, [script, ...(args ?? [])], { ...options, cwd: dir }, tether),
+  })
+  const write = (name: string, body: string): void => {
+    script = join(dir, name)
+    writeFileSync(script, body)
+  }
+  return { server, dir, write, failedLog: join(dir, 'logs', 'whisper-server.failed.log'), log: join(dir, 'logs', 'whisper-server.log') }
+}
+
+const REASON = 'ggml_vulkan: Error: Vulkan 1.2 required.'
+
+test('a process that says why on stderr and exits at once fails the start with that reason, every time', async () => {
+  const r = scriptRig()
+  r.write('die.mjs', `console.error(${JSON.stringify(REASON)})\nprocess.exit(1)\n`)
+  for (let i = 0; i < 5; i++) {
+    let message = ''
+    await assert.rejects(r.server.ensure(launch), (e: unknown) => {
+      assert.ok(e instanceof WhisperStartError)
+      message = e.message
+      assert.match(e.message, /exit code 1/)
+      assert.ok(e.message.includes(REASON), e.message)
+      assert.ok(e.logTail.includes(REASON), JSON.stringify(e.logTail))
+      return true
+    }, `attempt ${i}`)
+    assert.equal(r.server.state(), 'error')
+    assert.equal(r.server.error(), message)
+  }
+  await r.server.stop()
+})
+
+test('a failed start leaves whisper-server.failed.log with the command line then the reason, and a later start keeps it', async () => {
+  const r = scriptRig()
+  r.write('die.mjs', `console.error(${JSON.stringify(REASON)})\nprocess.exit(1)\n`)
+  await assert.rejects(r.server.ensure(launch), WhisperStartError)
+  const lines = readFileSync(r.failedLog, 'utf8').split('\n')
+  assert.match(lines[0], /^\[turbollm\] /)
+  assert.ok(lines[0].includes('this start failed:'))
+  assert.ok(lines[0].includes(launch.binPath))
+  assert.ok(lines[0].includes('--port'))
+  assert.ok(lines.slice(1).includes(REASON))
+
+  r.write('ok.mjs', readFileSync(FAKE_SERVER, 'utf8'))
+  try {
+    const port = await r.server.ensure(launch)
+    assert.equal(await healthOk(port), true)
+    assert.ok(readFileSync(r.failedLog, 'utf8').includes(REASON))
+    // The log is the new start's own: the failed one's reason lives only in the kept file.
+    assert.ok(!readFileSync(r.log, 'utf8').includes(REASON))
+  } finally {
+    await r.server.stop()
+  }
+})
+
+test('a start that stop() ends while it is still starting writes no failed log', async () => {
+  const r = scriptRig()
+  r.write('slow.mjs', readFileSync(FAKE_SERVER, 'utf8'))
+  process.env.FAKE_WHISPER_LOAD_MS = '60000'
+  try {
+    const started = r.server.ensure(launch)
+    started.catch(() => {})
+    await waitFor('the process to be spawned', () => r.server.launch() !== null)
+    await r.server.stop()
+    await assert.rejects(started, WhisperStartError)
+    assert.equal(existsSync(r.failedLog), false)
+  } finally {
+    delete process.env.FAKE_WHISPER_LOAD_MS
+    await r.server.stop()
+  }
+})
+
+test('a process that exits with no output fails with the plain message and its exit code', async () => {
+  const r = scriptRig()
+  r.write('quiet.mjs', 'process.exit(7)\n')
+  await assert.rejects(r.server.ensure(launch), (e: unknown) => {
+    assert.ok(e instanceof WhisperStartError)
+    assert.equal(e.message, 'whisper-server stopped while starting (exit code 7).')
+    return true
+  })
+  await r.server.stop()
+})
+
+test('a process that prints more than the kept lines is reported by its last ones', async () => {
+  const r = scriptRig()
+  r.write('chatty.mjs', "for (let i = 1; i <= 100; i++) console.error('line ' + i)\nconsole.error('error: boom')\nprocess.exit(2)\n")
+  await assert.rejects(r.server.ensure(launch), (e: unknown) => {
+    assert.ok(e instanceof WhisperStartError)
+    assert.match(e.message, /error: boom/)
+    assert.match(e.message, /exit code 2/)
+    assert.ok(e.logTail.length <= 20)
+    assert.equal(e.logTail.at(-1), 'error: boom')
+    assert.ok(!e.logTail.includes('line 1'))
+    return true
+  })
+  const kept = readFileSync(r.failedLog, 'utf8').split('\n').filter(Boolean)
+  assert.ok(kept.length <= 41 + 0)
+  assert.equal(kept.at(-1), 'error: boom')
+  await r.server.stop()
 })

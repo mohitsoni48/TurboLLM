@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { tmpDir } from '../test-support/tmp'
 import {
-  ANDROID_WHISPER_SERVER, WHISPER_BUILD, installHint, installWhisperServer, managedWhisperServer, removeWhisperServer, resolveWhisperServer,
+  ANDROID_WHISPER_SERVER, ANDROID_WHISPER_SERVER_GPU, WHISPER_BUILD, installHint, installWhisperServer, managedWhisperServer, removeWhisperServer, resolveWhisperServer,
   whisperDir, whisperModelsDir, whisperReleaseAsset, whisperReleaseUrl, whisperServerDir, whisperServerEnv, type InstallDeps,
 } from './whisper-binary'
 
@@ -115,6 +115,35 @@ test('on Android the bundled libwhisper_server.so is found in the native lib dir
   assert.deepEqual(resolveWhisperServer({ dataDir: dir, customPath: '', platform: 'android', env }), {
     ok: true, path: join(lib, ANDROID_WHISPER_SERVER), source: 'bundled', version: '',
   })
+})
+
+test('the Android GPU build is reported as gpuPath only when it sits beside the CPU build', () => {
+  const dir = tmpDir('tllm-whisper-resolve-')
+  const lib = join(dir, 'nativelib')
+  mkdirSync(lib)
+  const env = { PATH: '', TURBOLLM_ANDROID_NATIVE_LIB_DIR: lib }
+  const resolve = (platform: NodeJS.Platform = 'android') => resolveWhisperServer({ dataDir: dir, customPath: '', platform, env })
+
+  // The GPU file alone is not a server to run: the CPU build is what the pair falls back to.
+  writeFileSync(join(lib, ANDROID_WHISPER_SERVER_GPU), '')
+  assert.deepEqual(resolve(), { ok: false, reason: 'none' })
+
+  writeFileSync(join(lib, ANDROID_WHISPER_SERVER), '')
+  assert.deepEqual(resolve(), {
+    ok: true, path: join(lib, ANDROID_WHISPER_SERVER), source: 'bundled', version: '', gpuPath: join(lib, ANDROID_WHISPER_SERVER_GPU),
+  })
+  // Other platforms never see the bundle, so never a gpuPath.
+  assert.deepEqual(resolve('linux'), { ok: false, reason: 'none' })
+})
+
+test('the Android CPU build alone resolves as bundled with no gpuPath key', () => {
+  const dir = tmpDir('tllm-whisper-resolve-')
+  const lib = join(dir, 'nativelib')
+  mkdirSync(lib)
+  writeFileSync(join(lib, ANDROID_WHISPER_SERVER), '')
+  const r = resolveWhisperServer({ dataDir: dir, customPath: '', platform: 'android', env: { PATH: '', TURBOLLM_ANDROID_NATIVE_LIB_DIR: lib } })
+  assert.deepEqual(r, { ok: true, path: join(lib, ANDROID_WHISPER_SERVER), source: 'bundled', version: '' })
+  assert.equal('gpuPath' in r, false)
 })
 
 test('the Android bundle is ignored on other platforms', () => {

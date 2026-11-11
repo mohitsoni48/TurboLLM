@@ -43,6 +43,11 @@ const RELEASE_ASSETS: Readonly<Record<string, ReleaseAsset>> = {
  *  folder to be runnable there at all. */
 export const ANDROID_WHISPER_SERVER = 'libwhisper_server.so'
 
+/** The Android app's GPU build of the same server, beside it when the app was built with one (TurboLLM-Android,
+ *  -PturbollmWhisperVulkan=true): whisper-server with ggml's Vulkan backend linked in. A second file, so that a
+ *  Vulkan driver that takes the process down takes only this one, and the CPU server is still there to go back to. */
+export const ANDROID_WHISPER_SERVER_GPU = 'libwhisper_server_vk.so'
+
 /** Written into the install folder last, holding the release tag: a folder without it is an install that did not
  *  finish. */
 const INSTALL_MARKER = '.turbollm-provisioned'
@@ -87,7 +92,9 @@ export function installHint(
 }
 
 export type ResolvedWhisperServer =
-  | { ok: true; path: string; source: SttServerSource; version: string }
+  /** `gpuPath`: a second build to run when the GPU is asked for, where `path` itself cannot use one (the Android
+   *  app's pair). Absent where one binary does both. */
+  | { ok: true; path: string; source: SttServerSource; version: string; gpuPath?: string }
   /** `custom_missing`: Settings names a path with no file there. It is not skipped for the next source: the user
    *  chose that binary, and silently running another would hide the typo. */
   | { ok: false; reason: 'custom_missing' | 'none' }
@@ -111,7 +118,10 @@ export function resolveWhisperServer(input: ResolveInput): ResolvedWhisperServer
   const nativeLibDir = env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
   if (platform === 'android' && nativeLibDir) {
     const bundled = join(nativeLibDir, ANDROID_WHISPER_SERVER)
-    if (isFile(bundled)) return { ok: true, path: bundled, source: 'bundled', version: '' }
+    if (isFile(bundled)) {
+      const gpu = join(nativeLibDir, ANDROID_WHISPER_SERVER_GPU)
+      return { ok: true, path: bundled, source: 'bundled', version: '', ...(isFile(gpu) ? { gpuPath: gpu } : {}) }
+    }
   }
   const managed = managedWhisperServer(input.dataDir, platform)
   if (managed) return { ok: true, path: managed.path, source: 'managed', version: managed.version }
