@@ -34,6 +34,7 @@ import { VoiceBar } from './chat/VoiceBar'
 import { useVoiceInput, type ComposerClip } from './chat/useVoiceInput'
 import { formatClock } from '../lib/voice/pcm'
 import { speaker, ttsAvailable, type SpeechStream } from '../lib/voice/tts'
+import { readAloudOptions } from '../lib/voice/use-tts'
 import { useVoiceStore } from '../stores/voice'
 import { ContextMeter } from './chat/ContextMeter'
 import { CompactionDivider } from './chat/CompactionDivider'
@@ -1130,8 +1131,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       if (!speech) {
         if (!activeId || speakNextReplyIn.current !== activeId) return
         speakNextReplyIn.current = null
-        const { ttsVoice, ttsRate } = useVoiceStore.getState()
-        replySpeech.current = { assistantId: liveReplyId, stream: speaker.stream(liveReplyId, { voiceId: ttsVoice, rate: ttsRate }), fedChars: 0, lastContent: '' }
+        replySpeech.current = { assistantId: liveReplyId, stream: speaker.stream(liveReplyId, readAloudOptions()), fedChars: 0, lastContent: '' }
         return
       }
       if (speech.assistantId !== liveReplyId) return

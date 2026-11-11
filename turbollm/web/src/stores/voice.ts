@@ -31,6 +31,7 @@ const KEYS = {
   readAloud: 'tllm.voice.readAloud',
   ttsVoice: 'tllm.voice.ttsVoice',
   ttsRate: 'tllm.voice.ttsRate',
+  onlineVoices: 'tllm.voice.onlineVoices',
 } as const
 
 // localStorage can throw (a private window with storage blocked): a preference that cannot be read is its default,
@@ -78,9 +79,14 @@ type VoiceState = {
   setAutoStop: (on: boolean) => void
   readAloud: ReadAloud
   setReadAloud: (mode: ReadAloud) => void
-  /** The id of the voice replies are read in (lib/voice/tts.ts TtsVoice); '' lets the device choose. */
+  /** The id of the voice replies are read in (lib/voice/tts.ts TtsVoice); '' picks one for each reply's language.
+   *  A picked voice reads its own language; a reply in another still gets a voice of that language. */
   ttsVoice: string
   setTtsVoice: (id: string) => void
+  /** Voices that speak through their maker's servers may read a language this device has no voice for. Off by
+   *  default: such a voice is sent the text of the reply. */
+  onlineVoices: boolean
+  setOnlineVoices: (on: boolean) => void
   ttsRate: number
   setTtsRate: (rate: number) => void
 }
@@ -110,6 +116,11 @@ export const useVoiceStore = create<VoiceState>((set) => ({
   setTtsVoice: (ttsVoice) => {
     write(KEYS.ttsVoice, ttsVoice)
     set({ ttsVoice })
+  },
+  onlineVoices: read(KEYS.onlineVoices) === 'true',
+  setOnlineVoices: (onlineVoices) => {
+    write(KEYS.onlineVoices, String(onlineVoices))
+    set({ onlineVoices })
   },
   ttsRate: readRate(),
   setTtsRate: (ttsRate) => {

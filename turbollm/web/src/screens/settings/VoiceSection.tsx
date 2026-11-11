@@ -1,14 +1,17 @@
 // Settings → Voice: speech-to-text setup (whisper.cpp on the daemon), what a recording becomes, and reading replies
 // aloud (the device's own voices). The daemon's part is `speechToText` in settings and the voice status; the rest are
 // this browser's preferences (stores/voice.ts).
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { ChevronRight, Trash2 } from 'lucide-react'
 import type { SttModel, SttProgress } from '@contract/voice'
 import { ApiError } from '../../lib/api'
 import { useSettings } from '../../lib/queries'
 import { useVoiceSetup, useVoiceStatus } from '../../lib/voice/voice-queries'
-import { useSpeakingId, useTtsAvailable, useTtsVoices } from '../../lib/voice/use-tts'
-import { speaker } from '../../lib/voice/tts'
+import { readAloudOptions, useAllTtsVoices, useSpeakingId, useTtsAvailable } from '../../lib/voice/use-tts'
+import { speaker, ttsVoiceInstaller } from '../../lib/voice/tts'
+import { languageName } from '../../lib/voice/language'
+import { sampleFor } from '../../lib/voice/samples'
+import { spokenLanguages, usableVoices } from '../../lib/voice/voice-choice'
 import { AUTO_LANGUAGE, WHISPER_LANGUAGE_NAMES } from '../../lib/voice/languages'
 import { TTS_RATE_MAX, TTS_RATE_MIN, useVoiceStore, type AudioMode, type ReadAloud } from '../../stores/voice'
 import { Button } from '../../components/ui/button'
@@ -129,6 +132,9 @@ function SpeechToText() {
   } else {
     const { server } = stt
     const draft = pathDraft ?? savedPath
+    // The Android app runs the whisper-server it was built with and no other (it may only execute its own files), on
+    // the CPU: the two choices below are not its to offer. A path saved before stays, so it can be cleared.
+    const inApp = server.source === 'bundled' || server.hint === 'android'
     const open = binOpen ?? (savedPath !== '' || server.customMissing)
     body = (
       <>
@@ -174,7 +180,7 @@ function SpeechToText() {
             </div>
           ) : server.hint === 'android' ? (
             <div className="text-[12px] text-muted">
-              Speech-to-text is not part of the Android app yet. A model that hears audio can still take your voice messages as they are.
+              This build of the app was made without speech-to-text. A model that hears audio can still take your voice messages as they are.
             </div>
           ) : server.hint === 'build' ? (
             <div className="text-[12px] text-muted">
@@ -209,14 +215,16 @@ function SpeechToText() {
           </select>
         </SelectRow>
 
-        <CheckRow
-          title="Use the GPU"
-          description="Faster with the larger models, but it takes video memory from the chat model. Leave off unless transcription feels slow."
-          checked={saved?.gpu ?? false}
-          onChange={(gpu) => patch({ gpu })}
-        />
+        {!inApp && (
+          <CheckRow
+            title="Use the GPU"
+            description="Faster with the larger models, but it takes video memory from the chat model. Leave off unless transcription feels slow."
+            checked={saved?.gpu ?? false}
+            onChange={(gpu) => patch({ gpu })}
+          />
+        )}
 
-        <Collapsible open={open} onOpenChange={setBinOpen} className="border-t border-border py-3">
+        {(!inApp || savedPath !== '') && <Collapsible open={open} onOpenChange={setBinOpen} className="border-t border-border py-3">
           <CollapsibleTrigger className="group flex items-center gap-1.5 text-[13px] font-medium text-ink">
             <ChevronRight size={14} className="transition-transform group-data-[state=open]:rotate-90" />
             Use my own whisper-server
@@ -244,7 +252,7 @@ function SpeechToText() {
             </div>
             <div className="mt-1 text-[12px] text-muted">Leave empty to let TurboLLM find or install one.</div>
           </CollapsibleContent>
-        </Collapsible>
+        </Collapsible>}
 
         {stt.error && <div className="border-t border-border pt-3 text-[12px]" style={ERR}>Last problem: {stt.error}</div>}
         {stt.state === 'starting' && <div className="border-t border-border pt-3 text-[12px] text-muted">Loading the speech model…</div>}
@@ -357,20 +365,44 @@ function VoiceMessages() {
 }
 
 const SAMPLE_ID = 'voice-sample'
+/** How many of the languages the device speaks are named before the rest are counted. */
+const LANGUAGES_SHOWN = 10
 
 function ReadAloudCard() {
   const available = useTtsAvailable()
-  const voices = useTtsVoices()
+  const all = useAllTtsVoices()
   const speakingId = useSpeakingId()
   const readAloud = useVoiceStore((s) => s.readAloud)
   const setReadAloud = useVoiceStore((s) => s.setReadAloud)
   const ttsVoice = useVoiceStore((s) => s.ttsVoice)
   const setTtsVoice = useVoiceStore((s) => s.setTtsVoice)
+  const onlineVoices = useVoiceStore((s) => s.onlineVoices)
+  const setOnlineVoices = useVoiceStore((s) => s.setOnlineVoices)
   const ttsRate = useVoiceStore((s) => s.ttsRate)
   const setTtsRate = useVoiceStore((s) => s.setTtsRate)
+  const voices = useMemo(
+    () => usableVoices(all, onlineVoices).sort((a, b) => a.lang.localeCompare(b.lang) || a.name.localeCompare(b.name)),
+    [all, onlineVoices],
+  )
+  const languages = useMemo(
+    () => spokenLanguages(all, onlineVoices).map(languageName).sort((a, b) => a.localeCompare(b)),
+    [all, onlineVoices],
+  )
+  // Worth offering only where the device has both kinds: with no voice of its own it already uses what there is.
+  const hasOnline = all.some((v) => !v.local) && all.some((v) => v.local)
+  const install = ttsVoiceInstaller()
   const off = !available
   const playing = speakingId === SAMPLE_ID
-  const voiceValue = voices.some((v) => v.id === ttsVoice) ? ttsVoice : ''
+  const chosen = voices.find((v) => v.id === ttsVoice)
+  const playSample = () => {
+    if (playing) {
+      speaker.stop()
+      return
+    }
+    // In the chosen voice's language, or the user's own: a voice says little about itself reading another.
+    const sample = sampleFor(chosen?.lang || navigator.language || 'en')
+    speaker.speak(SAMPLE_ID, sample.text, { ...readAloudOptions(), language: sample.language })
+  }
   return (
     <section className={CARD}>
       <h2 className={H2}>Read aloud</h2>
@@ -386,22 +418,42 @@ function ReadAloudCard() {
           <option value="always">Every reply</option>
         </select>
       </SelectRow>
-      <SelectRow label="Voice">
-        <select aria-label="Voice" disabled={off} value={voiceValue} onChange={(e) => setTtsVoice(e.target.value)} className={SELECT}>
+      <SelectRow label="Voice" hint="A reply is read by a voice for the language it is written in. A voice picked here is used for its own language.">
+        <select aria-label="Voice" disabled={off} value={chosen ? ttsVoice : ''} onChange={(e) => setTtsVoice(e.target.value)} className={SELECT}>
           <option value="">Automatic</option>
-          {voices.map((v) => <option key={v.id} value={v.id}>{`${v.name} (${v.lang})`}</option>)}
+          {voices.map((v) => <option key={v.id} value={v.id}>{`${v.name} (${v.lang || 'language not given'})${v.local ? '' : ' · online'}`}</option>)}
         </select>
       </SelectRow>
+      {!off && (
+        <div className="border-t border-border py-3 text-[12px] text-muted">
+          {languages.length > 0 && (
+            <p>
+              This device can read {languages.slice(0, LANGUAGES_SHOWN).join(', ')}
+              {languages.length > LANGUAGES_SHOWN ? ` and ${languages.length - LANGUAGES_SHOWN} more` : ''}.
+            </p>
+          )}
+          <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
+            <span>
+              {install
+                ? 'Voices for other languages are downloaded in your phone’s text-to-speech settings.'
+                : 'Voices come from this device: add other languages in your system’s speech settings.'}
+            </span>
+            {install && <Button size="sm" variant="outline" onClick={install}>Get voices</Button>}
+          </div>
+        </div>
+      )}
+      {hasOnline && (
+        <CheckRow
+          title="Allow online voices"
+          description="Used only for a language this device has no voice for. An online voice is made on its maker's servers, so the text of the reply is sent there."
+          checked={onlineVoices}
+          onChange={setOnlineVoices}
+          disabled={off}
+        />
+      )}
       <Slider label="Speed" min={TTS_RATE_MIN} max={TTS_RATE_MAX} step={0.1} value={ttsRate} onChange={setTtsRate} fmt={(v) => `${v.toFixed(1)}×`} disabled={off} />
       <div className="border-t border-border pt-3">
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={off}
-          onClick={() =>
-            playing ? speaker.stop() : speaker.speak(SAMPLE_ID, 'This is how replies will sound.', { voiceId: ttsVoice, rate: ttsRate })
-          }
-        >
+        <Button size="sm" variant="outline" disabled={off} onClick={playSample}>
           {playing ? 'Stop' : 'Play a sample'}
         </Button>
       </div>

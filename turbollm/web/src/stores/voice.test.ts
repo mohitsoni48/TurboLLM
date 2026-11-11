@@ -21,6 +21,7 @@ describe('useVoiceStore defaults', () => {
     expect(s.readAloud).toBe('off')
     expect(s.ttsVoice).toBe('')
     expect(s.ttsRate).toBe(1)
+    expect(s.onlineVoices).toBe(false)
   })
 
   it('reads what an earlier visit saved', async () => {
@@ -109,5 +110,28 @@ describe('useVoiceStore setters', () => {
     expect(() => store.getState().setTtsRate(1.5)).not.toThrow()
     expect(store.getState().audioMode).toBe('text')
     expect(store.getState().ttsRate).toBe(1.5)
+  })
+})
+
+describe('useVoiceStore onlineVoices', () => {
+  it('is off unless saved as true', async () => {
+    expect((await loadStore()).getState().onlineVoices).toBe(false)
+    localStorage.setItem('tllm.voice.onlineVoices', 'yes')
+    expect((await loadStore()).getState().onlineVoices).toBe(false)
+  })
+
+  it('reads what an earlier visit saved', async () => {
+    localStorage.setItem('tllm.voice.onlineVoices', 'true')
+    expect((await loadStore()).getState().onlineVoices).toBe(true)
+  })
+
+  it('is saved under tllm.voice.onlineVoices', async () => {
+    const store = await loadStore()
+    store.getState().setOnlineVoices(true)
+    expect(store.getState().onlineVoices).toBe(true)
+    expect(localStorage.getItem('tllm.voice.onlineVoices')).toBe('true')
+    store.getState().setOnlineVoices(false)
+    expect(localStorage.getItem('tllm.voice.onlineVoices')).toBe('false')
+    expect((await loadStore()).getState().onlineVoices).toBe(false)
   })
 })

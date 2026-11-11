@@ -19,6 +19,7 @@ const save = { mutate: vi.fn(), isPending: false }
 const settings: { speechToText?: { model: string; language: string; serverPath: string; gpu: boolean } } = {}
 const tts = { available: true, voices: [] as { id: string; name: string; lang: string; local: boolean }[], speaking: null as string | null }
 const speaker = { speak: vi.fn(), stop: vi.fn() }
+const installer = { fn: null as (() => void) | null }
 
 vi.mock('../../lib/voice/voice-queries', () => ({
   useVoiceStatus: () => voice,
@@ -29,10 +30,18 @@ vi.mock('../../lib/queries', () => ({
 }))
 vi.mock('../../lib/voice/use-tts', () => ({
   useTtsAvailable: () => tts.available,
-  useTtsVoices: () => tts.voices,
+  useAllTtsVoices: () => tts.voices,
   useSpeakingId: () => tts.speaking,
+  // The real one: it reads the voice store the tests set.
+  readAloudOptions: () => {
+    const { ttsVoice, ttsRate, onlineVoices } = useVoiceStore.getState()
+    return { voiceId: ttsVoice, rate: ttsRate, allowOnline: onlineVoices }
+  },
 }))
-vi.mock('../../lib/voice/tts', () => ({ speaker: { speak: (...a: unknown[]) => speaker.speak(...a), stop: () => speaker.stop() } }))
+vi.mock('../../lib/voice/tts', () => ({
+  speaker: { speak: (...a: unknown[]) => speaker.speak(...a), stop: () => speaker.stop() },
+  ttsVoiceInstaller: () => installer.fn,
+}))
 vi.mock('../../components/ui/sonner', () => ({ toast: { error: vi.fn() } }))
 
 const model = (id: string, o: Partial<SttModel> = {}): SttModel => ({
@@ -61,7 +70,8 @@ beforeEach(() => {
   tts.available = true
   tts.voices = []
   tts.speaking = null
-  useVoiceStore.setState({ audioMode: 'ask', autoSend: false, autoStop: true, readAloud: 'off', ttsVoice: '', ttsRate: 1 })
+  installer.fn = null
+  useVoiceStore.setState({ audioMode: 'ask', autoSend: false, autoStop: true, readAloud: 'off', ttsVoice: '', ttsRate: 1, onlineVoices: false })
 })
 
 describe('formatSize', () => {
@@ -82,7 +92,7 @@ describe('VoiceSection engine', () => {
   })
 
   it.each([
-    ['android', /not part of the Android app yet/],
+    ['android', /This build of the app was made without speech-to-text\./],
     ['build', /no ready-made build for this machine/],
     ['homebrew', /no ready-made macOS build/],
   ] as const)('shows the %s hint and no Install button', (hint, text) => {
@@ -323,10 +333,135 @@ describe('VoiceSection read aloud', () => {
     tts.voices = [{ id: 'v1', name: 'Anna', lang: 'de-DE', local: true }]
     const { rerender } = render(<VoiceSection />)
     await userEvent.click(screen.getByRole('button', { name: 'Play a sample' }))
-    expect(speaker.speak).toHaveBeenCalledWith('voice-sample', 'This is how replies will sound.', { voiceId: 'v1', rate: 1.2 })
+    expect(speaker.speak).toHaveBeenCalledWith('voice-sample', 'So klingen die Antworten.', { voiceId: 'v1', rate: 1.2, allowOnline: false, language: 'de' })
     tts.speaking = 'voice-sample'
     rerender(<VoiceSection />)
     await userEvent.click(screen.getByRole('button', { name: 'Stop' }))
     expect(speaker.stop).toHaveBeenCalledTimes(1)
+  })
+  it('lists, in the voice list, the online voices with a suffix once they are allowed', async () => {
+    tts.voices = [
+      { id: 'v1', name: 'Anna', lang: 'de-DE', local: true },
+      { id: 'v2', name: 'Kyoko', lang: 'ja-JP', local: false },
+    ]
+    render(<VoiceSection />)
+    const select = screen.getByRole('combobox', { name: 'Voice' }) as HTMLSelectElement
+    expect(within(select).queryByText(/Kyoko/)).toBeNull()
+    await userEvent.click(screen.getByRole('checkbox', { name: /Allow online voices/ }))
+    expect(useVoiceStore.getState().onlineVoices).toBe(true)
+    expect(localStorage.getItem('tllm.voice.onlineVoices')).toBe('true')
+    expect(within(select).getByText('Kyoko (ja-JP) · online')).toBeTruthy()
+    expect(within(select).getByText('Anna (de-DE)')).toBeTruthy()
+  })
+
+  it('offers "Allow online voices" only when the device lists both local and online voices', () => {
+    const allow = () => screen.queryByRole('checkbox', { name: /Allow online voices/ })
+    tts.voices = [{ id: 'v1', name: 'Anna', lang: 'de-DE', local: true }]
+    const a = render(<VoiceSection />)
+    expect(allow()).toBeNull()
+    a.unmount()
+    tts.voices = [{ id: 'v2', name: 'Kyoko', lang: 'ja-JP', local: false }]
+    const b = render(<VoiceSection />)
+    expect(allow()).toBeNull()
+    b.unmount()
+    tts.voices = [{ id: 'v1', name: 'Anna', lang: 'de-DE', local: true }, { id: 'v2', name: 'Kyoko', lang: 'ja-JP', local: false }]
+    render(<VoiceSection />)
+    expect(allow()).toBeTruthy()
+  })
+
+  it('says which languages this device can read, by name, counting online ones only when allowed', () => {
+    tts.voices = [
+      { id: 'v1', name: 'Anna', lang: 'de-DE', local: true },
+      { id: 'v2', name: 'Bob', lang: 'en-US', local: true },
+      { id: 'v3', name: 'Carl', lang: 'en-GB', local: true },
+      { id: 'v4', name: 'Kyoko', lang: 'ja-JP', local: false },
+    ]
+    render(<VoiceSection />)
+    expect(screen.getByText(/This device can read English, German\./)).toBeTruthy()
+    expect(screen.queryByText(/Japanese/, { selector: 'p' })).toBeNull()
+  })
+
+  it('names at most ten languages and counts the rest', () => {
+    const langs = ['de', 'en', 'es', 'fr', 'it', 'pt', 'nl', 'pl', 'sv', 'tr', 'ru', 'ja']
+    tts.voices = langs.map((l) => ({ id: l, name: l, lang: l, local: true }))
+    render(<VoiceSection />)
+    const line = screen.getByText(/This device can read/)
+    expect(line.textContent).toMatch(/and 2 more\.$/)
+    expect(line.textContent?.split(',').length).toBe(10)
+  })
+
+  it('shows no "can read" line when the voices name no language', () => {
+    tts.voices = [{ id: 'v1', name: 'Anna', lang: '', local: true }]
+    render(<VoiceSection />)
+    expect(screen.queryByText(/This device can read/)).toBeNull()
+    expect(screen.getByText('Anna (language not given)')).toBeTruthy()
+  })
+
+  it('offers "Get voices" only where the app can open voice downloads, and asks it to', async () => {
+    const { unmount } = render(<VoiceSection />)
+    expect(screen.queryByRole('button', { name: 'Get voices' })).toBeNull()
+    expect(screen.getByText(/Voices come from this device/)).toBeTruthy()
+    unmount()
+    installer.fn = vi.fn()
+    render(<VoiceSection />)
+    expect(screen.getByText(/downloaded in your phone/)).toBeTruthy()
+    await userEvent.click(screen.getByRole('button', { name: 'Get voices' }))
+    expect(installer.fn).toHaveBeenCalledTimes(1)
+  })
+
+  it('plays a sample in the user\'s own language when no voice is chosen, and in English for one with no sample', async () => {
+    tts.voices = [{ id: 'v1', name: 'Anna', lang: 'de-DE', local: true }]
+    const { unmount } = render(<VoiceSection />)
+    await userEvent.click(screen.getByRole('button', { name: 'Play a sample' }))
+    expect(speaker.speak).toHaveBeenLastCalledWith('voice-sample', 'This is how replies will sound.', expect.objectContaining({ language: 'en' }))
+    unmount()
+    useVoiceStore.setState({ ttsVoice: 'v9' })
+    tts.voices = [{ id: 'v9', name: 'Zed', lang: 'xx-XX', local: true }]
+    render(<VoiceSection />)
+    await userEvent.click(screen.getByRole('button', { name: 'Play a sample' }))
+    expect(speaker.speak).toHaveBeenLastCalledWith('voice-sample', 'This is how replies will sound.', expect.objectContaining({ language: 'en' }))
+  })
+
+  it('plays the Portuguese sample, with its language, for a chosen pt-BR voice', async () => {
+    useVoiceStore.setState({ ttsVoice: 'v1', onlineVoices: true })
+    tts.voices = [{ id: 'v1', name: 'Luciana', lang: 'pt-BR', local: true }]
+    render(<VoiceSection />)
+    await userEvent.click(screen.getByRole('button', { name: 'Play a sample' }))
+    expect(speaker.speak).toHaveBeenCalledWith('voice-sample', 'É assim que as respostas vão soar.', { voiceId: 'v1', rate: 1, allowOnline: true, language: 'pt' })
+  })
+})
+
+describe('VoiceSection in the Android app', () => {
+  const gpu = () => screen.queryByRole('checkbox', { name: /Use the GPU/ })
+  const own = () => screen.queryByRole('button', { name: 'Use my own whisper-server' })
+
+  it('hides the GPU and own-binary choices for the bundled server', () => {
+    voice.data = status({ server: { source: 'bundled' } })
+    render(<VoiceSection />)
+    expect(gpu()).toBeNull()
+    expect(own()).toBeNull()
+  })
+
+  it('hides them for the android hint too', () => {
+    voice.data = status({ server: { hint: 'android' } })
+    render(<VoiceSection />)
+    expect(gpu()).toBeNull()
+    expect(own()).toBeNull()
+  })
+
+  it('shows them for a managed install', () => {
+    voice.data = status({ server: { source: 'managed', version: 'b1' } })
+    render(<VoiceSection />)
+    expect(gpu()).toBeTruthy()
+    expect(own()).toBeTruthy()
+  })
+
+  it('keeps "Use my own whisper-server" for a bundled server when a path was saved, so it can be cleared', () => {
+    voice.data = status({ server: { source: 'bundled' } })
+    settings.speechToText = { model: '', language: 'auto', serverPath: '/old/ws', gpu: false }
+    render(<VoiceSection />)
+    expect(own()).toBeTruthy()
+    expect((screen.getByLabelText('Path to whisper-server') as HTMLInputElement).value).toBe('/old/ws')
+    expect(gpu()).toBeNull()
   })
 })
