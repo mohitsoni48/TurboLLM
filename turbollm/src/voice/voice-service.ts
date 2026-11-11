@@ -13,7 +13,9 @@ import { join } from 'node:path'
 import type { ConfigStore } from '../config/config'
 import type { SttModel, SttProgress, SttStatus, TranscribeResult, VoiceStatus } from '../contract/voice'
 import { downloadFile, type ProvisionProgress } from '../engines/download'
+import { packagedAndroidApp } from '../engines/zip-install'
 import { emitInvalidation } from '../events/bus'
+import { getSysInfo } from '../sysinfo/sysinfo'
 import { withTimeout } from '../util/fetch-timeout'
 import {
   installHint, installWhisperServer, removeWhisperServer, resolveWhisperServer, whisperModelsDir, whisperReleaseAsset,
@@ -21,9 +23,9 @@ import {
 } from './whisper-binary'
 import {
   AUTO_LANGUAGE, WHISPER_MODEL_FILE, WHISPER_MODEL_REPO, WHISPER_MODELS, isEnglishOnlyFile, normalizeLanguage, tidyTranscript,
-  whisperCatalogModel,
+  whisperCatalog, whisperCatalogModel,
 } from './whisper-catalog'
-import { WhisperServer, WhisperStartError, type WhisperLaunch } from './whisper-server'
+import { WhisperServer, WhisperStartError, whisperThreads, type WhisperLaunch } from './whisper-server'
 
 /** A refusal a route answers with as it is: `status`, and `{ code, message }`. */
 export class VoiceError extends Error {
@@ -62,6 +64,8 @@ export interface VoiceServiceDeps {
   platform?: NodeJS.Platform
   arch?: string
   env?: NodeJS.ProcessEnv
+  /** The CPU's fast cores, when it has fast and slow ones (sysinfo's perfCores). */
+  perfCores?: () => number | undefined
 }
 
 /** How long one transcription may take. whisper-server's own read and write timeouts are ten minutes; a recording
@@ -206,7 +210,24 @@ export class VoiceService {
     }
     const model = activeModel(this.models(), cfg.model)
     if (!model) throw new VoiceError(503, 'stt_unavailable', 'Speech-to-text has no model yet. Download one in Settings → Voice.')
-    return { binPath: server.path, modelPath: this.modelPath(model), gpu: cfg.gpu }
+    const threads = whisperThreads({ perfCores: (this.deps.perfCores ?? (() => getSysInfo().perfCores))() })
+    return {
+      binPath: server.path,
+      modelPath: this.modelPath(model),
+      // The build inside the Android app has no GPU backend: the option, saved from another machine's habits, would
+      // only make it a different launch.
+      gpu: cfg.gpu && server.source !== 'bundled',
+      ...(threads ? { threads } : {}),
+    }
+  }
+
+  /** The model download in progress, as a download the Android app's poll counts as work (api/active-work.ts): a
+   *  speech model takes minutes on a phone's connection, and the app is left meanwhile. */
+  liveDownload(): { name: string; received: number; total: number } | null {
+    const job = this.downloadJob
+    const model = job ? whisperCatalogModel(job.model) : undefined
+    if (!job || !model) return null
+    return { name: `Speech model ${model.label}`, received: Math.round(Math.max(0, job.pct) * model.sizeBytes), total: model.sizeBytes }
   }
 
   // ── the whisper-server install ──
@@ -327,7 +348,7 @@ export class VoiceService {
     } catch {
       /* no models folder yet */
     }
-    const out: SttModel[] = WHISPER_MODELS.map((m) => ({
+    const out: SttModel[] = whisperCatalog(packagedAndroidApp(this.deps.platform, this.deps.env)).map((m) => ({
       id: m.id, label: m.label, sizeBytes: m.sizeBytes, multilingual: m.multilingual, note: m.note,
       installed: onDisk.has(m.file), ...(m.recommended ? { recommended: true } : {}),
     }))

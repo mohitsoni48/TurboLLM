@@ -6,9 +6,9 @@ import { defaultConfig, type ConfigStore } from '../config/config'
 import type { SttModel } from '../contract/voice'
 import { tmpDir } from '../test-support/tmp'
 import { VoiceError, VoiceService, activeModel, type VoiceServiceDeps } from './voice-service'
-import { whisperModelsDir, type ResolvedWhisperServer } from './whisper-binary'
+import { ANDROID_WHISPER_SERVER, whisperModelsDir, type ResolvedWhisperServer } from './whisper-binary'
 import { WHISPER_MODELS } from './whisper-catalog'
-import { WhisperStartError, type WhisperLaunch, type WhisperServer } from './whisper-server'
+import { WhisperStartError, whisperServerArgs, type WhisperLaunch, type WhisperServer } from './whisper-server'
 
 const BIN = '/opt/whisper/whisper-server'
 const FOUND: ResolvedWhisperServer = { ok: true, path: BIN, source: 'system', version: '' }
@@ -66,7 +66,9 @@ function rig(deps: Partial<VoiceServiceDeps> = {}, server = fakeServer()): Rig {
     update: (fn: (c: typeof cfg) => void) => fn(cfg),
     dir: () => dir,
   } as unknown as ConfigStore
-  const service = new VoiceService({ store, server: server.server, resolve: () => FOUND, platform: 'linux', arch: 'x64', env: {}, ...deps })
+  const service = new VoiceService({ store, server: server.server, resolve: () => FOUND, platform: 'linux', arch: 'x64', env: {},
+    // Not this machine's CPU: the launches asserted below must not depend on whether it has fast and slow cores.
+    perfCores: () => undefined, ...deps })
   return { service, cfg, dir, modelsDir: whisperModelsDir(dir), calls: server.calls, launches: server.launches }
 }
 
@@ -653,4 +655,125 @@ test('stop aborts a running download and install and shuts whisper-server down f
   assert.ok(signals.every((s) => s.aborted))
   assert.ok(r.calls.includes('shutdown'))
   await waitFor('the jobs to end', () => r.service.status().stt.downloading === null && r.service.status().stt.server.installing === null)
+})
+
+// ── the Android app's build, threads, and the phone catalog ──
+
+/** A rig as the packaged Android app runs it: its native-lib folder holds the bundled whisper-server, and the real
+ *  resolver finds it (no `resolve` override, no saved serverPath, which would take precedence). */
+function androidRig(perfCores: () => number | undefined) {
+  const nativeDir = tmpDir('tllm-native-')
+  writeFileSync(join(nativeDir, ANDROID_WHISPER_SERVER), 'elf')
+  const r = rig({
+    resolve: undefined, platform: 'android', arch: 'arm64', env: { TURBOLLM_ANDROID_NATIVE_LIB_DIR: nativeDir }, perfCores,
+    fetch: (async () => Response.json({ text: 'hi' })) as unknown as typeof fetch,
+  })
+  // `rig` spreads deps after its own resolve default, so an explicit undefined falls back to the real resolver.
+  installModel(r, 'ggml-base.bin')
+  r.cfg.speechToText.model = 'base'
+  r.cfg.speechToText.serverPath = ''
+  return { ...r, nativeDir }
+}
+
+test('on the Android app the bundled server runs without the GPU option even when it is saved on, and with the fast-core threads', async () => {
+  const r = androidRig(() => 2)
+  r.cfg.speechToText.gpu = true
+  assert.equal(r.service.status().stt.server.source, 'bundled')
+  await r.service.transcribe(AUDIO)
+  assert.equal(r.launches.length, 1)
+  assert.equal(r.launches[0].gpu, false)
+  assert.equal(r.launches[0].threads, 2)
+  assert.equal(r.launches[0].binPath, join(r.nativeDir, ANDROID_WHISPER_SERVER))
+  const args = whisperServerArgs(r.launches[0], PORT)
+  assert.ok(args.includes('-ng'))
+  assert.equal(args[args.indexOf('-t') + 1], '2')
+})
+
+test('a CPU without fast and slow cores gets no thread count, and warm() starts the same launch', async () => {
+  const r = androidRig(() => undefined)
+  r.cfg.speechToText.gpu = true
+  r.service.warm()
+  await waitFor('the warm-up', () => r.launches.length === 1)
+  assert.equal('threads' in r.launches[0], false)
+  assert.ok(!whisperServerArgs(r.launches[0], PORT).includes('-t'))
+})
+
+test('the thread count is capped at 8', async () => {
+  const r = androidRig(() => 12)
+  await r.service.transcribe(AUDIO)
+  assert.equal(r.launches[0].threads, 8)
+})
+
+test('a server that is not the bundled one follows the GPU option', async () => {
+  for (const source of ['system', 'managed', 'custom'] as const) {
+    const r = rig({
+      resolve: () => ({ ok: true, path: BIN, source, version: '' }),
+      perfCores: () => undefined,
+      fetch: (async () => Response.json({ text: 'hi' })) as unknown as typeof fetch,
+    })
+    installModel(r, 'ggml-base.bin')
+    r.cfg.speechToText.model = 'base'
+    r.cfg.speechToText.gpu = true
+    await r.service.transcribe(AUDIO)
+    assert.equal(r.launches[0].gpu, true, source)
+    assert.ok(!whisperServerArgs(r.launches[0], PORT).includes('-ng'), source)
+    r.cfg.speechToText.gpu = false
+    await r.service.transcribe(AUDIO)
+    assert.equal(r.launches[1].gpu, false, source)
+  }
+})
+
+test('the packaged Android app lists base-q5_1 first and recommended, and base is no longer recommended', () => {
+  const r = rig({ platform: 'android', env: { TURBOLLM_ANDROID_NATIVE_LIB_DIR: '/data/app/lib' } })
+  const { models } = r.service.status().stt
+  assert.equal(models[0].id, 'base-q5_1')
+  assert.equal(models[0].recommended, true)
+  assert.equal(models.find((m) => m.id === 'base')?.recommended, undefined)
+  assert.deepEqual(models.filter((m) => m.recommended).map((m) => m.id), ['base-q5_1'])
+  assert.equal(models.length, WHISPER_MODELS.length)
+})
+
+test('Android without the packaged app\'s native-lib folder, and other platforms, keep base first and recommended', () => {
+  for (const deps of [{ platform: 'android' as const, env: {} }, { platform: 'linux' as const, env: { TURBOLLM_ANDROID_NATIVE_LIB_DIR: '/x' } }, { platform: 'win32' as const }]) {
+    const { models } = rig(deps).service.status().stt
+    assert.equal(models[0].id, 'base')
+    assert.equal(models[0].recommended, true)
+    assert.deepEqual(models.filter((m) => m.recommended).map((m) => m.id), ['base'])
+  }
+})
+
+test('liveDownload is null with no download, names the running one with bytes from its progress, and is null again after', async () => {
+  const gate = deferred()
+  const r = downloadRig(async (_url, dest, onProgress) => {
+    onProgress?.({ phase: 'downloading', pct: 0.5 })
+    await gate.promise
+    writeFileSync(dest, 'weights')
+  })
+  assert.equal(r.service.liveDownload(), null)
+  r.service.startModelDownload('base')
+  const base = WHISPER_MODELS.find((m) => m.id === 'base')!
+  assert.deepEqual(r.service.liveDownload(), { name: `Speech model ${base.label}`, received: Math.round(0.5 * base.sizeBytes), total: base.sizeBytes })
+  gate.resolve()
+  await waitFor('the download to finish', () => r.service.status().stt.downloading === null)
+  assert.equal(r.service.liveDownload(), null)
+})
+
+test('liveDownload counts a negative progress as nothing received, and is null after a cancel', async () => {
+  let report: ((p: { phase: 'downloading'; pct: number }) => void) | undefined
+  const r = rig({
+    download: (_u, _d, onProgress, signal) => new Promise<never>((_, reject) => {
+      report = onProgress as typeof report
+      signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+    }),
+  })
+  r.service.startModelDownload('tiny')
+  await waitFor('the download to start', () => report !== undefined)
+  report!({ phase: 'downloading', pct: -0.2 })
+  const tiny = WHISPER_MODELS.find((m) => m.id === 'tiny')!
+  assert.deepEqual(r.service.liveDownload(), { name: `Speech model ${tiny.label}`, received: 0, total: tiny.sizeBytes })
+  report!({ phase: 'downloading', pct: 1 })
+  assert.equal(r.service.liveDownload()?.received, tiny.sizeBytes)
+  r.service.cancelModelDownload()
+  await waitFor('the download to end', () => r.service.status().stt.downloading === null)
+  assert.equal(r.service.liveDownload(), null)
 })

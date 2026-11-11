@@ -22,6 +22,8 @@ export interface WhisperLaunch {
   binPath: string
   modelPath: string
   gpu: boolean
+  /** How many threads whisper computes on; absent leaves it whisper's own choice (four, or fewer on a smaller CPU). */
+  threads?: number
 }
 
 export type WhisperState = 'stopped' | 'starting' | 'ready' | 'error'
@@ -282,8 +284,19 @@ export function whisperServerArgs(launch: WhisperLaunch, port: number): string[]
     '--port', String(port),
     '-m', launch.modelPath,
     '-l', 'auto',
+    ...(launch.threads && launch.threads > 0 ? ['-t', String(Math.floor(launch.threads))] : []),
     ...(launch.gpu ? [] : ['-ng']),
   ]
+}
+
+/** whisper gains little past this many threads, and the chat model is on the same cores. */
+const MAX_THREADS = 8
+
+/** PURE: the thread count to start whisper with, or undefined to leave it whisper's default of four. Only a CPU with
+ *  fast and slow cores is told: every step waits for its slowest thread, so on a phone with two fast cores four
+ *  threads are slower than two, and on one with more than four the default leaves fast cores idle. */
+export function whisperThreads(sys: { perfCores?: number }): number | undefined {
+  return sys.perfCores && sys.perfCores > 0 ? Math.min(MAX_THREADS, Math.floor(sys.perfCores)) : undefined
 }
 
 /** PURE: a start that ended with the process exiting, as a sentence. whisper-server prints why on its last lines. */
@@ -296,7 +309,7 @@ export function startFailureMessage(exitCode: number | null | undefined, logTail
 }
 
 function sameLaunch(a: WhisperLaunch, b: WhisperLaunch): boolean {
-  return a.binPath === b.binPath && a.modelPath === b.modelPath && a.gpu === b.gpu
+  return a.binPath === b.binPath && a.modelPath === b.modelPath && a.gpu === b.gpu && (a.threads ?? 0) === (b.threads ?? 0)
 }
 
 async function healthy(port: number): Promise<boolean> {

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
   WHISPER_LANGUAGES, WHISPER_MODEL_FILE, WHISPER_MODELS, isEnglishOnlyFile, isWhisperLanguage, normalizeLanguage, tidyTranscript,
-  whisperCatalogModel,
+  whisperCatalog, whisperCatalogModel,
 } from './whisper-catalog'
 
 test('catalog ids are unique, so a saved model id names exactly one entry', () => {
@@ -99,4 +99,29 @@ test('the web language picker mirrors the catalog table', async () => {
   const web = await import('../../web/src/lib/voice/languages')
   assert.deepEqual({ ...web.WHISPER_LANGUAGE_NAMES }, { ...WHISPER_LANGUAGES })
   assert.equal(web.AUTO_LANGUAGE, 'auto')
+})
+
+test('whisperCatalog(false) is the catalog as it is, as a copy that cannot change it', () => {
+  const desktop = whisperCatalog(false)
+  assert.deepEqual(desktop, [...WHISPER_MODELS])
+  assert.equal(desktop[0].id, 'base')
+  assert.deepEqual(desktop.filter((m) => m.recommended).map((m) => m.id), ['base'])
+  desktop.reverse()
+  assert.equal(WHISPER_MODELS[0].id, 'base')
+})
+
+test('whisperCatalog(true) recommends only base-q5_1 and lists it first, the rest in their order, every entry otherwise unchanged', () => {
+  const phone = whisperCatalog(true)
+  assert.deepEqual(phone.filter((m) => m.recommended).map((m) => m.id), ['base-q5_1'])
+  assert.equal(phone[0].id, 'base-q5_1')
+  assert.deepEqual(phone.slice(1).map((m) => m.id), WHISPER_MODELS.map((m) => m.id).filter((id) => id !== 'base-q5_1'))
+  const strip = (list: readonly { id: string; recommended?: boolean }[]) =>
+    list.map(({ recommended: _r, ...rest }) => rest).sort((a, b) => a.id.localeCompare(b.id))
+  assert.deepEqual(strip(phone), strip(WHISPER_MODELS))
+  // base lost its mark but kept its file, size and checksum.
+  assert.equal(phone.find((m) => m.id === 'base')?.recommended, undefined)
+  assert.equal(phone.find((m) => m.id === 'base')?.sha256, whisperCatalogModel('base')?.sha256)
+  // The shared catalog is not mutated by building the phone view.
+  assert.equal(whisperCatalogModel('base')?.recommended, true)
+  assert.equal(whisperCatalogModel('base-q5_1')?.recommended, undefined)
 })

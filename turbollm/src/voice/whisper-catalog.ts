@@ -85,6 +85,21 @@ export const WHISPER_MODELS: readonly WhisperCatalogModel[] = [
   },
 ]
 
+/** The model a phone is pointed at instead of the catalog's own recommendation: Base at well under half the download
+ *  and memory, which is what the Android app has least of beside a chat model. */
+const PHONE_RECOMMENDED = 'base-q5_1'
+
+/** The catalog as a device should see it: its recommended model marked, and first. `phone` is the packaged Android
+ *  app. */
+export function whisperCatalog(phone: boolean): WhisperCatalogModel[] {
+  if (!phone) return [...WHISPER_MODELS]
+  const marked = WHISPER_MODELS.map((m): WhisperCatalogModel => {
+    const { recommended: _dropped, ...rest } = m
+    return m.id === PHONE_RECOMMENDED ? { ...rest, recommended: true } : rest
+  })
+  return [...marked.filter((m) => m.recommended), ...marked.filter((m) => !m.recommended)]
+}
+
 export function whisperCatalogModel(id: string): WhisperCatalogModel | undefined {
   return WHISPER_MODELS.find((m) => m.id === id)
 }

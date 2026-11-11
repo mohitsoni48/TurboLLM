@@ -4,7 +4,7 @@ import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { tmpDir } from '../test-support/tmp'
 import { spawnTethered } from '../util/tether'
-import { WhisperServer, WhisperStartError, startFailureMessage, whisperServerArgs, type WhisperLaunch, type WhisperServerOptions } from './whisper-server'
+import { WhisperServer, WhisperStartError, startFailureMessage, whisperServerArgs, whisperThreads, type WhisperLaunch, type WhisperServerOptions } from './whisper-server'
 
 const FAKE_SERVER = fileURLToPath(new URL('../test-support/fake-whisper-server.mjs', import.meta.url))
 
@@ -54,6 +54,29 @@ test('whisperServerArgs binds loopback on the given port with the model, and tur
   const on = whisperServerArgs({ ...launch, gpu: true }, 4321)
   assert.equal(on.includes('-ng'), false)
   assert.equal(on[on.indexOf('--host') + 1], '127.0.0.1')
+})
+
+test('whisperServerArgs puts -t after -l auto and before -ng, with the count floored, only for a positive threads', () => {
+  const base = ['--host', '127.0.0.1', '--port', '4321', '-m', '/models/ggml-base.bin', '-l', 'auto']
+  for (const gpu of [false, true]) {
+    const tail = gpu ? [] : ['-ng']
+    // Absent and 0 leave the count to whisper: no flag at all.
+    assert.deepEqual(whisperServerArgs({ ...launch, gpu }, 4321), [...base, ...tail])
+    assert.deepEqual(whisperServerArgs({ ...launch, gpu, threads: 0 }, 4321), [...base, ...tail])
+    assert.deepEqual(whisperServerArgs({ ...launch, gpu, threads: 2 }, 4321), [...base, '-t', '2', ...tail])
+    assert.deepEqual(whisperServerArgs({ ...launch, gpu, threads: 3.7 }, 4321), [...base, '-t', '3', ...tail])
+  }
+})
+
+test('whisperThreads is the fast-core count capped at 8, and undefined when the CPU does not say', () => {
+  assert.equal(whisperThreads({}), undefined)
+  assert.equal(whisperThreads({ perfCores: 0 }), undefined)
+  assert.equal(whisperThreads({ perfCores: -3 }), undefined)
+  assert.equal(whisperThreads({ perfCores: 2 }), 2)
+  assert.equal(whisperThreads({ perfCores: 4 }), 4)
+  assert.equal(whisperThreads({ perfCores: 8 }), 8)
+  assert.equal(whisperThreads({ perfCores: 12 }), 8)
+  assert.equal(whisperThreads({ perfCores: 2.9 }), 2)
 })
 
 test('startFailureMessage quotes the last error-looking log line and the exit code', () => {
@@ -154,6 +177,38 @@ test('flipping the GPU option restarts the server with the flag changed', async 
     assert.ok(spawns[0].args.includes('-ng'))
     assert.ok(!spawns[1].args.includes('-ng'))
     await waitFor('the first process to be gone', () => exitedOf(spawns[0].child))
+  } finally {
+    await server.stop()
+  }
+})
+
+test('a different thread count restarts the server with -t changed, and the same count reuses the process', async () => {
+  const { server, spawns } = fakeRig()
+  try {
+    const a = await server.ensure({ ...launch, threads: 2 })
+    assert.equal(await server.ensure({ ...launch, threads: 2 }), a)
+    assert.equal(spawns.length, 1)
+    const b = await server.ensure({ ...launch, threads: 4 })
+    assert.equal(spawns.length, 2)
+    assert.notEqual(a, b)
+    await waitFor('the first process to be gone', () => exitedOf(spawns[0].child))
+    assert.equal(await healthOk(a), false)
+    assert.equal(await healthOk(b), true)
+    assert.deepEqual([spawns[0].args[spawns[0].args.indexOf('-t') + 1], spawns[1].args[spawns[1].args.indexOf('-t') + 1]], ['2', '4'])
+    assert.equal(server.launch()?.threads, 4)
+  } finally {
+    await server.stop()
+  }
+})
+
+test('a launch with threads undefined or 0 is the same launch as one without, so it does not restart', async () => {
+  const { server, spawns } = fakeRig()
+  try {
+    const a = await server.ensure(launch)
+    assert.equal(await server.ensure({ ...launch, threads: undefined }), a)
+    assert.equal(await server.ensure({ ...launch, threads: 0 }), a)
+    assert.equal(spawns.length, 1)
+    assert.ok(!spawns[0].args.includes('-t'))
   } finally {
     await server.stop()
   }
