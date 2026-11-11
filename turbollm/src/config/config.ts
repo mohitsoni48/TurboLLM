@@ -11,6 +11,7 @@ import type { ChatStoreConfig } from '../chat/store/load-adapter.js'
 import type { ReleaseProvenance } from '../engines/release-install'
 import { CHAT_APPROVAL_WAIT_MINUTES, DOWNLOAD_CONCURRENCY, ENGINE_LOAD_STALL_SECONDS, GATEWAY_MAX_BODY_MB, RETENTION_BOUNDS, loadBounded } from './config-bounds'
 import { writeFileAtomicSync } from '../util/atomic-write'
+import { isWhisperLanguage } from '../voice/whisper-catalog'
 
 export const SCHEMA_VERSION = 4
 
@@ -337,6 +338,21 @@ export interface RetentionConfig {
  *  Push-based: a one-time-installed ComfyUI custom node calls TurboLLM the moment a
  *  render starts (TurboLLM unloads the model + blocks loads) and when the queue drains
  *  (TurboLLM reloads the model it unloaded). No polling — see {@link ComfyGuard}. */
+/** Speech-to-text through whisper.cpp (voice/voice-service.ts): what Settings → Voice saves on the daemon. The
+ *  text-to-speech half of that screen is the browser's own voices and is kept in the browser. */
+export interface SpeechToText {
+  /** The whisper model transcriptions use: a catalog id (voice/whisper-catalog.ts) or the file name of a ggml model in
+   *  <dataDir>/whisper/models. '' (and a model that is no longer there) uses the first installed one. */
+  model: string
+  /** Spoken language as a whisper code (`en`, `de`…), or `auto` to detect it per recording. */
+  language: string
+  /** A whisper-server binary to run instead of the one TurboLLM finds or installs. '' finds one. */
+  serverPath: string
+  /** Let whisper use the GPU when its build can. Off by default: the chat model's load was fitted to the VRAM that was
+   *  free, and a whisper model loaded onto the same card afterwards takes from it. */
+  gpu: boolean
+}
+
 export interface ComfyUI {
   enabled: boolean
   /** Absolute path to the ComfyUI `custom_nodes` dir the gate node was installed into
@@ -667,6 +683,7 @@ export interface Config {
   modelDefaults: ModelDefaults
   featuredOverrideUrl: string
   comfyui: ComfyUI
+  speechToText: SpeechToText
   gateway: Gateway
   requestLog: RequestLogConfig
   retention: RetentionConfig
@@ -834,6 +851,7 @@ export function defaultConfig(): Config {
     modelDefaults: { ctx: BUILTIN_MODEL_DEFAULT_CTX, ngl: 99, imageMaxTokens: 0, maxTokens: 0 },
     featuredOverrideUrl: '',
     comfyui: { enabled: false, gatePath: '', url: '', reverseGate: false, cachePersist: false },
+    speechToText: { model: '', language: 'auto', serverPath: '', gpu: false },
     gateway: { autoSwap: true, keepN: 1, maxBodyMb: GATEWAY_MAX_BODY_MB.default },
     requestLog: { enabled: true, captureBodies: false, maxEntries: 500 },
     retention: { enabled: true, apiUsageRawDays: RETENTION_BOUNDS.apiUsageRawDays.default, routineRunsKept: RETENTION_BOUNDS.routineRunsKept.default },
@@ -1285,6 +1303,15 @@ function normalize(c: Config): void {
   c.autoLoadOnStart ??= false
   c.showAllEngineModels = c.showAllEngineModels === true
   c.featuredOverrideUrl ??= ''
+  // Speech-to-text (absent in configs from before voice input → defaults). A language whisper does not know is reset
+  // rather than kept: whisper-server refuses every request that names one.
+  const stt = (c.speechToText ?? {}) as Partial<SpeechToText>
+  c.speechToText = {
+    model: typeof stt.model === 'string' ? stt.model : '',
+    language: isWhisperLanguage(stt.language) ? stt.language : 'auto',
+    serverPath: typeof stt.serverPath === 'string' ? stt.serverPath : '',
+    gpu: stt.gpu === true,
+  }
   // ComfyUI coordination (absent in pre-comfyui configs → defaults; never throw on an
   // old file). Reseat only the known fields so the retired url/pollSeconds keys from
   // the earlier polling design don't linger on disk.

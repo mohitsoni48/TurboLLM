@@ -497,6 +497,25 @@ test('requiredCapability: reading /api/v1/activity needs models:load; nothing ma
   assert.equal(requiredCapability('POST', '/api/v1/activity'), null)
 })
 
+// Speech-to-text (api/voice-routes.ts): dictating is part of chatting, so reading the status, warming up and transcribing
+// take models:use. Anything that changes the host's disk (the whisper-server install, model downloads and deletes) has
+// no capability, so a scoped remote-access token cannot reach it.
+test('requiredCapability: the voice status, warm-up and transcription need models:use; the setup routes have no capability', () => {
+  assert.equal(requiredCapability('GET', '/api/v1/voice'), 'models:use')
+  assert.equal(requiredCapability('HEAD', '/api/v1/voice'), 'models:use')
+  assert.equal(requiredCapability('POST', '/api/v1/voice/transcribe'), 'models:use')
+  assert.equal(requiredCapability('POST', '/api/v1/voice/warm'), 'models:use')
+  assert.equal(requiredCapability('POST', '/v1/audio/transcriptions'), 'models:use')
+  assert.equal(requiredCapability('PUT', '/api/v1/voice'), null)
+  assert.equal(requiredCapability('GET', '/api/v1/voice/transcribe'), null)
+  assert.equal(requiredCapability('POST', '/api/v1/voice/server/install'), null)
+  assert.equal(requiredCapability('POST', '/api/v1/voice/server/install/cancel'), null)
+  assert.equal(requiredCapability('DELETE', '/api/v1/voice/server'), null)
+  assert.equal(requiredCapability('POST', '/api/v1/voice/models/base/download'), null)
+  assert.equal(requiredCapability('POST', '/api/v1/voice/models/base/cancel'), null)
+  assert.equal(requiredCapability('DELETE', '/api/v1/voice/models/base'), null)
+})
+
 // Every key check used to rewrite config.json (a full synchronous serialize + write + rename
 // on the event loop) just to bump lastUsedAt — once or twice per request, for a UI that polls
 // every 1–2 s. The bump is display-only, so a recent value is left alone.

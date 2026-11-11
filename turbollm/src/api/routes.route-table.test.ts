@@ -133,5 +133,15 @@ test('registerApi mounts every /api/v1 route in its original registration order'
     'POST /api/v1/jev/playground/run',
     'GET /api/v1/jev/playground/run',
     'DELETE /api/v1/jev/playground/run',
+    'GET /api/v1/voice',
+    'POST /api/v1/voice/warm',
+    'POST /api/v1/voice/transcribe', // the body limit
+    'POST /api/v1/voice/transcribe',
+    'POST /api/v1/voice/server/install',
+    'POST /api/v1/voice/server/install/cancel',
+    'DELETE /api/v1/voice/server',
+    'POST /api/v1/voice/models/:id/download',
+    'POST /api/v1/voice/models/:id/cancel',
+    'DELETE /api/v1/voice/models/:id',
   ])
 })

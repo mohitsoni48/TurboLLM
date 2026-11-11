@@ -833,6 +833,12 @@ export function requiredCapability(method: string, path: string): LinkCapability
   // held to what /v1/* is. GET reads the last answer, so it takes the same capability as asking: a token that may
   // not ask may not read what someone else asked either.
   if (path === '/api/v1/jev/playground/run') return 'models:use'
+  // Speech-to-text for the chat's microphone (api/voice-routes.ts). Dictating a message is part of chatting, so its
+  // status (which names no path), the warm-up and the transcription take what chatting takes: the "scan the QR, chat
+  // from your phone" journey is where a microphone is most wanted. Installing whisper-server and downloading or
+  // deleting its models stay unmapped: they change what is on the host's disk.
+  if (path === '/api/v1/voice') return read ? 'models:use' : null
+  if (m === 'POST' && (path === '/api/v1/voice/transcribe' || path === '/api/v1/voice/warm')) return 'models:use'
   return null
 }
 

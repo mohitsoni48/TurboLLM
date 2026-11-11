@@ -7,7 +7,8 @@ import type { MiddlewareHandler } from 'hono'
 import { eventBus, type EventBus } from './bus'
 
 const WRITE_FAMILIES: ReadonlyArray<{ prefix: string; keys: readonly string[] }> = [
-  { prefix: '/api/v1/settings', keys: ['settings', 'status'] },
+  // 'voice': the voice status is worked out from the speechToText settings (voice/voice-service.ts).
+  { prefix: '/api/v1/settings', keys: ['settings', 'status', 'voice'] },
   { prefix: '/api/v1/engines', keys: ['engines', 'status'] },
   { prefix: '/api/v1/engine', keys: ['engines', 'status'] },
   { prefix: '/api/v1/build', keys: ['engines', 'status'] },

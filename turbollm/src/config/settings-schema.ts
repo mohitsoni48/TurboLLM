@@ -34,6 +34,7 @@ import {
   RETENTION_BOUNDS, coerceBounded, isConfigTheme, isKvTypeName, isWholeInBounds, type BoundedConfigPath, type LoadedBound,
 } from './config-bounds'
 import type { DaemonSettings } from '../contract/settings'
+import { isWhisperLanguage, WHISPER_MODEL_FILE, whisperCatalogModel } from '../voice/whisper-catalog'
 
 /** Why a PATCH is refused: the route answers `status` with `{ error: { code, message } }`. */
 export class Refusal {
@@ -293,6 +294,37 @@ export const SETTINGS = [
       },
       set: (c, v) => { c.comfyui.url = v },
     }),
+  ]),
+  // Speech-to-text (Settings → Voice, voice/voice-service.ts). Read at each transcription, so a change needs no
+  // restart. `model` is a catalog id or a ggml file name, never a path; `serverPath` names a program the daemon will
+  // run, so only the host sets it.
+  row('speechToText', (c) => c.speechToText, [
+    field<string>('speechToText.model', {
+      type: 'string',
+      parse: (raw) => {
+        const id = (raw as string).trim()
+        return id === '' || whisperCatalogModel(id) || WHISPER_MODEL_FILE.test(id) ? id : invalid('speechToText.model must be a whisper model id, or empty.')
+      },
+      set: (c, v) => { c.speechToText.model = v },
+    }),
+    field<string>('speechToText.language', {
+      type: 'string',
+      parse: (raw) => {
+        const code = (raw as string).trim().toLowerCase()
+        return isWhisperLanguage(code) ? code : invalid('speechToText.language must be a whisper language code (en, de, pt…) or auto.')
+      },
+      set: (c, v) => { c.speechToText.language = v },
+    }),
+    field<string>('speechToText.serverPath', {
+      type: 'string',
+      parse: (raw) => {
+        const path = (raw as string).trim()
+        return path === '' || ABSOLUTE_PATH.test(path) ? path : invalid('speechToText.serverPath must be an absolute path to a whisper-server binary, or empty.')
+      },
+      set: (c, v) => { c.speechToText.serverPath = v },
+      hostOnly: { label: 'the whisper-server path', get: (c) => c.speechToText.serverPath },
+    }),
+    bool('speechToText.gpu', (c, v) => { c.speechToText.gpu = v }),
   ]),
   // Gateway intelligence (v0.6.0): auto-swap toggle + keep-N pool size, and the /v1 body cap (read per request, host-only:
   // raising it raises what this machine buffers).

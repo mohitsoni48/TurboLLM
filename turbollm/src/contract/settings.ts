@@ -4,6 +4,7 @@
 // DaemonSettings, so a setting added to the table must be declared here too.
 // A field is optional here when an older daemon omits it.
 // Declare nothing here that needs a runtime import: contract.test.ts rejects it.
+import type { SpeechToTextSettings } from './voice'
 
 /** Global model defaults (spec 05 §3): base load values applied to never-seen
  *  models that have no saved per-model profile. */
@@ -110,6 +111,8 @@ export type DaemonSettings = {
   modelDefaults: ModelDefaults
   /** ComfyUI GPU coordination settings. */
   comfyui: ComfyUiSettings
+  /** Speech-to-text through whisper.cpp (Settings → Voice). Absent from daemons that predate voice input. */
+  speechToText?: SpeechToTextSettings
   /** Gateway intelligence settings (ADR-06x): model auto-swap + keep-N pool, and the `/v1/*` request-body cap in MB
    *  (1–4096, default 128; host-only, no Settings control; absent from older daemons). */
   gateway: { autoSwap: boolean; keepN: number; maxBodyMb?: number }
@@ -181,9 +184,10 @@ export type DaemonSettings = {
 
 /** Settings patch: the persisted {@link DaemonSettings} fields plus write-only credentials. Every nested block is
  *  patchable per field: the daemon applies each member independently, so a patch sends only what it changes. */
-export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental' | 'code' | 'requestLog' | 'retention' | 'remoteAccess' | 'modelDefaults' | 'gateway'>> & {
+export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'speechToText' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental' | 'code' | 'requestLog' | 'retention' | 'remoteAccess' | 'modelDefaults' | 'gateway'>> & {
   /** `gatePath` is owned by the ComfyUI install endpoints. */
   comfyui?: Partial<ComfyUiSettings>
+  speechToText?: Partial<SpeechToTextSettings>
   modelDefaults?: Partial<ModelDefaults>
   gateway?: Partial<DaemonSettings['gateway']>
   experimental?: Partial<DaemonSettings['experimental']>
