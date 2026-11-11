@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useParams, useSearchParams } from 'react-router-dom'
-import { ArrowDown, Copy, Download, Loader2, PanelLeft, Paperclip, Search, SendHorizontal, Share2, Shrink, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { ArrowDown, AudioLines, Copy, Download, Loader2, Mic, PanelLeft, Paperclip, Search, SendHorizontal, Share2, Shrink, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
 import { fetchSysInfo, getConversation, listMemoryFacts } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { chatKeys, useConversation, useConversationMutations } from '../lib/chat-queries'
@@ -30,6 +30,11 @@ import { ThinkingBudgetSlider } from '../components/ThinkingBudgetSlider'
 import { DEFAULT_REASONING_EFFORT, ReasoningEffortSelect, type ReasoningEffort } from '../components/ReasoningEffortSelect'
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
 import { ToolApprovalBar } from './chat/ToolApprovalBar'
+import { VoiceBar } from './chat/VoiceBar'
+import { useVoiceInput, type ComposerClip } from './chat/useVoiceInput'
+import { formatClock } from '../lib/voice/pcm'
+import { speaker, ttsAvailable, type SpeechStream } from '../lib/voice/tts'
+import { useVoiceStore } from '../stores/voice'
 import { ContextMeter } from './chat/ContextMeter'
 import { CompactionDivider } from './chat/CompactionDivider'
 import { ChatFindBar } from './chat/ChatFindBar'
@@ -134,7 +139,12 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   useBackableOverlay(mobileSidebarOpen, () => setMobileSidebarOpen(false))
   const sidebarRef = useRef<HTMLDivElement>(null)
   const [sidebarWidth, setSidebarWidth] = useState(() => Math.min(Math.max(readSavedSidebarWidth(), SIDEBAR_MIN_W), sidebarMaxW()))
-  const [attachments, setAttachments] = useState<{ file: File; dataUrl: string }[]>([])
+  // Voice (useVoiceInput, further down): whether what is in the composer was spoken, and the chat whose next reply
+  // is to be read aloud as it streams.
+  const voiceUsed = useRef(false)
+  const speakNextReplyIn = useRef<string | null>(null)
+  // `durationMs`: a voice clip's length, for its chip. Clips have file.type audio/wav and go out as `audio`.
+  const [attachments, setAttachments] = useState<{ file: File; dataUrl: string; durationMs?: number }[]>([])
   // Share menu clipboard fallback (F-023)
   const [clipboardFallback, setClipboardFallback] = useState<{ text: string; title: string } | null>(null)
   // Import state (F-024)
@@ -678,6 +688,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const handleStop = async () => {
     const convId = activeId
     if (!convId) return
+    // A stopped reply is not read on: what was queued of it goes quiet with it.
+    speaker.stop()
     const replyId = liveByConv[convId]?.assistantId ?? (conv?.id === convId ? conv.runningReplyId ?? undefined : undefined)
     await session.stop(convId, replyId, () => mut.stop.mutateAsync({ convId, messageId: replyId }))
   }
@@ -755,9 +767,12 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const send = async (overrideInput?: string) => {
+  // `overrideAttachments`: what a voice message sends when it goes out the moment it is recorded, before the
+  // attachment state it was added to has rendered.
+  const send = async (overrideInput?: string, overrideAttachments?: typeof attachments) => {
     const rawText = (overrideInput ?? input).trim()
-    if ((!rawText && attachments.length === 0) || live) return
+    const outgoing = overrideAttachments ?? attachments
+    if ((!rawText && outgoing.length === 0) || live) return
     if (!ready) { toast.error('Load a model first.'); return }
 
     // `/compact` — a composer command, not a real turn: it never reaches the engine as a
@@ -782,12 +797,23 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     // Discriminate by file.type (authoritative, same as the preview thumbnail below) rather
     // than sniffing the extracted dataUrl content — a text/PDF attachment whose content
     // happens to start with "data:image/" would otherwise get mis-sent as an image.
-    const imageAttachments = attachments.filter((a) => a.file.type.startsWith('image/'))
-    const textAttachments = attachments.filter((a) => !a.file.type.startsWith('image/'))
+    const imageAttachments = outgoing.filter((a) => a.file.type.startsWith('image/'))
+    // A voice clip (useVoiceInput): sent as audio to a model that hears, never folded into the prompt as text.
+    const audioAttachments = outgoing.filter((a) => a.file.type.startsWith('audio/'))
+    const textAttachments = outgoing.filter((a) => !a.file.type.startsWith('image/') && !a.file.type.startsWith('audio/'))
     const images = imageAttachments.map((a) => a.dataUrl)
+    const audio = audioAttachments.map((a) => a.dataUrl)
     const docContext = textAttachments.map((a) => `[Attached: ${a.file.name}]\n${a.dataUrl}`).join('\n\n')
 
-    const sentAttachments = attachments
+    // Whether this turn's reply is read aloud as it arrives (Settings → Voice): always, or because the message was
+    // spoken. Whatever is being read now gives way to the new turn either way.
+    const spoken = voiceUsed.current
+    voiceUsed.current = false
+    speaker.stop()
+    const { readAloud } = useVoiceStore.getState()
+    const speakReply = (readAloud === 'always' || (readAloud === 'voice' && spoken)) && ttsAvailable()
+
+    const sentAttachments = outgoing
     setInput('')
     setAttachments([])
     setTimeout(autoResize, 0)
@@ -876,10 +902,12 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       if (matchedSkill) toast.success(`Using skill: ${matchedSkill.name}`)
 
       const textAttachmentNames = textAttachments.map((a) => a.file.name)
-      const { started, aborted } = await session.send(convId, { text, images, docContext, textAttachmentNames }, turnSettings)
+      speakNextReplyIn.current = speakReply ? convId : null
+      const { started, aborted } = await session.send(convId, { text, images, audio, docContext, textAttachmentNames }, turnSettings)
       // The session toasts the error itself and never rethrows. An abort is the user (or Eject)
       // stopping it, not a refusal.
       if (!started && !aborted) restoreComposer()
+      if (!started) speakNextReplyIn.current = null
     } catch (e) {
       // A failure here came before this send streamed (the session never throws): creating the
       // chat, or turning on the '/skill' it named. So the chat's live view, if any, is another
@@ -1045,6 +1073,93 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     }
     wasDaemonGenerating.current = daemonGenerating
   }, [daemonGenerating, activeId, qc])
+
+  // ── voice ──────────────────────────────────────────────────────────────────
+  const navigate = useNavigate()
+  const voiceAutoStop = useVoiceStore((v) => v.autoStop)
+  // Only this machine's own engine says whether its model hears audio; a linked machine's model is taken not to, so
+  // a recording for it is converted to text here first.
+  const modelHears = !activeRemoteId && status?.model?.audio === true
+  const voice = useVoiceInput({
+    modelHears,
+    onText: (text) => {
+      voiceUsed.current = true
+      const combined = input.trim() ? `${input.trimEnd()} ${text}` : text
+      if (useVoiceStore.getState().autoSend) {
+        void send(combined)
+        return
+      }
+      setInput(combined)
+      setTimeout(() => { autoResize(); inputRef.current?.focus() }, 0)
+    },
+    onClip: (clip: ComposerClip) => {
+      voiceUsed.current = true
+      if (useVoiceStore.getState().autoSend) {
+        void send(undefined, [...attachments, clip])
+        return
+      }
+      setAttachments((prev) => [...prev, clip])
+      setTimeout(() => inputRef.current?.focus(), 0)
+    },
+    notify: (message, kind) => { if (kind === 'error') toast.error(message); else toast(message) },
+  })
+  const composerLocked = !ready || !!live || !!editingId || mut.compact.isPending || compactingHere
+  const onMicClick = () => {
+    if (voice.phase === 'recording') { void voice.stop(); return }
+    if (voice.phase !== 'idle') return
+    if (voice.block) {
+      if (voice.block.kind === 'setup') toast(voice.block.message, { action: { label: 'Open Settings', onClick: () => navigate('/settings?section=voice') } })
+      else toast.error(voice.block.message)
+      return
+    }
+    // The microphone would otherwise record the reply being read aloud.
+    speaker.stop()
+    void voice.start()
+  }
+  const micLabel = voice.phase === 'recording' ? 'Finish recording' : 'Record a voice message'
+  const composerEmpty = !input.trim() && attachments.length === 0
+
+  // Reading the reply aloud while it is written. A turn that asked for it (send) is spoken from its first complete
+  // sentence; when the stream ends, what is left is spoken from the saved message.
+  const replySpeech = useRef<{ assistantId: string; stream: SpeechStream; fedChars: number; lastContent: string } | null>(null)
+  const liveReplyId = live?.assistantId
+  const liveContent = live?.content
+  useEffect(() => {
+    const speech = replySpeech.current
+    if (liveReplyId !== undefined && liveContent !== undefined) {
+      if (!speech) {
+        if (!activeId || speakNextReplyIn.current !== activeId) return
+        speakNextReplyIn.current = null
+        const { ttsVoice, ttsRate } = useVoiceStore.getState()
+        replySpeech.current = { assistantId: liveReplyId, stream: speaker.stream(liveReplyId, { voiceId: ttsVoice, rate: ttsRate }), fedChars: 0, lastContent: '' }
+        return
+      }
+      if (speech.assistantId !== liveReplyId) return
+      speech.lastContent = liveContent
+      // Not on every token: preparing the text is a pass over the whole reply. Often enough is each sentence end,
+      // or a few dozen characters.
+      const grown = liveContent.length - speech.fedChars
+      if (grown >= 48 || grown < 0 || (grown > 0 && /[.!?…。！？\n]\s*$/.test(liveContent))) {
+        speech.fedChars = liveContent.length
+        speech.stream.update(liveContent)
+      }
+      return
+    }
+    if (speech) {
+      replySpeech.current = null
+      speech.stream.end(messages.find((m) => m.id === speech.assistantId)?.content || speech.lastContent)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveReplyId, liveContent, activeId])
+  // Another chat, or leaving the screen: its reply is not read out over this one. A reply still awaited in the chat
+  // now open keeps its claim: a first message creates its chat (and so changes the open one) just before it is sent.
+  useEffect(() => {
+    if (speakNextReplyIn.current !== activeId) speakNextReplyIn.current = null
+    return () => {
+      replySpeech.current = null
+      speaker.stop()
+    }
+  }, [activeId])
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -1459,9 +1574,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                     <div key={i} className="relative flex items-center gap-1 rounded border border-border bg-panel-2 px-2 py-1 text-[12px]">
                       {a.file.type.startsWith('image/')
                         ? <img src={a.dataUrl} className="h-8 w-8 rounded object-cover" alt="" />
-                        : <span className="text-muted">{a.file.name}</span>
+                        : a.file.type.startsWith('audio/')
+                          ? <span className="flex items-center gap-1.5 text-muted"><AudioLines size={13} className="shrink-0 text-accent" />Voice message{a.durationMs ? ` · ${formatClock(a.durationMs)}` : ''}</span>
+                          : <span className="text-muted">{a.file.name}</span>
                       }
-                      <button type="button" onClick={() => { track('chat', 'remove_attachment'); setAttachments((prev) => prev.filter((_, j) => j !== i)) }} className="text-faint hover:text-err">
+                      <button type="button" aria-label="Remove attachment" onClick={() => { track('chat', 'remove_attachment'); setAttachments((prev) => prev.filter((_, j) => j !== i)) }} className="text-faint hover:text-err">
                         <X size={11} />
                       </button>
                     </div>
@@ -1487,6 +1604,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                 </div>
               )}
 
+              <VoiceBar voice={voice} autoStop={voiceAutoStop} />
+
               <div className="flex items-end gap-2 p-2">
                 <button
                   type="button"
@@ -1505,6 +1624,21 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                   hidden
                   onChange={handleFileSelect}
                 />
+                {/* The microphone has its own place from sm up. Below it (a phone) the chat box has no width to
+                    give, so it takes the Send button's place while there is nothing to send (below). */}
+                <button
+                  type="button"
+                  onClick={onMicClick}
+                  disabled={composerLocked || voice.phase === 'starting' || voice.phase === 'transcribing' || voice.phase === 'choosing'}
+                  className="hidden h-9 w-9 shrink-0 place-items-center rounded-md hover:bg-panel-2 disabled:opacity-40 sm:grid"
+                  title={micLabel}
+                  aria-label={micLabel}
+                  aria-pressed={voice.phase === 'recording'}
+                >
+                  {voice.phase === 'recording'
+                    ? <Square size={13} style={{ color: 'var(--err)' }} />
+                    : <Mic size={15} className="text-muted" />}
+                </button>
                 <textarea
                   ref={inputRef}
                   rows={1}
@@ -1558,9 +1692,26 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                     <Square size={15} />
                   </Button>
                 ) : (
-                  <Button size="icon" onClick={() => { track('chat', 'send_message'); void send() }} disabled={!ready || (!input.trim() && attachments.length === 0) || !!editingId || mut.compact.isPending} aria-label="Send">
-                    <SendHorizontal size={15} />
-                  </Button>
+                  <>
+                    {/* Phone widths: with nothing typed or attached there is nothing to send, so this place is
+                        the microphone's. From sm up it has its own button beside the paperclip. */}
+                    {composerEmpty && (
+                      <Button
+                        size="icon"
+                        variant={voice.phase === 'recording' ? 'default' : 'outline'}
+                        className="sm:hidden"
+                        onClick={onMicClick}
+                        disabled={composerLocked || voice.phase === 'starting' || voice.phase === 'transcribing' || voice.phase === 'choosing'}
+                        aria-label={micLabel}
+                        aria-pressed={voice.phase === 'recording'}
+                      >
+                        {voice.phase === 'recording' ? <Square size={14} /> : <Mic size={15} />}
+                      </Button>
+                    )}
+                    <Button size="icon" className={composerEmpty ? 'hidden sm:inline-flex' : undefined} onClick={() => { track('chat', 'send_message'); void send() }} disabled={!ready || composerEmpty || !!editingId || mut.compact.isPending} aria-label="Send">
+                      <SendHorizontal size={15} />
+                    </Button>
+                  </>
                 )}
               </div>
             </div>

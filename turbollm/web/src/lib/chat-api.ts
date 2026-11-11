@@ -164,11 +164,13 @@ export async function* sendMessage(
   model?: string,
   /** Runs once the daemon has answered 200: from then on the turn exists (followChatTurn). */
   onAccepted?: () => void,
+  /** Voice clips for a model that hears audio, as `data:audio/wav` URLs: sent to it as they are, not as text. */
+  audio?: string[],
 ): AsyncGenerator<ChatFrame> {
   const res = await fetch(`/api/v1/conversations/${encodeURIComponent(convId)}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ content, images: images?.length ? images : undefined, docContext: docContext || undefined, textAttachments: textAttachments?.length ? textAttachments : undefined, thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined, model: model || undefined }),
+    body: JSON.stringify({ content, images: images?.length ? images : undefined, audio: audio?.length ? audio : undefined, docContext: docContext || undefined, textAttachments: textAttachments?.length ? textAttachments : undefined, thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined, model: model || undefined }),
     signal,
   })
   if (!res.ok || !res.body) {

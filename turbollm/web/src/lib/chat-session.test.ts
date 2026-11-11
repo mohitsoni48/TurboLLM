@@ -21,6 +21,7 @@ vi.mock('./chat-api', () => ({
   continueConversation: vi.fn(),
 }))
 
+import { sendMessage } from './chat-api'
 import { ChatSession } from './chat-session'
 
 const META: ChatFrame = { event: 'meta', data: { userMessageId: 'u1', assistantMessageId: 'a1' } }
@@ -328,5 +329,33 @@ describe('ChatSession lifecycle', () => {
     onAccepted()
     expect(accepted).toHaveBeenCalled()
     expect(ac.signal.aborted).toBe(true)
+  })
+})
+
+describe('ChatSession.send', () => {
+  const settings = { thinkingBudget: -1, reasoningEffort: 'medium', remoteModel: undefined } as unknown as Parameters<ChatSession['send']>[2]
+
+  /** The arguments the page's POST was made with, once followChatTurn runs the send it was handed. */
+  async function sentArgs(message: Parameters<ChatSession['send']>[1]): Promise<unknown[]> {
+    script = () => frames()
+    vi.mocked(sendMessage).mockClear()
+    await makeSession().session.send('c1', message, settings)
+    const first = followCalls[0].first as (accepted: () => void) => unknown
+    first(() => {})
+    return vi.mocked(sendMessage).mock.calls[0]
+  }
+
+  it('forwards the message\'s audio clips to sendMessage, after the acceptance callback', async () => {
+    const args = await sentArgs({ text: 'hi', images: ['data:image/png;base64,II'], audio: ['data:audio/wav;base64,AA'], docContext: '', textAttachmentNames: [] })
+    expect(args[0]).toBe('c1')
+    expect(args[1]).toBe('hi')
+    expect(args[3]).toEqual(['data:image/png;base64,II'])
+    expect(typeof args[9]).toBe('function')
+    expect(args[10]).toEqual(['data:audio/wav;base64,AA'])
+  })
+
+  it('passes no audio when the message has none', async () => {
+    const args = await sentArgs({ text: 'hi', images: [], docContext: '', textAttachmentNames: [] })
+    expect(args[10]).toBeUndefined()
   })
 })
