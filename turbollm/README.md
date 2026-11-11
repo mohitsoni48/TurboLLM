@@ -267,6 +267,15 @@ the detail:
   edge to size it once and every block remembers it.
 - **Find in chat** — **Ctrl/Cmd+F** (or the header's search button) searches the open conversation:
   "3 of 17", Enter or the up/down buttons jump between matches and pan the chat to each, Esc closes.
+- **Voice** — talk to it, and have it talk back, without anything leaving your machine. The
+  **microphone** in the chat box records a message and stops by itself when you finish speaking;
+  [whisper.cpp](https://github.com/ggml-org/whisper.cpp) turns it into text you can read and fix
+  before sending. *Settings → Voice* sets it up: one click installs whisper.cpp's own build on
+  Windows and Linux (on macOS it uses Homebrew's `whisper.cpp`), and you pick a model to download.
+  A model that **hears audio** (Voxtral, Ultravox, Qwen-Omni, a LiteRT-LM bundle with an audio
+  encoder) can be sent the recording itself instead, so it hears your voice and not only your
+  words: TurboLLM asks which you want, once or every time. **Read aloud** on any reply speaks it
+  in your device's own voice, and replies can be read out as they are written.
 - **Markdown + syntax-highlighted code** with one-click copy — plus **inline Unicode charts**
   the model draws when a comparison, trend, or hierarchy is genuinely worth a visual.
 - **Live artifacts** — `html`, `svg`, and `mermaid` replies render as **sandboxed, offline
@@ -440,6 +449,10 @@ curl http://127.0.0.1:6996/v1/chat/completions \
   a chat model can stay loaded side by side.
 - **Anthropic-compatible** `/v1/messages` — including **tool use and streaming** — which powers
   Claude Code below. No other local host offers this.
+- **Speech-to-text API** — `POST /v1/audio/transcriptions` and `/v1/audio/translations`, the
+  shape of OpenAI's Whisper API (`json`, `text`, `srt`, `vtt`, `verbose_json`), answered by
+  whisper.cpp on your machine once it is set up in *Settings → Voice*. WAV, MP3, FLAC and Ogg
+  Vorbis are read as they are.
 - **Structured output** — constrain any response to a **GBNF grammar** (or JSON shape).
 - **API-key auth** you can require when sharing over a LAN (Settings → Network & sharing).
 - **A stateful External Chat API** (**Experimental — manual setup, no onboarding UI yet**),
@@ -721,6 +734,9 @@ TurboLLM is **offline-first**: core local use needs no account, no backend, and 
 **Your prompts, chats, files, and keys never leave your machine — regardless of your telemetry
 choice.** That's not a promise you have to take on faith: the client is source-available, so the
 claim is checkable against the actual code that ships.
+
+Voice is no exception: a recording is turned into text by whisper.cpp on your machine, or handed to
+the model you loaded, and replies are read aloud by voices that run on your own device.
 
 **Telemetry defaults to on** (Usage + benchmarks + crash reports), so setup problems and
 real-hardware speed get found and fixed — verifiable telemetry only helps if enough people are

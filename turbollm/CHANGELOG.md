@@ -23,7 +23,43 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+Voice: talk to a model and have it read its answers back, all on your machine.
+
+### Added
+
+- **Voice input.** A microphone in the chat box records a message and stops by itself when you finish speaking (or
+  when you press Done). What happens to the recording depends on what you have:
+  - **Speech-to-text with [whisper.cpp](https://github.com/ggml-org/whisper.cpp).** The recording is turned into text
+    in the chat box, where you can fix it before sending. *Settings → Voice* sets it up: on Windows and Linux one click
+    installs whisper.cpp's own release build (checked against a pinned checksum); on macOS, where whisper.cpp publishes
+    no build, it uses the one Homebrew installs (`brew install whisper.cpp`); anywhere, you can point it at a
+    `whisper-server` of your own. Then download a model (Base is a good start; Tiny to Large v3 Turbo are listed, and a
+    ggml file you put in the models folder yourself is offered too). whisper runs on the CPU unless you turn the GPU
+    option on, starts when you first record, and stops again after ten minutes unused.
+  - **Models that hear audio.** A model that takes audio as input (Voxtral, Ultravox, Qwen-Omni and others on
+    llama.cpp, found from the engine's own `/props`; a LiteRT-LM bundle with an audio encoder in the Android app) can
+    be sent the recording as it is, so it hears your voice, not only your words. With both available TurboLLM asks
+    after each recording, **Send as audio** or **Convert to text**, and "Don't ask again" (or *Settings → Voice*) makes
+    one the rule. A voice message shows in the chat as a player, is kept with the conversation as a file, and is sent
+    again with later turns so the model keeps the thread; a model that cannot hear gets a `[Voice message]` placeholder
+    in its place.
+- **Read aloud.** A speaker button on every reply reads it in your device's own voice, skipping code blocks and
+  markup. *Settings → Voice* picks the voice and speed, and can read replies out as they are written: every reply, or
+  only the replies to messages you spoke. Only voices that work offline are offered.
+- **Speech-to-text API.** `POST /v1/audio/transcriptions` and `/v1/audio/translations`, in the shape of OpenAI's
+  Whisper API (`response_format` json, text, srt, vtt or verbose_json; `language`, `prompt`, `temperature`), answered
+  by whisper.cpp once it is set up. Until then these paths go to the engine as before.
+- **Voice clips in the chat API.** `POST /api/v1/conversations/:id/messages` takes `audio` (WAV or MP3 `data:` URLs)
+  beside `images`, and refuses it with 409 `audio_unsupported` for a model that cannot hear. `GET /api/v1/status`
+  reports `model.audio` for a loaded model that can.
+
+### Changed
+
+- **The desktop app may use the microphone**, and only the microphone: a page asking for the camera or the screen is
+  still refused. macOS asks for permission the first time you record.
+- **Voice input needs a secure page.** Browsers give a page the microphone only over https or on the machine itself,
+  so over plain http on your LAN the microphone button explains this instead of recording. Remote access (https) and
+  the desktop and Android apps are unaffected.
 
 ## [1.15.1] - 2026-11-07
 
