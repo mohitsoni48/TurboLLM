@@ -96,6 +96,25 @@ test('allowPermission: an outside page gets nothing, not even what the app itsel
   for (const permission of ['media', 'geolocation', 'notifications', 'clipboard-sanitized-write', 'clipboard-read']) {
     assert.equal(allowPermission(permission, 'https://evil.example/', APP), false, permission)
   }
+  // The microphone too: asking for audio alone is what the app is allowed, and only the app.
+  assert.equal(allowPermission('media', 'https://evil.example/', APP, ['audio']), false)
+  assert.equal(allowPermission('media', 'https://evil.example/', APP, 'audio'), false)
+})
+
+// Electron has one 'media' permission for the microphone, the camera and screen capture. The chat's voice input
+// needs the first; granting the name would hand a page all three with no prompt.
+test('allowPermission: the app may use the microphone, and nothing else that Electron calls media', () => {
+  const app = 'http://127.0.0.1:6996/chat'
+  // The request handler's details.mediaTypes (a list), then the check handler's details.mediaType (one kind).
+  assert.equal(allowPermission('media', app, APP, ['audio']), true)
+  assert.equal(allowPermission('media', app, APP, 'audio'), true)
+  assert.equal(allowPermission('media', 'http://127.0.0.1:7001/chat', APP, ['audio']), true, 'after a port change too')
+  for (const kinds of [['video'], ['audio', 'video'], ['video', 'audio'], [], 'video', 'unknown', undefined, null]) {
+    assert.equal(allowPermission('media', app, APP, kinds), false, JSON.stringify(kinds))
+  }
+  // What a 'media' ask wants never unlocks another permission.
+  assert.equal(allowPermission('geolocation', app, APP, ['audio']), false)
+  assert.equal(allowPermission('display-capture', app, APP, ['audio']), false)
 })
 
 test('allowPermission: the app gets exactly what the web UI uses', () => {
@@ -125,6 +144,10 @@ test('main.js guards every window it creates', () => {
   assert.equal(guarded.length, windows.length)
   assert.match(mainSource, /setPermissionRequestHandler\(/)
   assert.match(mainSource, /setPermissionCheckHandler\(/)
+  // Each handler hands allowPermission what its 'media' ask wants: without it the microphone is never granted
+  // (and passing the wrong field would grant nothing, or, worse, be ignored and grant the camera).
+  assert.match(mainSource, /setPermissionRequestHandler\([\s\S]{0,300}?details && details\.mediaTypes\)/)
+  assert.match(mainSource, /setPermissionCheckHandler\([\s\S]{0,300}?details && details\.mediaType\)/)
 })
 
 test('main.js starts the daemon with --no-open: the window is the UI, a browser tab would duplicate it', () => {
