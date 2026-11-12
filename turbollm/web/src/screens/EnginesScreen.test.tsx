@@ -286,6 +286,28 @@ describe('EnginesScreen — the in-app SDK engines beside the llama.cpp server',
     expect((within(card('LiteRT-LM')).getByRole('button', { name: 'In use' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
+  // QA F-5b: the packaged app installs nothing, so the selector's "Install more engines below" pointed at nothing.
+  it('does not offer to install more engines in the selector, where the app installs none', async () => {
+    androidApp([SERVER, SDK_LLAMA, SDK_LITERT])
+    state.activeEngineId = SDK_LITERT.id
+    renderScreen()
+
+    await userEvent.click(screen.getByText('Running now').closest('div')!.querySelector('button[aria-haspopup="menu"]')!)
+    const menu = await screen.findByRole('menu')
+    expect(within(menu).getByText('LiteRT-LM')).toBeTruthy()
+    expect(within(menu).queryByText(/Install more engines/)).toBeNull()
+  })
+
+  it('still offers to install more engines in the selector on a desktop', async () => {
+    state.sys = undefined
+    state.engines = [LLAMA_LIVE_ENGINE]
+    state.activeEngineId = LLAMA_LIVE_ENGINE.id
+    renderScreen()
+
+    await userEvent.click(screen.getByText('Running now').closest('div')!.querySelector('button[aria-haspopup="menu"]')!)
+    expect(within(await screen.findByRole('menu')).getByText(/Install more engines below/)).toBeTruthy()
+  })
+
   it('takes each SDK card\'s copy from the runtime it is, without install, tools or vision lines', () => {
     androidApp([SERVER, SDK_LLAMA, SDK_LITERT])
     state.activeEngineId = SDK_LITERT.id

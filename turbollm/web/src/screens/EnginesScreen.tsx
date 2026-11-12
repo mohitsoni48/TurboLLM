@@ -767,8 +767,14 @@ function EngineHeaderBar({
                     </DropdownMenuItem>
                   )
                 })}
-                <DropdownMenuSeparator />
-                <div className="px-2 py-1.5 text-[11px] text-muted">Install more engines below ↓</div>
+                {/* The packaged app installs no engine (its gallery below has no install button), so the pointer is
+                    shown only where there is something to install. */}
+                {!sys?.bundledEnginesOnly && (
+                  <>
+                    <DropdownMenuSeparator />
+                    <div className="px-2 py-1.5 text-[11px] text-muted">Install more engines below ↓</div>
+                  </>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
 
