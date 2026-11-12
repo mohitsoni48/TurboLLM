@@ -104,7 +104,9 @@ test('a turn sent to a Turbo Link host from a machine on the SDK engine keeps it
 // Vision on the SDK engine (plan D-11, Revision 2 G-2): it reads no images in this version, so a new image is refused
 // before anything is stored or sent, and an image stored under another engine goes to it as a text placeholder.
 const IMAGE = 'data:image/png;base64,AAAA'
-const VISION_UNAVAILABLE = 'The in-app engine can\'t read images in this version. Switch to the bundled llama.cpp engine in Engines to use images.'
+// QA F-4: the in-app llama.cpp (CPU) row and the server row are both "llama.cpp", so the reply names the one that reads
+// images by the label the Engines screen shows.
+const VISION_UNAVAILABLE = 'The in-app engine can\'t read images in this version. Switch to llama.cpp server (CPU) in Engines to use images.'
 const IMAGE_OMITTED = { type: 'text', text: '[image omitted: this engine cannot read images]' }
 
 /** POST /messages with an image in a new chat; `model` picks a remote one. */

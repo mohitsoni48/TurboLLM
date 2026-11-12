@@ -673,7 +673,9 @@ for (const loaded of [false, true]) {
 // 400, so behind the façade the host withholds tools and refuses an image itself, before its engine is called.
 
 const ENGINE_URL = 'http://engine.test'
-const VISION_UNAVAILABLE = 'The in-app engine can\'t read images in this version. Switch to the bundled llama.cpp engine in Engines to use images.'
+// QA F-4: the in-app llama.cpp (CPU) row and the server row are both "llama.cpp", so the reply names the one that reads
+// images by the label the Engines screen shows.
+const VISION_UNAVAILABLE = 'The in-app engine can\'t read images in this version. Switch to llama.cpp server (CPU) in Engines to use images.'
 const TOOLS = [{ type: 'function', function: { name: 'web_search', parameters: { type: 'object', properties: {} } } }]
 const FUNCTIONS = [{ name: 'web_search', parameters: { type: 'object', properties: {} } }]
 

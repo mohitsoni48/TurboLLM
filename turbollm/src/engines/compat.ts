@@ -276,7 +276,7 @@ export function engineHoldsOneModel(engineKind: string): boolean {
 }
 
 /** The `vision_unavailable` refusal of an image sent to an engine that {@link engineWithholdsVision}. */
-export const VISION_UNAVAILABLE = 'The in-app engine can\'t read images in this version. Switch to the bundled llama.cpp engine in Engines to use images.'
+export const VISION_UNAVAILABLE = 'The in-app engine can\'t read images in this version. Switch to llama.cpp server (CPU) in Engines to use images.'
 
 /**
  * The value an OpenAI-compatible request must put in its `model` field for this engine.
