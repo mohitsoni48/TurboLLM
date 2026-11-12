@@ -8,6 +8,8 @@ import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { ConversationStore } from './db.js'
 import { registerChatRoutes } from './chat-routes.js'
+import { ChatTurns } from './chat-turns.js'
+import { ChatRuns } from './chat-runs.js'
 import { preloadSqlJs } from './store/sqlite-adapter.js'
 import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
@@ -122,7 +124,7 @@ test('a reply cut off by a daemon restart reads as stopped once the chat routes 
   try {
     const { chat, cutOff } = seed(store)
     const app = new Hono()
-    registerChatRoutes(app, { db: store, store: { snapshot: () => ({}), dir: () => dir } } as unknown as Deps)
+    registerChatRoutes(app, { chatTurns: new ChatTurns(), chatRuns: new ChatRuns(), db: store, store: { snapshot: () => ({}), read: () => ({}), dir: () => dir } } as unknown as Deps)
     const conv = await (await app.request(`/api/v1/conversations/${chat.id}`)).json() as { messages: Array<{ id: string; stats: { aborted: boolean } }> }
     assert.equal(conv.messages.find((m) => m.id === cutOff.id)!.stats.aborted, true)
   } finally {

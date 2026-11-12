@@ -16,7 +16,7 @@ function makeApp() {
   const d = {
     db,
     version: 'test',
-    store: { snapshot: () => ({ code: { defaultAgent: 'turbollm' } }) },
+    store: { snapshot: () => ({ code: { defaultAgent: 'turbollm' } }), read: () => ({ code: { defaultAgent: 'turbollm' } }) },
     manager: { status: () => ({ state: 'running', model: 'm' }), target: () => ({ host: '127.0.0.1', port: 1 }) },
   } as unknown as Deps
   const started: string[] = []

@@ -84,7 +84,7 @@ test('the generate routes document their SSE stream under 200 and only the JSON 
     const d = {
       db: conv,
       chatStore: new ChatStoreRouter(conv.chatStore, conv.chatStore),
-      store: { snapshot: () => ({ apiKeys: [{ hash: hashKey(key), tenant: 'acme' }] }) },
+      store: { snapshot: () => ({ apiKeys: [{ hash: hashKey(key), tenant: 'acme' }] }), read: () => ({ apiKeys: [{ hash: hashKey(key), tenant: 'acme' }] }) },
       manager: { status: () => ({ state: 'running', model: { key: 'm', name: 'm', ctx: 0 } }), target: () => 'http://127.0.0.1:9' },
     } as never
     const app = new Hono()
@@ -216,7 +216,7 @@ test('every documented error type is one of the nine frozen types', () => {
 
 test('no route is registered that the manifest does not document', () => {
   const app = new Hono()
-  const d = { chatStore: { capabilities: {} }, store: { snapshot: () => ({ apiKeys: [] }) } } as never
+  const d = { chatStore: { capabilities: {} }, store: { snapshot: () => ({ apiKeys: [] }), read: () => ({ apiKeys: [] }) } } as never
   registerExtChatRoutes(app, d)
 
   const documented = new Set(EXT_ROUTES.map((r) => `${r.method} ${r.path}`))
@@ -272,7 +272,7 @@ test('no run route is registered that the manifest does not document', () => {
     const d = {
       db: conv,
       chatStore,
-      store: { snapshot: () => ({ apiKeys: [] }) },
+      store: { snapshot: () => ({ apiKeys: [] }), read: () => ({ apiKeys: [] }) },
       manager: { status: () => ({ state: 'running', model: 'test-model' }), target: () => 'http://127.0.0.1:9999' },
     } as never
     const runs = new PublicRunManager()
@@ -323,7 +323,7 @@ test('GET /audit response body satisfies every field its own documented schema r
     const d = {
       db: conv,
       chatStore,
-      store: { snapshot: () => ({ apiKeys: [{ hash: hashKey(key), tenant: 'acme' }] }) },
+      store: { snapshot: () => ({ apiKeys: [{ hash: hashKey(key), tenant: 'acme' }] }), read: () => ({ apiKeys: [{ hash: hashKey(key), tenant: 'acme' }] }) },
     } as never
     const app = new Hono()
     registerExtChatRoutes(app, d)
@@ -372,6 +372,10 @@ function statusHarness(opts: { adapter: boolean; wrap?: (s: ChatStore) => ChatSt
     db: conv,
     chatStore: new ChatStoreRouter(conv.chatStore, opts.adapter ? (opts.wrap?.(conv.chatStore) ?? conv.chatStore) : null),
     store: { snapshot: () => ({ apiKeys: [
+      { hash: hashKey(KEY_FULL), tenant: 'acme' },
+      { hash: hashKey(KEY_READONLY), tenant: 'acme', scopes: ['chats:read'] },
+      { hash: hashKey(KEY_LOCAL), tenant: 'local' },
+    ] }), read: () => ({ apiKeys: [
       { hash: hashKey(KEY_FULL), tenant: 'acme' },
       { hash: hashKey(KEY_READONLY), tenant: 'acme', scopes: ['chats:read'] },
       { hash: hashKey(KEY_LOCAL), tenant: 'local' },

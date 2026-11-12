@@ -28,7 +28,7 @@ function app(deps?: Record<string, unknown>) {
   const a = new Hono()
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '/nonexistent' },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '/nonexistent' },
     manager: {
       currentOpts: () => null,
       restartOpts: () => null,

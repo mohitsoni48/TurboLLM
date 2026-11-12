@@ -1,0 +1,279 @@
+// Engine lifecycle (spec 02 A2): the ONE implementation of "load a model" and "unload the
+// model", extracted from routes.ts so that more than one transport can mount it.
+//
+// It has exactly two callers today: the local `/api/v1/engine/start` + `/api/v1/engine/stop`
+// routes (routes.ts; `/api/v1/engine/restart` too, whose reload on another engine is a load
+// here), and the Turbo Link façade's `/api/link/v1/models/load` + `/unload`
+// (link/link-routes.ts). The façade mounts THESE functions behind `requireCapability` rather
+// than reimplementing them, so eviction, the keep-N pool, the ComfyUI guard, the auto-tune
+// kill switch and swap serialization behave identically whether the caller is the local UI or
+// a linked peer. A second copy of this logic would drift — this project has already paid for
+// that once (an admin `probe()` diverging from `LinkManager.probeOnce`).
+import type { Context } from 'hono'
+import { basename } from 'node:path'
+import { isLocalOrAuthenticated } from '../auth'
+import type { Deps } from '../deps'
+import type { ModelInfo, StartOpts } from '../engines/manager'
+import { manualLoadRefusal } from '../engines/compat'
+import { engineForModel } from '../engines/registry'
+import { buildStartOpts } from '../engines/start-opts'
+import type { LoadProfile } from '../models/profile'
+import { autoThreadCount, getSysInfo } from '../sysinfo/sysinfo'
+import { litertLmProfileToConfig } from '../engines/litert-lm'
+import { launchFieldsRefusal, launchKeyRequired, loadsWithNow } from '../api/profile-validate'
+
+type Status = 200 | 202 | 400 | 409 | 500
+
+function err(c: Context, status: Status, code: string, message: string) {
+  return c.json({ error: { code, message } }, status)
+}
+
+/** What `POST /api/v1/engine/start` accepts.
+ *
+ *  `modelPath` / `extraArgs` / `modelName` are the transitional pre-A4 fallback. `modelPath` and
+ *  `extraArgs` name a filesystem path and extra process arguments, which is precisely what
+ *  ADR-139 says no remote caller may supply, so startEngine refuses them, and launch fields in
+ *  `profileOverrides` (launchFieldsRefusal), to a caller failing isLocalOrAuthenticated. The
+ *  Turbo Link façade constructs this object itself with `modelKey` alone — it never forwards a
+ *  peer's body. */
+export interface EngineStartBody {
+  modelKey?: string
+  profileOverrides?: Partial<LoadProfile>
+  modelPath?: string
+  extraArgs?: string[]
+  modelName?: string
+}
+
+/** Start (or swap to) a model. Fire-and-forget: returns 202 as soon as the load is queued —
+ *  the caller polls `/status` for the starting→running/error transition. */
+export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Promise<Response> {
+  const cfg = d.store.snapshot()
+  // Preferred (A4): start by modelKey with a resolved LoadProfile. An empty
+  // request (the Engines "Start" button) re-loads the last model.
+  let key = b.modelKey ?? ''
+  if (!key && !b.modelPath && cfg.lastLoaded.modelKey) key = cfg.lastLoaded.modelKey
+  const entry = key ? d.scanner.get(key) : undefined
+
+  // A Laya model loads on the Laya engine whichever engine is active; every other model on the active one.
+  const active = entry ? engineForModel(d.registry, entry) : d.registry.active()
+  if (!active) return err(c, 409, 'no_active_engine', 'Register and select an engine first.')
+  // A model path or engine flags of the caller's own (ADR-139), refused before anything is
+  // stopped or loaded: the legacy fields whenever they are sent (as PUT /api/v1/engines/:id does
+  // for a source repo), an override's flags and files only when they differ from what the model
+  // loads with on this engine, which the Load dialog sends back with every load.
+  if (b.modelPath !== undefined && !isLocalOrAuthenticated(c, d)) return launchKeyRequired(c, 'modelPath', 'Loading a model by its file path')
+  if (b.extraArgs !== undefined && !isLocalOrAuthenticated(c, d)) return launchKeyRequired(c, 'extraArgs', 'Setting extra command-line flags')
+  if (entry) {
+    const refused = launchFieldsRefusal(c, d, b.profileOverrides, loadsWithNow(d, entry.key, active.id))
+    if (refused) return refused
+  }
+  // ComfyUI guard: while ComfyUI is rendering it owns the GPU, so refuse to load a
+  // model (it would thrash/OOM VRAM). The guard reloads automatically once idle.
+  if (d.comfy?.isBlocked()) return err(c, 409, 'comfyui_busy', 'ComfyUI is rendering — model loading is paused until its queue finishes.')
+  const sys = getSysInfo()
+
+  if (entry) {
+    if (entry.incomplete || entry.parseError) {
+      return err(c, 409, 'model_not_loadable', 'This model is incomplete or unreadable.')
+    }
+    // A load asked for by hand starts on the selected engine whatever the model's format, audio tower or Jev vLLM
+    // requirement (spec 03 §2b/2c, ADR-434 (g)), and fails with that engine's own error if it cannot load it: only a
+    // Laya model with no Laya engine is refused here (compat.ts manualLoadRefusal). This refused every model the
+    // engine was not expected to run, with advice to activate another engine ("activate the LiteRT-LM engine to load
+    // it" for a .litertlm model under KoboldCpp), a choice that is the user's alone. The Models screen and the pickers
+    // still hide such a model unless the user shows them all.
+    const inc = manualLoadRefusal(active.kind, entry)
+    if (inc) return err(c, 409, 'engine_model_mismatch', inc.message)
+
+    // Side models — embedding and Laya — get their own pool slot via the router (same coexistence rule
+    // the auto-swap gateway path already uses — model-router.ts's `chatSlotCount`/
+    // `evictChatLru`) instead of replacing whatever's in the primary manager. Without
+    // this, clicking "Load" on an embedding model in the UI killed a running chat
+    // model's engine even though the two are meant to run side by side for RAG.
+    // Skips the kill switch below too: that exists to stop in-flight chats/auto-tune
+    // against an engine that's "going away" (chat-turns.ts's abortAll
+    // docblock) — the primary engine isn't going away here, so nothing needs aborting.
+    // `manual`: the router starts it on the selected engine as this function starts a chat model, with no
+    // compatibility refusal of its own (LoadExplicitOpts). A refusal or a failed start comes back as a result, not a
+    // rejection, and is logged as one.
+    if (entry.embedding || entry.laya) {
+      // The router loads nothing while an auto-tune runs (its probes would count this model's VRAM as their own), and
+      // that refusal reaches only the log below: the Load did nothing, silently (review L7). A manual Load cancels the
+      // tune, as a chat model's does below; only the tune, since nothing else is going away.
+      if (d.bench.isRunning()) {
+        d.bench.cancel()
+        await d.bench.waitIdle()
+      }
+      void d.modelRouter
+        .loadExplicit(entry.key, b.profileOverrides, { manual: true })
+        .then((r) => { if ('status' in r) console.warn(`engine load failed: ${r.message}`) })
+        .catch((e) => console.warn(`engine load failed: ${e}`))
+      return c.json({ ok: true }, 202)
+    }
+
+    // Kill switch: loading a model takes over the primary engine — cancel any auto-tune
+    // and abort in-flight chats, then wait for auto-tune to release the engine so the
+    // load can't race the runner's teardown.
+    d.bench.cancel()
+    d.chatTurns.abortAll()
+    await d.bench.waitIdle()
+
+    const opts = buildStartOpts({ entry, engine: active, cfg, sys, overrides: b.profileOverrides, trigger: 'manual' })
+    // Single chokepoint (rule 3): load() stops the current model, runs the reverse
+    // gate (F-011: ask ComfyUI to free VRAM first), spawns, and waits for readiness —
+    // all under the global load lock so this can't race another load. Fire-and-forget:
+    // the UI polls /status for the starting→running/error transition, so we return 202
+    // immediately rather than blocking the HTTP request on a multi-second load.
+    //
+    // Wrapped in the router's own swap-serialization queue (same one route()/doLoad() use)
+    // so a concurrent auto-swap request (e.g. a terminal-agent session's own gateway
+    // traffic) can't independently decide "the primary is occupied mid-switch, evict it and
+    // load MY model instead" — it now waits for this manual switch to fully settle first.
+    // Without this, the two paths only shared the lower-level Manager.runExclusive gate,
+    // which prevents a double-SPAWN but not a second caller silently overriding which model
+    // ends up loaded — the model-router.ts withSwapLock doc comment has the full trace.
+    void d.modelRouter
+      .withSwapLock(() => d.manager.load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() }))
+      .then(() => d.modelRouter.markPrimaryLoaded())
+      .catch((e) => console.warn(`engine load failed: ${e}`))
+    // Recorded through the router: this load may be queued behind the swap lock that release()'s resume of a gateway
+    // load a ComfyUI render paused holds, and that resume must not record its model over this one (see
+    // ModelRouter.recordManualLoad).
+    d.modelRouter.recordManualLoad(entry.key, active.id)
+    return c.json({ ok: true }, 202)
+  }
+
+  // Transitional fallback: explicit path or migrated devModel (pre-A4 configs).
+  let modelPath = b.modelPath ?? ''
+  let extra = b.extraArgs ?? []
+  let name = b.modelName ?? ''
+  if (!modelPath && cfg.devModel) {
+    modelPath = cfg.devModel.modelPath
+    extra = cfg.devModel.extraArgs
+    name = cfg.devModel.label
+  }
+  if (!modelPath) return err(c, 409, 'no_such_model', 'No model specified. Pick one from the Models screen.')
+  // This legacy path always targets the primary manager directly (no scanner entry to
+  // read `.embedding` off), so the kill switch still applies here.
+  d.bench.cancel()
+  d.chatTurns.abortAll()
+  await d.bench.waitIdle()
+  const opts: StartOpts = { engine: active, model: deriveModel(modelPath, name, extra), modelPath, extraArgs: extra }
+  // A .litertlm loaded by path gets what a library entry with nothing set gets (buildStartOpts): no backend and no
+  // context, so the server runs the model on its own, and the performance cores on a big.LITTLE CPU. It got none, and
+  // the Manager wrote the CPU backend for it, which a GPU-only bundle cannot run on.
+  if (active.kind === 'litert-lm') {
+    const sys = getSysInfo()
+    opts.litertLmConfig = litertLmProfileToConfig({ ctx: 0, threads: 0 }, sys.perfCores ? autoThreadCount(sys) : 0)
+  }
+  // Same single-chokepoint, fire-and-forget, swap-lock-coordinated load as the
+  // resolved-model branch above.
+  void d.modelRouter
+    .withSwapLock(() => d.manager.load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() }))
+    .then(() => d.modelRouter.markPrimaryLoaded())
+    .catch((e) => console.warn(`engine load failed: ${e}`))
+  return c.json({ ok: true }, 202)
+}
+
+/** `POST /api/v1/engine/restart`, the Engines card's Restart (shown while the primary runs or after its load failed):
+ *  reload the last load attempted (Manager.restartOpts), on the engine the user selected. Manager.restart() reloads
+ *  those opts engine included, and they outlive a stop and every activation: an install or Enable selects another
+ *  engine without stopping the model or clearing its error, so Restart brought the model back on the engine the user
+ *  had left, while the error banner's Retry (startEngine) loaded the same model on the selected one. On another
+ *  engine it is now loaded there as startEngine loads a chat model (its saved profile for that engine, recorded as
+ *  the model last loaded; never through the router, which can start a second copy of an embedding model in a pool
+ *  slot), and fails with that engine's own error if it cannot run it; with no engine selected it is refused as a Load
+ *  is. On the same engine, Manager.restart() as before. */
+export function restartEngine(c: Context, d: Deps): Response {
+  const o = d.manager.restartOpts()
+  const entry = o ? d.scanner.get(o.model.key) : undefined
+  // A Laya model loads on the Laya engine; every other model on the active one (engineForModel, as startEngine asks).
+  const selected = entry ? engineForModel(d.registry, entry) : d.registry.active()
+  if (o && !selected) return err(c, 409, 'no_active_engine', 'Register and select an engine first.')
+  const opts: StartOpts | null = !o || !selected || selected.id === o.engine.id
+    ? null
+    : entry
+      ? buildStartOpts({ entry, engine: selected, cfg: d.store.snapshot(), sys: getSysInfo(), trigger: 'manual' })
+      // A load by path (the pre-A4 fallback), or a model no longer in the library: the same launch on that engine.
+      : { ...o, engine: selected }
+  // Kill switch: cancel auto-tune + abort chats, wait for the runner to release the engine,
+  // then restart — so the reload doesn't race auto-tune's teardown.
+  d.bench.cancel()
+  d.chatTurns.abortAll()
+  if (!opts) {
+    void (async () => {
+      await d.bench.waitIdle()
+      await d.manager.restart()
+    })().catch(() => {})
+    return c.json({ ok: true }, 202)
+  }
+  // Under the router's swap lock with the ComfyUI reverse gate, as startEngine's load is (see there).
+  void (async () => {
+    await d.bench.waitIdle()
+    await d.modelRouter.withSwapLock(() => d.manager.load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() }))
+    d.modelRouter.markPrimaryLoaded()
+  })().catch((e) => console.warn(`engine load failed: ${e}`))
+  if (entry) d.modelRouter.recordManualLoad(entry.key, opts.engine.id)
+  return c.json({ ok: true }, 202)
+}
+
+/** What `POST /api/v1/engine/stop` accepts. `modelKey` is optional and BACKWARD
+ *  COMPATIBLE: every existing caller (the topbar Eject, `/api/v1/engine/restart`, the Turbo
+ *  Link façade's `/unload`) still posts no body at all, which keeps stopping the primary
+ *  manager exactly as before. */
+export interface EngineStopBody {
+  modelKey?: string
+}
+
+/** Whether `modelKey` names the primary manager's CURRENTLY loaded model — by key or by
+ *  on-disk path, mirroring `ModelRouter.keysMatch`'s reason for accepting either: the
+ *  primary manager reports a model by whichever spelling `startEngine` last loaded it
+ *  under, so an exact-key-only check can miss a path-loaded model. */
+function namesPrimaryModel(d: Deps, modelKey: string): boolean {
+  const ms = d.manager.status()
+  const primaryKey = ms.model?.key
+  if (!primaryKey) return false
+  return primaryKey === modelKey || d.scanner.get(primaryKey)?.path === modelKey
+}
+
+/** Unload a model. When `modelKey` names a model loaded into its own extra pool slot (an
+ *  embedding model, ADR-389) that slot is stopped and nothing else is touched — the
+ *  symmetric counterpart to `startEngine`'s `entry.embedding` branch above. When `modelKey`
+ *  names the primary's own currently-loaded model (or no key is given at all — the Engines
+ *  page's own "Stop" button and every legacy caller), this stops the PRIMARY manager,
+ *  unchanged. Anything else — a key that names neither — is a safe no-op.
+ *
+ *  Before this, `stopEngine` took no model identity at all and always stopped the primary,
+ *  so ejecting an embedding model loaded alongside a chat model actually killed the chat
+ *  model instead. A first fix routed a non-matching key straight to "stop the primary" as
+ *  its fallback, which reintroduced the same failure a different way: a stale key (a
+ *  duplicate eject click landing after the slot already drained, or a load that hasn't
+ *  finished populating its pool slot yet) would ALSO fall through and kill whatever the
+ *  primary happened to be running — an unrelated model, still live. Only a key that
+ *  genuinely names the primary's own model may stop it; every other non-matching key is a
+ *  no-op, never a fallback. */
+export function stopEngine(c: Context, d: Deps, b: EngineStopBody = {}): Response {
+  if (b.modelKey) {
+    if (d.modelRouter.stopExplicit(b.modelKey)) return c.json({ ok: true }, 202)
+    if (!namesPrimaryModel(d, b.modelKey)) return c.json({ ok: true }, 202)
+  }
+  // Kill switch: stopping the PRIMARY engine cancels auto-tune and aborts in-flight chats
+  // too — they all depend on the engine that's going away. Not run above: the primary
+  // isn't going away when an extra slot was stopped, or nothing matched at all.
+  d.bench.cancel()
+  d.chatTurns.abortAll()
+  d.manager.stop()
+  return c.json({ ok: true }, 202)
+}
+
+function deriveModel(modelPath: string, name: string, extraArgs: string[]): ModelInfo {
+  let ctx = 0
+  for (let i = 0; i + 1 < extraArgs.length; i++) {
+    if (extraArgs[i] === '-c' || extraArgs[i] === '--ctx-size') ctx = Number(extraArgs[i + 1]) || 0
+  }
+  return { key: modelPath, name: name || cleanModelName(modelPath), quant: '', ctx, vision: false }
+}
+
+function cleanModelName(p: string): string {
+  return basename(p).replace(/\.gguf$/i, '')
+}

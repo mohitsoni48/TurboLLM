@@ -5,12 +5,18 @@
 // content. If the visible content is empty/whitespace, make one extra inference
 // pass with tool_choice:'none' and use that result as the final reply.
 import assert from 'node:assert/strict'
+import { randomBytes } from 'node:crypto'
 import { test } from 'node:test'
 import { readFileSync, rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { stripThinkingBlocks, needsExtraPass } from './think-utils.js'
-import { recentTitleTurns, abortAllInFlightChats, chatCodeAuthorization, inFlightChatIds, registerChatRoutes } from './chat-routes.js'
+import { recentTitleTurns, chatCodeAuthorization, registerChatRoutes } from './chat-routes.js'
+import { ChatTurns } from './chat-turns.js'
+import { ChatRuns } from './chat-runs.js'
 import { ConversationStore } from './db.js'
+import { attachmentRefId } from './attachments.js'
+import { hashKey, lanAuth } from '../auth.js'
+import { defaultConfig } from '../config/config.js'
 import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
 
@@ -143,7 +149,7 @@ function gateProbe(daemon: { lanBind: boolean; requireApiKey: boolean }, apiKeys
   const app = new Hono()
   const d = {
     store: {
-      snapshot: () => ({ daemon, apiKeys }),
+      snapshot: () => ({ daemon, apiKeys }), read: () => ({ daemon, apiKeys }),
       update: (fn: (cfg: { apiKeys: unknown[] }) => void) => fn({ apiKeys }),
     },
   } as unknown as Deps
@@ -215,7 +221,7 @@ test('C1 invariant: both chat generation entry points DERIVE isCodeAuthorized, n
 
 // ── inFlightChatIds (ADR-434 (i)(3)) ─────────────────────────────────────────────────────────
 // The Jev-load confirmation names the chats a load would interrupt: exactly the conversations
-// abortAllInFlightChats() would abort. Driven through the real POST /messages route with the
+// abortAll() would abort. Driven through the real POST /messages route with the
 // engine fetch held open, in the style of chat-routes.remote.test.ts (real store, no port).
 
 /** `tools`, when given, is the tool registry the chat loop calls, its tools allowed without asking. */
@@ -229,9 +235,10 @@ function inFlightHarness(tools?: unknown) {
     tools: { toolPolicies: {}, autoAllowAll: tools !== undefined },
   }
   const d = {
+    chatTurns: new ChatTurns(), chatRuns: new ChatRuns(),
     db: store,
     // `dir`: an engine's error text is path-redacted against it (engineErrorText).
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
     registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
     modelRouter: { resolveRemoteTarget: () => undefined },
@@ -273,7 +280,7 @@ test('inFlightChatIds lists a chat while its reply is generating, and drops it w
   const engine = holdEngineReply()
   try {
     const conv = h.store.createConversation()
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
 
     const res = await h.app.request(`/api/v1/conversations/${conv.id}/messages`, {
       method: 'POST',
@@ -281,11 +288,11 @@ test('inFlightChatIds lists a chat while its reply is generating, and drops it w
       body: JSON.stringify({ content: 'hi' }),
     })
     assert.equal(res.status, 200)
-    assert.deepEqual(inFlightChatIds(), [conv.id])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [conv.id])
 
     engine.finish()
     await res.text()
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
   } finally {
     engine.restore()
     h.cleanup()
@@ -430,7 +437,7 @@ test('a stale turn unwinding after Stop never removes the NEXT turn\'s in-flight
     // Stop (the page's only way to stop a reply): it aborts A and frees the chat at once.
     const stop = await (await h.app.request('/api/v1/chat/stop', json({ conversationId: conv.id, messageId: replyA }))).json()
     assert.deepEqual(stop, { ok: true, stopped: true })
-    assert.deepEqual(inFlightChatIds(), [], 'Stop drops A\'s entry')
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [], 'Stop drops A\'s entry')
     const resB = await send() // ...and the page immediately sends a follow-up
     assert.equal(resB.status, 200)
     toolDone() // turn A's tool returns; A sees its abort and unwinds through its finally
@@ -438,12 +445,12 @@ test('a stale turn unwinding after Stop never removes the NEXT turn\'s in-flight
     // its turn body, up to the second stale release, settles within the next macrotask.
     await waitFor(() => h.store.getMessage(replyA)?.stats.totalMs !== undefined, 'turn A to unwind and save its reply')
     await new Promise((r) => setImmediate(r))
-    assert.deepEqual(inFlightChatIds(), [conv.id], 'turn B is still generating and must stay tracked')
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [conv.id], 'turn B is still generating and must stay tracked')
     assert.equal((await send()).status, 409, 'a third send must still be refused while B runs')
 
     await h.app.request('/api/v1/chat/stop', json({ conversationId: conv.id })) // Stop reaches B
     await resB.text()
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
   } finally {
     toolDone()
     engine.restore()
@@ -474,7 +481,7 @@ test('a turn that throws before generating releases its in-flight entry (no stuc
     const text = await bad.text()
     assert.match(text, /event: error\ndata: \{"code":"turn_failed","message":"The reply could not be generated\."\}/)
     assert.ok(logged.some((args) => String(args[0]).startsWith('[chat] turn for')), 'logged')
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
     h.store.getConversation = getConversation
     const ok = await h.app.request(url, json({ content: 'hi again' }))
     assert.equal(ok.status, 200)
@@ -498,7 +505,7 @@ test('POST /messages refuses non-array images or textAttachments (and a non-stri
       assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'invalid_input')
     }
     assert.deepEqual(h.store.getMessages(conv.id), [], 'nothing stored')
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
     assert.equal(engine.bodies.length, 0)
     // Arrays of strings (and null for an absent field) still go through.
     const ok = await h.app.request(url, json({ content: 'hi', images: ['data:image/png;base64,AAAA'], textAttachments: null, docContext: null }))
@@ -589,7 +596,7 @@ test('a Regenerate the engine or linked host refuses once the turn has started k
       assert.deepEqual(active(), ['user:q1', 'assistant:a1'], code)
       const group = h.store.getMessage(a1)!.variantGroup!
       assert.deepEqual(h.store.getMessageVariants(group).map((m) => `${m.content}:${m.isActive}`), ['a1:true'], 'no empty version left on its switcher')
-      assert.deepEqual(inFlightChatIds(), [])
+      assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
     }
 
     await (await h.app.request(`${base}/continue`, json({ regenerate: true, messageId: a1 }))).text()
@@ -966,7 +973,7 @@ test('a Save & Resend the engine or linked host refuses once the turn has starte
       assert.match(sse, new RegExp(`"code":"${code}"`), 'the error still reaches the chat')
       assert.deepEqual(active(), ['user:q1', 'assistant:a1', 'user:q2', 'assistant:a2'], code)
       assert.deepEqual(versions(), ['q1:true'], 'no unanswered version left on its switcher')
-      assert.deepEqual(inFlightChatIds(), [])
+      assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
     }
 
     // A turn that streamed anything keeps the new version and its reply, as a Regenerate does.
@@ -1031,7 +1038,7 @@ test('a tool round the engine refuses with an HTTP error keeps what the earlier 
       assert.equal(reply.content, 'Let me look that up for you right now.', `${flow}: round 1's text is kept`)
       assert.equal(reply.reasoning, 'I should search.', `${flow}: round 1's reasoning is kept`)
       assert.deepEqual(reply.toolCalls.map((t) => [t.name, t.result]), [['web_search', 'a long page of results']], `${flow}: round 1's tool call is kept`)
-      assert.deepEqual(inFlightChatIds(), [])
+      assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
     }
     assert.equal(engine.bodies.length, script.length)
   } finally {
@@ -1126,7 +1133,7 @@ test('a manual compaction holds the in-flight slot: turns, edits and switches ar
 
     const compacting = h.app.request(`${base}/compact`, json({}))
     await waitFor(() => engine.bodies.length === 1, 'the summary call to start')
-    assert.deepEqual(inFlightChatIds(), [conv.id])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [conv.id])
     const put = (id: string, content: string) => h.app.request(`${base}/messages/${id}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content }) })
     const refused = {
       regenerate: await h.app.request(`${base}/continue`, json({ regenerate: true })),
@@ -1145,7 +1152,7 @@ test('a manual compaction holds the in-flight slot: turns, edits and switches ar
 
     finish()
     assert.equal((await compacting).status, 200)
-    assert.deepEqual(inFlightChatIds(), [], 'released when it ends')
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [], 'released when it ends')
     assert.equal(h.store.getConversation(conv.id)!.compactionSummary, 'The user asked twice about x.')
     assert.equal((await put(a2b.id, 'fixed reply')).status, 200, 'the chat takes edits again')
   } finally {
@@ -1173,10 +1180,10 @@ function slotViews(h: ReturnType<typeof inFlightHarness>) {
 
 /** Ends the turn or compaction a test still holds and waits until its slot is free, so a failed assertion does not
  *  leave an in-flight entry behind for the tests after it. */
-async function endHeldTurn(release: () => void): Promise<void> {
+async function endHeldTurn(turns: ChatTurns, release: () => void): Promise<void> {
   release()
-  abortAllInFlightChats()
-  await waitFor(() => inFlightChatIds().length === 0, 'the held turn to end').catch(() => {})
+  turns.abortAll()
+  await waitFor(() => turns.inFlightChatIds().length === 0, 'the held turn to end').catch(() => {})
 }
 
 test('a conversation names the reply its turn generates, and its list row says running, until the turn ends', async () => {
@@ -1196,7 +1203,7 @@ test('a conversation names the reply its turn generates, and its list row says r
     assert.deepEqual(await state(conv.id), { runningReplyId: null, compacting: false })
     assert.deepEqual(await listed(), { [conv.id]: false, [other.id]: false })
   } finally {
-    await endHeldTurn(engine.finish)
+    await endHeldTurn(h.d.chatTurns, engine.finish)
     engine.restore()
     h.cleanup()
   }
@@ -1223,7 +1230,7 @@ test('a conversation says it is compacting while a manual compaction holds it, w
     assert.equal((await compacting).status, 200)
     assert.deepEqual(await state(conv.id), { runningReplyId: null, compacting: false })
   } finally {
-    await endHeldTurn(finish)
+    await endHeldTurn(h.d.chatTurns, finish)
     engine.restore()
     h.cleanup()
   }
@@ -1254,7 +1261,7 @@ test('a Regenerate names its new reply as running, and a Stop clears it once the
     assert.deepEqual(await state(conv.id), { runningReplyId: null, compacting: false })
     assert.deepEqual(await listed(), { [conv.id]: false })
   } finally {
-    await endHeldTurn(() => {})
+    await endHeldTurn(h.d.chatTurns, () => {})
     engine.restore()
     h.cleanup()
   }
@@ -1335,7 +1342,7 @@ test('deleting a conversation aborts its in-flight generation', async () => {
     assert.equal((await h.app.request(`/api/v1/conversations/${conv.id}`, { method: 'DELETE' })).status, 200)
     assert.equal(engineSignal?.aborted, true)
     await res.text()
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
   } finally {
     engine.restore()
     h.cleanup()
@@ -1351,7 +1358,7 @@ test('share-url: advertises the port really bound, not daemon.port', async () =>
   const savedAdvertised = process.env.TURBOLLM_ADVERTISED_HOST
   delete process.env.TURBOLLM_ADVERTISED_HOST
   try {
-    const d = { db: store, store: { snapshot: () => ({ daemon: { port: 6996 } }) }, bindPort: 7000 } as unknown as Deps
+    const d = { chatTurns: new ChatTurns(), chatRuns: new ChatRuns(), db: store, store: { snapshot: () => ({ daemon: { port: 6996 } }), read: () => ({ daemon: { port: 6996 } }) }, bindPort: 7000 } as unknown as Deps
     const app = new Hono()
     registerChatRoutes(app, d)
     const conv = store.createConversation()
@@ -1447,7 +1454,7 @@ test('the chat and folder routes refuse a text field that is not a string with 4
     assert.deepEqual(h.store.listFolders().map((f) => f.name), ['Work'])
     assert.deepEqual(h.store.getMessages(conv.id).map((m) => m.content), ['What is 2+2?'], 'nothing stored or edited')
     assert.equal(engine.bodies.length, 0, 'no turn ran')
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
     // Strings (and null for an absent field) still go through.
     assert.equal((await send('POST', '/api/v1/folders', { name: 'Home' })).status, 201)
     assert.equal((await send('PATCH', `/api/v1/folders/${folder.id}`, { name: 'Office' })).status, 200)
@@ -1457,6 +1464,141 @@ test('the chat and folder routes refuse a text field that is not a string with 4
     assert.deepEqual(h.store.getMessages(conv.id).map((m) => m.role), ['user', 'user', 'assistant'])
   } finally {
     engine.restore()
+    h.cleanup()
+  }
+})
+
+// ── 2.7: chat images stored as files ─────────────────────────────────────────────────────────────
+
+/** A ~3 MB phone-photo-sized PNG data URL (the bytes need not be a real image). */
+const bigImage = () => `data:image/png;base64,${randomBytes(3 * 1024 * 1024).toString('base64')}`
+
+test('a sent image is stored as a file reference; the engine gets the same data URL on the send and on a resend', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  const image = bigImage()
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    await (await h.app.request(`${base}/messages`, json({ content: 'what is this', images: [image] }))).text()
+    const [user] = h.store.getMessages(conv.id)
+    assert.equal(user.attachments.length, 1)
+    const id = attachmentRefId(user.attachments[0])
+    assert.ok(id, `stored as a reference, got ${user.attachments[0].slice(0, 40)}`)
+    assert.equal(h.store.messageAttachmentsJson(user.id)!.length < 200, true, 'the row holds no image bytes')
+
+    await h.app.request(`${base}/regenerate`, { method: 'POST' })
+    await (await h.app.request(`${base}/continue`, json({}))).text()
+    const parts = (n: number) => engine.bodies[n].messages.at(-1)!.content as Array<{ type: string; image_url?: { url: string } }>
+    assert.equal(parts(0)[1].image_url!.url, image, 'first send')
+    assert.equal(parts(1)[1].image_url!.url, image, 'resend reads the file back byte for byte')
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('POST /messages with stored references (an API caller resending a shown image) sends the engine data URLs', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  const image = bigImage()
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    await (await h.app.request(`${base}/messages`, json({ content: 'what is this', images: [image] }))).text()
+    const [ref] = h.store.getMessages(conv.id)[0].attachments
+    await (await h.app.request(`${base}/messages`, json({ content: 'and again', images: [ref] }))).text()
+
+    const urls = engine.bodies[1].messages.flatMap((m) => Array.isArray(m.content)
+      ? (m.content as Array<{ type: string; image_url?: { url: string } }>).flatMap((p) => p.image_url ? [p.image_url.url] : [])
+      : [])
+    assert.ok(urls.length >= 1)
+    assert.ok(urls.every((u) => u === image), 'no reference reaches the engine, in this turn or the history')
+    assert.equal(urls.at(-1), image)
+    assert.deepEqual(h.store.getMessages(conv.id).at(-2)!.attachments, [ref], 'the row keeps the reference')
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('a row from before (image inline in messages.attachments) still opens and still prompts', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    h.store.addMessage(conv.id, 'user', 'old question', { attachments: ['data:image/png;base64,AAAA'] })
+    h.store.addMessage(conv.id, 'assistant', 'old answer')
+    const shown = await (await h.app.request(`/api/v1/conversations/${conv.id}`)).json() as { messages: Array<{ attachments: string[] }> }
+    assert.deepEqual(shown.messages[0].attachments, ['data:image/png;base64,AAAA'])
+    await (await h.app.request(`/api/v1/conversations/${conv.id}/continue`, json({ regenerate: true }))).text()
+    assert.deepEqual(engine.bodies[0].messages.at(-1)!.content, [
+      { type: 'text', text: 'old question' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+    ])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('opening a chat with many photos no longer ships megabytes', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    for (let i = 0; i < 3; i++) {
+      await (await h.app.request(`/api/v1/conversations/${conv.id}/messages`, json({ content: `photo ${i}`, images: [bigImage()] }))).text()
+    }
+    const text = await (await h.app.request(`/api/v1/conversations/${conv.id}`)).text()
+    assert.ok(text.length < 20_000, `GET /conversations/:id sent ${text.length} bytes for 3 photos of ~4 MB each`)
+    assert.equal((text.match(/"attachment:[0-9a-f]{64}\.png"/g) ?? []).length, 3)
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('GET /api/v1/attachments/:id serves the image bytes, cacheable for good; a malformed or unknown id is a 404', async () => {
+  const h = inFlightHarness()
+  try {
+    const bytes = randomBytes(1000)
+    const [ref] = await h.store.attachments.save([`data:image/jpeg;base64,${bytes.toString('base64')}`])
+    const id = attachmentRefId(ref)!
+    const res = await h.app.request(`/api/v1/attachments/${id}`)
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get('content-type'), 'image/jpeg')
+    assert.match(res.headers.get('cache-control') ?? '', /immutable/)
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff')
+    assert.deepEqual(Buffer.from(await res.arrayBuffer()), bytes)
+
+    for (const bad of ['..%2Fturbollm.db', '..%5Cturbollm.db', '%2E%2E', id.toUpperCase(), `${id.slice(0, -4)}.svg`, `${'0'.repeat(64)}.png`]) {
+      const r = await h.app.request(`/api/v1/attachments/${bad}`)
+      assert.equal(r.status, 404, bad)
+    }
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('GET /api/v1/attachments/:id sits behind lanAuth: a LAN caller needs a key, the owner\'s browser does not', async () => {
+  const h = inFlightHarness()
+  const raw = 'tllm-attachmentsattachmentsattachmentsat1'
+  const cfg = defaultConfig()
+  cfg.daemon.lanBind = true
+  cfg.apiKeys.push({ id: 'k', name: 'k', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null })
+  const app = new Hono()
+  app.use('*', lanAuth({ ...h.d, store: { ...h.d.store, snapshot: () => cfg, read: () => cfg } } as unknown as Deps))
+  app.route('/', h.app)
+  const from = (remoteAddress: string, headers: Record<string, string> = {}) => (path: string) =>
+    app.request(path, { headers }, { incoming: { socket: { localPort: 6996, remoteAddress, remotePort: 5555, remoteFamily: 'IPv4' } } } as never)
+  try {
+    const [ref] = await h.store.attachments.save(['data:image/png;base64,AAAA'])
+    const path = `/api/v1/attachments/${attachmentRefId(ref)}`
+    assert.equal((await from('192.168.1.50')(path)).status, 401)
+    assert.equal((await from('192.168.1.50', { 'X-TurboLLM-Auth': raw })(path)).status, 200)
+    assert.equal((await from('127.0.0.1')(path)).status, 200)
+  } finally {
     h.cleanup()
   }
 })

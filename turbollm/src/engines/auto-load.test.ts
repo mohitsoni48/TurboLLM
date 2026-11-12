@@ -748,7 +748,7 @@ function mkRunDeps(options: RunDepsOptions = {}) {
   }
   let inLock = false
   const store = {
-    snapshot: () => { record.snapshotCalls++; return structuredClone(data) },
+    snapshot: () => { record.snapshotCalls++; return structuredClone(data) }, read: () => { record.snapshotCalls++; return structuredClone(data) },
     update: (fn: (c: Config) => void) => { record.updateCalls++; fn(data) },
   }
   const deps: AutoLoadDeps = {
@@ -795,7 +795,7 @@ const flush = () => new Promise<void>((r) => setImmediate(r))
 function cloningConfigStore(root: string, data: Config): ConfigStore {
   return {
     dir: () => root,
-    snapshot: () => structuredClone(data),
+    snapshot: () => structuredClone(data), read: () => structuredClone(data),
     update: (fn: (c: Config) => void) => { fn(data) },
   } as unknown as ConfigStore
 }

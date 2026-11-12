@@ -1,18 +1,21 @@
-// Source-level guards for the daemon's listen / rebind / shutdown wiring in cli.ts.
+// Source-level guards for the daemon's listen / rebind / shutdown wiring in cli.ts and boot.ts, read as one program in
+// boot order (test-support/daemon-source.ts).
 //
-// Why a source scan and not a behavioural test: cli.ts is top-level module code. Importing it
-// boots the real daemon (config, engines, a listening port), so it cannot be loaded from a test —
-// the same reason as cli.restart-wiring.test.ts. Each test pins one fix that only exists as
-// wiring in this file; the logic it leans on is unit-tested where it lives (daemon-pid.ts,
-// routines/cli-interactive-runner.ts).
+// Why still source scans: what these pin is ordering and process-level wiring a test daemon (boot.test.ts) cannot
+// show: the CLI's guards and exits before the boot (--stop, the data-dir claim, the job sentinel, the config's access
+// check), a step's place in the listen callback before its first await, a banner or a browser that only a real boot
+// prints or opens, an IPv6 or --addr bind. The wiring a test daemon can show is tested on one: boot.*-wiring.test.ts.
+// The logic these lean on is unit-tested where it lives (daemon-pid.ts, routines/cli-interactive-runner.ts).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { daemonSourceInBootOrder, source } from './test-support/daemon-source'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-const CLI = readFileSync(join(HERE, 'cli.ts'), 'utf8').replace(/\r\n/g, '\n')
+// cli.ts with bootDaemon's body (boot.ts) in place of its call: the daemon's source in the order it runs.
+const CLI = daemonSourceInBootOrder()
 
 /** The text from `opening` through the first closing brace at column 0 after it. */
 function blockFrom(opening: string): string {
@@ -25,8 +28,9 @@ function blockFrom(opening: string): string {
 
 const LISTEN = 'function listen(attempt = 0): void {'
 const REBIND = 'deps.rebind = () => {'
-// The signal shutdown (also run by Ctrl+Break on Windows and by the stdin lifeline).
-const SIGNALS = 'beginShutdown = (reason: string) => {'
+// The one teardown both the signal shutdown and the restart run (boot.ts close). What it stops and waits for, and in
+// which order, is boot.teardown-wiring.test.ts's, on a real daemon; these pin the steps that test cannot watch.
+const TEARDOWN = 'function close({ forRestart = false, alsoWaitFor = () => Promise.resolve() }: TeardownOptions = {}): Promise<void> {'
 
 test('every listener instance gets the terminal WebSocket upgrade handler (bind retry, rebind, revert)', () => {
   const listen = blockFrom(LISTEN)
@@ -77,11 +81,11 @@ test('every successful bind records the bound host for the auth gates before the
   }
 })
 
-test('signal shutdown drops open connections before close() (an SSE stream otherwise holds it 12 s)', () => {
-  const signals = blockFrom(SIGNALS)
-  const drop = signals.indexOf('closeAllConnections?.()')
-  assert.ok(drop >= 0, 'the signal path must call closeAllConnections')
-  assert.ok(drop < signals.indexOf('server.close(() => process.exit(0))'))
+test('the teardown drops open connections before close() (an SSE stream otherwise holds it 12 s)', () => {
+  const teardown = blockFrom(TEARDOWN)
+  const drop = teardown.indexOf('closeAllConnections?.()')
+  assert.ok(drop >= 0, 'the teardown must call closeAllConnections')
+  assert.ok(drop < teardown.indexOf('server.close(() => closed())'))
 })
 
 // The behaviour itself is terminal-routes.test.ts's "dropStaleTerminalSockets" tests. A terminal
@@ -98,15 +102,11 @@ test('every bind and every remote-access state change drop terminal WebSockets w
 })
 
 // The behaviour itself is terminal-routes.test.ts's "closeTerminalSockets" test.
-test('signal shutdown and restart drop open terminal WebSockets before close() (one held it past --stop\'s 10 s)', () => {
-  const signals = blockFrom(SIGNALS)
-  const drop = signals.indexOf('closeTerminalSockets()')
-  assert.ok(drop >= 0, 'the signal path must call closeTerminalSockets')
-  assert.ok(drop < signals.indexOf('server.close(() => process.exit(0))'))
-  const restart = blockFrom('if (!packagedAndroidApp()) deps.requestRestart = (')
-  const restartDrop = restart.indexOf('closeTerminalSockets()')
-  assert.ok(restartDrop >= 0, 'the restart path must call closeTerminalSockets')
-  assert.ok(restartDrop < restart.indexOf('server.close(() => {'))
+test('the teardown drops open terminal WebSockets before close() (one held it past --stop\'s 10 s)', () => {
+  const teardown = blockFrom(TEARDOWN)
+  const drop = teardown.indexOf('closeTerminalSockets()')
+  assert.ok(drop >= 0, 'the teardown must call closeTerminalSockets')
+  assert.ok(drop < teardown.indexOf('server.close(() => closed())'))
 })
 
 // `turbollm --stop && …` must not carry on when the daemon is still running. Which results count
@@ -188,13 +188,18 @@ test('the harness resync after a model load uses the bound port, not daemon.port
 // user's own `tailscale serve 6997`. Both must use the port the main listener binds.
 test('the remote-access ingress port is resolved against the bound port, not daemon.port', () => {
   assert.ok(!/resolveIngressPort\([^)]*daemon\.port\)/.test(CLI), 'no ingress port resolved against the configured daemon.port')
-  assert.ok(CLI.includes('const reconcileTailscalePromise = reconcileTailscale(bootIngressPort)'))
+  assert.match(CLI, /const reconcileTailscalePromise = opts\.reconcileTailscale === false\n\s*\? Promise\.resolve\(\)\n\s*: reconcileTailscale\(bootIngressPort\)/)
   assert.match(blockFrom('const remote = new RemoteAccessManager({'), /ingressPort: bootIngressPort\b/)
   // The boot port the ingress is resolved against is parsed like the listen address below.
   const def = CLI.slice(CLI.indexOf('const bootIngressPort = (() => {'), CLI.indexOf('const reconcileTailscalePromise'))
-  assert.ok(def.includes("const portFlag = argValue('--port', '')"))
-  assert.ok(def.includes("argValue('--addr', `:${store.snapshot().daemon.port}`)"))
-  assert.ok(CLI.includes("addr = argValue('--addr', `${defaultHost}:${cfg.daemon.port}`)"))
+  assert.ok(def.includes("const portFlag = opts.portFlag ?? ''"))
+  assert.ok(def.includes("(opts.addr ?? `:${store.snapshot().daemon.port}`)"))
+  assert.ok(def.includes('opts.listenPort ?? parseListenAddr(addr).port'))
+  assert.ok(CLI.includes("addr = opts.addr ?? `${defaultHost}:${cfg.daemon.port}`"))
+  assert.ok(CLI.includes('let port = opts.listenPort ?? listenAddr.port'))
+  // cli.ts hands bootDaemon the flags as given.
+  const cli = source('cli.ts')
+  assert.ok(cli.includes("portFlag: argValue('--port', ''),") && cli.includes("addr: optionalArg('--addr'),"))
 })
 
 // Until the boot start runs, remote access reads `off`, so the UI lets a provider be picked; the
@@ -223,7 +228,9 @@ test('the packaged Android app never wires a restart (exiting its in-process Nod
 // at every launch, for a release nothing there can apply. With no checker, GET /api/v1/app/update
 // answers "no update" (routes.ts) and the boot check does not run.
 test('the packaged Android app never checks npm for an app update', () => {
-  assert.ok(CLI.includes('const appUpdates = packagedAndroidApp() ? undefined : new AppUpdateChecker(version)'))
+  assert.ok(CLI.includes('const appUpdates = packagedAndroidApp() || !checkAppUpdates ? undefined : new AppUpdateChecker(version)'))
+  assert.ok(CLI.includes('const checkAppUpdates = opts.checkAppUpdates !== false'), 'off only when a test daemon says so')
+  assert.ok(!source('cli.ts').includes('checkAppUpdates'), 'the CLI never turns it off')
   assert.equal(CLI.split('new AppUpdateChecker(').length, 2, 'one checker')
   assert.match(CLI, /if \(appUpdates\) setTimeout\(\(\) => \{\n\s*void appUpdates\n\s*\.check\(/, 'the boot check needs the checker')
   assert.equal(CLI.split('appUpdates.check(').length, 1, 'no other check from cli.ts')
@@ -245,10 +252,10 @@ test('the interactive-routine sweep maps Code session ids to terminal ids', () =
 // util/tether.ts ties every tethered child to this process; these pin where cli.ts drives it. The behaviour itself
 // is util/tether.test.ts's: "stopTethered: SIGTERM first, then a group kill after the grace" and the daemon-SIGKILL
 // tests.
-test('both teardowns stop the tethered children beside the engine, and the exit handler kills them first', () => {
-  const WITH_TETHER = /Promise\.all\(\[[^\]]*\bmanager\.shutdown\(\)[^\]]*\bstopTethered\(\)[^\]]*\]\)\.finally\(/
-  assert.match(blockFrom('if (!packagedAndroidApp()) deps.requestRestart = ('), WITH_TETHER, 'the restart teardown')
-  assert.match(blockFrom(SIGNALS), WITH_TETHER, 'the signal teardown')
+test('the teardown stops the tethered children beside the engine, and the exit handler kills them first', () => {
+  const teardown = blockFrom(TEARDOWN)
+  assert.match(teardown, /const stopping: Promise<unknown>\[\] = \[[^\]]*\bmanager\.shutdown\(\)[^\]]*\bstopTethered\(\)[^\]]*\]/)
+  assert.match(teardown, /void Promise\.all\(stopping\)\.finally\(/)
   const exit = CLI.indexOf("process.on('exit', () => {\n  // Every tethered child")
   assert.ok(exit > 0, "the last-resort 'exit' handler")
   const firstCall = CLI.indexOf('try {', exit)
@@ -266,14 +273,6 @@ test('boot waits for the tether (the Android helper\'s self-test) before anythin
   }
 })
 
-// The behaviour is gateway/model-router.test.ts's "shutdownPool() stops every pool slot's engine and waits for it to
-// exit".
-test('both teardowns stop the pool slots\' engines beside the primary\'s', () => {
-  const WITH_POOL = /Promise\.all\(\[[^\]]*\bmanager\.shutdown\(\)[^\]]*\bmodelRouter\.shutdownPool\(\)[^\]]*\]\)\.finally\(/
-  assert.match(blockFrom('if (!packagedAndroidApp()) deps.requestRestart = ('), WITH_POOL, 'the restart teardown')
-  assert.match(blockFrom(SIGNALS), WITH_POOL, 'the signal teardown')
-})
-
 // The export browser's profile lives in <dataDir>/run (artifacts/screenshot.ts), and a daemon that died during an
 // export left it there; the boot sweeps it, before anything can export again. reapStaleChromeProfiles' own behaviour is
 // screenshot.test.ts's.
@@ -281,7 +280,9 @@ test('the boot sweeps the export browser\'s leftover profiles from the run dir t
   const sweep = CLI.indexOf("reapStaleChromeProfiles(join(store.dir(), 'run'))")
   assert.ok(sweep > 0, 'cli.ts sweeps <dataDir>/run')
   assert.ok(sweep < CLI.indexOf('void runAutoLoad({'), 'at boot')
-  const ROUTES = readFileSync(join(HERE, 'api', 'routes.ts'), 'utf8')
+  // The export route, wherever under api/ it is registered.
+  const ROUTES = readdirSync(join(HERE, 'api')).filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
+    .map((f) => readFileSync(join(HERE, 'api', f), 'utf8')).join('\n')
   assert.ok(ROUTES.includes("screenshotArtifact(html, { width: w, height: h, runDir: join(d.store.dir(), 'run') })"), 'the export route puts the profile there')
 })
 

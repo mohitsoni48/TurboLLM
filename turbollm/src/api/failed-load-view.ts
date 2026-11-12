@@ -12,6 +12,9 @@ export interface FailedLoadView {
   engineName: string
   /** Name of the model it tried to load ('' when no load is recorded). */
   modelName: string
+  /** Key of that model ('' when no load is recorded): what the banner's Retry loads. The config's lastLoaded is no
+   *  stand-in, as it is recorded only once a load succeeds and still names the previous model after a failed one. */
+  modelKey: string
   /** False when that engine is not expected to load that model (modelIncompatibility: the Models screen's
    *  compatibleWithActiveEngine for it); true when it is, or when the model has left the library. */
   expectedToLoad: boolean
@@ -20,11 +23,12 @@ export interface FailedLoadView {
 /** Read off Manager.restartOpts(), the last load attempted, also one that failed (status() names no model then). */
 export function failedLoadView(d: Pick<Deps, 'manager' | 'scanner'>): FailedLoadView {
   const opts = d.manager.restartOpts()
-  if (!opts) return { engineName: '', modelName: '', expectedToLoad: true }
+  if (!opts) return { engineName: '', modelName: '', modelKey: '', expectedToLoad: true }
   const entry = d.scanner.get(opts.model.key)
   return {
     engineName: opts.engine.name,
     modelName: opts.model.name,
+    modelKey: opts.model.key,
     expectedToLoad: !entry || modelIncompatibility(opts.engine.kind, entry) === null,
   }
 }

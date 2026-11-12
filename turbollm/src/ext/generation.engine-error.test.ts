@@ -37,7 +37,7 @@ test('an extension run the engine refuses fails with the engine\'s reason, from 
         generationEnd: () => {},
       },
       registry: { active: () => ({ id: 'lrt', kind: 'litert-lm' }) },
-      store: { snapshot: () => ({ tools: { toolPolicies: {}, autoAllowAll: false }, modelDefaults: {} }), dir: () => dir },
+      store: { snapshot: () => ({ tools: { toolPolicies: {}, autoAllowAll: false }, modelDefaults: {} }), read: () => ({ tools: { toolPolicies: {}, autoAllowAll: false }, modelDefaults: {} }), dir: () => dir },
     } as unknown as Deps
     const chat = await chatStore.createChat(SCOPE, { title: 't' })
     await chatStore.addMessage(SCOPE, chat.id, { role: 'user', content: 'go' })

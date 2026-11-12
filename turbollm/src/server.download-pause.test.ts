@@ -22,7 +22,7 @@ function mkDeps(mutate: (cfg: Config) => void = () => {}): { d: Deps; done: stri
   const done: string[] = []
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
     db: new Proxy({}, { get: () => () => [] }),
     telemetry: { firstUse: () => {}, useFeature: () => {} },
     manager: { status: () => ({ state: 'stopped', model: null }), currentOpts: () => null },

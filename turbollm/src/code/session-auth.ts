@@ -15,6 +15,7 @@ export class SessionAuthRegistry {
   private tokenToSession = new Map<string, string>()
   private sessionThinkingBudget = new Map<string, number>()
   private sessionReasoningEffort = new Map<string, ReasoningEffort>()
+  private revokeListeners: Array<(codeSessionId: string) => void> = []
 
   /** Mint a token for a Code session — idempotent: returns the SAME token on every call for a
    *  given session (a reconnect/remount must never invalidate the CLI's already-running auth). */
@@ -32,6 +33,11 @@ export class SessionAuthRegistry {
     return this.tokenToSession.get(token) ?? null
   }
 
+  /** Whether the session still holds a minted token (its CLI has not ended). */
+  hasToken(codeSessionId: string): boolean {
+    return this.sessionToToken.has(codeSessionId)
+  }
+
   /** Drop a session's token (terminal killed/exited) — safe to call even if none was ever
    *  minted. Deliberately does NOT clear the session's stored thinking budget: a model-relaunch
    *  (revoke + mint again under the same codeSessionId) should keep whatever the user had the
@@ -40,6 +46,14 @@ export class SessionAuthRegistry {
     const token = this.sessionToToken.get(codeSessionId)
     if (token) this.tokenToSession.delete(token)
     this.sessionToToken.delete(codeSessionId)
+    for (const listener of this.revokeListeners) listener(codeSessionId)
+  }
+
+  /** Be told whenever a session's token is revoked — the one signal every way a CLI ends (terminal
+   *  kill, exit, routine finish) already sends. Lets per-session state held elsewhere (the gateway's
+   *  pending tool calls) be released without this registry importing it. */
+  onRevoke(listener: (codeSessionId: string) => void): void {
+    this.revokeListeners.push(listener)
   }
 
   /** Set (or clear, with `null`) the live thinking-budget override for a session — takes effect

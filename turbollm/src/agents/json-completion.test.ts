@@ -31,7 +31,7 @@ function deps(kind = 'litert-lm', opts: { running?: boolean } = {}): Deps {
       currentOpts: () => ({ modelPath: '/models/m.litertlm' }),
     },
     registry: { active: () => ({ kind }) },
-    store: { snapshot: () => cfg, dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, dir: () => dir },
   } as unknown as Deps
 }
 

@@ -43,7 +43,7 @@ function fakeDeps(target: string, gate: GenerationGate | undefined, dbCalls: unk
   return {
     scanner: { list: () => ({ models: LIBRARY, scanning: false, lastScanAt: '' }) },
     modelRouter: { targetEntry: () => undefined, route: async () => ({ target }) },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }) },
     manager: {
       status: () => ({ state: 'stopped', model: null }),
       target: () => target,

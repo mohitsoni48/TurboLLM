@@ -3,6 +3,7 @@ import { track } from '../../lib/api'
 import { useEngineLog } from '../../lib/use-engine-log'
 import { cn } from '../../lib/utils'
 import { CopyButton } from '../../components/ui/copy-button'
+import { EngineLogSlotSelect } from './EngineLogSlotSelect'
 import { Switch } from '../../components/ui/switch'
 import {
   Collapsible,
@@ -21,7 +22,7 @@ export function EngineLogPanel({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
-  const { lines, autoScroll, setAutoScroll, viewportRef } = useEngineLog(open)
+  const { lines, autoScroll, setAutoScroll, viewportRef, model, setModel, slots } = useEngineLog(open)
 
   return (
     <Collapsible
@@ -39,6 +40,7 @@ export function EngineLogPanel({
         </CollapsibleTrigger>
         {open && (
           <div className="flex items-center gap-3">
+            <EngineLogSlotSelect slots={slots} value={model} onChange={setModel} />
             <label htmlFor="engine-log-autoscroll" className="flex items-center gap-1.5 text-[12px] text-muted">
               <Switch id="engine-log-autoscroll" checked={autoScroll} onCheckedChange={(v) => { track('engines', 'toggle_engine_log_autoscroll'); setAutoScroll(v) }} />
               Auto-scroll

@@ -29,7 +29,7 @@ function fakeDeps(routed: { model: string | null }, autoSwap = true): Deps {
         return { target: 'http://engine.local' }
       },
     },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap } }) },
     manager: {
       status: () => ({ state: 'stopped', model: null }),
       target: () => 'http://engine.local',
@@ -88,7 +88,7 @@ async function listedIds(o: { engineKind: string; showAllEngineModels?: boolean;
   registerGateway(app, {
     scanner: { list: () => ({ models: [BUNDLE, GGUF, SAFETENSORS], scanning: false, lastScanAt: '' }) },
     modelRouter: { loadedModelKeys: () => new Set(o.running ?? []) },
-    store: { snapshot: () => ({ gateway: { autoSwap: true }, showAllEngineModels: o.showAllEngineModels ?? false }) },
+    store: { snapshot: () => ({ gateway: { autoSwap: true }, showAllEngineModels: o.showAllEngineModels ?? false }), read: () => ({ gateway: { autoSwap: true }, showAllEngineModels: o.showAllEngineModels ?? false }) },
     registry: { active: () => ({ id: 'e', kind: o.engineKind }), layaEngine: () => undefined },
   } as unknown as Deps)
   const body = (await (await app.request('/v1/models', { method: 'GET' })).json()) as { data: Array<{ id: string }> }
@@ -123,7 +123,7 @@ test('GET /v1/models with no engine selected lists every model', async () => {
   registerGateway(app, {
     scanner: { list: () => ({ models: [BUNDLE, GGUF], scanning: false, lastScanAt: '' }) },
     modelRouter: { loadedModelKeys: () => new Set<string>() },
-    store: { snapshot: () => ({ gateway: { autoSwap: false }, showAllEngineModels: false }) },
+    store: { snapshot: () => ({ gateway: { autoSwap: false }, showAllEngineModels: false }), read: () => ({ gateway: { autoSwap: false }, showAllEngineModels: false }) },
     registry: { active: () => undefined, layaEngine: () => undefined },
   } as unknown as Deps)
   const body = (await (await app.request('/v1/models', { method: 'GET' })).json()) as { data: Array<{ id: string }> }

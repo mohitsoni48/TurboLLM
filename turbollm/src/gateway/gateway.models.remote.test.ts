@@ -61,7 +61,7 @@ function fakeDeps(remoteCatalog?: RemoteCatalog, autoSwap = true): Deps {
   return {
     scanner: { list: () => ({ models: LIBRARY, scanning: false, lastScanAt: '' }) },
     modelRouter: { route: async () => ({ target: 'http://engine.local' }), loadedModelKeys: () => new Set<string>() },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap } }) },
     manager: { status: () => ({ state: 'stopped', model: null }), target: () => 'http://engine.local' },
     registry: { active: () => ({ kind: 'llama.cpp' }) },
     remoteCatalog,

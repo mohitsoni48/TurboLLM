@@ -3,7 +3,7 @@ import { cors } from 'hono/cors'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { dirname, join, normalize } from 'node:path'
-import { Agent, setGlobalDispatcher } from 'undici'
+import { setGlobalDispatcher } from 'undici'
 import { registerApi } from './api/routes'
 import { registerLinkAdminRoutes } from './api/link-admin-routes'
 import { registerRemoteApi } from './remote/routes'
@@ -16,6 +16,8 @@ import { registerGateway } from './gateway/gateway'
 import { featureForPath } from './telemetry/feature-map'
 import { registerTerminalRoutes } from './terminal/terminal-routes'
 import { registerRoutineRoutes } from './routines/routine-routes'
+import { registerEventsRoutes } from './events/events-routes'
+import { invalidateOnWrite } from './events/write-invalidation'
 import { lanAuth, codeAuth, appSecretProof, isTunneled, localPort } from './auth'
 import { registerLinkApi, registerLinkAuth } from './link/link-routes'
 import { mountExtApi } from './ext/mount'
@@ -24,11 +26,12 @@ import { createMakeBody } from './ext/generation'
 import { DEFAULT_AUDIT_RETENTION_DAYS } from './ext/audit'
 import { extErrorHandler } from './ext/errors'
 import { daemonTick } from './util/daemon-ticks'
+import { createDaemonDispatcher } from './util/daemon-dispatcher'
 
 // Reuse TCP connections for all engine and HF fetch calls. Without this, Node
 // opens a new connection per request — ~5–20 ms of extra latency every Claude
 // Code turn (it sends back-to-back requests at each agentic step).
-setGlobalDispatcher(new Agent({ keepAliveMaxTimeout: 60_000, connections: 10 }))
+setGlobalDispatcher(createDaemonDispatcher())
 
 const WEB_ROOT = join(dirname(fileURLToPath(import.meta.url)), 'webdist')
 
@@ -133,6 +136,11 @@ export function createApp(d: Deps): Hono {
     await next()
   })
 
+  // Announces successful writes to config-backed state (settings, engines, models) on the invalidation
+  // bus that GET /api/v1/events streams (review 4.14). After the auth gates, so a refused write is not
+  // announced; ahead of every route, since a route that answers without next() skips later middleware.
+  app.use('/api/v1/*', invalidateOnWrite())
+
   // Turbo Link façade HANDLERS (ADR-376) — gate already registered above.
   //
   // These must come after the feature-telemetry middleware directly above. Hono composes
@@ -170,6 +178,7 @@ export function createApp(d: Deps): Hono {
   registerTerminalRoutes(app, d)
   registerRoutineRoutes(app, d)
   registerGateway(app, d)
+  registerEventsRoutes(app)
 
   // External chat API (spec 27) — flag-gated off by default (config.ts's `api.ext.enabled`);
   // mountExtApi registers nothing at all when the flag is off, so this is a true no-op for

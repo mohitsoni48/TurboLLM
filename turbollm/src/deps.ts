@@ -11,6 +11,8 @@ import type { Scanner } from './models/scanner'
 import type { HashStore } from './models/hashes'
 import type { ConversationStore } from './chat/db'
 import type { ChatStore } from './chat/store/chat-store.js'
+import type { ChatTurns } from './chat/chat-turns'
+import type { ChatRuns } from './chat/chat-runs'
 import type { HfClient } from './hf/hf'
 import type { DownloadManager } from './downloads/downloads'
 import type { BenchRunner } from './bench/bench'
@@ -24,6 +26,13 @@ import type { CodeRunManager } from './code/code-run-manager'
 import type { LinkManager } from './link/link-manager'
 import type { RemoteCatalog } from './link/remote-catalog'
 
+/** What deleting a Code session came to (code-routes.ts deleteCodeSessionWithCleanup). */
+export type CodeSessionDeletion =
+  | { deleted: true; worktreeNote?: string }
+  | { deleted: false; reason: 'not_found' | 'run_active' }
+  /** Only when asked to keep a session whose worktree could not be removed (the retention sweep): it is still there. */
+  | { deleted: false; reason: 'worktree_kept'; worktreeNote: string }
+
 export interface Deps {
   store: ConfigStore
   registry: Registry
@@ -35,6 +44,11 @@ export interface Deps {
    *  handle as `db`. Phase 2 replaces this with a tenant-dispatching router. The web UI
    *  does NOT go through this — it keeps using `db` directly (spec 27 §4.3). */
   chatStore: ChatStore
+  /** The chat turns running in this daemon: their in-flight slots, approval waits and pending saves. One instance,
+   *  built by bootDaemon; every reader (the active-work probe, the engine lifecycle, the idle watchdog) takes it from here. */
+  chatTurns: ChatTurns
+  /** The runs of those turns (their buffered frames and viewers). One instance, built by bootDaemon. */
+  chatRuns: ChatRuns
   provision: ProvisionState
   /** Live status of an in-app compile-from-source run (ADR-100). One build at a time;
    *  guarded alongside `provision` so a build and a download never run concurrently. */
@@ -57,8 +71,13 @@ export interface Deps {
    *  Optional: only wired in the real `serve()` entrypoint (cli.ts); absent under tests. */
   comfy?: ComfyGuard
   /** Priority-queue mutex serialising engine calls (multiple concurrent generation
-   *  requests). Optional — absent under tests; only wired in cli.ts. */
+   *  requests) on the PRIMARY engine: in-app chat, Code, memory, compaction, extensions and
+   *  routines all talk to the primary. Optional — absent under tests; only wired in cli.ts. */
   gate?: GenerationGate
+  /** The gate of the engine process a gateway request was routed to (scalability review 1.1):
+   *  a keep-N pool slot's own, sized by its own `--parallel`; for the primary, `gate` itself.
+   *  Optional — absent under tests, where the gateway falls back to `gate`; wired in cli.ts. */
+  gateFor?: (engine: Manager) => GenerationGate
   /** Remote access supervisor (ADR-422). Present while the daemon owns a
    *  RemoteAccessManager — always in the real `serve()` entrypoint (cli.ts), absent under
    *  tests that don't exercise it. Its ingress port being bound is what makes a request
@@ -105,6 +124,10 @@ export interface Deps {
    *  the SAME kind of observable session a live one is. Optional: only wired in the real
    *  serve() entrypoint (cli.ts); absent under tests that don't exercise Code/Routines. */
   codeRuns?: CodeRunManager
+  /** Deletes a Code session the way its DELETE route does: LSP clients, background jobs and worktree, then its rows
+   *  (code-routes.ts deleteCodeSessionWithCleanup). Set by registerCodeRoutes, so absent where Code is (Android,
+   *  tests without Code routes); the retention sweep then leaves Code routine runs alone. */
+  deleteCodeSession?: (sessionId: string) => Promise<CodeSessionDeletion>
   /** The live RoutineScheduler instance (Phase 1, turbollm/src/routines/scheduler.ts), exposed
    *  so routine-routes.ts's POST .../run-now can trigger an immediate fire through the exact
    *  same overlap guard a normal scheduled tick uses. Optional: only wired in the real serve()

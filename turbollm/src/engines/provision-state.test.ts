@@ -29,3 +29,29 @@ test('each run carries its own startedAt, kept on its failure and cleared when i
   state.done()
   assert.equal(state.get().startedAt, 0)
 })
+
+// A backend download runs for minutes with nothing else telling an open page it moved: the state announces the
+// run's start, its end, and each progress milestone (a phase, an archive, a tenth of the download), not every chunk.
+test('announces status at start, at each progress milestone, and when the run settles', () => {
+  const heard: string[] = []
+  const state = new ProvisionState((key) => heard.push(key))
+  state.start('cuda')
+  assert.deepEqual(heard.splice(0), ['status', 'engines'])
+
+  state.progress('downloading', 0.01)
+  state.progress('downloading', 0.05)
+  assert.deepEqual(heard.splice(0), [], 'within the same tenth')
+  state.progress('downloading', 0.12)
+  assert.deepEqual(heard.splice(0), ['status'])
+  state.progress('downloading', 0.02, 2, 2)
+  assert.deepEqual(heard.splice(0), ['status'], 'the next archive')
+  state.progress('extracting', -1, 2, 2)
+  assert.deepEqual(heard.splice(0), ['status'], 'the next phase')
+
+  state.done()
+  assert.deepEqual(heard.splice(0), ['status', 'engines'])
+  state.start('cuda')
+  heard.length = 0
+  state.fail('boom')
+  assert.deepEqual(heard.splice(0), ['status', 'engines'])
+})

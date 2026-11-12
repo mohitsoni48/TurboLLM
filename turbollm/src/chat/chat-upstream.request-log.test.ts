@@ -14,7 +14,7 @@ import type { Deps } from '../deps'
 
 function fakeDeps(requestLog: RequestLog | undefined, captureBodies = false, enabled = true): Deps {
   return {
-    store: { snapshot: () => ({ requestLog: { enabled, captureBodies, maxEntries: 500 } }) },
+    store: { snapshot: () => ({ requestLog: { enabled, captureBodies, maxEntries: 500 } }), read: () => ({ requestLog: { enabled, captureBodies, maxEntries: 500 } }) },
     requestLog,
   } as unknown as Deps
 }

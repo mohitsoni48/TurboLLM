@@ -10,6 +10,11 @@ const MIN_LENGTH = 12
 const MAX_FACTS_PER_TURN = 5
 const MAX_FACT_LENGTH = 200
 
+/** How many of the newest facts a new one is checked against for duplicates. Bounded so each
+ *  extraction costs the same however many facts have piled up; a repeat of a fact older than
+ *  this window is stored again, which the user can delete like any other. */
+export const MEMORY_DEDUPE_WINDOW = 500
+
 function extractionPrompt(userText: string): string {
   return `Extract any durable personal facts the user stated about themselves in the message below — the kind of thing worth remembering for future conversations (name, role/job, location, preferences, hardware/software setup, ongoing projects, goals, recurring constraints).
 
@@ -99,7 +104,7 @@ export async function extractMemoryFacts(d: Deps, convId: string, userText: stri
     const facts = parseFacts(data.choices?.[0]?.message?.content ?? '')
     if (!facts.length) return
 
-    const existing = d.db.listMemoryFacts().map((f) => f.factText)
+    const existing = d.db.recentMemoryFactTexts(MEMORY_DEDUPE_WINDOW)
     for (const fact of facts) {
       if (isDuplicateFact(existing, fact)) continue
       d.db.addMemoryFact({ factText: fact, sourceConvId: convId })

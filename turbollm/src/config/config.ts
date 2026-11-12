@@ -9,7 +9,8 @@ import { basename, dirname, join } from 'node:path'
 import type { LinkGrant, LinkRecord } from '../link/types'
 import type { ChatStoreConfig } from '../chat/store/load-adapter.js'
 import type { ReleaseProvenance } from '../engines/release-install'
-import { CHAT_APPROVAL_WAIT_MINUTES } from './config-bounds'
+import { CHAT_APPROVAL_WAIT_MINUTES, DOWNLOAD_CONCURRENCY, ENGINE_LOAD_STALL_SECONDS, GATEWAY_MAX_BODY_MB, RETENTION_BOUNDS, loadBounded } from './config-bounds'
+import { writeFileAtomicSync } from '../util/atomic-write'
 
 export const SCHEMA_VERSION = 4
 
@@ -306,6 +307,10 @@ export interface Gateway {
    *  swap (unload A, load B). Values 2–4 keep multiple models hot in a pool with
    *  LRU eviction. Capped at 4. */
   keepN: number
+  /** Largest request body, in MB, the `/v1/*` gateway accepts before refusing it with a 413 (scalability review 4.4):
+   *  a body is buffered whole and JSON.parsed synchronously, so over LAN/remote access an unbounded one is an OOM or a
+   *  stalled event loop. The default leaves room for base64 vision payloads. Config-file only. */
+  maxBodyMb: number
 }
 
 /** The developer request log (issue #211 follow-up, superseding ADR-409): every completion this
@@ -320,6 +325,16 @@ export interface RequestLogConfig {
    *  the app. Metadata (params, tokens, timings, status) is captured either way. */
   captureBodies: boolean
   maxEntries: number
+}
+
+/** Data retention (scalability review 2.4, chat/retention.ts): a daily sweep folds raw gateway usage rows older than
+ *  `apiUsageRawDays` into daily totals (the dashboards read both, so their numbers do not change) and keeps the newest
+ *  `routineRunsKept` runs per routine, deleting older ones with the conversation or Code session each one made. On by
+ *  default. Bounds: config-bounds.ts RETENTION_BOUNDS. */
+export interface RetentionConfig {
+  enabled: boolean
+  apiUsageRawDays: number
+  routineRunsKept: number
 }
 
 /** ComfyUI GPU-coordination (so the LLM engine and ComfyUI don't fight over VRAM).
@@ -584,6 +599,12 @@ export interface Config {
   /** The folder downloads/imports land in (spec 01 §3, ADR-035). When '' or not in
    *  modelDirs, the FIRST entry in modelDirs is the effective default. */
   primaryModelDir: string
+  /** How many files the download manager streams at once (config-bounds.ts DOWNLOAD_CONCURRENCY: 1-8, default 2). Config
+   *  only: no settings route exposes it. */
+  downloadConcurrency: number
+  /** Seconds a native engine's load may show no progress before it is stopped (config-bounds.ts ENGINE_LOAD_STALL_SECONDS: 0-600,
+   *  default 120, 0 = never stall-stop). Config only. */
+  engineLoadStallSeconds: number
   /** Saved per-model LoadProfiles, nested by (modelKey → engineId → {@link ProfileEntry})
    *  so two installed engines (even two builds of the same kind, e.g. llama.cpp CUDA vs
    *  Vulkan, each with its own {@link Engine.id}) keep independent tunes for the same
@@ -652,6 +673,7 @@ export interface Config {
   comfyui: ComfyUI
   gateway: Gateway
   requestLog: RequestLogConfig
+  retention: RetentionConfig
   tools: ToolsConfig
   mcp: McpConfig
   /** Agents + skills configuration (spec 13 §2.1). */
@@ -799,6 +821,8 @@ export function defaultConfig(): Config {
     defaultEngineSeeded: false,
     modelDirs: [],
     primaryModelDir: '',
+    downloadConcurrency: DOWNLOAD_CONCURRENCY.default,
+    engineLoadStallSeconds: ENGINE_LOAD_STALL_SECONDS.default,
     modelProfiles: {},
     modelPresets: {},
     lastPresetId: {},
@@ -814,8 +838,9 @@ export function defaultConfig(): Config {
     modelDefaults: { ctx: BUILTIN_MODEL_DEFAULT_CTX, ngl: 99, imageMaxTokens: 0, maxTokens: 0 },
     featuredOverrideUrl: '',
     comfyui: { enabled: false, gatePath: '', url: '', reverseGate: false, cachePersist: false },
-    gateway: { autoSwap: true, keepN: 1 },
+    gateway: { autoSwap: true, keepN: 1, maxBodyMb: GATEWAY_MAX_BODY_MB.default },
     requestLog: { enabled: true, captureBodies: false, maxEntries: 500 },
+    retention: { enabled: true, apiUsageRawDays: RETENTION_BOUNDS.apiUsageRawDays.default, routineRunsKept: RETENTION_BOUNDS.routineRunsKept.default },
     tools: { chatApprovalWaitMinutes: CHAT_APPROVAL_WAIT_MINUTES.default },
     mcp: { servers: [] },
     agents: { agents: [] },
@@ -951,6 +976,19 @@ function sweepDeadSaveTmps(configPath: string): void {
   }
 }
 
+export type DeepReadonly<T> = T extends (infer U)[]
+  ? readonly DeepReadonly<U>[]
+  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T
+
+/** Freezes `value` and everything under it, in place. The config is plain JSON data, so a walk of own values covers it. */
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value)
+    for (const v of Object.values(value)) deepFreeze(v)
+  }
+  return value
+}
+
 export class ConfigStore {
   /** Set by stopSaving() (the restart keeper): config.json belongs to another process from then on. */
   private saving = true
@@ -960,7 +998,9 @@ export class ConfigStore {
     private filePath: string,
     private brokenPath = '',
     private brokenKept = false,
-  ) {}
+  ) {
+    deepFreeze(data)
+  }
 
   static load(path: string): ConfigStore {
     sweepDeadSaveTmps(path)
@@ -1011,8 +1051,16 @@ export class ConfigStore {
     return store
   }
 
+  /** A mutable deep copy: for a caller that changes it, or keeps it past the next update(). A reader that only
+   *  looks, above all on a per-request path, uses read(): the clone costs ~2 ms on a library-sized config. */
   snapshot(): Config {
     return structuredClone(this.data)
+  }
+
+  /** The live config, not a copy: the same object until the next update() replaces it. Deep-frozen, so a caller that
+   *  mutates it throws (and cannot corrupt what every other reader sees) instead of silently doing so. */
+  read(): DeepReadonly<Config> {
+    return this.data
   }
 
   /** Mutate the config under one synchronous call, then validate + persist. */
@@ -1020,7 +1068,10 @@ export class ConfigStore {
     const work = structuredClone(this.data)
     fn(work)
     validate(work)
-    this.data = work
+    // A frozen COPY: `fn` may have put in objects its caller still holds and changes (Registry.add*'s engine, a link
+    // record, an API key, an MCP server, a custom agent), which freezing `work` in place froze under them (review L4).
+    // One more clone per write; update() is not on a hot path.
+    this.data = deepFreeze(structuredClone(work))
     if (this.saving) this.save()
   }
 
@@ -1050,26 +1101,10 @@ export class ConfigStore {
 
   private save(): void {
     mkdirSync(dirname(this.filePath), { recursive: true })
-    // A tmp file of this process's own. A process that loads the config can save it (load()
-    // persists its migration), so a refused second start can write the RUNNING daemon's
-    // config.json too; with one shared `config.json.tmp`, a Settings save interleaving with that
-    // had its tmp overwritten with the other process's older snapshot (which then became
-    // config.json), or found it already renamed away and threw ENOENT.
-    const tmp = `${this.filePath}.${process.pid}.tmp`
-    // Owner-only (CONFIG_FILE_MODE): the rename keeps the tmp's mode, so config.json is 0600 after
-    // every save (load() tightens an existing install's 0644 file in place). A mode applies only
-    // to a file the write creates, so one left under this pid (pid reuse after a kill, one the
-    // load's best-effort sweep did not remove) is removed first rather than written through with
-    // its old mode.
-    rmSync(tmp, { force: true })
-    writeFileSync(tmp, JSON.stringify(this.data, null, 2), { mode: CONFIG_FILE_MODE })
-    try {
-      renameSync(tmp, this.filePath) // libuv MoveFileEx replaces on Windows
-    } catch (e) {
-      // Per-process names are never overwritten by a later save: don't leave this one behind.
-      try { rmSync(tmp, { force: true }) } catch { /* best-effort */ }
-      throw e
-    }
+    // Owner-only (CONFIG_FILE_MODE): the rename keeps the tmp's mode, so config.json is 0600 after every save
+    // (load() tightens an existing install's 0644 file in place). The tmp file is per-process: a process that
+    // loads the config can save it too, and a shared tmp name let two saves overwrite each other's.
+    writeFileAtomicSync(this.filePath, JSON.stringify(this.data, null, 2), { mode: CONFIG_FILE_MODE })
   }
 }
 
@@ -1181,6 +1216,9 @@ function normalize(c: Config): void {
   // Primary model dir (spec 01 §3, ADR-035): absent in old files → '' (effective
   // default falls back to the first modelDir). Never throw on an old config.
   c.primaryModelDir ??= ''
+  // Absent in older files, or hand-edited out of range / to a non-integer: the default, never a throw on load.
+  c.downloadConcurrency = loadBounded(c.downloadConcurrency, DOWNLOAD_CONCURRENCY)
+  c.engineLoadStallSeconds = loadBounded(c.engineLoadStallSeconds, ENGINE_LOAD_STALL_SECONDS)
   // Per-engine model profiles (issue #35, schema v3): modelProfiles moved from a flat
   // { modelKey → profile } map to a nested { modelKey → { engineId → ProfileEntry } } map
   // so two installed engines keep independent tunes for the same model. Migrate in place,
@@ -1271,6 +1309,7 @@ function normalize(c: Config): void {
   c.gateway = {
     autoSwap: gw.autoSwap !== false,
     keepN: typeof gw.keepN === 'number' && gw.keepN >= 1 ? Math.min(Math.floor(gw.keepN), 4) : 1,
+    maxBodyMb: loadBounded(gw.maxBodyMb, GATEWAY_MAX_BODY_MB),
   }
   // Developer request log (issue #211 follow-up): absent in pre-this-feature configs →
   // defaults (on, bodies off). `captureBodies` in particular must never silently flip on for
@@ -1281,6 +1320,14 @@ function normalize(c: Config): void {
     enabled: rl.enabled !== false,
     captureBodies: rl.captureBodies === true,
     maxEntries: typeof rl.maxEntries === 'number' && rl.maxEntries >= 50 ? Math.min(Math.floor(rl.maxEntries), 5000) : 500,
+  }
+  // Data retention (scalability review 2.4): absent in configs written before it → on, with the defaults. A value out of
+  // range (hand-edited) loads as its default, never a throw; a fraction is floored.
+  const rt = (c.retention ?? {}) as Partial<RetentionConfig>
+  c.retention = {
+    enabled: rt.enabled !== false,
+    apiUsageRawDays: loadBounded(rt.apiUsageRawDays, RETENTION_BOUNDS.apiUsageRawDays),
+    routineRunsKept: loadBounded(rt.routineRunsKept, RETENTION_BOUNDS.routineRunsKept),
   }
   // Built-in tools (v0.7.0): absent in pre-v0.7.0 configs → empty defaults.
   const tl = (c.tools ?? {}) as Partial<ToolsConfig>
@@ -1320,11 +1367,7 @@ function normalize(c: Config): void {
   c.tools.pdfReading = tl.pdfReading === true
   // Absent in configs written before the setting, or hand-edited out of range: the default (30
   // minutes), never a throw on load. A fraction is floored, as the minutes it stands for.
-  const wait = tl.chatApprovalWaitMinutes
-  c.tools.chatApprovalWaitMinutes =
-    typeof wait === 'number' && Number.isFinite(wait) && wait >= CHAT_APPROVAL_WAIT_MINUTES.min && wait <= CHAT_APPROVAL_WAIT_MINUTES.max
-      ? Math.floor(wait)
-      : CHAT_APPROVAL_WAIT_MINUTES.default
+  c.tools.chatApprovalWaitMinutes = loadBounded(tl.chatApprovalWaitMinutes, CHAT_APPROVAL_WAIT_MINUTES)
   // MCP host (v0.7.0): absent in pre-v0.7.0 configs → empty server list.
   const mc = (c.mcp ?? {}) as Partial<McpConfig>
   c.mcp = {
@@ -1647,7 +1690,7 @@ export function setModelHidden(cfg: Config, modelKey: string, hidden: boolean): 
 }
 
 /** Whether the user hid `modelKey` by hand (Config.hiddenModels). */
-export function isModelHidden(cfg: Pick<Config, 'hiddenModels'>, modelKey: string): boolean {
+export function isModelHidden(cfg: DeepReadonly<Pick<Config, 'hiddenModels'>>, modelKey: string): boolean {
   return (cfg.hiddenModels ?? []).includes(modelKey)
 }
 
@@ -1833,7 +1876,7 @@ export function isUnsafeMapKey(key: string): boolean {
   return key === '__proto__' || key === 'constructor' || key === 'prototype'
 }
 
-export function getModelProfile(cfg: Config, modelKey: string, engineId: string): unknown {
+export function getModelProfile(cfg: DeepReadonly<Config>, modelKey: string, engineId: string): unknown {
   // Pinned preset (ADR-353 D4) outranks the saved per-engine profiles — but ONLY when its
   // engine matches. The engine check is load-bearing: engines keep independent tunes per model
   // (issue #35), so a preset tuned on ONE engine must not shadow another engine's profile —

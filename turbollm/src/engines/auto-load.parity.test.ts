@@ -5,13 +5,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Hono } from 'hono'
-import { startEngine, type EngineStartBody } from '../api/engine-lifecycle'
+import { startEngine, type EngineStartBody } from '../services/engine-lifecycle'
 import { type Config, type Engine, defaultConfig } from '../config/config'
 import type { Deps } from '../deps'
 import type { ModelEntry } from '../models/scanner'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { runAutoLoad, type AutoLoadDeps } from './auto-load'
 import type { StartOpts } from './manager'
+import { chatRegistries } from '../test-support/chat-registries'
 
 type SavedProfile = Record<string, unknown>
 
@@ -95,8 +96,9 @@ async function captureResumedLoad(parity: ParityCase): Promise<StartOpts> {
 
 async function driveManualLoad(parity: ParityCase, side: EngineSide): Promise<void> {
   const d = {
+    ...chatRegistries(),
     ...side,
-    bench: { cancel: () => {}, waitIdle: () => Promise.resolve() },
+    bench: { isRunning: () => false, cancel: () => {}, waitIdle: () => Promise.resolve() },
     comfy: undefined,
   } as unknown as Deps
   const app = new Hono()
@@ -136,7 +138,7 @@ function recordingEngineSide(parity: ParityCase) {
   return {
     primaryLoads,
     loadExplicitCalls,
-    store: { snapshot: () => structuredClone(data), update: (fn: (c: Config) => void) => { fn(data) } },
+    store: { snapshot: () => structuredClone(data), read: () => structuredClone(data), update: (fn: (c: Config) => void) => { fn(data) } },
     scanner: { get: (key: string) => (key === parity.entry.key ? parity.entry : undefined) },
     registry: { active: () => parity.engine },
     manager: {

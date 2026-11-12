@@ -50,7 +50,7 @@ function memStore(root: string, opts: { throwOnSnapshot?: boolean } = {}) {
   const calls = { snapshot: 0 }
   const store = {
     dir: () => root,
-    snapshot: () => { calls.snapshot++; if (opts.throwOnSnapshot) throw new Error('boom'); return cfg },
+    snapshot: () => { calls.snapshot++; if (opts.throwOnSnapshot) throw new Error('boom'); return cfg }, read: () => { calls.snapshot++; if (opts.throwOnSnapshot) throw new Error('boom'); return cfg },
     update: (fn: (c: Config) => void) => { fn(cfg) },
   } as unknown as ConfigStore
   return { store, calls }

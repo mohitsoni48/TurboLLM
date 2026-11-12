@@ -124,7 +124,9 @@ const WRITABLE_LEAVES: Record<string, (v: unknown) => boolean> = Object.assign(
  *  whole-object write to `daemon` would replace `authToken`, `lanBind`, `requireApiKey`,
  *  `port` and `machineId` along with the two cosmetic fields, which is precisely the
  *  escalation this file exists to prevent. A block is only listed when EVERY one of its
- *  keys is itself writable.
+ *  keys is itself writable. `gateway` is not, for the same reason on a smaller scale: its
+ *  host-only `maxBodyMb` would be dropped by the replacement (falling back to its default),
+ *  so a peer reaches `autoSwap` and `keepN` only as leaves.
  *
  *  The value is the set of keys a block write must supply: these mirror the REQUIRED
  *  (non-optional) fields of the corresponding `Config` interface, so a block write can
@@ -140,7 +142,6 @@ const WRITABLE_BLOCKS: Record<string, readonly string[]> = Object.assign(
   Object.create(null) as Record<string, readonly string[]>,
   {
     modelDefaults: ['ctx', 'ngl'],
-    gateway: ['autoSwap', 'keepN'],
   },
 )
 

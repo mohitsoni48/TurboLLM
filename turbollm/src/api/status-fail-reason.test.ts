@@ -30,7 +30,7 @@ function appWithEngineError(dataDir: string, err: ErrLike | undefined, failed?: 
   const app = new Hono()
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dataDir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dataDir },
     manager: {
       currentOpts: () => null,
       restartOpts: () => failed?.opts ?? null,
@@ -55,7 +55,7 @@ function appWithEngineError(dataDir: string, err: ErrLike | undefined, failed?: 
     downloads: { activeCount: () => 0 },
     provision: { get: () => undefined },
     build: { get: () => undefined },
-    tunnel: { snapshot: () => null },
+    tunnel: { snapshot: () => null, read: () => null },
   } as unknown as Deps
   registerApi(app, d)
   return app

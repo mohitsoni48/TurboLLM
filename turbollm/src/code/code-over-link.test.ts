@@ -67,7 +67,7 @@ function mkHost(opts: { requireApiKey?: boolean } = {}): { d: Deps; h: HostHarne
   }
   const d = {
     version: '1.12.1',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     db: { recordApiUsage: () => {}, getConversation: () => null, getAgentRun: () => null },
     registry: { active: () => ({ kind: 'llama.cpp' }) },

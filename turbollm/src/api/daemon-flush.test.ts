@@ -11,6 +11,8 @@ import { createApp } from '../server'
 import { hashKey, provisionRemoteApiKey } from '../auth'
 import { defaultConfig, type Config } from '../config/config'
 import { registerChatRoutes } from '../chat/chat-routes'
+import { ChatTurns } from '../chat/chat-turns'
+import { ChatRuns } from '../chat/chat-runs'
 import { ConversationStore } from '../chat/db'
 import { openSqlJsDatabaseSync, preload } from '../chat/store/sql-js-database'
 import { preloadSqlJs } from '../chat/store/sqlite-adapter'
@@ -26,8 +28,9 @@ function mkDeps(db: Pick<ConversationStore, 'flush'>, mutate: (cfg: Config) => v
   mutate(cfg)
   const dir = tmpDir('daemon-flush-')
   const d = {
+    chatTurns: new ChatTurns(), chatRuns: new ChatRuns(),
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
     // createApp's other routes read the store at registration; only flush matters here.
     db: new Proxy(db, { get: (target, key) => (key in target ? Reflect.get(target, key) : () => []) }),
     telemetry: { firstUse: () => {}, useFeature: () => {} },
@@ -147,7 +150,9 @@ test('a reply still streaming is saved first: the file on disk holds the text it
 
   const dir = tmpDir('daemon-flush-streaming-')
   const store = new ConversationStore(dir)
-  const flushApp = createApp(mkDeps(store).d)
+  // The daemon builds one ChatTurns: the flush route reads the saves the chat routes registered.
+  const flushDeps = mkDeps(store).d
+  const flushApp = createApp(flushDeps)
   const chatCfg = {
     modelDefaults: { maxTokens: 0 },
     gateway: { autoSwap: true },
@@ -156,8 +161,10 @@ test('a reply still streaming is saved first: the file on disk holds the text it
   }
   const chat = new Hono()
   registerChatRoutes(chat, {
+    chatTurns: flushDeps.chatTurns,
+    chatRuns: flushDeps.chatRuns,
     db: store,
-    store: { snapshot: () => chatCfg, update: (fn: (c: never) => void) => fn(chatCfg as never), dir: () => dir },
+    store: { snapshot: () => chatCfg, read: () => chatCfg, update: (fn: (c: never) => void) => fn(chatCfg as never), dir: () => dir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
     registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
     manager: {

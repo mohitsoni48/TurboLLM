@@ -16,6 +16,8 @@ import { lanAuth, provisionRemoteApiKey } from '../auth'
 import { defaultConfig, type ApiKey } from '../config/config'
 import { registerLinkApi } from '../link/link-routes'
 import { registerChatRoutes } from '../chat/chat-routes'
+import { ChatTurns } from '../chat/chat-turns'
+import { ChatRuns } from '../chat/chat-runs'
 import { ConversationStore } from '../chat/db'
 import { tmpDir } from '../test-support/tmp'
 import type { Deps } from '../deps'
@@ -26,7 +28,7 @@ function fakeDeps(): Deps {
   return {
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     modelRouter: { targetEntry: () => undefined, route: async () => ({ target: REMOTE.baseUrl, remote: REMOTE }) },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     manager: {
       status: () => ({ state: 'stopped', model: null }),
       target: () => null,
@@ -243,7 +245,7 @@ function ledgerDeps(over: { remote?: boolean } = {}): { deps: Deps; ledger: Ledg
       route: async () => (remote ? { target: REMOTE.baseUrl, remote } : { target: 'http://127.0.0.1:8081' }),
       resolveRemoteTarget: () => undefined,
     },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     gate: {
       acquire: async () => { ledger.gateAcquires++; return () => {} },
     },
@@ -307,8 +309,9 @@ for (const [path, body] of [
     const { deps, ledger } = ledgerDeps({ remote: false })
     const res = await drive(deps, path, { ...(body as object), model: 'Qwen3' } as Record<string, unknown>)
     assert.equal(res.status, 200)
-    // The OpenAI path records usage off a TEED copy of the body, which drains after the
-    // handler has already returned its Response — so settle before reading the ledger.
+    // The OpenAI path records usage off a tap fed as the client reads the body (scalability review 4.5), so read it,
+    // then settle before reading the ledger.
+    await res.text()
     await new Promise((r) => setTimeout(r, 20))
     assert.equal(ledger.gateAcquires, 1)
     assert.equal(ledger.generationStarts, 1)
@@ -455,7 +458,7 @@ function linkedRouterDeps(advertised: { key: string; loaded: boolean }) {
     linkByName: (n: string) => (n.toLowerCase() === 'rig' ? link : undefined),
     modelOn: (id: string, key: string) => (id === link.id && key === remoteModel.key ? remoteModel : undefined),
   }
-  const store = { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) }
+  const store = { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) }
   const manager = fakeDeps().manager
   const scanner = { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined }
   const router = new ModelRouter(store as never, {} as never, manager as never, scanner as never, undefined, catalog as never)
@@ -538,7 +541,7 @@ test('a models:use token cannot switch a linked machine back to the model its ca
   }
   const hostDeps = {
     version: '1.14.7',
-    store: { snapshot: () => hostCfg, update: (fn: (c: never) => void) => fn(hostCfg as never) },
+    store: { snapshot: () => hostCfg, read: () => hostCfg, update: (fn: (c: never) => void) => fn(hostCfg as never) },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     db: { recordApiUsage: () => {} },
     registry: { active: () => ({ kind: 'llama.cpp' }) },
@@ -632,6 +635,8 @@ for (const loaded of [false, true]) {
     cfg.daemon = { ...(cfg.daemon as object), autoGenerateTitles: false, experimental: { memory: false }, autoMemoryEnabled: false }
     const chatDeps = {
       ...d,
+      chatTurns: new ChatTurns(),
+      chatRuns: new ChatRuns(),
       db,
       remoteCatalog: { modelOn: () => ({ key: 'big-model', name: 'Big', quant: null, nativeCtx: 8192, vision: false, loaded }) },
     } as unknown as Deps

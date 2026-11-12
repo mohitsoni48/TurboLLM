@@ -1,4 +1,4 @@
-import type { ApiKey } from '../config/config'
+import type { ApiKey, DeepReadonly } from '../config/config'
 import type { LinkCapability } from './types'
 
 /** Does this key carry `cap`?
@@ -9,7 +9,7 @@ import type { LinkCapability } from './types'
  *    defaulting these to "nothing" would silently revoke the user's existing keys)
  *  - key WITH a grant → exactly what the grant lists. An empty array grants nothing,
  *    and is deliberately distinct from an absent grant. */
-export function hasCapability(key: ApiKey | undefined, cap: LinkCapability): boolean {
+export function hasCapability(key: DeepReadonly<ApiKey> | undefined, cap: LinkCapability): boolean {
   if (!key) return false
   if (!key.grant) return true
   return key.grant.capabilities.includes(cap)
@@ -19,7 +19,7 @@ export function hasCapability(key: ApiKey | undefined, cap: LinkCapability): boo
  *  Absent grant → yes. Absent or empty allowlist → yes (the spec's default is "all local
  *  models"). Otherwise an EXACT match only — never a prefix or substring test, so the
  *  fuzzy matching in ModelRouter.resolveEntry can never widen an allowlist. */
-export function allowsModel(key: ApiKey | undefined, modelKey: string): boolean {
+export function allowsModel(key: DeepReadonly<ApiKey> | undefined, modelKey: string): boolean {
   if (!key) return false
   if (!key.grant) return true
   const list = key.grant.models

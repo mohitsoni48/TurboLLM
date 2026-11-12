@@ -12,6 +12,7 @@ import { basename, dirname, join, relative, win32 } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { tetheredExecFile } from '../util/tether'
+import { API_TIMEOUT_MS, LISTING_TIMEOUT_MS, createIdleAbort, withTimeout } from '../util/fetch-timeout'
 import { getSysInfo, primaryVendor, type GpuVendor } from '../sysinfo/sysinfo'
 import { quotePowerShellArg } from '../util/shell-command'
 // nvidia-smi and probe are leaf modules (the former imports only node builtins, the latter
@@ -343,6 +344,9 @@ function throwIfSwapBlocked(blockSwap: SwapGuard | undefined): void {
   if (blocked) throw Object.assign(new Error(blocked), { code: 'engine_in_use' })
 }
 
+/** How long a provisioning download may go without receiving a byte before it is treated as stalled. */
+const DOWNLOAD_STALL_MS = 120_000
+
 export async function downloadFile(
   url: string,
   dest: string,
@@ -352,7 +356,26 @@ export async function downloadFile(
   /** `expectedSha256`: the archive hash, verified as the body streams in; a mismatch deletes the download. */
   opts: { blockSwap?: SwapGuard; expectedSha256?: string } = {},
 ): Promise<void> {
+  // The daemon's global dispatcher has no body timeout (engine generations are silent for minutes), so a download
+  // that stops flowing is ended here instead: no bytes for DOWNLOAD_STALL_MS aborts it, however big the archive.
+  const idle = createIdleAbort(signal, DOWNLOAD_STALL_MS)
+  try {
+    await downloadBody(url, dest, onProgress, idle, fetchImpl, opts)
+  } finally {
+    idle.stop()
+  }
+}
+
+async function downloadBody(
+  url: string,
+  dest: string,
+  onProgress: ((p: ProvisionProgress) => void) | undefined,
+  idle: ReturnType<typeof createIdleAbort>,
+  fetchImpl: typeof fetch,
+  opts: { blockSwap?: SwapGuard; expectedSha256?: string },
+): Promise<void> {
   const { expectedSha256 } = opts
+  const signal = idle.signal
   const res = await fetchImpl(url, { redirect: 'follow', signal })
   if (!res.ok || !res.body) throw Object.assign(new Error(`download failed: HTTP ${res.status}`), { code: 'download_failed' })
   const total = Number(res.headers.get('content-length') ?? 0)
@@ -361,6 +384,7 @@ export async function downloadFile(
   let lastPct = -1
   const body = Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0])
   body.on('data', (chunk: Buffer) => {
+    idle.touch()
     hash?.update(chunk)
     got += chunk.length
     if (total && onProgress) {
@@ -774,7 +798,7 @@ export async function latestGithubRelease(repo: string, signal?: AbortSignal): P
   const apiUrl = `https://api.github.com/repos/${repo}/releases/latest`
   const res = await fetch(apiUrl, {
     headers: githubHeaders(),
-    signal,
+    signal: withTimeout(signal, API_TIMEOUT_MS),
   })
   if (isRateLimited(res)) throw new GithubRateLimitError(repo)
   if (!res.ok) throw new Error(`could not query ${repo} releases: HTTP ${res.status}`)
@@ -803,7 +827,7 @@ export async function latestReleaseTag(repo: string, signal?: AbortSignal): Prom
 export async function latestBuildTagRelease(repo: string, signal?: AbortSignal): Promise<string> {
   const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=100`, {
     headers: githubHeaders(),
-    signal,
+    signal: withTimeout(signal, LISTING_TIMEOUT_MS),
   })
   if (isRateLimited(res)) throw new GithubRateLimitError(repo)
   if (!res.ok) throw new Error(`could not list ${repo} releases: HTTP ${res.status}`)
@@ -831,7 +855,7 @@ export async function latestBuildTagRelease(repo: string, signal?: AbortSignal):
 export async function releaseAssetsForTag(repo: string, tag: string, signal?: AbortSignal): Promise<ReleaseAsset[]> {
   const res = await fetch(`https://api.github.com/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`, {
     headers: githubHeaders(),
-    signal,
+    signal: withTimeout(signal, API_TIMEOUT_MS),
   })
   if (isRateLimited(res)) throw new GithubRateLimitError(repo)
   if (!res.ok) throw new Error(`could not query ${repo} release ${tag}: HTTP ${res.status}`)
@@ -847,7 +871,7 @@ export async function latestCommitSha(repo: string, branch = '', signal?: AbortS
   const ref = branch.trim() ? encodeURIComponent(branch.trim()) : 'HEAD'
   const res = await fetch(`https://api.github.com/repos/${repo}/commits/${ref}`, {
     headers: githubHeaders(),
-    signal,
+    signal: withTimeout(signal, API_TIMEOUT_MS),
   })
   if (isRateLimited(res)) throw new GithubRateLimitError(repo)
   if (!res.ok) throw new Error(`could not query ${repo} commits: HTTP ${res.status}`)
@@ -1079,7 +1103,7 @@ async function listGithubReleases(repo: string, signal?: AbortSignal, maxPages =
   for (let page = 1; page <= maxPages; page++) {
     const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=100&page=${page}`, {
       headers: githubHeaders(),
-      signal,
+      signal: withTimeout(signal, LISTING_TIMEOUT_MS),
     })
     if (isRateLimited(res)) throw new GithubRateLimitError(repo)
     if (!res.ok) throw new Error(`could not list ${repo} releases: HTTP ${res.status}`)

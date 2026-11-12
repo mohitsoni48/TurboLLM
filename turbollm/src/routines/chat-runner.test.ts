@@ -20,7 +20,7 @@ function fakeDeps(overrides: Partial<{ customAgents: typeof AGENT[]; tools: Tool
   const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const d = {
     db,
-    store: { snapshot: () => ({ customAgents: overrides.customAgents ?? [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), dir: () => '/data/turbollm' },
+    store: { snapshot: () => ({ customAgents: overrides.customAgents ?? [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), read: () => ({ customAgents: overrides.customAgents ?? [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), dir: () => '/data/turbollm' },
     manager: {
       status: () => ({ state: 'running', model: { key: 'm', name: 'm', quant: '', ctx: overrides.ctx ?? 8192, vision: false } }),
       target: () => 'http://engine.invalid.local:1',
@@ -443,7 +443,7 @@ function mcpRoutineDeps(callerTools: string[]) {
   const { d, db } = fakeDeps({ customAgents: agents })
   const fired: string[] = []
   const runNow = async (id: string) => { fired.push(id); return { ok: true as const } }
-  const agentStore = { snapshot: () => ({ customAgents: agents }), update: (fn: (cfg: { customAgents: typeof agents }) => void) => fn({ customAgents: agents }) }
+  const agentStore = { snapshot: () => ({ customAgents: agents }), read: () => ({ customAgents: agents }), update: (fn: (cfg: { customAgents: typeof agents }) => void) => fn({ customAgents: agents }) }
   Object.assign(d, { tools: new ToolRegistry({ search: {}, sandbox: {}, mcpServers: [] } as never, db, runNow, agentStore as never) })
   // Created on the MCP agent directly: a stored routine's agentId cannot change (routine() edits).
   const ownerRoutine = db.createRoutine({ flavor: 'chat', prompt: 'owner prompt', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: OWNER_MCP_AGENT.id })

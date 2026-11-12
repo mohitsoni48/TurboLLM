@@ -257,20 +257,8 @@ export class TerminalManager {
 
     session.onData((data: string) => this.onOutput(id, data))
 
-    // On exit, close every attached WebSocket and clean up
-    session.onExit(() => {
-      this.broadcast(id, (h) => h.onClose?.())
-      this.sessions.delete(id)
-      this.infoMap.delete(id)
-      this.idleSince.delete(id)
-      this.idleTtl.delete(id)
-      this.lastOutput.delete(id)
-      if (shellPid) clearTerminalPid(this.dataDir, shellPid)
-      // The CLI subprocess exited on its own (e.g. `exit` typed in-shell) rather than via the
-      // kill endpoint below — revoke its session-scoped auth token here too, otherwise it only
-      // gets cleaned up on daemon restart.
-      if (codeSessionId) sessionAuth.revoke(codeSessionId)
-    })
+    // The shell exited on its own (e.g. "exit" typed in-shell); kill() runs the same cleanup.
+    session.onExit(() => this.finishTerminal(id))
 
     this.sessions.set(id, session)
     this.infoMap.set(id, {
@@ -326,20 +314,27 @@ export class TerminalManager {
    * Kill a terminal session.
    */
   kill(id: string): void {
+    // dispose() removes the session's listeners, so its exit event never reaches create()'s hook: finish here.
+    this.sessions.get(id)?.dispose()
+    this.finishTerminal(id)
+  }
+
+  /** The one end-of-life cleanup, run by the PTY's exit and by kill(), whichever comes first (the second is a
+   *  no-op once the session is gone): tell every attached socket, drop the bookkeeping, and revoke the Code
+   *  session's tllm-cs-* token, which otherwise stays valid until the daemon restarts. */
+  private finishTerminal(id: string): void {
     const session = this.sessions.get(id)
-    if (session) {
-      const shellPid = session.getPid()
-      session.dispose()
-      this.sessions.delete(id)
-      this.infoMap.delete(id)
-      this.idleSince.delete(id)
-      this.idleTtl.delete(id)
-      this.lastOutput.delete(id)
-      // Also cleared by the onExit handler in create() once the process actually exits —
-      // idempotent (force:true), so clearing eagerly here too just closes the window between
-      // "we told it to die" and "it actually did" a little sooner.
-      if (shellPid) clearTerminalPid(this.dataDir, shellPid)
-    }
+    if (!session) return
+    const codeSessionId = this.infoMap.get(id)?.codeSessionId ?? null
+    this.broadcast(id, (h) => h.onClose?.())
+    this.sessions.delete(id)
+    this.infoMap.delete(id)
+    this.idleSince.delete(id)
+    this.idleTtl.delete(id)
+    this.lastOutput.delete(id)
+    const shellPid = session.getPid()
+    if (shellPid) clearTerminalPid(this.dataDir, shellPid)
+    if (codeSessionId) sessionAuth.revoke(codeSessionId)
   }
 
   /**

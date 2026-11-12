@@ -76,7 +76,7 @@ function mkDeps(
     activeCount: () => records.filter((r) => r.status === 'downloading').length,
   }
 
-  const store = { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) }
+  const store = { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) }
   const d = { version: '1.11.2', store, downloads } as unknown as Deps
   return { d, enqueued, removed }
 }

@@ -27,7 +27,7 @@ function fakeDeps(target = 'http://engine.invalid.local:1'): Deps {
   return {
     scanner: { list: () => ({ models: LIBRARY, scanning: false, lastScanAt: '' }) },
     modelRouter: { targetEntry: () => undefined, route: async () => ({ target }), loadedModelKeys: () => new Set<string>() },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }), dir: () => '/tmp/turbollm-test-data' },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }), dir: () => '/tmp/turbollm-test-data' },
     manager: {
       status: () => ({ state: 'stopped', model: null }),
       target: () => target,
@@ -548,7 +548,7 @@ for (const [label, result, retry] of [
 // still loading (or while ComfyUI holds the GPU, which unloads it until the render ends) — and a link not probed yet
 // reads 'unknown'. A revoked link stays down until it is re-paired, so that one is still final.
 function realRouterDeps(opts: { primary?: Status['state']; linkStatus?: string }): Deps {
-  const store = { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false, keepN: 1 } }) }
+  const store = { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false, keepN: 1 } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false, keepN: 1 } }) }
   const primary = {
     status: () => ({ state: opts.primary ?? 'stopped', model: opts.primary === 'starting' ? { key: LIBRARY[0].key } : null }),
     target: () => null,
@@ -781,6 +781,7 @@ function managerIn(state: Status['state'], modelKey?: string, load?: () => Promi
     currentOpts: () => null,
     generationStart: () => {},
     generationEnd: () => {},
+    sessionStats: () => ({ activeRequests: 0 }), // keep-N eviction skips an engine mid-generation
   }
 }
 
@@ -799,7 +800,7 @@ function restrictedDeps(opts: {
 }): { d: Deps; router: ModelRouter; token: string } {
   const cfg = defaultConfig()
   cfg.gateway.keepN = opts.keepN ?? 1
-  const store = { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '/tmp/turbollm-test-data' }
+  const store = { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '/tmp/turbollm-test-data' }
   const scanner = { list: () => ({ models: [MODEL, OTHER, ...(opts.library ?? [])], scanning: false, lastScanAt: '' }), get: () => undefined }
   const engine = { id: 'llama', kind: opts.engineKind ?? 'llama-server', capabilities: { flags: [], kvTypes: [] } } as unknown as Engine
   const registry = { active: () => engine, layaEngine: () => undefined }
@@ -809,6 +810,7 @@ function restrictedDeps(opts: {
   const router = new ModelRouter(
     store as never, registry as never, opts.primary as unknown as Manager, scanner as never, comfy as never, undefined,
     () => (opts.slot ?? managerIn('stopped')) as unknown as Manager,
+    async () => null, // no real nvidia-smi: a pool-slot chat load reads the cards first (placeOnFreeVram)
   )
   const d = {
     ...fakeDeps(),
@@ -903,7 +905,7 @@ for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
     }
     // The engine the opts name is the selected one: release() reloads a model only on the selected engine.
     const comfyStore = {
-      snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g' }, activeEngineId: 'e' }),
+      snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g' }, activeEngineId: 'e' }), read: () => ({ comfyui: { enabled: true, gatePath: '/cn/g' }, activeEngineId: 'e' }),
       dir: () => '/tmp/turbollm-test-data',
     }
     const guard = new ComfyGuard(comfyStore as never, primary as unknown as Manager, 30, async () => ({ ok: true, status: 200 }))
@@ -960,7 +962,7 @@ for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
       }
       // The engine the opts name is the selected one: release() reloads a model only on the selected engine.
       const comfyStore = {
-        snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g' }, activeEngineId: 'e' }),
+        snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g' }, activeEngineId: 'e' }), read: () => ({ comfyui: { enabled: true, gatePath: '/cn/g' }, activeEngineId: 'e' }),
         dir: () => '/tmp/turbollm-test-data',
       }
       const guard = new ComfyGuard(comfyStore as never, primary as unknown as Manager, 30, async () => ({ ok: true, status: 200 }))
@@ -1064,4 +1066,29 @@ for (const [path, body] of JEV_REQUESTS) {
       await engine.close()
     }
   })
+}
+
+// Review L2: a refusal that clears once a reply finishes or a tune ends (RouteResult's `reason`) tells the client when to
+// come back, as the extension API's own 429s do; the SDKs' default backoff otherwise spends its retries in about a second.
+for (const [label, result, retryAfter] of [
+  ['every engine generating', { status: 503, message: 'Every loaded model is generating…', reason: 'busy' }, '5'],
+  ['auto-tune running', { status: 503, message: 'Auto-tune is running…', reason: 'autotune' }, '5'],
+  ['ComfyUI holding the GPU', { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }, null],
+  ['a failed model load', { status: 503, message: 'Engine start failed: out of memory', permanent: true }, null],
+] as const) {
+  for (const [path, body] of [
+    ['/v1/messages', { model: 'big', max_tokens: 100, messages: [] }],
+    ['/v1/chat/completions', { model: 'big', messages: [] }],
+  ] as const) {
+    test(`${path}: ${label} → 503 with Retry-After ${retryAfter ?? 'unset'}`, async () => {
+      const app = new Hono()
+      const deps = fakeDeps() as unknown as { modelRouter: { route: () => Promise<unknown> } }
+      deps.modelRouter.route = async () => result
+      registerGateway(app, deps as unknown as Deps)
+      const res = await app.request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      assert.equal(res.status, 503)
+      assert.equal(res.headers.get('retry-after'), retryAfter)
+      assert.equal(res.headers.get('x-should-retry'), retryAfter ? null : (('permanent' in result) ? 'false' : null))
+    })
+  }
 }

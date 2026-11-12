@@ -9,7 +9,8 @@
  * Never throws.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { readFileSync, mkdirSync } from 'node:fs'
+import { writeFileAtomicSync } from '../util/atomic-write'
 import { join } from 'node:path'
 
 /** How many `daily:` keys to retain — one per day would otherwise grow forever. */
@@ -46,7 +47,7 @@ export function claimOnce(dataDir: string, key: string): boolean {
     const rest = keys.filter((k) => !k.startsWith('daily:'))
 
     mkdirSync(join(dataDir, 'telemetry'), { recursive: true })
-    writeFileSync(ledgerPath(dataDir), JSON.stringify([...rest, ...dailies]))
+    writeFileAtomicSync(ledgerPath(dataDir), JSON.stringify([...rest, ...dailies]))
     return true
   } catch {
     return false

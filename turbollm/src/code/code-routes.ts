@@ -19,9 +19,9 @@
 // (navigate away), and reopen without ever aborting the run. See code-run-manager.ts.
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import type { Deps } from '../deps'
+import type { CodeSessionDeletion, Deps } from '../deps'
 import { holdOpen } from '../auth'
-import type { AgentRun, Message } from '../chat/db'
+import type { AgentRun, ConversationStore, Message } from '../chat/db'
 import { CodeRunManager, type SteerKind } from './code-run-manager'
 import { parseReasoningEffort } from '../chat/reasoning-effort'
 import { compactCodeSession, disposeLspClientsForConv } from './code-session'
@@ -165,6 +165,42 @@ function toSidebarRow(run: AgentRun) {
  *  the session's scope) ends when the session is archived or deleted. */
 export function releaseCodeSessionProcesses(sessionId: string): Promise<void> {
   return releaseTetherScope(`code-session:${sessionId}`)
+}
+
+/** Permanently deletes a Code session with everything it holds outside the database: its LSP clients, its agent's
+ *  background jobs and its worktree, then its rows (db.deleteCodeSession). Refused while a run is active, so a live
+ *  turn never deletes out from under itself. With `keepWhenWorktreeStays` (the retention sweep, which no user asked to
+ *  delete anything), a session whose worktree could not be removed is kept, rows and all, rather than leaving that
+ *  worktree's uncommitted work with nothing pointing at it. */
+export async function deleteCodeSessionWithCleanup(
+  db: ConversationStore, runs: Pick<CodeRunManager, 'isActive'>, id: string, removeWorktree: typeof removeSessionWorktree,
+  { keepWhenWorktreeStays = false } = {},
+): Promise<CodeSessionDeletion> {
+  const run = db.getAgentRun(id)
+  if (!run) return { deleted: false, reason: 'not_found' }
+  if (runs.isActive(id)) return { deleted: false, reason: 'run_active' }
+  disposeLspClientsForConv(run.convId)
+  // Its agent's background jobs end first, and are gone before the worktree is removed: one whose cwd is the
+  // worktree stops Windows from removing the directory, and on POSIX it could keep writing into it, so `git
+  // worktree remove` (without --force) refused for its untracked files.
+  await releaseCodeSessionProcesses(id)
+
+  // Clean up the session's worktree, but never at the cost of unmerged work. `git worktree
+  // remove` (deliberately without --force) refuses while the worktree has modified or untracked
+  // files, so uncommitted changes block removal and are reported instead of vanishing with the
+  // session. Committed work is safe either way — removing a worktree does not delete its branch.
+  let worktreeNote: string | undefined
+  if (run.worktreePath && run.repoRoot) {
+    const removed = await removeWorktree(run.repoRoot, run.worktreePath)
+    if (!removed.ok) worktreeNote = removed.message
+  }
+  if (worktreeNote && keepWhenWorktreeStays) return { deleted: false, reason: 'worktree_kept', worktreeNote }
+
+  db.deleteCodeSession(id)
+  // The session row is gone regardless — leaving it behind because a directory couldn't be
+  // cleaned would strand the user with an undeletable session. The note tells them what is
+  // still on disk and the exact command to finish the job.
+  return worktreeNote ? { deleted: true, worktreeNote } : { deleted: true }
 }
 
 /** `seams` is for the route tests: what the delete route removes the session's worktree with. */
@@ -503,8 +539,8 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (archived && runs.isActive(id)) return err(c, 409, 'run_active', 'Stop the current run before archiving this session.')
     db.setAgentRunArchived(id, archived)
     // An archived session's background jobs end (SIGTERM, then the group kill after 3 s): it is closed, as a
-    // deleted one is, and nothing would ever end them otherwise but TurboLLM's own stop.
-    if (archived) void releaseCodeSessionProcesses(id)
+    // deleted one is, and nothing would ever end them otherwise but TurboLLM's own stop. Likewise its language servers.
+    if (archived) { disposeLspClientsForConv(run.convId); void releaseCodeSessionProcesses(id) }
     return c.json({ ok: true, archived })
   })
 
@@ -512,32 +548,19 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
   // Permanent — messages, the working doc, and the agent_run + conversation rows are all
   // gone (db.deleteCodeSession). Blocked while a run is active so a live turn never deletes
   // out from under itself; the client is expected to stop the run first (or the user retries).
+  const deleteSession = (id: string) => deleteCodeSessionWithCleanup(db, runs, id, removeWorktree)
+  // The retention sweep (chat/retention.ts) deletes a pruned Code routine run's session through this same
+  // cleanup, keeping one whose worktree holds uncommitted work. Handed over here because this module is loaded
+  // lazily, and never on Android.
+  d.deleteCodeSession = (id) => deleteCodeSessionWithCleanup(db, runs, id, removeWorktree, { keepWhenWorktreeStays: true })
   app.delete('/api/v1/code/sessions/:id', async (c) => {
-    const id = c.req.param('id')
-    const run = db.getAgentRun(id)
-    if (!run) return err(c, 404, 'not_found', 'Session not found.')
-    if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop the current run before deleting this session.')
-    disposeLspClientsForConv(run.convId)
-    // Its agent's background jobs end first, and are gone before the worktree is removed: one whose cwd is the
-    // worktree stops Windows from removing the directory, and on POSIX it could keep writing into it, so `git
-    // worktree remove` (without --force) refused for its untracked files.
-    await releaseCodeSessionProcesses(id)
-
-    // Clean up the session's worktree, but never at the cost of unmerged work. `git worktree
-    // remove` (deliberately without --force) refuses while the worktree has modified or untracked
-    // files, so uncommitted changes block removal and are reported instead of vanishing with the
-    // session. Committed work is safe either way — removing a worktree does not delete its branch.
-    let worktreeNote: string | undefined
-    if (run.worktreePath && run.repoRoot) {
-      const removed = await removeWorktree(run.repoRoot, run.worktreePath)
-      if (!removed.ok) worktreeNote = removed.message
+    const result = await deleteSession(c.req.param('id'))
+    if (!result.deleted) {
+      return result.reason === 'not_found'
+        ? err(c, 404, 'not_found', 'Session not found.')
+        : err(c, 409, 'run_active', 'Stop the current run before deleting this session.')
     }
-
-    db.deleteCodeSession(id)
-    // The session row is gone regardless — leaving it behind because a directory couldn't be
-    // cleaned would strand the user with an undeletable session. The note tells them what is
-    // still on disk and the exact command to finish the job.
-    return c.json(worktreeNote ? { ok: true, worktreeNote } : { ok: true })
+    return c.json(result.worktreeNote ? { ok: true, worktreeNote: result.worktreeNote } : { ok: true })
   })
 
   // ── manual /compact ────────────────────────────────────────────────────────

@@ -16,7 +16,7 @@ function tempDir(): string {
 function fakeStore(level: string, machineId = '22222222-2222-2222-2222-222222222222') {
   const cfg = { telemetry: { level, machineId } }
   return {
-    snapshot: () => cfg,
+    snapshot: () => cfg, read: () => cfg,
     update: (fn: (c: typeof cfg) => void) => fn(cfg),
     cfg,
   }

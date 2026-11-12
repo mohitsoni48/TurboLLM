@@ -36,7 +36,7 @@ function mkDeps(keys: ApiKey[], opts: { busy?: boolean; loaded?: string | null }
   }
   const d = {
     version: '1.11.2',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     db: { recordApiUsage: () => {} },
     registry: { active: () => ({ kind: 'llama.cpp' }) },
@@ -388,3 +388,31 @@ for (const body of ['null', '5', '"hello"', 'true', '[]', '[{"role":"user","cont
     assert.equal(upstream, null)
   })
 }
+
+// The one endpoint a remote peer key reaches buffers its body whole (c.req.json()): it takes the gateway's body cap too
+// (scalability review 4.4), after linkAuth so a caller without a valid key cannot make it buffer anything.
+test('a peer chat body over gateway.maxBodyMb is a 413 before it is read, and never reaches the router', async () => {
+  const { d, h } = mkDeps([key('tllm-a', ['models:use'])])
+  ;(d.store.read() as unknown as { gateway: { maxBodyMb: number } }).gateway.maxBodyMb = 1
+  const res = await app(d).request('/api/link/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'X-TurboLLM-Auth': 'tllm-a', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: LOADED, messages: [{ role: 'user', content: 'x'.repeat(2 * 1024 * 1024) }] }),
+  })
+  assert.equal(res.status, 413)
+  const body = await res.json() as { error: { type: string; code: string } }
+  assert.equal(body.error.type, 'invalid_request_error')
+  assert.equal(body.error.code, 'request_too_large')
+  assert.deepEqual(h.routed, [])
+})
+
+test('an oversized body without a valid key is still the 401, not a 413', async () => {
+  const { d } = mkDeps([key('tllm-a', ['models:use'])])
+  ;(d.store.read() as unknown as { gateway: { maxBodyMb: number } }).gateway.maxBodyMb = 1
+  const res = await app(d).request('/api/link/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'X-TurboLLM-Auth': 'wrong', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: LOADED, messages: [{ role: 'user', content: 'x'.repeat(2 * 1024 * 1024) }] }),
+  })
+  assert.equal(res.status, 401)
+})

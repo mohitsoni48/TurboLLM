@@ -34,7 +34,7 @@ function fixture(t: TestContext) {
     const cfg: Config = { ...defaultConfig(), modelDirs: dirs }
     return new Scanner({
       dir: () => data,
-      snapshot: () => cfg,
+      snapshot: () => cfg, read: () => cfg,
       update: (fn: (c: Config) => void) => fn(cfg),
     } as unknown as ConfigStore)
   } }

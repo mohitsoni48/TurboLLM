@@ -2,7 +2,7 @@ import { negotiateVersion, LINK_API_VERSIONS } from './protocol'
 import type { LinkProbe } from './link-state'
 import { LINK_CAPABILITIES } from './types'
 import type { HelloResponse, LinkCapability, LinkRecord, RemoteDownload, RemoteModel } from './types'
-import type { ModelStatusView } from '../api/status-view'
+import type { ModelStatusView } from '../services/status-view'
 
 const DEFAULT_TIMEOUT_MS = 8000
 

@@ -18,6 +18,7 @@ import type { Deps } from '../deps'
 import type { LoadProfile } from '../models/profile'
 import type { ModelEntry } from '../models/scanner'
 import { tmpDir } from '../test-support/tmp'
+import { chatRegistries } from '../test-support/chat-registries'
 
 const CAPS = { kvTypes: ['f16', 'q8_0'], flags: [] as string[] }
 const CUDA = { id: 'cuda', name: 'llama.cpp CUDA', kind: 'llama-server', binPath: '/e/llama-server', version: 'b1', capabilities: CAPS }
@@ -68,7 +69,7 @@ function harness(store = ConfigStore.load(join(tmpDir('tllm-bench-keep-'), 'conf
   const bench = new BenchRunner(manager as never, store, scanner as never, registry as never, 'test', {} as never)
   const r = bench as unknown as RunnerInternals
   r.extractCardSampling = async () => undefined
-  const d = { version: 'test', store, registry, manager, scanner, bench, modelRouter: { stopExplicit: () => false } } as unknown as Deps
+  const d = { version: 'test', store, registry, manager, scanner, bench, modelRouter: { stopExplicit: () => false }, ...chatRegistries() } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
   const post = (path: string) => app.request(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })

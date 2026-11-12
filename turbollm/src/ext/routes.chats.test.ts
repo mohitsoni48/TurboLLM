@@ -40,6 +40,10 @@ function harness(ext?: ExtRouteDeps) {
       { hash: keyHash(ACME), tenant: 'acme' },
       { hash: keyHash(GLOBEX), tenant: 'globex' },
       { hash: keyHash(ACME_READONLY), tenant: 'acme', scopes: ['chats:read'] },
+    ] }), read: () => ({ apiKeys: [
+      { hash: keyHash(ACME), tenant: 'acme' },
+      { hash: keyHash(GLOBEX), tenant: 'globex' },
+      { hash: keyHash(ACME_READONLY), tenant: 'acme', scopes: ['chats:read'] },
     ] }) },
   } as never
   const app = new Hono()
@@ -60,6 +64,8 @@ function harnessNoAdapter() {
     db: conv,
     chatStore: new ChatStoreRouter(conv.chatStore, null),
     store: { snapshot: () => ({ apiKeys: [
+      { hash: keyHash(ACME), tenant: 'acme' },
+    ] }), read: () => ({ apiKeys: [
       { hash: keyHash(ACME), tenant: 'acme' },
     ] }) },
   } as never
@@ -89,6 +95,9 @@ function harnessWithRuns(bodyFactory?: () => Promise<{ status: 'complete' | 'abo
     db: conv,
     chatStore,
     store: { snapshot: () => ({ apiKeys: [
+      { hash: keyHash(ACME), tenant: 'acme' },
+      { hash: keyHash(GLOBEX), tenant: 'globex' },
+    ] }), read: () => ({ apiKeys: [
       { hash: keyHash(ACME), tenant: 'acme' },
       { hash: keyHash(GLOBEX), tenant: 'globex' },
     ] }) },
@@ -138,7 +147,7 @@ function harnessWithRunsDelayedGetChat(gate: Promise<void>) {
   const d = {
     db: conv,
     chatStore,
-    store: { snapshot: () => ({ apiKeys: [{ hash: keyHash(ACME), tenant: 'acme' }] }) },
+    store: { snapshot: () => ({ apiKeys: [{ hash: keyHash(ACME), tenant: 'acme' }] }), read: () => ({ apiKeys: [{ hash: keyHash(ACME), tenant: 'acme' }] }) },
     manager: {
       status: () => ({ state: 'running', model: 'test-model' }),
       target: () => 'http://127.0.0.1:9999',
@@ -752,6 +761,27 @@ test('an attachments-only message (no content) is accepted with generate:false, 
     const full = await got.json() as { attachments: string[]; content: string }
     assert.deepEqual(full.attachments, ['data:image/png;base64,AAA='])
     assert.equal(full.content, '')
+  } finally {
+    cleanup()
+  }
+})
+
+test('include=attachments never reads a local image file for another tenant that posts its reference', async () => {
+  const { app, db, cleanup } = harness()
+  try {
+    // An in-app image saved as a file: a tenant that learns its hash must not get the bytes back through this API.
+    const [ref] = await db.attachments.save(['data:image/png;base64,iVBORw0KGgo='])
+    assert.match(ref, /^attachment:/)
+    const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'Files', owner: 'u1' }))
+    const chatId = (await made.json() as { id: string }).id
+    const posted = await app.request(`/api/ext/v1/chats/${chatId}/messages?include=attachments`,
+      json(ACME, { role: 'user', owner: 'u1', generate: false, attachments: [ref] }))
+    assert.deepEqual((await posted.json() as { attachments: string[] }).attachments, [ref], 'returned as posted')
+
+    const one = await app.request(`/api/ext/v1/messages/${(await db.chatStore.listMessages({ tenant: 'acme', owner: 'u1' }, chatId, {})).data[0].id}?owner=u1&include=attachments`, json(ACME))
+    assert.deepEqual((await one.json() as { attachments: string[] }).attachments, [ref])
+    const list = await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1&include=attachments`, json(ACME))
+    assert.deepEqual((await list.json() as { data: Array<{ attachments: string[] }> }).data.map((m) => m.attachments), [[ref]])
   } finally {
     cleanup()
   }
@@ -1452,7 +1482,7 @@ test('an unhandled throw anywhere on this surface still returns a JSON error env
   const d = {
     db: conv,
     chatStore: new ChatStoreRouter(conv.chatStore, conv.chatStore),
-    store: { snapshot: () => ({ apiKeys: [{ hash: keyHash(ACME), tenant: 'acme' }] }) },
+    store: { snapshot: () => ({ apiKeys: [{ hash: keyHash(ACME), tenant: 'acme' }] }), read: () => ({ apiKeys: [{ hash: keyHash(ACME), tenant: 'acme' }] }) },
   } as never
   const throwingRuns = { isChatActive: () => { throw new Error('synthetic isChatActive failure') } } as never
   const app = new Hono()

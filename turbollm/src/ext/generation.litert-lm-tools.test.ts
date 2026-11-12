@@ -46,7 +46,7 @@ async function engineBody(engineKind: string, toolCalls: boolean | undefined, ct
       },
       registry: { active: () => ({ id: engineKind, kind: engineKind }) },
       scanner: { get: (key: string) => (key === 'm' && toolCalls !== undefined ? { key: 'm', toolCalls } : undefined) },
-      store: { snapshot: () => ({ tools: { toolPolicies: {}, autoAllowAll: false }, modelDefaults: {} }) },
+      store: { snapshot: () => ({ tools: { toolPolicies: {}, autoAllowAll: false }, modelDefaults: {} }), read: () => ({ tools: { toolPolicies: {}, autoAllowAll: false }, modelDefaults: {} }) },
       tools: new ToolRegistry({ search: {}, sandbox: {}, mcpServers: [] } as never),
     } as unknown as Deps
     const chat = await chatStore.createChat(SCOPE, { title: 't' })

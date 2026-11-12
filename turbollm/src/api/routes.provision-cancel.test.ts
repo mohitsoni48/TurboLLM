@@ -21,7 +21,7 @@ function app(provision: ProvisionState, dir: string) {
   }
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
     manager: {
       status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }),
       launchCommand: () => undefined,

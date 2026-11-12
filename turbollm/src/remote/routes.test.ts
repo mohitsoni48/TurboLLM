@@ -37,7 +37,7 @@ const makeApp = (opts: { enabled: boolean; lanBind?: boolean }) => {
   let enabled = 0
   let disabled = 0
   const d = {
-    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
     remote: {
       ingressPort: () => 6997,
       state: () => ({ kind: 'connected', url: 'https://x.test', since: '2026-09-10T00:00:00Z' }),
@@ -99,7 +99,7 @@ test('remote routes: status names the port a self-run tunnel points at, while of
   const status = async (ingressPort: number) => {
     const remote = new RemoteAccessManager({ app: new Hono(), ingressPort, makeProvider: () => provider, probe: async () => true })
     const d = {
-      store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
+      store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
       remote,
       bindPort: 6997,
     } as unknown as Deps
@@ -149,7 +149,7 @@ test('remote routes: status names no tunnel port while the main listener holds t
   cfg.remoteAccess.provider = 'custom'
   const remote = new RemoteAccessManager({ app: new Hono(), ingressPort: 6997, makeProvider: () => { throw new Error('not started') }, probe: async () => true })
   const d = {
-    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
     remote,
     bindPort: 6997, // moved there from 6996 in Settings, this boot
   } as unknown as Deps
@@ -174,7 +174,7 @@ test("settings: a port change onto this boot's remote-access port is refused whi
     let rebinds = 0
     const d = {
       version: 'test',
-      store: { snapshot: () => structuredClone(cfg), update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
+      store: { snapshot: () => structuredClone(cfg), read: () => structuredClone(cfg), update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
       manager: { status: () => ({ state: 'stopped', model: null }) },
       bindPort: 6996,
       // What the listen callback does once the new port is bound (cli.ts deps.rebind).
@@ -291,7 +291,7 @@ test('remote routes: a Start sent during a Stop waits for it, then answers with 
   const p = new SlowStopProvider()
   const remote = new RemoteAccessManager({ app: new Hono(), ingressPort: 0, makeProvider: () => p, probe: async () => true })
   const d = {
-    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
     remote,
   } as unknown as Deps
   const app = new Hono()
@@ -329,7 +329,7 @@ test('remote routes: Start answers with a token whose key is stored, minting afr
   cfg.daemon.experimental.remoteAccess = true
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
     manager: { status: () => ({ state: 'stopped', model: null }) },
     remote: {
       ingressPort: () => 6997,
@@ -407,7 +407,7 @@ test("boot gating: a persisted enabled:true does NOT bypass the experimental fla
   const cfg = defaultConfig()
   cfg.remoteAccess.enabled = true
   cfg.daemon.experimental.remoteAccess = false
-  const d = { store: { snapshot: () => cfg } } as unknown as Deps
+  const d = { store: { snapshot: () => cfg, read: () => cfg } } as unknown as Deps
   const tunnelFlag = false
   const remoteWanted = tunnelFlag || (isRemoteAccessEnabled(d) && cfg.remoteAccess.enabled)
   assert.equal(remoteWanted, false)
@@ -417,7 +417,7 @@ test("boot gating: enabled:true DOES start the supervisor once the flag is on", 
   const cfg = defaultConfig()
   cfg.remoteAccess.enabled = true
   cfg.daemon.experimental.remoteAccess = true
-  const d = { store: { snapshot: () => cfg } } as unknown as Deps
+  const d = { store: { snapshot: () => cfg, read: () => cfg } } as unknown as Deps
   const tunnelFlag = false
   const remoteWanted = tunnelFlag || (isRemoteAccessEnabled(d) && cfg.remoteAccess.enabled)
   assert.equal(remoteWanted, true)
@@ -427,7 +427,7 @@ test("boot gating: --tunnel is the ungated override regardless of the flag or en
   const cfg = defaultConfig()
   cfg.remoteAccess.enabled = false
   cfg.daemon.experimental.remoteAccess = false
-  const d = { store: { snapshot: () => cfg } } as unknown as Deps
+  const d = { store: { snapshot: () => cfg, read: () => cfg } } as unknown as Deps
   const tunnelFlag = true
   const remoteWanted = tunnelFlag || (isRemoteAccessEnabled(d) && cfg.remoteAccess.enabled)
   assert.equal(remoteWanted, true)
@@ -462,7 +462,7 @@ function settingsApp(opts: { uiEnabled: boolean }) {
   const d = {
     version: 'test',
     // snapshot() is a copy, as in ConfigStore — the PATCH compares before/after snapshots.
-    store: { snapshot: () => structuredClone(cfg), update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
+    store: { snapshot: () => structuredClone(cfg), read: () => structuredClone(cfg), update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
     manager: { status: () => ({ state: 'stopped', model: null }) },
     remote: {
       ingressPort: () => 6997,

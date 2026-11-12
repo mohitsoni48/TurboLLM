@@ -1,9 +1,8 @@
 // turbollm/src/ext/generation.test.ts
 //
 // generation.ts's engine-wiring is not exercised by routes.runs.test.ts (that file injects a
-// fake `makeBody` and never touches this module — see generation.ts's own header comment). This
-// file targets the one piece of generation.ts that IS practical and worthwhile to unit-test in
-// isolation: `loadFullHistory`'s pagination loop, which fixes a Critical bug a review found —
+// fake `makeBody` and never touches this module); generation.loop.test.ts drives it end to end.
+// This file unit-tests its pure pieces, first `loadFullHistory`'s pagination loop, which fixes a Critical bug a review found —
 // `d.chatStore.listMessages(scope, chatId, {limit: N})` with no cursor returns the OLDEST page
 // (`ORDER BY seq ASC`), so a single un-paginated call silently drops the newest messages —
 // including the turn currently being generated — once a chat has more than one page's worth of
@@ -18,7 +17,7 @@ import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
 import {
   loadFullHistory, shouldFlushCheckpoint, FLUSH_INTERVAL_MS, FLUSH_MIN_CHARS,
-  extractChunkUsage, buildUsagePatch, buildEngineRequestBody, mapSampling, createMakeBody,
+  extractChunkUsage, buildUsagePatch, mapSampling, createMakeBody,
 } from './generation.js'
 import { ToolRegistry, MCP_AGENT_REFUSED_MESSAGE, MCP_ROUTINE_REFUSED_MESSAGE } from '../tools/tool-registry'
 import type { Deps } from '../deps'
@@ -174,32 +173,12 @@ test('buildUsagePatch: spreads cleanly into a patch literal alongside other fiel
 
 // Release-gate I7: samplingOverride is unvalidated integrator JSON (chat.sampling, stored
 // verbatim). A tenant setting sampling.model/.messages/.stream/.stream_options must never be
-// able to override this route's own control fields.
-test('buildEngineRequestBody: a legitimate sampling key merges in alongside the control fields', () => {
-  const body = buildEngineRequestBody(
-    { model: 'real-model', messages: [{ role: 'user', content: 'hi' }], stream: true },
-    { temperature: 0.7, top_p: 0.9 },
-  )
-  assert.deepEqual(body, {
-    temperature: 0.7, top_p: 0.9,
-    model: 'real-model', messages: [{ role: 'user', content: 'hi' }], stream: true,
-  })
-})
+// able to override this route's own control fields. The precedence itself (sampling UNDER the
+// request's fields) is the generation core's (GenerationTurn.engineSampling: generation-core.test.ts),
+// proven through a real run with a hostile sampling object in generation.loop.test.ts.
 
-test('buildEngineRequestBody: sampling cannot override model, messages, stream, or stream_options', () => {
-  const body = buildEngineRequestBody(
-    { model: 'real-model', messages: [{ role: 'user', content: 'real history' }], stream: true, stream_options: { include_usage: true } },
-    { model: 'attacker-model', messages: [{ role: 'user', content: 'smuggled prompt' }], stream: false, stream_options: { include_usage: false }, temperature: 0.5 },
-  )
-  assert.equal(body.model, 'real-model', 'sampling must not override which model is called')
-  assert.deepEqual(body.messages, [{ role: 'user', content: 'real history' }], 'sampling must not override the assembled history')
-  assert.equal(body.stream, true, 'sampling must not turn off streaming — the SSE read loop assumes it is on')
-  assert.deepEqual(body.stream_options, { include_usage: true }, 'sampling must not override usage capture')
-  assert.equal(body.temperature, 0.5, 'a non-reserved sampling key still comes through normally')
-})
-
-// Round-2 release-gate finding H2: buildEngineRequestBody's precedence only protects fields the
-// ROUTE explicitly sets afterward — tool_choice is never set by any route, so there was no
+// Round-2 release-gate finding H2: that precedence only protects fields the
+// ROUTE explicitly sets — tool_choice is never set by any route, so there was no
 // control field for it to lose to, and it reached the engine verbatim. Live-reproduced: a tenant
 // setting sampling.tool_choice: 'required' could COMPEL a tool call every turn (not just hope for
 // one), executed under the local install's own tool policy — sharpening I10's accepted risk.
@@ -264,7 +243,7 @@ async function tenantRun(calls: (routineId: string) => ScriptedCall[], mcpPolicy
   const { chatStore, cleanup } = harness()
   try {
     const agents = [{ id: 'owner-mcp-agent', name: 'Owner', systemPrompt: '', tools: ['mcp__srv_1__run'] }]
-    const agentStore = { snapshot: () => ({ customAgents: agents }), update: (fn: (cfg: { customAgents: typeof agents }) => void) => fn({ customAgents: agents }) }
+    const agentStore = { snapshot: () => ({ customAgents: agents }), read: () => ({ customAgents: agents }), update: (fn: (cfg: { customAgents: typeof agents }) => void) => fn({ customAgents: agents }) }
     const fired: string[] = []
     const runNow = async (id: string) => { fired.push(id); return { ok: true as const } }
     const tools = new ToolRegistry({ search: {}, sandbox: {}, mcpServers: [] } as never, routines, runNow, agentStore as never, undefined, () => true)
@@ -279,7 +258,7 @@ async function tenantRun(calls: (routineId: string) => ScriptedCall[], mcpPolicy
         generationEnd: () => {},
       },
       registry: { active: () => undefined },
-      store: { snapshot: () => ({ tools: { toolPolicies, autoAllowAll: false }, modelDefaults: {} }) },
+      store: { snapshot: () => ({ tools: { toolPolicies, autoAllowAll: false }, modelDefaults: {} }), read: () => ({ tools: { toolPolicies, autoAllowAll: false }, modelDefaults: {} }) },
       tools,
     } as unknown as Deps
     const chat = await chatStore.createChat(SCOPE, { title: 'tenant' })

@@ -20,7 +20,8 @@
  * risk ADR-009 already accepts for the queue flush.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { readFileSync, mkdirSync } from 'node:fs'
+import { writeFileAtomicSync } from '../util/atomic-write'
 import { join } from 'node:path'
 
 interface DailyCount {
@@ -51,7 +52,7 @@ function readFromDisk(dataDir: string): DailyUsage {
 
 function writeToDisk(dataDir: string, usage: DailyUsage): void {
   mkdirSync(join(dataDir, 'telemetry'), { recursive: true })
-  writeFileSync(usagePath(dataDir), JSON.stringify(usage))
+  writeFileAtomicSync(usagePath(dataDir), JSON.stringify(usage))
 }
 
 /** The in-memory usage map for `dataDir`, hydrated from disk on first access

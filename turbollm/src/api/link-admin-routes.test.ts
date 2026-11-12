@@ -20,7 +20,7 @@ function mkApp(fetchImpl?: typeof fetch, telemetry?: Emitter, daemon?: Record<st
   }
   const d = {
     version: '1.11.2',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     ...(telemetry ? { telemetry } : {}),
     ...deps,
   } as unknown as Deps
@@ -37,7 +37,7 @@ function mkTelemetry(): { telemetry: Emitter; dir: string; cleanup: () => void }
   const cfg = { telemetry: { level: 'anon', machineId: '33333333-3333-3333-3333-333333333333' } }
   const telemetry = new Emitter({
     dataDir: dir,
-    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } as never,
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } as never,
     version: '1.11.2',
     os: 'win32/x64',
   })
@@ -359,7 +359,7 @@ test('PATCH re-probe flags a machineId change instead of silently adopting it â€
   const appPatched = new Hono()
   registerLinkAdminRoutes(appPatched, {
     version: '1.11.2',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
   } as unknown as Deps, { fetchImpl: second })
   const res = await appPatched.request(`/api/v1/links/${id}`, {
     method: 'PATCH', headers: { 'content-type': 'application/json' },
@@ -611,7 +611,7 @@ function mkCatalogApp(rows: unknown[], daemon?: Record<string, unknown>) {
   const cfg: Record<string, unknown> = { apiKeys: [], links: [], daemon: { port: 6996, experimental: { turboLink: true }, ...daemon } }
   const d = {
     version: '1.11.2',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     remoteCatalog: { models: () => rows },
   } as unknown as Deps
   const app = new Hono()

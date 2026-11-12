@@ -10,6 +10,7 @@ import type { ScheduleRule, RoutineFlavor, Routine, RoutineRun, CodingAgentChoic
 import { CODING_AGENT_CHOICES } from './schema'
 import { isTextClassifierKey } from '../models/text-classifier'
 import { nonStringField } from '../util/string-fields'
+import { InvalidCursorError } from '../chat/db'
 
 type Status = 200 | 201 | 400 | 401 | 403 | 404 | 409 | 500 | 503
 
@@ -270,11 +271,21 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
     return c.json(routine)
   })
 
+  // Newest first, a page at a time: `?limit` (50 by default, 200 at most) and `?before`, the
+  // cursor the previous page sent in X-Next-Cursor (absent on the last page). The body stays
+  // the plain array of runs it always was.
   app.get('/api/v1/routines/:id/runs', (c) => {
     const routine = d.db.getRoutine(c.req.param('id'))
     if (!routine) return err(c, 404, 'not_found', 'Routine not found.')
-    const runs = d.db.listRoutineRuns(routine.id)
-    return c.json(routine.flavor === 'code' && codeGateBlocks(c, d) ? runs.map(forCodeGateRefused) : runs)
+    let page: { runs: RoutineRun[]; nextCursor: string | null }
+    try {
+      page = d.db.listRoutineRunsPage(routine.id, { limit: Number(c.req.query('limit')), cursor: c.req.query('before') })
+    } catch (e) {
+      if (e instanceof InvalidCursorError) return err(c, 400, 'invalid_cursor', 'That `before` cursor is not one this list issued.')
+      throw e
+    }
+    if (page.nextCursor) c.header('X-Next-Cursor', page.nextCursor)
+    return c.json(routine.flavor === 'code' && codeGateBlocks(c, d) ? page.runs.map(forCodeGateRefused) : page.runs)
   })
 
   app.post('/api/v1/routines', async (c) => {

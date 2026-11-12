@@ -19,7 +19,7 @@ function fakeApp() {
   // The hwstats route never touches `d` — a minimal double is enough for registerApi.
   const d = {
     version: 'test',
-    store: { snapshot: () => ({}), update: (fn: (c: unknown) => void) => fn({}) },
+    store: { snapshot: () => ({}), read: () => ({}), update: (fn: (c: unknown) => void) => fn({}) },
     manager: { status: () => ({ state: 'stopped', model: null }) },
   } as unknown as Deps
   const app = new Hono()

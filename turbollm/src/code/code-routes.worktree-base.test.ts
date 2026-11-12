@@ -20,7 +20,7 @@ function makeApp() {
   const d = {
     db,
     version: 'test',
-    store: { snapshot: () => ({ code: { defaultAgent: 'turbollm' } }) },
+    store: { snapshot: () => ({ code: { defaultAgent: 'turbollm' } }), read: () => ({ code: { defaultAgent: 'turbollm' } }) },
   } as unknown as Deps
   const runs = { reconcileOnStartup() {} } as unknown as CodeRunManager
   registerCodeRoutes(app, d, runs)

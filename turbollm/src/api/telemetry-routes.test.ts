@@ -26,7 +26,7 @@ function fakeApp(dataDir: string, telemetry: { level: string; machineId: string 
   }
   const app = new Hono()
   const store = {
-    snapshot: () => cfg,
+    snapshot: () => cfg, read: () => cfg,
     update: (fn: (c: FakeConfig) => void) => fn(cfg),
     dir: () => dataDir,
   }

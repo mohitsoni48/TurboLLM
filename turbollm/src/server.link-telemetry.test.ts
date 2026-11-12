@@ -31,7 +31,7 @@ function mkDeps(recorded: string[]): Deps {
   return {
     version: '1.11.2',
     store: {
-      snapshot: () => cfg,
+      snapshot: () => cfg, read: () => cfg,
       update: (fn: (c: never) => void) => fn(cfg as never),
       dir: () => '.',
     },

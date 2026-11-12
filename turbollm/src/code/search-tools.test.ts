@@ -28,6 +28,10 @@ import { tmpDir } from '../test-support/tmp'
 const POSIX = process.platform === 'win32' ? 'POSIX stand-ins and a FIFO' : false
 const noRg = findSearchTool('rg') === null ? 'ripgrep (rg) is not installed (CI installs it)' : false
 const noFd = findSearchTool('fd') === null ? 'fd is not installed (CI installs it)' : false
+
+/** The tests that run a real rg or fd, or kill a daemon that has one running, are unmeasured on ubuntu runners: more than
+ *  `npm test`'s 60 s per-test default. */
+const SPAWN_TIMEOUT_MS = 180_000
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 const ctx = undefined as never
 
@@ -82,7 +86,7 @@ function within<T>(p: Promise<T>, what: string, ms = 30_000): Promise<T> {
 // process can exit and report.
 after(() => stopTethered(1000))
 
-test('grep returns exactly what pi\'s own grep returns, on every case of the fixture', { skip: noRg }, async () => {
+test('grep returns exactly what pi\'s own grep returns, on every case of the fixture', { skip: noRg, timeout: SPAWN_TIMEOUT_MS }, async () => {
   const restore = sortedRg()
   try {
     const outside = fixture(tmpDir('tllm-grep-outside-'))
@@ -135,7 +139,7 @@ function sortFindText(r: unknown): unknown {
   }
 }
 
-test('find returns exactly what pi\'s own find returns, on every case of the fixture', { skip: noFd }, async () => {
+test('find returns exactly what pi\'s own find returns, on every case of the fixture', { skip: noFd, timeout: SPAWN_TIMEOUT_MS }, async () => {
   const outside = fixture(tmpDir('tllm-find-outside-'))
   const repo = fixture(tmpGitRepo('tllm-find-repo-'))
   const other = fixture(tmpDir('tllm-find-other-'))
@@ -168,7 +172,7 @@ test('find returns exactly what pi\'s own find returns, on every case of the fix
   for (const line of oursBody.split('\n')) assert.ok(all.has(line), `${line} is a real match`)
 })
 
-test('a daemon SIGKILLed during a search takes rg with it', { skip: POSIX || noRg }, async () => {
+test('a daemon SIGKILLed during a search takes rg with it', { skip: POSIX || noRg, timeout: SPAWN_TIMEOUT_MS }, async () => {
   // A search with no match writes nothing until it ends: rg reading a FIFO no one writes to never ends.
   const dir = tmpDir('tllm-grep-tether-')
   mkfifo(join(dir, 'never-written'))
@@ -189,7 +193,7 @@ setInterval(() => {}, 1e9)
   }
 })
 
-test('a daemon SIGKILLed during a find takes fd with it', { skip: POSIX }, async () => {
+test('a daemon SIGKILLed during a find takes fd with it', { skip: POSIX, timeout: SPAWN_TIMEOUT_MS }, async () => {
   const dir = tmpDir('tllm-find-tether-')
   const bin = join(dir, 'bin')
   mkdirSync(bin)
@@ -213,7 +217,7 @@ setInterval(() => {}, 1e9)
   }
 })
 
-test('a Stop during a search kills rg and rejects as pi\'s grep does', { skip: POSIX || noRg }, async () => {
+test('a Stop during a search kills rg and rejects as pi\'s grep does', { skip: POSIX || noRg, timeout: SPAWN_TIMEOUT_MS }, async () => {
   const dir = tmpDir('tllm-grep-abort-')
   mkfifo(join(dir, 'never-written'))
   const ac = new AbortController()

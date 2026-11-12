@@ -27,7 +27,7 @@ function deps(routed: string[] = []): Deps {
       routeTo: async () => ({ target: ENGINE }),
       loadedModelKeys: () => new Set([GGUF_KEY]),
     },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     manager: {
       status: () => ({ state: 'running', model: { key: GGUF_KEY, name: 'Qwen3 8B' } }),
       target: () => ENGINE,

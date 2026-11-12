@@ -557,9 +557,9 @@ test('a Deny on an MCP tool holds for every spelling of its server id', async ()
   } finally { reg.disconnectAll() }
 })
 
-// Not on Windows: there the client spawns through `cmd.exe /c`, and killing cmd.exe does not reach
-// the server under it — a separate, pre-existing gap of every MCP disconnect, not this fix's.
-test('a stdio MCP server whose initialize fails is not left running', { skip: process.platform === 'win32' ? 'cmd.exe-wrapped spawn' : false }, async () => {
+// On Windows the client spawns through `cmd.exe /c`: ending only cmd.exe left the server under it running
+// (and holding its pipes, so this test file never exited).
+test('a stdio MCP server whose initialize fails is not left running', async () => {
   const { server, spawnedPids } = fakeMcpServer({ FAKE_MCP_MODE: 'error-init' })
   const reg = new ToolRegistry(EMPTY_TOOLS_CFG)
   try {
@@ -572,6 +572,21 @@ test('a stdio MCP server whose initialize fails is not left running', { skip: pr
   } finally {
     for (const pid of spawnedPids()) if (isAlive(pid)) process.kill(pid)
     reg.disconnectAll()
+  }
+})
+
+test('disconnectAll ends the stdio MCP server process itself, not only the cmd.exe or shell in front of it', async () => {
+  const { server, spawnedPids } = fakeMcpServer({})
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG)
+  try {
+    await reg.syncMcpServers([server])
+    const [pid] = spawnedPids()
+    assert.ok(pid && isAlive(pid), 'the server is running')
+    reg.disconnectAll()
+    for (let i = 0; i < 100 && isAlive(pid); i++) await new Promise((r) => setTimeout(r, 50))
+    assert.equal(isAlive(pid), false, 'the server process must end with its client')
+  } finally {
+    for (const pid of spawnedPids()) if (isAlive(pid)) process.kill(pid)
   }
 })
 
