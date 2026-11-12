@@ -1,5 +1,6 @@
 import { Check, Cpu, HardDrive, Loader2, MonitorSmartphone } from 'lucide-react'
-import { useEngineBackends, useStatus } from '../../../lib/queries'
+import { engineGroupKey, groupLabel } from '../../../lib/engine-groups'
+import { useEngineBackends, useEngines, useStatus } from '../../../lib/queries'
 import { primaryVendorSummary } from '../../../lib/vram'
 import type { StepComponentProps } from '../OnboardingScreen'
 
@@ -18,6 +19,8 @@ export default function WelcomeStep({ onContinue }: StepComponentProps) {
   // is the same helper the Engines hero uses (it sums the primary vendor and drops an iGPU that
   // only shares system RAM, ADR-306), so the two readouts cannot drift apart again.
   const hw = primaryVendorSummary(backends?.gpus ?? [])
+
+  const readyEngine = useActiveEngineLabel()
 
   const provisionDone = !provision || (!provision.active && provision.phase !== 'error')
   const provisionFailed = provision?.phase === 'error'
@@ -66,7 +69,7 @@ export default function WelcomeStep({ onContinue }: StepComponentProps) {
         ) : provisionDone ? (
           <div className="flex items-center gap-2 text-sm text-ink">
             <Check size={14} className="text-accent" />
-            Ready — llama.cpp is installed
+            {`Ready — ${readyEngine} is installed`}
           </div>
         ) : (
           <div className="flex items-center gap-2 text-sm text-muted">
@@ -87,4 +90,12 @@ export default function WelcomeStep({ onContinue }: StepComponentProps) {
       </div>
     </div>
   )
+}
+
+/** The active engine by the label the Engines screen's selector shows it under (QA F-5c: a phone whose default is
+ *  LiteRT-LM read "llama.cpp is installed"). llama.cpp, the engine first-run setup installs, until one is active. */
+function useActiveEngineLabel(): string {
+  const { data: list } = useEngines()
+  const active = list?.engines.find((e) => e.id === list.activeEngineId)
+  return active ? groupLabel(engineGroupKey(active), [active]) : 'llama.cpp'
 }
