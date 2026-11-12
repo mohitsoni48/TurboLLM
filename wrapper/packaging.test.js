@@ -57,6 +57,17 @@ test('the tray icon main.js loads ships in the packaged app', () => {
   assert.ok(existsSync(copies[0].from), `${TRAY_ICON.source} must exist`)
 })
 
+// A signed macOS build runs under the hardened runtime, which refuses the microphone, without asking, to an
+// app that lacks the audio-input entitlement. The app and its helpers are signed with the same file.
+test('a signed macOS build is entitled to the microphone', () => {
+  const entitlements = join(__dirname, config.mac.entitlements)
+
+  assert.equal(config.mac.entitlementsInherit, config.mac.entitlements, 'the helpers record: they need it too')
+  assert.ok(existsSync(entitlements), `${config.mac.entitlements} must exist`)
+  assert.match(readFileSync(entitlements, 'utf8'), /<key>com\.apple\.security\.device\.audio-input<\/key>\s*<true\/>/)
+  assert.ok(config.mac.extendInfo.NSMicrophoneUsageDescription, 'macOS shows this when it asks')
+})
+
 function relativeRequires (source) {
   return [...source.matchAll(LOCAL_REQUIRE)].map((match) => match[1])
 }

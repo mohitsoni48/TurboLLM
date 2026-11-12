@@ -51,6 +51,10 @@ interface Utterance {
 
 interface TtsBackend {
   voices(): TtsVoice[]
+  /** Have the engine list its voices, where it lists them only when asked (the Android app's). */
+  listVoices?: () => void
+  /** Whether it can speak, where that is not simply "it lists a voice": the Android app's lists none until asked. */
+  canSpeak?: () => boolean
   /** Voices load late in some browsers; call back when the list changes. Returns the unsubscribe. */
   onVoices(listener: () => void): () => void
   /** Speak one piece. `done(true)` when it was spoken to the end, `done(false)` when it failed or was cut short. */
@@ -82,6 +86,11 @@ function nativePort(): NativePort | null {
 
 function androidBackend(port: NativePort): TtsBackend {
   let voices: TtsVoice[] = []
+  /** Whether the app has been asked for its voices, and whether it has answered. Its speech engine starts with the
+   *  first message it is sent, and most sessions never ask for speech (TtsBridge.kt): so it is sent nothing until
+   *  there is something to say or a list of voices to show, and until it answers it is taken to be able to speak. */
+  let asked = false
+  let answered = false
   let next = 0
   const voiceListeners = new Set<() => void>()
   const pending = new Map<string, (spoken: boolean) => void>()
@@ -101,6 +110,7 @@ function androidBackend(port: NativePort): TtsBackend {
       return
     }
     if (message.type === 'tts.voices' && Array.isArray(message.voices)) {
+      answered = true
       voices = (message.voices as Array<{ id?: unknown; name?: unknown; lang?: unknown; local?: unknown }>)
         .filter((v) => typeof v?.id === 'string' && typeof v.name === 'string')
         // `local` is absent from an app that only ever listed on-device voices.
@@ -112,22 +122,28 @@ function androidBackend(port: NativePort): TtsBackend {
       done?.(message.ok === true)
     }
   })
-  // The engine starts with the app's first message; its voices arrive as the answer to this, and again each time it
-  // is asked.
-  send({ type: 'tts.voices' })
+  // The voices arrive as the answer to this, and again each time it is asked.
+  const listVoices = () => {
+    if (asked) return
+    asked = true
+    send({ type: 'tts.voices' })
+  }
   // Asked again when the app comes back to the front: that is where the user returns from, having added a voice.
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') send({ type: 'tts.voices' })
+      if (asked && document.visibilityState === 'visible') send({ type: 'tts.voices' })
     })
   }
   return {
     voices: () => voices,
+    listVoices,
+    canSpeak: () => !answered || voices.length > 0,
     onVoices: (listener) => {
       voiceListeners.add(listener)
       return () => voiceListeners.delete(listener)
     },
     speak: (utterance, done) => {
+      listVoices() // the pieces after this one are then read by a voice chosen from the list
       const id = `u${++next}`
       pending.set(id, done)
       const message = { type: 'tts.speak', id, text: utterance.text, voice: utterance.voice?.id ?? '', lang: utterance.language ?? '', rate: utterance.rate }
@@ -203,7 +219,9 @@ export function resetTtsBackend(): void {
 
 /** Every voice the engine lists, the online ones included, in the engine's order. */
 export function ttsAllVoices(): TtsVoice[] {
-  return backend()?.voices() ?? []
+  const b = backend()
+  b?.listVoices?.()
+  return b?.voices() ?? []
 }
 
 /** The voices to choose from: those that speak on this device (or every voice when the device reports none as local;
@@ -221,7 +239,7 @@ export function onTtsVoices(listener: () => void): () => void {
  *  (Chrome on Linux without speech-dispatcher) would accept text and stay silent, so it does not count. */
 export function ttsAvailable(): boolean {
   const b = backend()
-  return b !== null && b.voices().length > 0
+  return b !== null && (b.canSpeak?.() ?? b.voices().length > 0)
 }
 
 /** Opens the place this device's voices are added, or null where the page cannot (a browser: the user goes to the

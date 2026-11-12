@@ -791,18 +791,28 @@ describe('the Android bridge', () => {
     { id: 'nolang', name: 'No language' },
   ]
 
-  it('asks the app for its voices once, when the backend is created', () => {
+  it('sends the app nothing until its voices are listed, then asks for them once', () => {
+    // The app starts its speech engine with the first message it is sent: a chat that only shows the button must
+    // not start it.
     const { posted, port } = installPort()
     expect(port.addEventListener).not.toHaveBeenCalled()
     ttsAvailable()
-    ttsVoices()
-    expect(posted).toEqual([{ type: 'tts.voices' }])
+    expect(posted).toEqual([])
     expect(port.addEventListener).toHaveBeenCalledWith('message', expect.any(Function))
+    ttsVoices()
+    ttsAllVoices()
+    expect(posted).toEqual([{ type: 'tts.voices' }])
   })
 
-  it('is unavailable until a tts.voices message with at least one voice arrives', () => {
+  it('asks for the voices with the first thing it is given to say', () => {
+    const { posted } = installPort()
+    speaker.speak('m', 'One.', OPTS)
+    expect(posted.map((m) => m.type)).toEqual(['tts.voices', 'tts.speak'])
+  })
+
+  it('counts as able to speak until the app answers that it has no voice', () => {
     const { emitJson } = installPort()
-    expect(ttsAvailable()).toBe(false)
+    expect(ttsAvailable()).toBe(true)
     emitJson({ type: 'tts.voices', voices: [] })
     expect(ttsAvailable()).toBe(false)
     emitJson({ type: 'tts.voices', voices: VOICES })
@@ -834,7 +844,7 @@ describe('the Android bridge', () => {
   it('is preferred over speechSynthesis when both are there', () => {
     installSpeechSynthesis([voice('web', 'en-US')])
     installPort()
-    expect(ttsAvailable()).toBe(false)
+    expect(ttsAllVoices()).toEqual([])
     expect(ttsVoices().map((v) => v.id)).not.toContain('web')
   })
 
@@ -983,9 +993,17 @@ describe('the Android bridge', () => {
       const setVisibility = (state: string) => Object.defineProperty(document, 'visibilityState', { value: state, configurable: true })
       afterEach(() => { delete (document as { visibilityState?: unknown }).visibilityState })
 
-      it('asks for the voices again, and not when it goes away', () => {
+      it('asks nothing of an app that was never asked for its voices', () => {
         const { posted } = installPort()
         ttsAvailable()
+        setVisibility('visible')
+        document.dispatchEvent(new Event('visibilitychange'))
+        expect(posted).toEqual([])
+      })
+
+      it('asks for the voices again, and not when it goes away', () => {
+        const { posted } = installPort()
+        ttsVoices()
         const asks = () => posted.filter((m) => m.type === 'tts.voices').length
         expect(asks()).toBe(1)
         setVisibility('hidden')

@@ -910,22 +910,37 @@ test('whisper refusing the audio on the GPU build is not a fallback: it surfaces
   assert.deepEqual(r.launches.map((l) => l.binPath), [r.vkPath, r.vkPath])
 })
 
-test('an aborted caller with a TypeError, and a TimeoutError, are not GPU failures', async () => {
+test('an aborted caller, with a TypeError or a TimeoutError, is not a GPU failure', async () => {
+  for (const error of [() => new TypeError('fetch failed'), () => new DOMException('slow', 'TimeoutError')]) {
+    let vk = ''
+    const ac = new AbortController()
+    const r = gpuRig(true, failingGpu(() => vk, () => { ac.abort(); return error() }))
+    vk = r.vkPath
+    r.cfg.speechToText.gpu = true
+    await assert.rejects(r.service.transcribe(AUDIO, {}, ac.signal))
+    assert.equal(r.launches.length, 1)
+    assert.equal(r.service.status().stt.server.gpuError, null)
+  }
+})
+
+test('a GPU build that gives no answer in time (a driver that hangs) falls back too, and is not tried again', async () => {
   let vk = ''
-  const ac = new AbortController()
-  const r = gpuRig(true, failingGpu(() => vk, () => { ac.abort(); return new TypeError('fetch failed') }))
+  const r = gpuRig(true, failingGpu(() => vk, () => new DOMException('The operation timed out', 'TimeoutError')))
   vk = r.vkPath
   r.cfg.speechToText.gpu = true
-  await assert.rejects(r.service.transcribe(AUDIO, {}, ac.signal), TypeError)
-  assert.equal(r.launches.length, 1)
-  assert.equal(r.service.status().stt.server.gpuError, null)
+  assert.deepEqual(JSON.parse((await r.service.transcribe(AUDIO)).body), { text: 'hi' })
+  assert.deepEqual(r.launches.map((l) => l.binPath), [r.vkPath, r.cpu])
+  assert.match(r.service.status().stt.server.gpuError ?? '', /GPU/)
 
-  const t = gpuRig(true, failingGpu(() => t.vkPath, () => new DOMException('slow', 'TimeoutError')))
-  t.cfg.speechToText.gpu = true
-  await assert.rejects(t.service.transcribe(AUDIO), (e: unknown) => e instanceof VoiceError && e.status === 502)
-  assert.equal(t.launches.length, 1)
-  assert.equal(t.service.status().stt.server.gpuError, null)
-  assert.equal(t.launches[0].binPath, t.vkPath)
+  // Left on the GPU build, every later recording would wait out the same timeout.
+  await r.service.transcribe(AUDIO)
+  assert.deepEqual(r.launches.slice(2).map((l) => l.binPath), [r.cpu])
+})
+
+test('whisper taking too long on the CPU build is still the timeout it was', async () => {
+  const r = gpuRig(false, () => Promise.reject(new DOMException('slow', 'TimeoutError')))
+  await assert.rejects(r.service.transcribe(AUDIO), (e: unknown) => e instanceof VoiceError && e.status === 502 && /too long/.test(e.message))
+  assert.equal(r.launches.length, 1)
 })
 
 test('a failure on the CPU build after a fallback is thrown as usual, with no further attempt', async () => {

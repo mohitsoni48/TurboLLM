@@ -827,6 +827,38 @@ test('compactConversation: an aborted caller signal reaches the summarization ca
   }
 })
 
+// ── Compaction and voice clips ───────────────────────────────────────────────────────────
+
+test('pickCompactionCut: voice clips count toward the cut for a model that hears them, and not for one that does not', () => {
+  const messages = Array.from({ length: 8 }, (_, i) => (i % 2 === 0 ? makeMsg('user', '', { attachments: [CLIP_REF] }) : makeMsg('assistant', 'ok')))
+  // By their words alone, eight nearly empty messages fit any tail: sized that way, a conversation held by voice
+  // was never cut, though a hearing model is sent every one of its clips again on each turn.
+  assert.equal(pickCompactionCut(messages, 2000, undefined, false, false), null)
+  assert.equal(pickCompactionCut(messages, 2000), null)
+  const picked = pickCompactionCut(messages, 2000, undefined, false, true)
+  assert.ok(picked)
+  assert.equal(picked!.toSummarize.length, 6)
+  assert.ok(picked!.tokensBefore >= 900, `three clips' worth, got ${picked!.tokensBefore}`)
+})
+
+test('compactConversation: a voice-only turn is named in the summary\'s transcript, not left an empty line', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model' })
+    db.addMessage(conv.id, 'user', '', { attachments: [CLIP_REF] })
+    for (let i = 1; i < 8; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', `message ${i} with enough real content to count as real tokens`)
+    const prompts: string[] = []
+    await compactConversation(fakeDeps(db, 200), conv.id, { fetchImpl: recordingFetch(prompts) })
+    assert.equal(prompts.length, 1)
+    assert.ok(prompts[0].includes(`User: ${VOICE_MESSAGE_PLACEHOLDER}`), prompts[0].slice(0, 400))
+    assert.ok(!/User: (\\n|$)/.test(prompts[0]))
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 // ── Compaction fixes: the turn's snapshot, an already-applied compaction, a frozen cut ────
 
 /** A fake summarizer that records every summarization prompt it is sent. */

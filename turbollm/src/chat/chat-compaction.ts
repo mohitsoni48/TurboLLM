@@ -275,11 +275,25 @@ const MIN_MESSAGES_TO_COMPACT = 4
  *  (see effectiveTailText) — confirmed live: a real preserveThinking conversation's tail
  *  looked like a 9.8x under-estimate (content-only) until the reasoning fold was counted,
  *  which alone brought it to 2.98x — comfortably inside this clamp, not requiring a wider one. */
-function calibratedTokenScale(pool: Message[], realCtxUsed: number | undefined, preserveThinking: boolean): number {
+function calibratedTokenScale(pool: Message[], realCtxUsed: number | undefined, preserveThinking: boolean, hearsAudio: boolean): number {
   if (!realCtxUsed) return 1
-  const raw = estimateTokens(pool.map((m) => ({ role: m.role, content: effectiveTailText(preserveThinking, m) })))
+  const raw = estimateTokens(pool.map((m) => ({ role: m.role, content: effectiveTailText(preserveThinking, m) }))) + voiceClipTokens(pool, hearsAudio)
   if (raw < 200) return 1 // too little text for the ratio to mean anything
   return Math.min(4, Math.max(0.5, realCtxUsed / raw))
+}
+
+/** What one voice clip is taken to cost a model that hears it. The row names the clip's file, not its length, and
+ *  audio models spend from about six to twenty-five tokens on a second of sound, so a spoken message of ten or twenty
+ *  seconds is a few hundred. Rough, and enough: counted as nothing, every spoken turn fitted the kept tail for free. */
+const VOICE_CLIP_TOKENS = 300
+
+/** What the voice clips of `messages` add to a prompt for a model that hears, which is resent every earlier clip
+ *  (spokenTurnContent). Nothing for one that does not: it gets the turn's text, or a placeholder. */
+function voiceClipTokens(messages: Message[], hearsAudio: boolean): number {
+  if (!hearsAudio) return 0
+  let clips = 0
+  for (const m of messages) if (m.role === 'user') clips += (m.attachments ?? []).filter(isAudioAttachment).length
+  return clips * VOICE_CLIP_TOKENS
 }
 
 /** Chooses how much of `pool` (already past any earlier compaction cut — see
@@ -293,16 +307,17 @@ function calibratedTokenScale(pool: Message[], realCtxUsed: number | undefined, 
  *  budget. `realCtxUsed` — the engine's own last-reported prompt size for this exact pool,
  *  from `lastCtxUsage` — calibrates the estimate; see calibratedTokenScale. `preserveThinking`
  *  must be the conversation's own flag, so the sizing estimate matches what actually gets
- *  resent (see effectiveTailText). */
-export function pickCompactionCut(pool: Message[], ctxMax: number, realCtxUsed?: number, preserveThinking = false): { toSummarize: Message[]; cutMessageId: string; tokensBefore: number } | null {
+ *  resent (see effectiveTailText), and `hearsAudio` the upstream's, for the same reason (see
+ *  voiceClipTokens). */
+export function pickCompactionCut(pool: Message[], ctxMax: number, realCtxUsed?: number, preserveThinking = false, hearsAudio = false): { toSummarize: Message[]; cutMessageId: string; tokensBefore: number } | null {
   if (pool.length < MIN_MESSAGES_TO_COMPACT) return null
-  const scale = calibratedTokenScale(pool, realCtxUsed, preserveThinking)
+  const scale = calibratedTokenScale(pool, realCtxUsed, preserveThinking, hearsAudio)
   const keepBudget = Math.max(1, Math.round(ctxMax * KEEP_RECENT_FRACTION))
   let tailStart = pool.length
   let tailTokens = 0
   while (tailStart > 0) {
     const next = pool[tailStart - 1]
-    const nextTokens = estimateTokens([{ role: next.role, content: effectiveTailText(preserveThinking, next) }]) * scale
+    const nextTokens = (estimateTokens([{ role: next.role, content: effectiveTailText(preserveThinking, next) }]) + voiceClipTokens([next], hearsAudio)) * scale
     if (tailStart < pool.length && tailTokens + nextTokens > keepBudget) break
     tailTokens += nextTokens
     tailStart--
@@ -321,7 +336,7 @@ export function pickCompactionCut(pool: Message[], ctxMax: number, realCtxUsed?:
   tailStart = userStart
   if (tailStart <= 0) return null // the only user turn is the pool's first: nothing left to summarize
   const toSummarize = pool.slice(0, tailStart)
-  const tokensBefore = Math.round(estimateTokens(toSummarize.map((m) => ({ role: m.role, content: effectiveTailText(preserveThinking, m) }))) * scale)
+  const tokensBefore = Math.round((estimateTokens(toSummarize.map((m) => ({ role: m.role, content: effectiveTailText(preserveThinking, m) }))) + voiceClipTokens(toSummarize, hearsAudio)) * scale)
   return { toSummarize, cutMessageId: toSummarize[toSummarize.length - 1].id, tokensBefore }
 }
 
@@ -341,7 +356,9 @@ const COMPACTION_GATE_TIMEOUT_MS = 60_000
 const SUMMARIZATION_TIMEOUT_MS = 60_000
 
 function buildSummarizationPrompt(priorSummary: string | null, toSummarize: Message[]): { role: string; content: string }[] {
-  const transcript = toSummarize.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n\n')
+  // A turn that was only a voice clip has no words to write down: it is named as one, not left an empty line.
+  const said = (m: Message): string => m.content || (m.role === 'user' && (m.attachments ?? []).some(isAudioAttachment) ? VOICE_MESSAGE_PLACEHOLDER : '')
+  const transcript = toSummarize.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${said(m)}`).join('\n\n')
   const priorBlock = priorSummary ? `Summary of the conversation so far:\n${priorSummary}\n\n---\n\n` : ''
   return [
     {
@@ -405,7 +422,7 @@ export async function compactConversation(
   // auto-trigger check) calibrates pickCompactionCut's char-based estimate against reality —
   // see calibratedTokenScale's doc comment for why the raw estimate alone under-fires.
   const { ctxUsed: realCtxUsed } = lastCtxUsage(activeMessages)
-  const picked = pickCompactionCut(pool, upstream.ctxMax, realCtxUsed, !!conv.preserveThinking)
+  const picked = pickCompactionCut(pool, upstream.ctxMax, realCtxUsed, !!conv.preserveThinking, !!upstream.hearsAudio)
   if (!picked) throw new Error('nothing_to_compact')
 
   const promptMessages = buildSummarizationPrompt(priorSummary, picked.toSummarize)

@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, renderHook } from '@testing-library/react'
 import type { ReactNode } from 'react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../../lib/api'
 import { MicError, VoiceRecorder, clipDataUrl, micSupport, type RecorderOptions, type VoiceClip } from '../../lib/voice/recorder'
 import { transcribeClip, warmVoice, type TranscribeResult } from '../../lib/voice/voice-api'
@@ -492,6 +492,40 @@ describe('useVoiceInput cancel', () => {
     act(() => hook.result.current.cancel())
     await act(async () => { stopping.resolve(clip()); await finishing })
     expect(onClip).not.toHaveBeenCalled()
+  })
+})
+
+describe('useVoiceInput when the page leaves the screen', () => {
+  const setVisibility = (state: string) => Object.defineProperty(document, 'visibilityState', { value: state, configurable: true })
+  const hide = () => act(async () => {
+    setVisibility('hidden')
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  afterEach(() => { delete (document as { visibilityState?: unknown }).visibilityState })
+
+  it('ends a recording and keeps what was said, as stop() does', async () => {
+    stt.available = true
+    transcribe.mockResolvedValueOnce(said('so far'))
+    const hook = mount(false)
+    const recorder = await begin(hook)
+    await hide()
+    expect(recorder.stop).toHaveBeenCalledTimes(1)
+    expect(recorder.cancel).not.toHaveBeenCalled()
+    expect(onText).toHaveBeenCalledWith('so far')
+    expect(hook.result.current.phase).toBe('idle')
+  })
+
+  it('leaves a recording alone when the page comes back, and does nothing when none is being made', async () => {
+    const hook = mount(true)
+    await hide()
+    expect(hook.result.current.phase).toBe('idle')
+    const recorder = await begin(hook)
+    await act(async () => {
+      setVisibility('visible')
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    expect(recorder.stop).not.toHaveBeenCalled()
+    expect(hook.result.current.phase).toBe('recording')
   })
 })
 

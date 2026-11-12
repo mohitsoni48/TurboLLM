@@ -242,9 +242,11 @@ export class VoiceService {
     } catch (e) {
       const server = this.resolveServer()
       const onGpuBuild = server.ok && server.gpuPath !== undefined && launch.binPath === server.gpuPath
-      // A start that failed, or a connection that broke (the process died). Not the caller leaving, and not whisper
-      // taking long: neither says the GPU build is at fault.
-      const serverFailed = e instanceof WhisperStartError || (e instanceof TypeError && !signal?.aborted)
+      // A start that failed, a connection that broke (the process died), or no answer in the time a transcription is
+      // given: a driver that hangs is as lost as one that crashes, and left on the GPU build every later recording
+      // would wait out the same timeout. Not the caller leaving, which says nothing about the GPU build.
+      const gaveUp = e instanceof TypeError || (e instanceof Error && e.name === 'TimeoutError')
+      const serverFailed = e instanceof WhisperStartError || (gaveUp && !signal?.aborted)
       if (!onGpuBuild || !serverFailed) throw e
       this.gpuFailure = `whisper could not run on this device's GPU (${messageOf(e)}). Speech-to-text is using the CPU.`
       announce()

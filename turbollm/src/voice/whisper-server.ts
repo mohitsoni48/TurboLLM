@@ -73,6 +73,9 @@ export class WhisperServer {
   private current: WhisperState = 'stopped'
   private errorMessage: string | null = null
   private inFlight = 0
+  /** The requests the running server is answering now, and those waiting for it to have none. */
+  private answering = 0
+  private drained: Array<() => void> = []
   private closed = false
   private idleTimer: NodeJS.Timeout | null = null
   private readonly idleMs: number
@@ -112,6 +115,12 @@ export class WhisperServer {
       const running = this.running
       if (running && running.port !== null && sameLaunch(running.launch, launch)) return running.port
       if (running) {
+        // What it is still answering finishes first: a model or option changed in Settings must not end a
+        // transcription that is under way on the old one.
+        if (this.answering > 0) {
+          await new Promise<void>((resolve) => this.drained.push(resolve))
+          continue
+        }
         await this.stop()
         continue
       }
@@ -128,7 +137,13 @@ export class WhisperServer {
     this.inFlight++
     this.clearIdle()
     try {
-      return await work(await this.ensure(launch))
+      const port = await this.ensure(launch)
+      this.answering++
+      try {
+        return await work(port)
+      } finally {
+        if (--this.answering === 0) for (const resume of this.drained.splice(0)) resume()
+      }
     } finally {
       this.inFlight--
       this.armIdle()

@@ -230,6 +230,36 @@ test('a different launch requested while one is starting waits for it to settle,
   }
 })
 
+test('a different launch waits for what the running server is still answering before it replaces it', async () => {
+  const { server, spawns } = fakeRig()
+  const other = { ...launch, modelPath: '/models/ggml-tiny.bin' }
+  try {
+    let finish = (): void => {}
+    let firstChildGoneMidWork = false
+    const first = server.use(launch, async (port) => {
+      await new Promise<void>((resolve) => { finish = resolve })
+      firstChildGoneMidWork = exitedOf(spawns[0].child)
+      return port
+    })
+    await waitFor('the first transcription to be under way', () => spawns.length === 1 && server.state() === 'ready')
+    let secondPort = 0
+    const second = server.use(other, async (port) => { secondPort = port })
+    // Long enough for a stop() to have ended the first server, had the new launch not waited.
+    await new Promise((r) => setTimeout(r, 300))
+    assert.equal(spawns.length, 1)
+    assert.equal(exitedOf(spawns[0].child), false)
+    finish()
+    const firstPort = await first
+    await second
+    assert.equal(firstChildGoneMidWork, false)
+    assert.equal(spawns.length, 2)
+    assert.notEqual(secondPort, firstPort)
+    assert.equal(server.launch()?.modelPath, '/models/ggml-tiny.bin')
+  } finally {
+    await server.stop()
+  }
+})
+
 test('a start whose process exits early rejects with WhisperStartError carrying the exit code and the log line', async () => {
   const { server } = fakeRig({ FAKE_WHISPER_FAIL: '1' })
   try {

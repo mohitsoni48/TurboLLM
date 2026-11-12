@@ -556,6 +556,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       return err(c, 400, 'invalid_input', 'images, audio and textAttachments must be arrays of strings, and docContext a string.')
     const audioRefusal = voiceClipsRefusal(audio)
     if (audioRefusal) return err(c, 400, 'invalid_input', audioRefusal)
+    // A clip is told from an image by what it is, not by the field it came in (chat-compaction.ts mediaPart): sent
+    // as an image it would pass every check made on `audio` and still reach the engine as audio.
+    if (images.some(isAudioAttachment)) return err(c, 400, 'invalid_input', 'A voice clip goes in audio, not in images.')
     // A message is valid if it has typed text OR carries an image, a voice clip or a file
     // attachment — image-only / voice-only / file-only sends are allowed.
     if (!content && images.length === 0 && audio.length === 0 && textAttachments.length === 0)
@@ -654,6 +657,13 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const busy = inflightRefusal(c, d, convId, 'A generation is already running for this conversation.')
     if (busy) return busy
 
+    // The turn being answered goes out with its voice clips, as POST /messages first sent it (buildEngineMessages),
+    // so that route's refusal applies here too: a model swapped since, or a Turbo Link machine's, would be handed
+    // audio it cannot take. Asked before the question is branched or the old reply set aside.
+    const unheard = (m: Message) => !upstream.hearsAudio && (m.attachments ?? []).some(isAudioAttachment)
+      ? err(c, 409, 'audio_unsupported', `${upstream.modelName} cannot take audio, and this message is a voice recording. Load a model that hears audio to answer it again.`)
+      : null
+
     // Save & Resend (`edit`): the question is branched only here, once nothing above refused the
     // turn, as Regenerate sets its reply aside below. Sent first as its own request (PUT), a
     // /continue the client then skipped (no model ready) or the daemon refused (a Turbo Link
@@ -671,12 +681,17 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       if (msg.role !== 'user') return err(c, 400, 'invalid_input', 'Only a question can be edited and resent.')
       // As in PUT: only a question on the shown branch.
       if (!msg.isActive) return err(c, 409, 'stale_message', STALE_MESSAGE)
+      // Its new version keeps its clips.
+      const refused = unheard(msg)
+      if (refused) return refused
       edited = { from: msg.id, to: branchEditedQuestion(db, convId, msg, content).id }
       conv.messages = db.getMessages(convId)
     }
 
     const lastUser = (conv.messages ?? []).filter((m) => m.role === 'user').at(-1)
     if (!lastUser) return err(c, 400, 'no_user_message', 'No user message to respond to.')
+    const refused = unheard(lastUser)
+    if (refused) return refused
 
     // Regenerate (`regenerate: true`, what the web UI sends): the reply it replaces is set aside
     // only here, once nothing above refused the turn. Sent first as its own request

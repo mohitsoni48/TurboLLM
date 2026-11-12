@@ -715,7 +715,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           const r = new FileReader()
           r.onload = () => res(r.result as string)
           r.onerror = () => rej(r.error)
-          if (file.type.startsWith('image/')) r.readAsDataURL(file)
+          // An audio file goes out as a voice clip (send), which is a data URL like an image, not the file's text.
+          if (file.type.startsWith('image/') || file.type.startsWith('audio/')) r.readAsDataURL(file)
           else r.readAsText(file)
         })
         return { file, dataUrl }
@@ -1081,12 +1082,16 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // Only this machine's own engine says whether its model hears audio; a linked machine's model is taken not to, so
   // a recording for it is converted to text here first.
   const modelHears = !activeRemoteId && status?.model?.audio === true
+  const composerLocked = !ready || !!live || !!editingId || mut.compact.isPending || compactingHere
+  // "Send automatically" only when a send can go out now. One that send() would refuse (a reply still streaming, no
+  // model ready) leaves what was said in the chat box, where it used to be dropped.
+  const autoSendNow = () => useVoiceStore.getState().autoSend && !composerLocked
   const voice = useVoiceInput({
     modelHears,
     onText: (text) => {
       voiceUsed.current = true
       const combined = input.trim() ? `${input.trimEnd()} ${text}` : text
-      if (useVoiceStore.getState().autoSend) {
+      if (autoSendNow()) {
         void send(combined)
         return
       }
@@ -1095,7 +1100,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     },
     onClip: (clip: ComposerClip) => {
       voiceUsed.current = true
-      if (useVoiceStore.getState().autoSend) {
+      if (autoSendNow()) {
         void send(undefined, [...attachments, clip])
         return
       }
@@ -1104,7 +1109,6 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     },
     notify: (message, kind) => { if (kind === 'error') toast.error(message); else toast(message) },
   })
-  const composerLocked = !ready || !!live || !!editingId || mut.compact.isPending || compactingHere
   const onMicClick = () => {
     if (voice.phase === 'recording') { void voice.stop(); return }
     if (voice.phase !== 'idle') return

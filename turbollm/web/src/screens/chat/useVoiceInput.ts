@@ -224,6 +224,15 @@ export function useVoiceInput(opts: VoiceInputOptions) {
     void (mode === 'audio' ? attach(clip) : transcribe(clip))
   }, [attach, transcribe])
 
+  // Nothing is recorded while the page is not on screen (another tab, the Android app in the background): the
+  // recording ends there, and what was said so far goes where a finished recording goes.
+  useEffect(() => {
+    if (phase !== 'recording') return
+    const onHide = () => { if (document.visibilityState === 'hidden') void finish() }
+    document.addEventListener('visibilitychange', onHide)
+    return () => document.removeEventListener('visibilitychange', onHide)
+  }, [phase, finish])
+
   // Leaving the screen ends whatever was in progress: a microphone left open keeps the browser's recording light on.
   useEffect(() => () => {
     run.current++

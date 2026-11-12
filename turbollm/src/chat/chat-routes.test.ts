@@ -1701,6 +1701,9 @@ test('POST /messages refuses a malformed, unsupported, non-audio or too many voi
       { audio: ['data:image/png;base64,AAAA'] },
       { audio: ['not a clip'] },
       { audio: Array.from({ length: 9 }, () => WAV_URL) },
+      // A clip is one by what it is, whatever field it came in: as an image it would skip every check on `audio`.
+      { images: [WAV_URL] },
+      { images: [`attachment:${'ab'.repeat(32)}.wav`] },
     ]
     for (const extra of bad) {
       const res = await h.app.request(url, json({ content: 'hi', ...extra }))
@@ -1727,6 +1730,33 @@ test('Regenerate resends the answered turn\'s clip as input_audio', async () => 
     await (await h.app.request(`${base}/continue`, json({ regenerate: true }))).text()
     assert.equal(engine.bodies.length, 2)
     assert.deepEqual(lastParts(engine, 1), [{ type: 'input_audio', input_audio: { data: WAV_B64, format: 'wav' } }])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('Regenerate and Save & Resend of a voice message are refused with 409 audio_unsupported once the model no longer hears', async () => {
+  const h = inFlightHarness()
+  setHearing(h, true)
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    await (await h.app.request(`${base}/messages`, json({ audio: [WAV_URL] }))).text()
+    const rows = () => h.store.getMessages(conv.id).map((m) => [m.id, m.isActive])
+    const before = rows()
+    setHearing(h, false)
+
+    for (const body of [{ regenerate: true }, { edit: { messageId: before[0][0], content: 'typed instead' } }]) {
+      const res = await h.app.request(`${base}/continue`, json(body))
+      assert.equal(res.status, 409, JSON.stringify(body))
+      assert.equal(await errorCode(res), 'audio_unsupported')
+    }
+    // The reply was not set aside, the question not branched, and the engine not handed audio it cannot take.
+    assert.deepEqual(rows(), before)
+    assert.equal(engine.bodies.length, 1)
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
   } finally {
     engine.restore()
     h.cleanup()
