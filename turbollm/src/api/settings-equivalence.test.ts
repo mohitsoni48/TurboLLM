@@ -154,7 +154,7 @@ const BOOL = [true, false, 'false', null, 0]
 const STR = ['  value  ', '', 5, null]
 const BOOLEAN_FIELDS = [
   'autoGenerateTitles', 'autoMemoryEnabled', 'openBrowserOnStart', 'autoLoadOnStart', 'showAllEngineModels', 'lanBind',
-  'requireApiKey', 'autoAllowAll', 'comfyui.enabled', 'comfyui.reverseGate', 'gateway.autoSwap', 'requestLog.enabled',
+  'requireApiKey', 'autoAllowAll', 'pdfReading', 'comfyui.enabled', 'comfyui.reverseGate', 'gateway.autoSwap', 'requestLog.enabled',
   'requestLog.captureBodies', 'retention.enabled', 'experimental.memory', 'experimental.cloudDeploy', 'experimental.routines',
   'experimental.turboLink', 'experimental.remoteAccess', 'remoteAccess.cloudflare.requireAccess',
 ]
