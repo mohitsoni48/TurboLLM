@@ -97,7 +97,14 @@ const LITERT_LM_FILTER = 'filter=litert-lm&'
  *  sees. Vision-language and any-to-any bundles stay (they may answer text). Every other engine's rows are all kept. */
 function chatRowsFor(engine: EngineFormatRef | undefined, rows: RawSearchItem[]): RawSearchItem[] {
   if (!engine || !isSdkRow(engine) || !readsOnlyLitertlm(engine)) return rows
-  return rows.filter((m) => !NON_CHAT_PIPELINES.has(m.pipeline_tag ?? '') && !/embedding/i.test(repoIdOf(m)))
+  return rows.filter((m) => !isNonChatBundle(m))
+}
+
+/** A bundle that cannot chat, by its HF pipeline tag, any of its tags, or its name. Community re-uploads of the speech
+ *  and voice bundles carry no pipeline tag at all (QA F-1), so the name of the model family is the only signal left. */
+function isNonChatBundle(m: RawSearchItem): boolean {
+  const tags = [m.pipeline_tag ?? '', ...(Array.isArray(m.tags) ? m.tags : [])]
+  return tags.some((tag) => NON_CHAT_PIPELINES.has(tag)) || NON_CHAT_FAMILY_NAMES.test(repoIdOf(m))
 }
 
 const NON_CHAT_PIPELINES: ReadonlySet<string> = new Set([
@@ -106,6 +113,8 @@ const NON_CHAT_PIPELINES: ReadonlySet<string> = new Set([
   'feature-extraction',
   'sentence-similarity',
 ])
+
+const NON_CHAT_FAMILY_NAMES = /embedding|whisper|parakeet|kokoro|moonshine/i
 
 function toSearchItem(m: RawSearchItem): HfSearchItem {
   return {

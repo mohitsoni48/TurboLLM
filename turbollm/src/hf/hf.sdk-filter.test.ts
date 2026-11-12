@@ -98,6 +98,28 @@ test('on the LiteRT-LM SDK row, speech, voice and embedding bundles are dropped 
   assert.deepEqual(searched.result.map((r) => r.repo), CHAT_REPOS)
 })
 
+// QA F-1 (E-41, 2026-11-07): community re-uploads of the speech and voice bundles carry no pipeline tag at all (checked
+// against the HF API), so only their name or a tag says what they are. A name search listed all four on LiteRT-LM.
+const UNTAGGED_REUPLOADS: RawSearchItem[] = [
+  { id: 'warped-community/whisper-tiny-litert-lm' },
+  { id: 'warped-community/parakeet-tdt-0.6b-litert-lm' },
+  { id: 'warped-community/Kokoro-82M-litert-lm' },
+  { id: 'warped-community/moonshine-tiny-litert-lm' },
+  { id: 'someone/voice-bundle-litert-lm', tags: ['litert-lm', 'text-to-speech'] },
+  { id: 'someone/gemma-3-1b-it-litert-lm' },
+  { id: 'someone/Qwen3-0.6B-litert-lm' },
+  { id: 'someone/LFM2-1.2B-litert-lm', tags: ['litert-lm', 'text-generation'] },
+]
+
+test('on the LiteRT-LM SDK row, untagged speech and voice re-uploads are dropped by name or tag; chat ones stay', async () => {
+  const { result } = await withHfListing(UNTAGGED_REUPLOADS, () => client().searchModels('litert', LITERT_ROW))
+  assert.deepEqual(result.map((r) => r.repo), [
+    'someone/gemma-3-1b-it-litert-lm',
+    'someone/Qwen3-0.6B-litert-lm',
+    'someone/LFM2-1.2B-litert-lm',
+  ])
+})
+
 test('a search row carries its pipeline tag', async () => {
   const { result } = await withHfListing(LITERT_LISTING, () => client().browseModels('downloads', LITERT_ROW))
   assert.equal(result[0].pipelineTag, 'text-generation')
