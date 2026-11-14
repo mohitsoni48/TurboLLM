@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { describeRun, documentsFrom, pythonError, RUN_PYTHON_TOOL, safeName, sandboxTurn, turnFiles } from './run-python'
+import { describeRun, documentsFrom, filesFor, pythonError, RUN_PYTHON_TOOL, safeName, sandboxTurn, turnFiles } from './run-python'
 import type { SandboxManager } from './sandbox-manager'
 import { SandboxError, type SandboxFile, type SandboxRunResult } from './sandbox-process'
 
@@ -33,16 +33,47 @@ test('safeName: no folders, no odd characters, never empty', () => {
   assert.equal(safeName('', 'fallback.txt'), 'fallback.txt')
 })
 
-test('turnFiles: the turn\'s images and text documents, under unique names; other formats stay out', async () => {
-  const files = await turnFiles({
+test('turnFiles: images and text documents, under unique names; other formats stay out', async () => {
+  const files = await turnFiles([{
     attachments: ['attachment:abc.png', 'attachment:gone.png'],
     textAttachments: ['data.csv', 'report.pdf', 'Data.csv'],
     docContext: '[Attached: data.csv]\na\n\n[Attached: report.pdf]\nextracted\n\n[Attached: Data.csv]\nb',
-  }, store)
+  }], store)
   assert.deepEqual(files.map((f) => f.name), ['image-1.png', 'data.csv', 'Data-2.csv'])
   assert.deepEqual(files[0].bytes, PNG)
   assert.equal(files[1].bytes.toString(), 'a')
-  assert.deepEqual(await turnFiles(undefined, store), [])
+  assert.deepEqual(await turnFiles([], store), [])
+})
+
+test('turnFiles: across the chat, a name sent again is the newer file, and images are numbered in order', async () => {
+  const files = await turnFiles([
+    { attachments: ['attachment:abc.png'], textAttachments: ['sales.csv', 'notes.txt'], docContext: '[Attached: sales.csv]\nold\n\n[Attached: notes.txt]\nn' },
+    { attachments: [], textAttachments: [], docContext: undefined },
+    { attachments: ['attachment:abc.png'], textAttachments: ['sales.csv'], docContext: '[Attached: sales.csv]\nnew' },
+  ], store)
+  assert.deepEqual(files.map((f) => f.name), ['image-1.png', 'notes.txt', 'image-2.png', 'sales.csv'])
+  assert.equal(files.find((f) => f.name === 'sales.csv')!.bytes.toString(), 'new')
+})
+
+test('turnFiles: over 20 files, the newest are the ones sent', async () => {
+  const rows = Array.from({ length: 25 }, (_, i) => ({ attachments: [], textAttachments: [`f${i}.txt`], docContext: `[Attached: f${i}.txt]\n${i}` }))
+  const names = (await turnFiles(rows, store)).map((f) => f.name)
+  assert.equal(names.length, 20)
+  assert.equal(names[0], 'f5.txt')
+  assert.equal(names[19], 'f24.txt')
+})
+
+const user = (name: string) => ({ role: 'user' as const, toolCalls: [], attachments: [], textAttachments: [name], docContext: `[Attached: ${name}]\nx` })
+const reply = (ran: boolean) => ({ role: 'assistant' as const, toolCalls: ran ? [{ id: 't', name: 'run_python', args: {} }] : [], attachments: [], textAttachments: [] })
+
+test('filesFor: a fresh sandbox gets every user row; a warm one only the rows since the last run_python call', () => {
+  // The real chat this came from: sales.csv in turn 1, a run, and a follow-up with no attachment after the sandbox
+  // closed when idle. The follow-up's run must still find sales.csv.
+  const rows = [user('sales.csv'), reply(true), user('extra.csv'), reply(false), user('q.txt')] as never[]
+  const names = (r: ReturnType<typeof filesFor>) => r.map((x) => x.textAttachments![0])
+  assert.deepEqual(names(filesFor(rows, true)), ['sales.csv', 'extra.csv', 'q.txt'])
+  assert.deepEqual(names(filesFor(rows, false)), ['extra.csv', 'q.txt'])
+  assert.deepEqual(names(filesFor([user('a.csv')] as never[], false)), ['a.csv'])
 })
 
 const result = (over: Partial<SandboxRunResult>): SandboxRunResult => ({ ok: true, stdout: '', stderr: '', files: [], skipped: [], ...over })
@@ -99,18 +130,30 @@ test('sandboxTurn: the turn\'s files go in with its first run only, and again in
     has: () => warm,
     run: async (_c: string, _code: string, files: SandboxFile[]) => { calls.push(files); warm = true; return result({ stdout: 'ok' }) },
   } as unknown as SandboxManager
-  const turn = sandboxTurn({ convId: 'c1', manager, store, userMessage: () => ({ attachments: ['attachment:abc.png'], textAttachments: [], docContext: undefined }) })
+  const turn = sandboxTurn({ convId: 'c1', manager, store, history: () => [{ role: 'user', toolCalls: [], attachments: ['attachment:abc.png'], textAttachments: [], docContext: undefined }] })
   const ac = new AbortController()
-  await turn.run({ code: 'a' }, ac.signal)
+  const first = await turn.run({ code: 'a' }, ac.signal)
   await turn.run({ code: 'b' }, ac.signal)
   warm = false // the sandbox was killed (a timeout)
-  await turn.run({ code: 'c' }, ac.signal)
+  const after = await turn.run({ code: 'c' }, ac.signal)
   assert.deepEqual(calls.map((f) => f.length), [1, 0, 1])
+  // The chat's first run is not a "new sandbox" to the model; the one after the kill is.
+  assert.doesNotMatch(first.result, /new sandbox/)
+  assert.match(after.result, /^This run started a new sandbox: variables from earlier runs are gone\. The files attached in this chat are back in the folder: image-1\.png\./)
+})
+
+test('sandboxTurn: a follow-up after the sandbox closed gets the chat\'s earlier files, and is told it is a new sandbox', async () => {
+  const calls: SandboxFile[][] = []
+  const manager = { has: () => false, run: async (_c: string, _code: string, files: SandboxFile[]) => { calls.push(files); return result({ stdout: '51800' }) } } as unknown as SandboxManager
+  const history = [user('sales.csv'), reply(true), { role: 'user', toolCalls: [], attachments: [], textAttachments: [], docContext: undefined }] as never[]
+  const r = await sandboxTurn({ convId: 'c1', manager, store, history: () => history }).run({ code: 'print(1)' }, new AbortController().signal)
+  assert.deepEqual(calls[0].map((f) => f.name), ['sales.csv'])
+  assert.match(r.result, /new sandbox.*back in the folder: sales\.csv\./)
 })
 
 test('sandboxTurn: empty code, and a sandbox failure, come back as the tool\'s error text', async () => {
   const manager = { has: () => false, run: async () => { throw new SandboxError('timeout', 'The code ran longer than 60 seconds and was stopped.') } } as unknown as SandboxManager
-  const turn = sandboxTurn({ convId: 'c1', manager, store, userMessage: () => undefined })
+  const turn = sandboxTurn({ convId: 'c1', manager, store, history: () => [] })
   const ac = new AbortController()
   assert.match((await turn.run({}, ac.signal)).result, /needs a non-empty `code`/)
   assert.match((await turn.run({ code: 'while True: pass' }, ac.signal)).result, /^Error: The code ran longer .* Variables from earlier runs are gone\.$/)

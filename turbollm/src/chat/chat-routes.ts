@@ -1301,11 +1301,12 @@ function chatSandbox(d: Deps, convId: string, assistantId: string, isCodeAuthori
     convId,
     manager: d.sandbox,
     store: d.db.attachments,
-    // The user row this turn answers: the last active user message before its placeholder, read at the call.
-    userMessage: () => {
+    // The chat's active rows before this turn's placeholder, read at the call: the files every user message attached,
+    // and where the last run_python call was.
+    history: () => {
       const msgs = d.db.getMessages(convId)
       const at = msgs.findIndex((m) => m.id === assistantId)
-      return msgs.slice(0, at < 0 ? msgs.length : at).reverse().find((m) => m.role === 'user')
+      return msgs.slice(0, at < 0 ? msgs.length : at)
     },
   })
 }
