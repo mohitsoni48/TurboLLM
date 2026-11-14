@@ -7,10 +7,11 @@
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import { test } from 'node:test'
-import { readFileSync, rmSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
 import { Hono } from 'hono'
 import { stripThinkingBlocks, needsExtraPass } from './think-utils.js'
-import { recentTitleTurns, chatCodeAuthorization, registerChatRoutes, voiceClipsRefusal } from './chat-routes.js'
+import { recentTitleTurns, chatCodeAuthorization, readCappedJson, registerChatRoutes, voiceClipsRefusal } from './chat-routes.js'
 import { VOICE_MESSAGE_PLACEHOLDER } from './chat-compaction.js'
 import { ChatTurns } from './chat-turns.js'
 import { ChatRuns } from './chat-runs.js'
@@ -1794,6 +1795,61 @@ test('voiceClipsRefusal accepts up to 8 WAV or MP3 clips and names why it refuse
     assert.match(voiceClipsRefusal([clip])!, /WAV or MP3/, clip)
   }
   assert.match(voiceClipsRefusal([`data:audio/wav;base64,${'A'.repeat(44 * 1024 * 1024)}`])!, /32 MB/)
+})
+
+// A data URL the store cannot turn into a file (garbage, line breaks, odd padding) would stay inline in the message row,
+// up to 44 MB of it, and be resent on every later turn; the engine would answer it with an opaque 500.
+test('voiceClipsRefusal refuses a clip whose base64 is not canonical, so it cannot sit inline in the database', () => {
+  for (const clip of ['data:audio/wav;base64,!!!', 'data:audio/wav;base64,AAAA\nAAAA', 'data:audio/wav;base64,AAA', 'data:audio/wav;base64,AA=A', 'data:audio/wav;base64,AAAB=']) {
+    assert.match(voiceClipsRefusal([clip])!, /valid base64/, clip)
+  }
+})
+
+// Checked before the conversation is read and the model asked, so a refused send writes nothing to disk (the janitor
+// would only collect the clips later, and a model swap between recording and send makes this easy to hit).
+test('a refused voice send leaves no clip file on disk', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    const attachments = join(h.d.store.dir(), 'attachments')
+    const files = () => (existsSync(attachments) ? readdirSync(attachments).filter((f) => !f.endsWith('.tmp')) : [])
+    setHearing(h, false)
+    assert.equal((await h.app.request(`/api/v1/conversations/${conv.id}/messages`, json({ content: 'hi', audio: [WAV_URL] }))).status, 409)
+    assert.deepEqual(files(), [], 'a model that cannot hear refused the clip')
+    setHearing(h, true)
+    assert.equal((await h.app.request('/api/v1/conversations/no-such-chat/messages', json({ audio: [WAV_URL] }))).status, 404)
+    assert.deepEqual(files(), [], 'a conversation that does not exist refused the clip')
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+// The cap must not replace the request object: holdTurn finds the caller by it (auth.ts admissions), so a replaced
+// request would leave a running turn that revoking the caller's way in no longer stops.
+test('readCappedJson reads a JSON body within the cap, whatever its framing, and reports one past it without parsing it', async () => {
+  const chunked = (parts: string[]) => new Request('http://x/', {
+    method: 'POST', duplex: 'half',
+    body: new ReadableStream({ start(ctl) { for (const p of parts) ctl.enqueue(new TextEncoder().encode(p)); ctl.close() } }),
+  } as RequestInit)
+  assert.deepEqual(await readCappedJson(chunked(['{"a":', '1}']), 100), { ok: true, value: { a: 1 } })
+  assert.deepEqual(await readCappedJson(chunked(['{"a":', '"' + 'x'.repeat(50) + '"}']), 20), { ok: false })
+  assert.deepEqual(await readCappedJson(chunked(['not json']), 100), { ok: true, value: {} }, 'unparsable is an empty body, as body() treats it')
+  assert.deepEqual(await readCappedJson(new Request('http://x/', { method: 'POST' }), 100), { ok: true, value: {} })
+})
+
+test('POST /messages refuses a body larger than eight clips and a few images with 413 before reading it', async () => {
+  const h = inFlightHarness()
+  try {
+    const conv = h.store.createConversation()
+    const res = await h.app.request(`/api/v1/conversations/${conv.id}/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'content-length': String(600 * 1024 * 1024) }, body: '{}',
+    })
+    assert.equal(res.status, 413)
+  } finally {
+    h.cleanup()
+  }
 })
 
 test('recentTitleTurns drops input_audio parts, names a clip-only turn, and leaves images and plain text alone', () => {

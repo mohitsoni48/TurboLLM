@@ -71,6 +71,12 @@ function dataUrlPayload(url: string): string {
   return url.slice(url.indexOf(',') + 1)
 }
 
+/** Whether `url` is a data URL whose base64 is canonical, the only kind this store can turn into a file. Anything
+ *  else (garbage, line breaks, odd padding) would stay inline in the message row. */
+export function isCanonicalDataUrl(url: string): boolean {
+  return parseConvertible(url) !== null
+}
+
 /** An image or clip data URL this store can keep as a file, or null to keep it inline. */
 function parseConvertible(url: string): { ext: string; bytes: Buffer } | null {
   const m = DATA_URL_PATTERN.exec(url)

@@ -9,8 +9,10 @@
 //    `models:use`). The status names no file path.
 //  - installing or removing whisper-server: the host, or a caller with a full API key (isLocalOrAuthenticated), as
 //    for every route that ends in running a downloaded binary.
-//  - model downloads and deletes: any caller lanAuth admits except a scoped remote-access token (unmapped in
+//  - model downloads: any caller lanAuth admits except a scoped remote-access token (unmapped in
 //    requiredCapability). The download is a fixed file from a fixed list, not a URL the caller chooses.
+//  - model deletes: the host or a caller with a full API key, like deleting a chat model. A hand-placed ggml file
+//    cannot be fetched again.
 import type { Hono } from 'hono'
 import { bodyLimit } from 'hono/body-limit'
 import { isLocalOrAuthenticated } from '../auth'
@@ -119,6 +121,7 @@ export function registerVoiceRoutes(app: Hono, d: Deps): void {
   })
 
   app.delete('/api/v1/voice/models/:id', async (c) => {
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'api_key_required', 'Deleting a whisper model requires a valid API key from a non-host device.')
     const v = voice()
     if (!v) return err(c, 503, 'stt_unavailable', NOT_RUNNING)
     try {

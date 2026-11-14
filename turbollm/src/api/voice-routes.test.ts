@@ -251,6 +251,16 @@ test('POST /voice/models/:id/cancel cancels only the download that is running un
   assert.deepEqual(f.names(), ['cancelModelDownload'])
 })
 
+// A hand-placed ggml file cannot be downloaded again, so deleting a model is no more for an anonymous LAN peer than
+// deleting a chat model is (models-routes.ts).
+test('DELETE /voice/models/:id is refused with 403 api_key_required for a non-host caller and never reaches the service', async () => {
+  const f = fakeVoice()
+  const res = await mk({ voice: f.voice, remote: true }).request('/api/v1/voice/models/base', { method: 'DELETE' })
+  assert.equal(res.status, 403)
+  assert.equal((await errorOf(res)).code, 'api_key_required')
+  assert.deepEqual(f.calls, [])
+})
+
 test('DELETE /voice/models/:id calls deleteModel with the id, and maps its VoiceError through', async () => {
   const f = fakeVoice()
   const ok = await mk({ voice: f.voice }).request('/api/v1/voice/models/base', { method: 'DELETE' })
