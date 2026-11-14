@@ -6,6 +6,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { ToolRegistry, ToolCall } from './tool-registry'
 import { executeToolCallWithApproval } from './execute-with-approval'
+import { resolveToolApproval } from './approval-gate'
 
 function fakeTools(result = 'ok'): ToolRegistry {
   return {
@@ -221,4 +222,60 @@ test('a Stop while an Ask waits within its limit stays a deny by the user', asyn
   await new Promise((r) => setImmediate(r))
   ac.abort()
   assert.equal((await outcome).result, 'Denied by user.')
+})
+
+// ── run_python (GitHub #52) ─────────────────────────────────────────────────────────────────
+
+const pythonTurn = (files: string[] = []) => {
+  const runs: Array<Record<string, unknown>> = []
+  return { runs, sandbox: { run: async (args: Record<string, unknown>) => { runs.push(args); return { result: 'Output:\n2', files } } } }
+}
+const pythonCall = (over: Partial<Parameters<typeof executeToolCallWithApproval>[0]>) => executeToolCallWithApproval({
+  tools: fakeTools('registry must not run it'),
+  sink: () => {},
+  convId: 'c-py',
+  id: 'p1',
+  name: 'run_python',
+  args: { code: 'print(1 + 1)' },
+  globalPolicies: {},
+  convOverrides: {},
+  signal: new AbortController().signal,
+  interactive: true,
+  ...over,
+})
+
+test('run_python: refused without a sandbox, before any approval is asked', async () => {
+  const { sink, events } = collectSink()
+  const r = await pythonCall({ sink })
+  assert.match(r.result, /only available in a chat on this computer/)
+  assert.equal(events.some((e) => (e.data as { status?: string }).status === 'awaiting_approval'), false)
+})
+
+test('run_python: refused to a run with nobody to ask, even when its agent lists the tool', async () => {
+  const { sandbox, runs } = pythonTurn()
+  const r = await pythonCall({ sandbox, interactive: false, agentAllowedTools: ['run_python'] })
+  assert.match(r.result, /only available in a chat on this computer/)
+  assert.equal(runs.length, 0)
+})
+
+test('run_python: Always Allow, Allow for this chat and Auto-allow all still ask; Allow once runs it and returns its files', async () => {
+  const { sandbox, runs } = pythonTurn(['attachment:aa.png'])
+  const { sink, events } = collectSink()
+  const pending = pythonCall({ sandbox, sink, globalPolicies: { run_python: 'allow' }, convOverrides: { run_python: 'allow' }, autoAllowAll: true })
+  await new Promise((r) => setImmediate(r))
+  assert.equal((events[0].data as { status: string }).status, 'awaiting_approval')
+  assert.equal(runs.length, 0)
+  resolveToolApproval('c-py:p1', 'allow')
+  const r = await pending
+  assert.equal(runs.length, 1)
+  assert.equal(r.result, 'Output:\n2')
+  assert.deepEqual(r.files, ['attachment:aa.png'])
+  assert.deepEqual((events.at(-1)!.data as { files?: string[] }).files, ['attachment:aa.png'])
+})
+
+test('run_python: a Deny in Settings blocks it without asking', async () => {
+  const { sandbox, runs } = pythonTurn()
+  const r = await pythonCall({ sandbox, globalPolicies: { run_python: 'deny' } })
+  assert.match(r.result, /^Blocked/)
+  assert.equal(runs.length, 0)
 })

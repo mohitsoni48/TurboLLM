@@ -405,6 +405,9 @@ export interface ToolCallRecord {
   args: Record<string, unknown>
   result?: string
   error?: string
+  /** run_python only (GitHub #52): the images the run handed back, as attachment references (`attachment:<id>`). The
+   *  reply row's own `attachments` names them too, which is what the attachment janitor keeps. */
+  files?: string[]
   /** Code mode only (pi's edit tool result) — a display-oriented diff and a standard unified
    *  patch of the change. Persisted so the diff panel and revert-to-message (code-routes.ts's
    *  revert endpoint) both still have this after a page reload, not just on the live SSE
@@ -935,9 +938,10 @@ export class ConversationStore {
     return row ? rowToMsg(row) : null
   }
 
-  updateMessage(id: string, patch: Partial<Pick<Message, 'content' | 'reasoning' | 'toolCalls' | 'timeline' | 'stats' | 'researchMeta' | 'edited'>>): boolean {
+  updateMessage(id: string, patch: Partial<Pick<Message, 'content' | 'reasoning' | 'attachments' | 'toolCalls' | 'timeline' | 'stats' | 'researchMeta' | 'edited'>>): boolean {
     const sets: string[] = []
     const params: Record<string, SqlValue> = { $id: id }
+    if (patch.attachments  !== undefined) { sets.push('attachments = $att');         params.$att          = JSON.stringify(patch.attachments) }
     if (patch.content      !== undefined) { sets.push('content = $content');         params.$content      = patch.content }
     if (patch.reasoning    !== undefined) { sets.push('reasoning = $reasoning');     params.$reasoning    = patch.reasoning }
     if (patch.toolCalls    !== undefined) { sets.push('tool_calls = $tc');           params.$tc           = JSON.stringify(patch.toolCalls) }
