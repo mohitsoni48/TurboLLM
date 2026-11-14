@@ -3,12 +3,13 @@
 // then opens a native window pointed at http://localhost:6996. Closing the window leaves
 // the app and its daemon running (a tray icon on Windows and Linux, the Dock on macOS);
 // only quitting the app stops the daemon (window-lifecycle.js).
-const { app, BrowserWindow, Menu, Notification, Tray, dialog, nativeImage, session, shell } = require('electron')
+const { app, BrowserWindow, Menu, Notification, Tray, clipboard, dialog, nativeImage, session, shell } = require('electron')
 const { join } = require('path')
 const { homedir } = require('os')
 const { execFile, spawn } = require('child_process')
 const http = require('http')
 const { existsSync, readFileSync } = require('fs')
+const { contextMenuTemplate } = require('./context-menu')
 const { createDaemonSupervisor, daemonSpawnSpec, dataDirInUseNotice, configAccessNotice } = require('./daemon-supervisor')
 const { allowPermission, appOriginFor, daemonPortFor, decodeConfigText, isAppUrl, isWebUrl, launchPortFor, recordedPortFor } = require('./window-guards')
 const {
@@ -334,6 +335,14 @@ function openMainWindow () {
   })
   guardWindow(mainWindow)
   const win = mainWindow
+  // Right-click: Electron shows no menu of its own (context-menu.js).
+  win.webContents.on('context-menu', (_event, params) => {
+    const template = contextMenuTemplate(params, {
+      replaceMisspelling: (word) => win.webContents.replaceMisspelling(word),
+      copyLink: (url) => clipboard.writeText(url),
+    })
+    if (template.length > 0) Menu.buildFromTemplate(template).popup({ window: win })
+  })
   // Windows and Linux: a close hides the window into the tray (minimizes it on a Linux desktop that shows no tray
   // icon) and the daemon keeps running; Quit is what stops it. During a quit the close goes through (see
   // window-lifecycle.js closeAction).

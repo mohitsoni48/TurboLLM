@@ -107,11 +107,14 @@ async function readBodies(d: Deps, socket: Socket, headers: Record<string, strin
 const HOST_ONLY: [string, (cfg: Config) => unknown][] = [
   ['requireApiKey', (cfg) => ({ requireApiKey: !cfg.daemon.requireApiKey })],
   ['lanBind', (cfg) => ({ lanBind: !cfg.daemon.lanBind })],
+  ['pdfReading', (cfg) => ({ pdfReading: !(cfg.tools?.pdfReading ?? false) })],
   ['port', (cfg) => ({ port: cfg.daemon.port + 1 })],
   ['remoteAccess', () => ({ remoteAccess: { cloudflare: { accessTeamDomain: 'https://evil.cloudflareaccess.com', accessAud: 'evil-aud' } } })],
   ['remoteAccess', () => ({ remoteAccess: { ngrok: { authtoken: 'attacker-token' } } })],
   ['remoteAccess', () => ({ remoteAccess: { tokenGrant: { capabilities: ['models:use', 'models:load'] } } })],
   ['experimental.remoteAccess', () => ({ experimental: { remoteAccess: true } })],
+  // Switching on code execution on the host is the host's call.
+  ['experimental.sandbox', () => ({ experimental: { sandbox: true } })],
   // GET /api/v1/build/prereqs (no gate) runs git/cmake from here: a UNC share passes the
   // absolute-path check, so on Windows this is the caller's git.exe run by the daemon.
   ['build.toolchainDirs', () => ({ build: { toolchainDirs: ['\\\\attacker\\share'] } })],

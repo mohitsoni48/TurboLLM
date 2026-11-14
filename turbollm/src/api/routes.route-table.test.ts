@@ -143,5 +143,13 @@ test('registerApi mounts every /api/v1 route in its original registration order'
     'POST /api/v1/voice/models/:id/download',
     'POST /api/v1/voice/models/:id/cancel',
     'DELETE /api/v1/voice/models/:id',
+    'GET /api/v1/sandbox/runtime',
+    'GET /api/v1/sandbox/runtime',
+    'POST /api/v1/sandbox/runtime/install',
+    'POST /api/v1/sandbox/runtime/install',
+    'DELETE /api/v1/sandbox/runtime/install',
+    'DELETE /api/v1/sandbox/runtime/install',
+    'DELETE /api/v1/sandbox/runtime',
+    'DELETE /api/v1/sandbox/runtime',
   ])
 })

@@ -87,6 +87,7 @@ test('PATCH /api/v1/settings answers a boolean, string or number field of anothe
     ['lanBind', 'false'],
     ['requireApiKey', null],
     ['autoAllowAll', 'false'],
+    ['pdfReading', 'true'],
     ['autoGenerateTitles', 1],
     ['autoMemoryEnabled', 0],
     ['openBrowserOnStart', 'true'],
@@ -149,7 +150,7 @@ test('PATCH /api/v1/settings answers a boolean, string or number field of anothe
 test('PATCH /api/v1/settings still takes every such field with its own JSON type, as the Settings screen sends it', async () => {
   const { cfg, patch } = mkApp()
   const res = await patch(JSON.stringify({
-    lanBind: false, requireApiKey: true, autoAllowAll: false, autoGenerateTitles: false, autoMemoryEnabled: true,
+    lanBind: false, requireApiKey: true, autoAllowAll: false, pdfReading: false, autoGenerateTitles: false, autoMemoryEnabled: true,
     openBrowserOnStart: false, autoLoadOnStart: true, showAllEngineModels: true,
     comfyui: { enabled: true, reverseGate: false }, gateway: { autoSwap: true, keepN: 2 },
     requestLog: { enabled: true, captureBodies: true },
@@ -187,4 +188,15 @@ test('PATCH /api/v1/settings still takes every such field with its own JSON type
   assert.equal(cfg.remoteAccess.custom.publicUrl, 'https://x.example.com')
   assert.deepEqual(cfg.build.toolchainDirs, ['/opt/cuda/bin'])
   assert.deepEqual(cfg.code.agentsMdProjectCandidates, ['AGENTS.md'])
+})
+
+test('PATCH /api/v1/settings stores pdfReading as sent (default off) and echoes it back', async () => {
+  const { cfg, patch } = mkApp()
+  assert.equal(cfg.tools.pdfReading === true, false, 'PDF reading is off until Settings turns it on')
+  const on = await patch(JSON.stringify({ pdfReading: true }))
+  assert.equal(on.status, 200)
+  assert.equal(cfg.tools.pdfReading, true)
+  const off = await patch(JSON.stringify({ pdfReading: false }))
+  assert.equal(off.status, 200)
+  assert.equal(cfg.tools.pdfReading, false)
 })

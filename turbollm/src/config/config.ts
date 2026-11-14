@@ -195,6 +195,12 @@ export interface ExperimentalFeatures {
    *  supervisor does not run. Deliberately does NOT gate Phase 1's ingress listener or
    *  `--tunnel`, both of which must keep working for every install. */
   remoteAccess: boolean
+  /** Master gate for the Python sandbox (GitHub #52): Pyodide inside Deno with no network, no env and no write
+   *  access, downloaded once (about 75 MB) into `<config dir>/runtimes/sandbox/`. Off for every install, new or
+   *  upgraded, and never on Android (Deno has no Android build; `sandbox/gate.ts` refuses there whatever this
+   *  says). When off, the runtime routes other than reading its state refuse with a typed code. Turning it off
+   *  keeps the downloaded runtime; Remove in Settings deletes it. */
+  sandbox: boolean
 }
 export interface Telemetry {
   level: string
@@ -264,6 +270,10 @@ export interface ToolsConfig {
    *  instead. Only silences a resolved 'ask' — an explicit 'deny' (global or
    *  per-conversation) is still honored; see resolveToolPolicy. */
   autoAllowAll?: boolean
+  /** Settings → Tool permissions → "Read PDFs in fetch_url", default OFF (a proposed safety default:
+   *  fetch_url feeds untrusted remote bytes to a PDF parser). When false, a PDF reply gets a fixed
+   *  "PDF reading is disabled" note and is never parsed or decoded. */
+  pdfReading?: boolean
   /** How long a chat reply waits for the answers to its tool calls set to Ask, all its calls
    *  together, in whole minutes (Settings → Tool permissions; CHAT_APPROVAL_WAIT_MINUTES's bounds,
    *  default 30). Past it the call still waiting, and every later one of the reply, is not run and
@@ -822,7 +832,7 @@ export function defaultConfig(): Config {
       theme: 'system',
       autoGenerateTitles: true,
       autoMemoryEnabled: false,
-      experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false },
+      experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false, sandbox: false },
     },
     telemetry: { level: 'full', machineId: '' },
     apiKeys: [],
@@ -1387,6 +1397,7 @@ function normalize(c: Config): void {
   }
   c.tools.toolPolicies = toolPolicies
   c.tools.autoAllowAll = tl.autoAllowAll === true
+  c.tools.pdfReading = tl.pdfReading === true
   // Absent in configs written before the setting, or hand-edited out of range: the default (30
   // minutes), never a throw on load. A fraction is floored, as the minutes it stands for.
   c.tools.chatApprovalWaitMinutes = loadBounded(tl.chatApprovalWaitMinutes, CHAT_APPROVAL_WAIT_MINUTES)
@@ -1602,6 +1613,8 @@ function normalize(c: Config): void {
     // presence would silently enable an unverified cross-machine feature on upgrade.
     turboLink: ex.turboLink === true,
     remoteAccess: ex.remoteAccess === true,
+    // `sandbox` (2026-11-10, GitHub #52): new, so there is no earlier opt-in to carry forward.
+    sandbox: ex.sandbox === true,
   }
   // Telemetry level (spec 09 §3): the UI exposes 'off' | 'anon' | 'full'. Migrate
   // legacy/unknown values safely → 'off' (the conservative, opt-in default).

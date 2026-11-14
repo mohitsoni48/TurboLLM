@@ -22,6 +22,7 @@ import { registerLifecycleRoutes } from './lifecycle-routes'
 import { registerMcpRoutes } from './mcp-routes'
 import { registerModelRoutes } from './models-routes'
 import { registerOnboardingRoutes } from './onboarding-routes'
+import { registerSandboxRuntimeRoutes } from './sandbox-runtime-routes'
 import { registerSettingsRoutes } from './settings-routes'
 import { registerStatusRoutes } from './status-routes'
 import { registerSystemOneJobRoutes } from './systemone-job'
@@ -66,4 +67,6 @@ export function registerApi(app: Hono, d: Deps): void {
   registerSystemOneJobRoutes(app, d)
   // Speech-to-text for the chat's microphone (voice-routes.ts).
   registerVoiceRoutes(app, d)
+  // The Python sandbox's runtime download (GitHub #52).
+  registerSandboxRuntimeRoutes(app, d)
 }

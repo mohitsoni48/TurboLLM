@@ -271,8 +271,7 @@ the detail:
   **microphone** in the chat box records a message and stops by itself when you finish speaking;
   [whisper.cpp](https://github.com/ggml-org/whisper.cpp) turns it into text you can read and fix
   before sending. *Settings → Voice* sets it up: one click installs whisper.cpp's own build on
-  Windows and Linux (on macOS it uses Homebrew's `whisper.cpp`; the Android app has it built
-  in), and you pick a model to download.
+  Windows and Linux (on macOS it uses Homebrew's `whisper.cpp`; the Android app is to carry it, with a matching app release), and you pick a model to download.
   A model that **hears audio** (Voxtral, Ultravox, Qwen-Omni, a LiteRT-LM bundle with an audio
   encoder) can be sent the recording itself instead, so it hears your voice and not only your
   words: TurboLLM asks which you want, once or every time. **Read aloud** on any reply speaks it

@@ -420,6 +420,8 @@ export const SETTINGS = [
     bool('experimental.routines', (c, v) => { c.daemon.experimental.routines = v }),
     bool('experimental.turboLink', (c, v) => { c.daemon.experimental.turboLink = v }),
     bool('experimental.remoteAccess', (c, v) => { c.daemon.experimental.remoteAccess = v }, { label: 'remote access', get: (c) => c.daemon.experimental.remoteAccess }),
+    // Host-only: a remote caller must not be able to switch on code execution on this machine.
+    bool('experimental.sandbox', (c, v) => { c.daemon.experimental.sandbox = v }, { label: 'the Python sandbox', get: (c) => c.daemon.experimental.sandbox }),
   ], { effect: 'stopRemoteAccess' }),
   // Tool-call approval gate: global per-tool policy map, every value ask | allow | deny.
   row('toolPolicies', (c) => c.tools.toolPolicies ?? {}, [
@@ -441,6 +443,10 @@ export const SETTINGS = [
   ]),
   row('autoAllowAll', (c) => c.tools.autoAllowAll ?? false, [
     bool('autoAllowAll', (c, v) => { c.tools.autoAllowAll = v }, { label: '"Auto-allow all"', get: (c) => c.tools.autoAllowAll }),
+  ]),
+  // Same posture as autoAllowAll: it widens what an untrusted URL's bytes may reach (the PDF parser).
+  row('pdfReading', (c) => c.tools.pdfReading ?? false, [
+    bool('pdfReading', (c, v) => { c.tools.pdfReading = v }, { label: '"Read PDFs in fetch_url"', get: (c) => c.tools.pdfReading }),
   ]),
   // How long a chat reply waits for its tool calls' approvals (execute-with-approval.ts). Not host-only like
   // toolPolicies: the wait running out runs nothing (the call is answered as not run), so no value of it lets a tool run.

@@ -634,6 +634,8 @@ export const UI_ACTIONS = [
   'toggle_artifact_interactive', 'toggle_artifact_fit', 'download_artifact',
 
   'toggle_auto_allow_tools', 'set_tool_policy',
+  // Added after the Phase 6jj batch note above was written.
+  'toggle_pdf_reading',
   'close_import_url_dialog', 'import_model_url',
   'restart_engine',
   'cancel_custom_build_dialog', 'continue_custom_build_dialog',

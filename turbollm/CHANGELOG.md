@@ -33,11 +33,11 @@ Voice: talk to a model and have it read its answers back, all on your machine.
     in the chat box, where you can fix it before sending. *Settings → Voice* sets it up: on Windows and Linux one click
     installs whisper.cpp's own release build (checked against a pinned checksum); on macOS, where whisper.cpp publishes
     no build, it uses the one Homebrew installs (`brew install whisper.cpp`); anywhere, you can point it at a
-    `whisper-server` of your own. The Android app has whisper.cpp built in (compiled from the same release), so there
-    is nothing to install on a phone. Then download a model (Base is a good start, and its compact build on a phone;
+    `whisper-server` of your own. The Android app is meant to carry whisper.cpp inside the app (a matching TurboLLM-Android
+    release is needed for that; this release only looks for it), so a phone would need nothing installed. Then download a model (Base is a good start, and its compact build on a phone;
     Tiny to Large v3 Turbo are listed, and a ggml file you put in the models folder yourself is offered too). whisper
     runs on the CPU unless you turn the GPU option on, starts when you first record, and stops again after ten minutes
-    unused. The Android app carries a GPU server too (a second, Vulkan build of whisper-server, for Android 9 and
+    unused. With that Android release a GPU server comes too (a second, Vulkan build of whisper-server, for Android 9 and
     later), so the option is there as well; if the phone's graphics driver cannot run it, the recording is
     transcribed on the CPU instead and *Settings → Voice* says why.
   - **Models that hear audio.** A model that takes audio as input (Voxtral, Ultravox, Qwen-Omni and others on
@@ -64,6 +64,12 @@ Voice: talk to a model and have it read its answers back, all on your machine.
 - **Voice clips in the chat API.** `POST /api/v1/conversations/:id/messages` takes `audio` (WAV or MP3 `data:` URLs)
   beside `images`, and refuses it with 409 `audio_unsupported` for a model that cannot hear. `GET /api/v1/status`
   reports `model.audio` for a loaded model that can.
+- **Python sandbox runtime** (Experimental, off by default: Settings → Experimental → Python sandbox; desktop only).
+  The first step of the Python sandbox (GitHub #52). With the switch on, Download fetches Deno 2.9.6 and Pyodide 0.29.5
+  with pandas, numpy, matplotlib, Pillow, sympy and their dependencies, about 77 MB once and about 130 MB on disk, into
+  `runtimes/sandbox/` next to the config. Every file is checked against a size and SHA-256 shipped inside TurboLLM, and
+  the install is all or nothing. Turning the switch off keeps the runtime; Remove deletes it. Nothing runs Python yet;
+  that comes with the `run_python` tool.
 
 ### Changed
 
