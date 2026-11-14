@@ -220,6 +220,35 @@ export function installCodeAgent(id: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/v1/code/agents/${encodeURIComponent(id)}/install`, { method: 'POST', json: {} })
 }
 
+// ── Python sandbox runtime (GitHub #52) ──────────────────────────────────────
+/** The sandbox's downloaded runtime: Deno plus Pyodide, fetched once when the user turns the sandbox on. */
+export interface SandboxRuntimeState {
+  /** The experimental flag, as the daemon reads it (always false on Android). */
+  enabled: boolean
+  /** False where no Deno build exists for this machine. */
+  supported: boolean
+  installed: { deno: string; pyodide: string } | null
+  downloadBytes: number
+  diskBytes: number
+  job: { state: 'idle' | 'running' | 'error'; doneBytes: number; error?: { code: string; message: string } }
+}
+
+export function getSandboxRuntime(): Promise<SandboxRuntimeState> {
+  return request<SandboxRuntimeState>('/api/v1/sandbox/runtime')
+}
+
+export function installSandboxRuntime(): Promise<SandboxRuntimeState> {
+  return request<SandboxRuntimeState>('/api/v1/sandbox/runtime/install', { method: 'POST', json: {} })
+}
+
+export function cancelSandboxRuntime(): Promise<SandboxRuntimeState> {
+  return request<SandboxRuntimeState>('/api/v1/sandbox/runtime/install', { method: 'DELETE' })
+}
+
+export function removeSandboxRuntime(): Promise<SandboxRuntimeState> {
+  return request<SandboxRuntimeState>('/api/v1/sandbox/runtime', { method: 'DELETE' })
+}
+
 /** Live running-session stats (B4) ride on the status payload — surfaced from the
  *  status poll rather than a separate endpoint. Re-exported for convenience. */
 export type { EngineStats } from './types'

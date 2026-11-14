@@ -78,6 +78,7 @@
   },
   "overrides": {
     "esbuild": "^0.28.1",
+    "@napi-rs/canvas": "1.1.0",
     "@earendil-works/pi-coding-agent": {
       "undici": "8.11.2"
     }

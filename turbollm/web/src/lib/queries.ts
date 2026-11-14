@@ -133,6 +133,11 @@ import {
   type SysInfo,
   type TelemetryLevel,
   getAgentAvailability,
+  getSandboxRuntime,
+  installSandboxRuntime,
+  cancelSandboxRuntime,
+  removeSandboxRuntime,
+  type SandboxRuntimeState,
   ApiError,
 } from './api'
 import { toast } from '../components/ui/sonner'
@@ -184,6 +189,7 @@ export const queryKeys = {
   modelDirs: ['modeldirs'] as const,
   downloads: ['downloads'] as const,
   agentAvailability: ['agent-availability'] as const,
+  sandboxRuntime: ['sandbox-runtime'] as const,
   tokenUsage: (range: TokenUsageRange) => ['token-usage', range] as const,
   hwStats: ['hwstats'] as const,
 }
@@ -201,6 +207,29 @@ export function useAgentAvailability() {
     refetchOnWindowFocus: true,
     refetchInterval: (q) => (q.state.data?.agents.some((a) => a.installing) ? 2000 : false),
   })
+}
+
+/** The Python sandbox's runtime (GitHub #52), read only while its Settings row is open. The daemon announces each
+ *  tenth of a download (`sandboxRuntime`); the 1 s poll while one runs is the safety net for a closed stream. */
+export function useSandboxRuntime(enabled: boolean) {
+  return useQuery({
+    queryKey: queryKeys.sandboxRuntime,
+    queryFn: getSandboxRuntime,
+    enabled,
+    retry: false,
+    refetchInterval: (q) => (q.state.data?.job.state === 'running' ? 1000 : false),
+  })
+}
+
+/** Download, cancel or remove the sandbox runtime; each answers with the new state. */
+export function useSandboxRuntimeActions() {
+  const qc = useQueryClient()
+  const onSuccess = (state: SandboxRuntimeState) => qc.setQueryData(queryKeys.sandboxRuntime, state)
+  return {
+    install: useMutation({ mutationFn: installSandboxRuntime, onSuccess }),
+    cancel: useMutation({ mutationFn: cancelSandboxRuntime, onSuccess }),
+    remove: useMutation({ mutationFn: removeSandboxRuntime, onSuccess }),
+  }
 }
 
 /** How often an idle status refetches while the invalidation stream is open (live-events.ts): the daemon

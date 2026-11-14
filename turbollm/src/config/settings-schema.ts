@@ -388,6 +388,8 @@ export const SETTINGS = [
     bool('experimental.routines', (c, v) => { c.daemon.experimental.routines = v }),
     bool('experimental.turboLink', (c, v) => { c.daemon.experimental.turboLink = v }),
     bool('experimental.remoteAccess', (c, v) => { c.daemon.experimental.remoteAccess = v }, { label: 'remote access', get: (c) => c.daemon.experimental.remoteAccess }),
+    // Host-only: a remote caller must not be able to switch on code execution on this machine.
+    bool('experimental.sandbox', (c, v) => { c.daemon.experimental.sandbox = v }, { label: 'the Python sandbox', get: (c) => c.daemon.experimental.sandbox }),
   ], { effect: 'stopRemoteAccess' }),
   // Tool-call approval gate: global per-tool policy map, every value ask | allow | deny.
   row('toolPolicies', (c) => c.tools.toolPolicies ?? {}, [

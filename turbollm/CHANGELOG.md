@@ -23,7 +23,14 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Python sandbox runtime** (Experimental, off by default: Settings → Experimental → Python sandbox; desktop only).
+  The first step of the Python sandbox (GitHub #52). With the switch on, Download fetches Deno 2.9.6 and Pyodide 0.29.5
+  with pandas, numpy, matplotlib, Pillow, sympy and their dependencies, about 77 MB once and about 130 MB on disk, into
+  `runtimes/sandbox/` next to the config. Every file is checked against a size and SHA-256 shipped inside TurboLLM, and
+  the install is all or nothing. Turning the switch off keeps the runtime; Remove deletes it. Nothing runs Python yet;
+  that comes with the `run_python` tool.
 
 ## [1.15.1] - 2026-11-07
 

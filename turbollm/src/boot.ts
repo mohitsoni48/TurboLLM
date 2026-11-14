@@ -89,6 +89,8 @@ import { appUpdateAvailable, appUpdateApplied, appUpdateFailed } from './telemet
 import { remoteAccessState } from './telemetry/events/remote'
 import { checkDailyQueryRollups } from './telemetry/runtime/daily-query-rollups'
 import { markEverLoadedModel } from './api/onboarding-routes'
+import { SandboxRuntime } from './sandbox/runtime-install'
+import { sandboxSupported } from './sandbox/gate'
 
 export interface BootOptions {
   /** The loaded config; its directory is the data dir. */
@@ -356,6 +358,8 @@ export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
   }
   // `requestRestart` is attached after the server is created (it must close over it).
   const deps: Deps = { store, registry, manager, scanner, hashes, db, chatStore, chatTurns, chatRuns, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, remoteCatalog, tools: toolRegistry, version, startedAt }
+  // The Python sandbox's runtime (GitHub #52). Downloads nothing until the user turns the sandbox on and confirms.
+  if (sandboxSupported()) deps.sandboxRuntime = new SandboxRuntime({ runtimesDir: () => join(store.dir(), 'runtimes') })
   // One gate per engine process (scalability review 1.1), each sized to ITS running engine's own slot
   // count, re-read on every admission (a model swap changes it). `Infinity` when the engine advertises
   // no `--parallel` — see Manager.parallelSlots() for why that is not 1. `deps.gate` is the primary's:

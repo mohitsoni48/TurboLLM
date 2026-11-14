@@ -82,6 +82,9 @@ export type PdfParseOutcome =
    *  broken install is never reported as a bad document. */
   | { kind: 'unavailable' }
 
+/** Error codes Node raises when the worker file, or a module it imports, cannot be found. */
+const MISSING_WORKER_CODES = new Set(['MODULE_NOT_FOUND', 'ERR_MODULE_NOT_FOUND', 'ERR_WORKER_PATH'])
+
 const WORKER_EXT = import.meta.url.endsWith('.ts') ? '.ts' : '.js'
 const WORKER_PATH = new URL(`./pdf-text-worker${WORKER_EXT}`, import.meta.url)
 
@@ -137,7 +140,8 @@ export async function extractPdfText(
           if (m?.unavailable === true) return finish({ kind: 'unavailable' })
           finish(typeof m?.text === 'string' && m.text ? { kind: 'text', text: m.text } : { kind: 'unreadable' })
         })
-        worker.once('error', () => finish({ kind: 'unreadable' }))
+        // A worker (or a module it imports) that is not in this install is a broken install, not a bad document.
+        worker.once('error', (e: NodeJS.ErrnoException) => finish({ kind: MISSING_WORKER_CODES.has(e?.code ?? '') ? 'unavailable' : 'unreadable' }))
         // An exit with no message means the worker died before posting (OOM at its own heap
         // ceiling reports as an exit code, not necessarily an 'error' event). finish() is a
         // no-op once a message settled, so classifying EVERY exit as unreadable is safe -
