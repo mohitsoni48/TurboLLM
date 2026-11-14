@@ -226,6 +226,8 @@ export class SandboxRuntime {
 function exactSize(fetchImpl: typeof fetch, f: RuntimeFile): typeof fetch {
   return async (input, init) => {
     const res = await fetchImpl(input, init)
+    // An HTTP error is the caller's to report as one; its body and length say nothing about the pinned file.
+    if (!res.ok) return res
     const declared = res.headers.get('content-length')
     const encoding = (res.headers.get('content-encoding') ?? 'identity').toLowerCase()
     if (declared !== null && encoding === 'identity' && Number(declared) !== f.size) {
@@ -241,7 +243,14 @@ function exactSize(fetchImpl: typeof fetch, f: RuntimeFile): typeof fetch {
         else controller.enqueue(chunk)
       },
     }))
-    return new Response(capped, { status: res.status, statusText: res.statusText, headers: res.headers })
+    // The decoded body is what the download counts, so a compressed response's own length would push progress past
+    // the total: hand it on as the identity-encoded file of the pinned size it must turn out to be.
+    const headers = new Headers(res.headers)
+    if (encoding !== 'identity') {
+      headers.set('content-length', String(f.size))
+      headers.delete('content-encoding')
+    }
+    return new Response(capped, { status: res.status, statusText: res.statusText, headers })
   }
 }
 

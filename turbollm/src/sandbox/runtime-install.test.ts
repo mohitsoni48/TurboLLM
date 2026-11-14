@@ -128,6 +128,36 @@ test('install: a compressed response declaring its compressed length still insta
   assert.deepEqual(rt.view().installed, { deno: DENO_VERSION, pyodide: PYODIDE_VERSION })
 })
 
+// A real CDN 404 carries a body and a Content-Length; it must be reported as the HTTP failure it is, not as a
+// size mismatch against the pinned size.
+test('install: an HTTP error with a body is reported as a failed download, not a size mismatch', async () => {
+  const fx = fixture()
+  const notFound = (async () => new Response('Not Found', { status: 404, headers: { 'content-length': '9' } })) as typeof fetch
+  const { rt } = runtime({ fetchImpl: notFound, files: fx.files })
+  await rt.install()
+  const error = rt.view().job.error
+  assert.equal(error?.code, 'download_failed')
+  assert.match(error?.message ?? '', /404/)
+})
+
+// A compressed response declares its compressed length while fetch hands over the decoded bytes; the progress
+// computed from that length must never run past the total or the bar jumps forward and then back.
+test('install: progress never exceeds the total for a compressed response', async () => {
+  const fx = fixture()
+  const compressed = (async (input: string | URL | Request) => {
+    const res = await fx.fetchImpl(input)
+    return new Response(res.body, { headers: { 'content-length': '3', 'content-encoding': 'br' } })
+  }) as typeof fetch
+  const seen: number[] = []
+  const holder: { rt?: SandboxRuntime } = {}
+  const { rt } = runtime({ fetchImpl: compressed, announce: () => { if (holder.rt) seen.push(holder.rt.view().job.doneBytes) } })
+  holder.rt = rt
+  const total = rt.view().downloadBytes
+  await rt.install()
+  assert.ok(seen.length > 0)
+  assert.ok(Math.max(...seen) <= total, `peak ${Math.max(...seen)} exceeded total ${total}`)
+})
+
 test('install: a body running past its pinned size is cut off', async () => {
   const fx = fixture()
   const long = (async (input: string | URL | Request) => {
