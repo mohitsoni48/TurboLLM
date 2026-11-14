@@ -4,6 +4,7 @@ import { existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Deps } from '../deps'
 import { customSourceKey } from '../engines/registry'
+import { engineFormats } from '../engines/compat'
 import { ProbeError } from '../engines/probe'
 import { isLocalOrAuthenticated } from '../auth'
 import { LLAMA_BUILD, availableBackends, backendDefAt, backendDir, deleteAllBackendBuilds, installedBackendBuild, provisionBackend, recommendBackendId } from '../engines/download'
@@ -41,7 +42,9 @@ export function registerEngineRoutes(app: Hono, d: Deps, jobs: EngineJobs): void
       .customSources()
       .filter((s) => !liveKeys.has(customSourceKey(s)))
       .map((s) => ({ ...s, binPathExists: existsSync(s.binPath) }))
-    return c.json({ engines, activeEngineId, customDisabled })
+    // Each row's formats, computed here (ADR-462) so the web never mirrors compat.ts: the two in-app SDK rows read
+    // different formats under one kind. Read-only: never written back to config.
+    return c.json({ engines: engines.map((e) => ({ ...e, formats: engineFormats(e) })), activeEngineId, customDisabled })
   })
 
   // ---- engine backends (ADR-025): hardware-aware default + override ----

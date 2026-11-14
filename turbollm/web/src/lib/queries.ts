@@ -5,6 +5,7 @@ import {
   useMutation,
   useQuery,
   useQueryClient,
+  type UseQueryOptions,
   type UseQueryResult,
 } from '@tanstack/react-query'
 import { useEffect, useRef } from 'react'
@@ -355,11 +356,13 @@ export function useEngineStats(): EngineStats | null {
   return data?.engine.state === 'running' ? data.engineStats ?? null : null
 }
 
-export function useEngines(): UseQueryResult<EnginesList> {
+/** `refetchInterval` is for a caller that waits on the list (onboarding's Model step); no caller polls by default. */
+export function useEngines(options: Pick<UseQueryOptions<EnginesList>, 'refetchInterval'> = {}): UseQueryResult<EnginesList> {
   return useQuery({
     queryKey: queryKeys.engines,
     queryFn: listEngines,
     retry: false,
+    ...options,
   })
 }
 

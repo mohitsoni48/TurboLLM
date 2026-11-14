@@ -672,3 +672,109 @@ for (const loaded of [false, true]) {
     }
   })
 }
+
+// ── G-5: a phone on the in-app SDK engine serving a Turbo Link peer ───────────────────────
+// The peer decides tools and images from its OWN engine, so a desktop peer sends both. The SDK refuses them with a
+// 400, so behind the façade the host withholds tools and refuses an image itself, before its engine is called.
+
+const ENGINE_URL = 'http://engine.test'
+// QA F-4: the in-app llama.cpp (CPU) row and the server row are both "llama.cpp", so the reply names the one that reads
+// images by the label the Engines screen shows.
+const VISION_UNAVAILABLE = 'The in-app engine can\'t read images in this version. Switch to llama.cpp server (CPU) in Engines to use images.'
+const TOOLS = [{ type: 'function', function: { name: 'web_search', parameters: { type: 'object', properties: {} } } }]
+const FUNCTIONS = [{ name: 'web_search', parameters: { type: 'object', properties: {} } }]
+
+function hostDeps(engineKind: string): Deps {
+  return {
+    scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
+    modelRouter: { targetEntry: () => undefined, route: async () => ({ target: ENGINE_URL }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
+    manager: {
+      status: () => ({ state: 'running', model: null }),
+      target: () => ENGINE_URL,
+      currentOpts: () => null,
+      generationStart: () => {},
+      generationEnd: () => {},
+      recordCompletion: () => {},
+      setLiveGen: () => {},
+    },
+    registry: { active: () => ({ kind: engineKind }) },
+    db: { recordApiUsage: () => {} },
+  } as unknown as Deps
+}
+
+function toolTurn(): Record<string, unknown> {
+  return { model: 'Qwen3', messages: [{ role: 'user', content: 'search for it' }], tools: TOOLS, tool_choice: 'auto', functions: FUNCTIONS }
+}
+
+function imageTurn(): Record<string, unknown> {
+  const content = [{ type: 'text', text: 'what is this?' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' } }]
+  return { model: 'Qwen3', messages: [{ role: 'user', content }] }
+}
+
+/** POSTs `body` through the façade (`origin: 'link'`) or the public /v1 mount, recording what reached the engine. */
+async function hostRequest(engineKind: string, mount: 'link' | 'public', body: Record<string, unknown>): Promise<{ res: Response; calls: Captured[] }> {
+  const deps = hostDeps(engineKind)
+  const app = mount === 'link' ? facadeApp(deps) : new Hono()
+  if (mount === 'public') registerGateway(app, deps)
+  const path = mount === 'link' ? '/api/link/v1/chat/completions' : '/v1/chat/completions'
+  const f = captureFetch(async () => jsonCompletion())
+  try {
+    const res = await app.request(`http://host.test${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    return { res, calls: f.calls }
+  } finally {
+    f.restore()
+  }
+}
+
+function sentToEngine(calls: Captured[]): Record<string, unknown> {
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].url, `${ENGINE_URL}/v1/chat/completions`)
+  return JSON.parse(calls[0].body) as Record<string, unknown>
+}
+
+test('a link peer\'s tool turn reaches the in-app SDK engine without tools, tool_choice or functions', async () => {
+  const { res, calls } = await hostRequest('turbollm-sdk', 'link', toolTurn())
+  assert.equal(res.status, 200)
+  const sent = sentToEngine(calls)
+  assert.equal('tools' in sent, false)
+  assert.equal('tool_choice' in sent, false)
+  assert.equal('functions' in sent, false)
+  assert.deepEqual(sent.messages, [{ role: 'user', content: 'search for it' }])
+})
+
+test('a link peer\'s image turn to the in-app SDK engine is refused with vision_unavailable, and the engine is not called', async () => {
+  const { res, calls } = await hostRequest('turbollm-sdk', 'link', imageTurn())
+  assert.equal(res.status, 400)
+  const body = await res.json() as { error: { code: string; message: string } }
+  assert.equal(body.error.code, 'vision_unavailable')
+  assert.equal(body.error.message, VISION_UNAVAILABLE)
+  assert.equal(calls.length, 0)
+})
+
+test('a plain /v1 client\'s tool turn reaches the in-app SDK engine unchanged, for its own honest 400', async () => {
+  const { calls } = await hostRequest('turbollm-sdk', 'public', toolTurn())
+  const sent = sentToEngine(calls)
+  assert.deepEqual(sent.tools, TOOLS)
+  assert.equal(sent.tool_choice, 'auto')
+  assert.deepEqual(sent.functions, FUNCTIONS)
+})
+
+test('a plain /v1 client\'s image turn reaches the in-app SDK engine unchanged', async () => {
+  const { calls } = await hostRequest('turbollm-sdk', 'public', imageTurn())
+  assert.deepEqual(sentToEngine(calls).messages, imageTurn().messages)
+})
+
+test('a link peer\'s tool and image turns reach a llama.cpp host unchanged', async () => {
+  const tools = sentToEngine((await hostRequest('llama-server', 'link', toolTurn())).calls)
+  assert.deepEqual(tools.tools, TOOLS)
+  assert.equal(tools.tool_choice, 'auto')
+  assert.deepEqual(tools.functions, FUNCTIONS)
+  const image = await hostRequest('llama-server', 'link', imageTurn())
+  assert.equal(image.res.status, 200)
+  assert.deepEqual(sentToEngine(image.calls).messages, imageTurn().messages)
+})

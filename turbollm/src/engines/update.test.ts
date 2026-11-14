@@ -262,6 +262,11 @@ test('resolveUpdateSource: litert-lm → PyPI package + stripped version', () =>
   })
 })
 
+// The in-app SDK engine ships inside the Android APK and updates with the app: there is no feed to probe (plan R-4).
+test('resolveUpdateSource: the in-app turbollm-sdk engine has no update source', () => {
+  assert.equal(resolveUpdateSource(eng({ kind: 'turbollm-sdk', binPath: '', version: 'in-app' })), null)
+})
+
 test('resolveUpdateSource: koboldcpp/llamafile → GitHub repo + stored tag (Phase 4)', () => {
   assert.deepEqual(resolveUpdateSource(eng({ kind: 'koboldcpp', version: 'v1.115.2' })), {
     source: 'github-release',

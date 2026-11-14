@@ -3,7 +3,17 @@
 // Vitest (not the repo root's `tsx --test`), matching vram-fit.test.ts — see that file's
 // header for why new web tests go here rather than into vram.test.ts.
 import { describe, expect, test } from 'vitest'
-import { modelDisplayName, pickOnboardingModel, requiredMb, SMALL_DEVICE_LADDER } from './onboarding-pick'
+import {
+  LITERT_GEMMA_E2B_PICK,
+  LITERT_SMALL_DEVICE_LADDER,
+  LITERT_SMALLEST_PICK,
+  modelDisplayName,
+  onboardingFormats,
+  pickOnboardingModel,
+  requiredMb,
+  SMALL_DEVICE_LADDER,
+} from './onboarding-pick'
+import type { Engine } from './types'
 
 // Verbatim from the daemon's BLESSED (src/onboarding/models.ts) — the entries this screen
 // actually receives. Copied, not imported: web must not import from the daemon, and the
@@ -93,5 +103,95 @@ describe('modelDisplayName', () => {
     expect(modelDisplayName('unsloth/Llama-3.2-1B-Instruct-GGUF')).toBe('Llama-3.2-1B-Instruct')
     // A repo that is only the suffix must not render as an empty string.
     expect(modelDisplayName('someone/GGUF')).toBe('GGUF')
+  })
+
+  test('drops the -litert-lm packaging suffix too (W-4)', () => {
+    expect(modelDisplayName('litert-community/gemma-4-E2B-it-litert-lm')).toBe('gemma-4-E2B-it')
+  })
+})
+
+// ADR-462 (W-4): with LiteRT-LM active, the active engine cannot read a GGUF, so the pick comes from the LiteRT ladder.
+// N1: the smallest rung is one constant. Tests name it, never its literals, except the one evidence pin below.
+describe('pickOnboardingModel on a LiteRT-LM row', () => {
+  const LITERT: readonly ['litertlm'] = ['litertlm']
+  const GEMMA_E2B = LITERT_SMALL_DEVICE_LADDER[1]
+  const PHONE_6GB = { os: 'android/arm64', ramMB: 5600, gpus: [] }
+
+  test('a 4 GB and a 6 GB phone get the smallest LiteRT pick', () => {
+    for (const phone of [PHONE_4GB, PHONE_6GB]) {
+      expect(pickOnboardingModel(T0_B, phone, LITERT)).toMatchObject({
+        kind: 'pick', source: 'small-device', repo: LITERT_SMALLEST_PICK.repo, file: LITERT_SMALLEST_PICK.file,
+        requiredMb: requiredMb(LITERT_SMALLEST_PICK.bytes),
+      })
+    }
+  })
+
+  test('an 8 GB phone gets the larger rung, gemma-4-E2B, named without its packaging suffix', () => {
+    expect(pickOnboardingModel(T0_B, PHONE_8GB, LITERT)).toMatchObject({
+      kind: 'pick', source: 'small-device', repo: GEMMA_E2B.repo, file: GEMMA_E2B.file, name: 'gemma-4-E2B-it',
+    })
+  })
+
+  test('a budget below the smallest pick gets none', () => {
+    const tiny = { os: 'android/arm64', ramMB: 3000, gpus: [] }
+    expect(requiredMb(LITERT_SMALLEST_PICK.bytes)).toBeGreaterThan(Math.round(tiny.ramMB * 0.6) - 1024)
+    expect(pickOnboardingModel(T0_B, tiny, LITERT)).toEqual({ kind: 'none', reason: 'too-big-for-hardware' })
+    expect(pickOnboardingModel(null, tiny, LITERT)).toEqual({ kind: 'none', reason: 'no-candidate' })
+  })
+
+  test('a blessed GGUF that fits is still not offered to a LiteRT-LM row', () => {
+    const pick = pickOnboardingModel(C_T3, DESKTOP_16GB, LITERT)
+    expect(pick).toMatchObject({ kind: 'pick', source: 'small-device', file: GEMMA_E2B.file })
+  })
+
+  test('unknown hardware gets the smallest LiteRT pick with no fit claim, never the blessed GGUF', () => {
+    expect(pickOnboardingModel(G_T2, null, LITERT)).toMatchObject({
+      kind: 'pick', source: 'small-device', file: LITERT_SMALLEST_PICK.file, budgetMb: 0,
+    })
+  })
+
+  test('a GGUF row keeps today\'s pick', () => {
+    expect(pickOnboardingModel(T0_B, PHONE_8GB, ['gguf'])).toEqual(pickOnboardingModel(T0_B, PHONE_8GB))
+  })
+
+  test('no ladder rung is a thinking model, and every rung is a .litertlm bundle', () => {
+    for (const c of LITERT_SMALL_DEVICE_LADDER) {
+      expect(c.file.endsWith('.litertlm'), c.file).toBe(true)
+      expect(/qwen/i.test(c.repo), c.repo).toBe(false)
+    }
+    expect(LITERT_SMALL_DEVICE_LADDER[0]).toBe(LITERT_SMALLEST_PICK)
+    expect(LITERT_SMALL_DEVICE_LADDER[1]).toBe(LITERT_GEMMA_E2B_PICK)
+  })
+
+  // A swap of the smallest pick (N1) edits LITERT_SMALLEST_PICK and this one test, nothing else.
+  test('evidence: the smallest LiteRT pick was read off the HF tree on 2026-11-07', () => {
+    expect(LITERT_SMALLEST_PICK).toEqual({
+      repo: 'litert-community/LFM2.5-1.2B-Instruct', file: 'LFM2.5-1.2B-Instruct_int4_gpu.litertlm', bytes: 736_220_768,
+    })
+    expect(GEMMA_E2B).toEqual({ repo: 'litert-community/gemma-4-E2B-it-litert-lm', file: 'gemma-4-E2B-it.litertlm', bytes: 2_588_147_712 })
+  })
+})
+
+describe('onboardingFormats', () => {
+  const row = (over: Partial<Engine> & { id: string }): Engine =>
+    ({ name: over.id, binPath: '', version: '', capabilities: { kvTypes: [], flags: [] }, ...over })
+  const sdkLitert = row({ id: 'lit', kind: 'turbollm-sdk', formats: ['litertlm'] })
+  const sdkLlama = row({ id: 'cpu', kind: 'turbollm-sdk', formats: ['gguf'] })
+  const server = row({ id: 'srv', kind: 'llama-server', formats: ['gguf'] })
+
+  test('the active row\'s formats, or gguf for a row that names none', () => {
+    expect(onboardingFormats([sdkLitert, server], 'lit', true)).toEqual(['litertlm'])
+    expect(onboardingFormats([sdkLitert, server], 'srv', true)).toEqual(['gguf'])
+    expect(onboardingFormats([row({ id: 'old' })], 'old', false)).toEqual(['gguf'])
+  })
+
+  test('on Android with nothing active yet, the fresh-install default\'s format', () => {
+    expect(onboardingFormats([server, sdkLlama, sdkLitert], '', true)).toEqual(['litertlm'])
+    expect(onboardingFormats([server, sdkLlama], '', true)).toEqual(['gguf'])
+  })
+
+  test('on a desktop with nothing active, gguf', () => {
+    expect(onboardingFormats([sdkLitert], '', false)).toEqual(['gguf'])
+    expect(onboardingFormats([], '', false)).toEqual(['gguf'])
   })
 })

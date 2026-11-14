@@ -28,7 +28,9 @@ import { describeRemoteFailure } from '../../lib/remote-failure'
 import type { FitVerdict, HfCheckpoint, HfRepoDetail, HfRepoFile } from '../../lib/types'
 import { downloadSubdir } from '../../lib/download-subdir'
 import { sayIfAlreadyListed } from '../../lib/download-listed'
-import { gpuBudgetMb } from '../../lib/vram'
+import { fitBudgetMb, gpuBudgetMb } from '../../lib/vram'
+import { requiredMb } from '../../lib/onboarding-pick'
+import { isAndroidOs } from '../../lib/platform'
 import { Badge } from '../../components/ui/badge'
 import { Button } from '../../components/ui/button'
 import { CheckpointPicker } from './CheckpointPicker'
@@ -70,12 +72,15 @@ export function HfRepoDialog({
   repo,
   onClose,
   onSearch,
+  preselectFile,
 }: {
   repo: string | null
   onClose: () => void
   /** Fallback when the repo isn't found (e.g. an inferred id that doesn't match HF):
    *  switch to a Hugging Face search for the given term. */
   onSearch?: (term: string) => void
+  /** Forwarded to HfRepoContent. */
+  preselectFile?: string
 }) {
   // Side panel, not a modal (spec 00 §9): pad the app shell so content resizes
   // instead of being covered, same convention as ModelDetailDialog.
@@ -94,7 +99,7 @@ export function HfRepoDialog({
         onPointerDownOutside={(e) => e.preventDefault()}
         onInteractOutside={(e) => e.preventDefault()}
       >
-        <HfRepoContent repo={repo} onClose={onClose} onSearch={onSearch} />
+        <HfRepoContent repo={repo} onClose={onClose} onSearch={onSearch} preselectFile={preselectFile} />
       </SheetContent>
     </Sheet>
   )
@@ -108,10 +113,14 @@ export function HfRepoContent({
   repo,
   onClose,
   onSearch,
+  preselectFile,
 }: {
   repo: string | null
   onClose: () => void
   onSearch?: (term: string) => void
+  /** The file to select when the repo opens (a curated Discover row names its bundle); ignored when the repo does not
+   *  list it. */
+  preselectFile?: string
 }) {
   const detailQ = useHfRepo(repo)
   const sysQ = useSysInfo()
@@ -132,6 +141,7 @@ export function HfRepoContent({
   // Discover has no load profile yet; use the default budget across all GPUs.
   const vramMb = gpuBudgetMb(sysQ.data?.gpus ?? [])
   const isSafetensors = !!detail?.safetensors
+  const android = isAndroidOs(sysQ.data?.os ?? '')
   const [selected, setSelected] = useState<string>('')
 
   // Pre-select the recommended quant: largest that fits; prefer K-quants over IQ at
@@ -170,8 +180,15 @@ export function HfRepoContent({
     if (repoChanged) userPicked.current = false
     const ggufs = detail.files.filter((f) => !f.mmproj)
     if (ggufs.length === 0) return
+    // A curated row's file is the user's pick made one screen earlier, so it holds like one made here.
+    if (repoChanged && preselectFile && ggufs.some((f) => f.name === preselectFile)) {
+      userPicked.current = true
+      setSelected(preselectFile)
+      return
+    }
     if (isLitertlm) {
-      if (repoChanged) setSelected('')
+      // Still never a pick by size: on a phone, only the one bundle any device runs, when it is the only one (ADR-462).
+      if (repoChanged) setSelected((android && soleAnyDeviceBundle(ggufs)) || '')
       return
     }
     const fits = ggufs.filter((f) => fileFit(f.sizeBytes, vramMb) === 'fits')
@@ -184,7 +201,7 @@ export function HfRepoContent({
       return aK - bK
     })[0]
     setSelected((cur) => (userPicked.current && ggufs.some((f) => f.name === cur) ? cur : best.name))
-  }, [detail, vramMb, isLitertlm])
+  }, [detail, vramMb, isLitertlm, android, preselectFile])
 
   // Quant options sorted by size (smallest → largest) so the listing reads in a
   // sensible progression instead of alphabetically by filename. Holds GGUF quants or
@@ -195,6 +212,8 @@ export function HfRepoContent({
   )
   const selectedFile = ggufFiles.find((f) => f.name === selected) ?? null
   const selectedIsLocal = !!selectedFile?.downloaded
+  // A phone-memory verdict for a bundle, the one onboarding uses; a desktop gets none, as before.
+  const phoneBudgetMb = android && sysQ.data ? fitBudgetMb(sysQ.data) : 0
 
   const fit = selectedFile ? fileFit(selectedFile.sizeBytes, vramMb) : 'unknown'
   const gated = detail?.gated ?? false
@@ -388,8 +407,10 @@ export function HfRepoContent({
           {isLitertlm && (
             <div className="rounded-md border border-border bg-panel-2 px-3 py-2.5 text-[12px] text-muted">
               LiteRT-LM model — each file is one self-contained bundle (weights + tokenizer) that
-              runs on the LiteRT-LM engine. Pick the variant matching your hardware (GPU, browser,
-              or a specific device).
+              runs on the LiteRT-LM engine.{' '}
+              {android
+                ? 'Bundles for other hardware are folded away. Use the one listed first unless you know you need another.'
+                : 'Pick the variant matching your hardware (GPU, browser, or a specific device).'}
             </div>
           )}
 
@@ -403,6 +424,10 @@ export function HfRepoContent({
             </label>
             <QuantDropdown files={ggufFiles} selected={selected} onSelect={pickQuant} vramMb={vramMb} />
           </div>
+
+          {selectedFile && isLitertlm && phoneBudgetMb > 0 && (
+            <p className="text-[12px] text-muted">{phoneFitLine(selectedFile.sizeBytes, phoneBudgetMb)}</p>
+          )}
 
           {/* VRAM verdict line — a GGUF signal only: it estimates from the file size, and a
               .litertlm bundle (encoders embedded, often CPU-bound under LiteRT-LM) would make
@@ -476,6 +501,22 @@ export function HfRepoContent({
   )
 }
 
+/** A bundle built for hardware this device is not (the daemon's `runsHere`); unknown counts as runnable. */
+function builtElsewhere(f: HfRepoFile): boolean {
+  return f.runsHere === false
+}
+
+/** The one bundle any device runs, when the repo lists exactly one that runs here: choosing it is no hardware guess. */
+function soleAnyDeviceBundle(files: HfRepoFile[]): string | undefined {
+  const anyDevice = files.filter((f) => f.runsHere && f.target?.kind === 'any')
+  return anyDevice.length === 1 ? anyDevice[0].name : undefined
+}
+
+function phoneFitLine(sizeBytes: number, budgetMb: number): string {
+  const free = `about ${(budgetMb / 1024).toFixed(1)} GB free for a model`
+  return requiredMb(sizeBytes) <= budgetMb ? `Fits in this phone's memory (${free}).` : `Larger than this phone's free memory (${free}).`
+}
+
 /** A small colored dot indicating VRAM fit — green/yellow/red (fits/tight/overflow),
  *  neutral otherwise. Used both standalone (VRAM verdict line) and inside the quant
  *  dropdown so every option's fit is visible without opening it further. */
@@ -506,6 +547,11 @@ function QuantDropdown({
   vramMb: number | undefined
 }) {
   const selectedFile = files.find((f) => f.name === selected) ?? null
+  // Bundles this device runs come first (ADR-462); the rest are folded below them.
+  const [showBuiltElsewhere, setShowBuiltElsewhere] = useState(false)
+  const runnable = files.filter((f) => !builtElsewhere(f))
+  const elsewhere = files.filter(builtElsewhere)
+  const item = (f: HfRepoFile) => <QuantItem key={f.name} file={f} vramMb={vramMb} onSelect={onSelect} />
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
@@ -529,24 +575,42 @@ function QuantDropdown({
         align="start"
         className="max-h-72 w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto"
       >
-        {files.map((f) => (
-          <DropdownMenuItem key={f.name} onSelect={() => { track('models', 'select_hf_quant'); onSelect(f.name) }} className="justify-between gap-2">
-            <span className="flex min-w-0 items-center gap-2">
-              {!f.litertlm && <FitDot fit={fileFit(f.sizeBytes, vramMb)} />}
-              <span className="truncate">
-                {pickerLabel(f)} · {fmtSize(f.sizeBytes)}
-                {f.parts > 1 ? ` · ${f.parts} parts` : ''}
-              </span>
-            </span>
-            {f.downloaded && (
-              <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium" style={{ color: 'var(--ok)', background: 'color-mix(in srgb, var(--ok) 15%, transparent)' }}>
-                Downloaded
-              </span>
-            )}
+        {runnable.map(item)}
+        {/* Folded, never removed (ADR-402): each stays one tap away. */}
+        {elsewhere.length > 0 && (
+          <DropdownMenuItem
+            onSelect={(e) => {
+              e.preventDefault()
+              setShowBuiltElsewhere((shown) => !shown)
+            }}
+            className="gap-2 text-muted"
+          >
+            <ChevronDown size={14} className={`shrink-0 transition-transform ${showBuiltElsewhere ? '' : '-rotate-90'}`} />
+            Built for other hardware ({elsewhere.length})
           </DropdownMenuItem>
-        ))}
+        )}
+        {showBuiltElsewhere && elsewhere.map(item)}
       </DropdownMenuContent>
     </DropdownMenu>
+  )
+}
+
+function QuantItem({ file: f, vramMb, onSelect }: { file: HfRepoFile; vramMb: number | undefined; onSelect: (name: string) => void }) {
+  return (
+    <DropdownMenuItem onSelect={() => { track('models', 'select_hf_quant'); onSelect(f.name) }} className="justify-between gap-2">
+      <span className="flex min-w-0 items-center gap-2">
+        {!f.litertlm && <FitDot fit={fileFit(f.sizeBytes, vramMb)} />}
+        <span className="truncate">
+          {pickerLabel(f)} · {fmtSize(f.sizeBytes)}
+          {f.parts > 1 ? ` · ${f.parts} parts` : ''}
+        </span>
+      </span>
+      {f.downloaded && (
+        <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium" style={{ color: 'var(--ok)', background: 'color-mix(in srgb, var(--ok) 15%, transparent)' }}>
+          Downloaded
+        </span>
+      )}
+    </DropdownMenuItem>
   )
 }
 

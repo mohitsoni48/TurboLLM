@@ -223,6 +223,13 @@ test('buildEngineMessages: the answered user turn is rebuilt with its images and
   assert.deepEqual(buildEngineMessages(makeConv(), [imageOnly], imageOnly.id)[0].content, [{ type: 'image_url', image_url: { url: 'data:image/png;base64,BBBB' } }])
 })
 
+test('buildEngineMessages withholdImages (G-2): each image of the answered turn becomes a text placeholder, its text kept', () => {
+  const answering = makeMsg('user', 'What is in these?', { attachments: ['data:image/png;base64,AAAA', 'data:image/png;base64,BBBB'] })
+  const omitted = { type: 'text', text: '[image omitted: this engine cannot read images]' }
+  const out = buildEngineMessages(makeConv(), [answering], answering.id, { withholdImages: true })
+  assert.deepEqual(out[0].content, [{ type: 'text', text: 'What is in these?' }, omitted, omitted])
+})
+
 test('buildEngineMessages: preserveThinking folds reasoning into an assistant message ONLY for the raw tail, never for the summary', () => {
   const m1 = makeMsg('assistant', 'old reply', { reasoning: 'old thoughts' })
   const m2 = makeMsg('assistant', 'new reply', { reasoning: 'new thoughts' })

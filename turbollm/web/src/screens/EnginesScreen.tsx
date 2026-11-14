@@ -106,10 +106,14 @@ import { EngineStatusHeader } from './engines/EngineStatusHeader'
 import { EngineLogPanel } from './engines/EngineLogPanel'
 import { LlamaCppBackendRows } from './engines/ManagedEngines'
 import {
-  BUNDLED_ENGINE_TITLES,
+  ANDROID_CPU_SERVER_NAME,
+  bundledTitles,
   customSourceKey,
   groupEngines,
+  isSdkLitertRow,
+  isSdkRow,
   memberToActivate,
+  readsOnlyLitert,
   repoSlug,
   variantLabel,
   type EngineGroup,
@@ -130,6 +134,8 @@ const isOfficialLlama = (binPath: string) => /[\\/]engines[\\/]llama\.cpp-/.test
  *  self-service TurboQuant/ik_llama.cpp build fell through to the 'llama.cpp' default and
  *  showed the wrong catalog card as active. */
 export function catalogIdFor(e: Engine, catalog?: Pick<CatalogEngine, 'id' | 'releaseEngineId'>[]): string {
+  // An in-app SDK row takes the curated copy of the runtime it really is (ADR-462).
+  if (isSdkRow(e)) return isSdkLitertRow(e) ? 'litert-lm' : 'llama.cpp'
   if (e.kind === 'mlx') return 'mlx'
   if (e.kind === 'mlx-vlm') return 'mlx-vlm'
   if (e.kind === 'vllm') return 'vllm'
@@ -163,8 +169,8 @@ function buildContextFor(e: Engine, backends: EngineBackends | undefined): strin
     return active ? `llama.cpp · ${active.label}` : 'llama.cpp'
   }
   // The Android app's own engines, which read as their registered names ("litert-lm-android") under the selector.
-  const bundled = BUNDLED_ENGINE_TITLES[e.name]
-  if (bundled) return `${bundled.title} · ${bundled.detail}`
+  const bundled = bundledTitles(e)
+  if (bundled) return bundled.detail ? `${bundled.title} · ${bundled.detail}` : bundled.title
   return e.name
 }
 
@@ -773,8 +779,14 @@ function EngineHeaderBar({
                     </DropdownMenuItem>
                   )
                 })}
-                <DropdownMenuSeparator />
-                <div className="px-2 py-1.5 text-[11px] text-muted">Install more engines below ↓</div>
+                {/* The packaged app installs no engine (its gallery below has no install button), so the pointer is
+                    shown only where there is something to install. */}
+                {!sys?.bundledEnginesOnly && (
+                  <>
+                    <DropdownMenuSeparator />
+                    <div className="px-2 py-1.5 text-[11px] text-muted">Install more engines below ↓</div>
+                  </>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
 
@@ -2146,7 +2158,8 @@ function CatalogUpdateStatusLine({ st, repoUrl }: { st: EngineUpdateStatus | und
 function BundledEngineGallery({ list, activeEngine }: { list: EnginesList | undefined; activeEngine: Engine | null }) {
   const mut = useEngineMutations()
   const { data: status } = useStatus()
-  const engines = (list?.engines ?? []).filter((e) => e.kind !== 'laya')
+  const engines = inBundledCardOrder((list?.engines ?? []).filter((e) => e.kind !== 'laya'))
+  const sdkRegistered = engines.some(isSdkRow)
   const running = status?.engine.state === 'running' || status?.engine.state === 'starting'
   // The engine the loaded model runs on, which need not be the active one (an install or Enable activates another
   // without stopping the model).
@@ -2174,6 +2187,7 @@ function BundledEngineGallery({ list, activeEngine }: { list: EnginesList | unde
             isActive={e.id === activeEngine?.id}
             isRunning={e.id === servingId && running}
             busy={mut.activate.isPending}
+            footer={bundledCardFooter(e, sdkRegistered)}
             onUse={() => use(e)}
           />
         ))}
@@ -2182,26 +2196,49 @@ function BundledEngineGallery({ list, activeEngine }: { list: EnginesList | unde
   )
 }
 
+/** The default engine first (ADR-462): the SDK's LiteRT-LM, then its other engines, then the spawned servers in
+ *  the order the daemon lists them. */
+function inBundledCardOrder(engines: Engine[]): Engine[] {
+  const rank = (e: Engine) => (!isSdkRow(e) ? 2 : isSdkLitertRow(e) ? 0 : 1)
+  return [...engines].sort((a, b) => rank(a) - rank(b))
+}
+
+/** One line under a Built-in card. The llama.cpp server says why it is there only beside the in-app engines, which
+ *  do not run tools, image input or embeddings yet; it states a fact, not advice prompted by an error. */
+function bundledCardFooter(e: Engine, sdkRegistered: boolean): string {
+  if (readsOnlyLitert(e.formats ?? [])) return 'Runs .litertlm models once it is selected'
+  if (e.name === ANDROID_CPU_SERVER_NAME && sdkRegistered) {
+    return "Use this one for tools, image input and embeddings. The in-app engines don't run them yet."
+  }
+  return 'Updates with the app'
+}
+
+/** Desktop/Termux copy with no meaning inside the app (installing Python, CUDA, …); on an in-app SDK engine also any
+ *  tools or vision claim, since the SDK runs neither. */
+function appliesInsideTheApp(e: Engine): (line: string) => boolean {
+  return (line) => !/termux|python|cuda|install/i.test(line) && !(isSdkRow(e) && /tools|tool call|vision|image/i.test(line))
+}
+
 function BundledEngineCard({
   engine: e,
   isActive,
   isRunning,
   busy,
+  footer,
   onUse,
 }: {
   engine: Engine
   isActive: boolean
   isRunning: boolean
   busy: boolean
+  footer: string
   onUse: () => void
 }) {
   const meta = ENGINE_META[catalogIdFor(e)]
   const Icon = meta?.icon ?? Boxes
-  const names = BUNDLED_ENGINE_TITLES[e.name] ?? { title: e.name, detail: '' }
-  // Copy written for desktop/Termux installs that has no meaning inside the app (installing Python, CUDA, …).
-  const cons = (meta?.cons ?? []).filter((c) => !/termux|python|cuda|install/i.test(c))
-  const pros = meta?.pros ?? []
-  const isLitert = e.kind === 'litert-lm'
+  const names = bundledTitles(e) ?? { title: e.name, detail: '' }
+  const cons = (meta?.cons ?? []).filter(appliesInsideTheApp(e))
+  const pros = (meta?.pros ?? []).filter(appliesInsideTheApp(e))
 
   return (
     <div className="flex flex-col rounded-xl border border-border bg-panel p-4">
@@ -2226,7 +2263,7 @@ function BundledEngineCard({
 
       <div className="mt-3 flex flex-wrap gap-1.5">
         {meta?.format && <AttrChip icon={<Package size={11} />}>{meta.format}</AttrChip>}
-        {e.version && <AttrChip icon={<Cpu size={11} />}>{e.version}</AttrChip>}
+        {e.version && <AttrChip icon={<Cpu size={11} />}>{isSdkRow(e) ? 'Built into the app' : e.version}</AttrChip>}
       </div>
 
       {(pros.length > 0 || cons.length > 0) && (
@@ -2257,9 +2294,7 @@ function BundledEngineCard({
       )}
 
       <div className="mt-3 flex items-center justify-between gap-2 border-t border-border pt-3">
-        <span className="text-[11px] text-muted">
-          {isLitert ? 'Runs .litertlm models once it is selected' : 'Updates with the app'}
-        </span>
+        <span className="text-[11px] text-muted">{footer}</span>
         {/* LiteRT-LM is selected here like the others. A model loads only on the engine the user selected, so a
             .litertlm model reaches LiteRT-LM only once it is; the card offered no "Use" and said those models loaded
             on it automatically, which left the selector's raw "litert-lm-android" row as the only way to pick it. */}

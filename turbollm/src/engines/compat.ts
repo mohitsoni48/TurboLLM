@@ -6,9 +6,14 @@ import type { HardwareProfile } from './hardware'
 import type { HardwareReq } from './catalog'
 import type { GpuVendor } from '../sysinfo/sysinfo'
 import type { ModelEntry } from '../models/scanner'
+import type { Engine } from '../config/config'
 import { shapeLitertLmRequest } from './litert-lm-request'
 
 export type ModelFormat = 'gguf' | 'mlx' | 'litertlm'
+
+/** What the format rules read of an engine row: its kind, and on an SDK row the SDK engine it is (ADR-462) and the name
+ *  a refusal gives it. A bare `{ kind }` is read by the kind table alone. */
+export type EngineFormatRef = Pick<Engine, 'kind'> & Partial<Pick<Engine, 'sdkEngine' | 'name'>>
 
 export type Incompatibility =
   | { code: 'format'; label: string; message: string }
@@ -16,17 +21,18 @@ export type Incompatibility =
   | { code: 'needs_vllm'; label: 'Needs vLLM (Linux or WSL2)'; message: string }
   | { code: 'needs_laya'; label: 'Needs the Laya engine'; message: string }
 
-/** null = the engine of `engineKind` can load `entry`. Order: needs_laya and needs_vllm (most specific), then
+/** null = the engine row `engine` can load `entry`. Order: needs_laya and needs_vllm (most specific), then
  *  format, then audio. The ONE place this rule lives; engineAcceptsFormat/engineRejectsAudioModel
  *  stay exported as its building blocks. `label` is the short text a model row shows. */
 export function modelIncompatibility(
-  engineKind: string,
+  engine: EngineFormatRef,
   entry: Pick<ModelEntry, 'format' | 'audio' | 'jev' | 'laya'> & Partial<Pick<ModelEntry, 'arch'>>,
 ): Incompatibility | null {
+  const engineKind = engine.kind
   if (entry.format === 'gguf' && entry.arch === GGMLC_ARCH) return GGMLC_GGUF
   if (entry.laya) return engineKind === 'laya' ? null : NEEDS_LAYA
   if (entry.jev && engineKind !== 'vllm') return needsVllm(engineKind)
-  if (!engineAcceptsFormat(engineKind, entry.format)) return formatIncompatibility(engineKind, entry.format)
+  if (!engineAcceptsFormat(engine, entry.format)) return formatIncompatibility(engine, entry.format)
   if (entry.audio && engineRejectsAudioModel(engineKind)) return audioIncompatibility(engineKind)
   return null
 }
@@ -45,10 +51,10 @@ export function modelIncompatibility(
  *  take this refusal too: once the user shows such models, one is always started on the selected engine, and if it
  *  fails there it fails (model-router.ts loadRefusal, auto-load.ts). */
 export function manualLoadRefusal(
-  engineKind: string,
+  engine: EngineFormatRef,
   entry: Parameters<typeof modelIncompatibility>[1],
 ): Incompatibility | null {
-  return entry.laya ? modelIncompatibility(engineKind, entry) : null
+  return entry.laya ? modelIncompatibility(engine, entry) : null
 }
 
 // The refusal messages state what the selected engine cannot run, and nothing else: no other engine, no "activate",
@@ -71,6 +77,7 @@ const ENGINE_NAMES: Record<string, string> = {
   sglang: 'SGLang',
   'litert-lm': 'LiteRT-LM',
   laya: 'The Laya engine',
+  'turbollm-sdk': 'TurboLLM SDK',
 }
 
 function engineName(engineKind: string): string {
@@ -118,17 +125,23 @@ export function refusedOnEveryEngine(inc: Incompatibility): boolean {
 
 const NEEDS_PYTHON_ENGINE_LABEL = 'needs MLX or vLLM'
 
-function formatIncompatibility(engineKind: string, format: ModelFormat): Incompatibility {
+function formatIncompatibility(engine: EngineFormatRef, format: ModelFormat): Incompatibility {
   const label = format === 'gguf' ? 'needs llama.cpp' : format === 'litertlm' ? 'needs LiteRT-LM' : NEEDS_PYTHON_ENGINE_LABEL
-  return { code: 'format', label, message: formatMismatchMessage(engineKind, format) }
+  return { code: 'format', label, message: formatMismatchMessage(engine, format) }
 }
 
 /** User-facing message when the active engine can't load a model's format (ADR-044): the engine and the format, no
  *  advice (see ENGINE_NAMES). It said which engine to activate or switch to ("activate the LiteRT-LM engine to load
  *  it", "or switch to a llama.cpp engine for GGUF"). */
-function formatMismatchMessage(engineKind: string, format: ModelFormat): string {
-  if (engineKind === 'laya') return 'The Laya engine runs only Laya models.'
-  return `${engineName(engineKind)} can't run this ${FORMAT_NAMES[format]} model.`
+function formatMismatchMessage(engine: EngineFormatRef, format: ModelFormat): string {
+  if (engine.kind === 'laya') return 'The Laya engine runs only Laya models.'
+  return `${refusalName(engine)} can't run this ${FORMAT_NAMES[format]} model.`
+}
+
+/** An SDK row is named by its own name ("LiteRT-LM", "llama.cpp (CPU)"): the kind's name is the shared in-app host
+ *  every SDK row is. Every other row is named by its kind, as before. */
+function refusalName(engine: EngineFormatRef): string {
+  return isSdkRow(engine) && engine.name ? engine.name : engineName(engine.kind)
 }
 
 function audioIncompatibility(engineKind: string): Incompatibility {
@@ -147,7 +160,8 @@ function audioIncompatibility(engineKind: string): Incompatibility {
 }
 
 /**
- * True when an engine of `engineKind` can load a model of `format`:
+ * True when the engine row can load a model of `format` (engineFormats). The kind table, for every row but an SDK row
+ * that names its SDK engine:
  *   - llama.cpp and its forks (e.g. TurboQuant + ik_llama.cpp, kind 'llama-server') → GGUF
  *   - llamafile (kind 'llamafile') → GGUF (it bundles llama.cpp's server)
  *   - KoboldCpp (kind 'koboldcpp') → GGUF (it wraps llama.cpp)
@@ -158,20 +172,44 @@ function audioIncompatibility(engineKind: string): Incompatibility {
  *     scanner tags 'mlx' (config.json + *.safetensors + tokenizer)
  *   - SGLang (kind 'sglang') → the same HF safetensors directories as vLLM
  *   - LiteRT-LM (kind 'litert-lm') → `.litertlm` bundles, a format no other engine reads
+ *   - TurboLLM SDK (kind 'turbollm-sdk', the Android app's in-app engine) → its SDK engine's formats (ADR-462); the
+ *     M1 legacy row, which names none, GGUF and `.litertlm`: it hosts both llama.cpp and LiteRT-LM behind one server
  *   - Laya (kind 'laya') → no plain format: it loads only Laya models, which modelIncompatibility
  *     recognises by `entry.laya` before the format is ever checked
  */
-export function engineAcceptsFormat(engineKind: string, format: ModelFormat): boolean {
-  if (engineKind === 'mlx') return format === 'mlx'
-  if (engineKind === 'rapid-mlx') return format === 'mlx'
-  if (engineKind === 'mlx-vlm') return format === 'mlx'
-  if (engineKind === 'vllm') return format === 'mlx'
-  if (engineKind === 'sglang') return format === 'mlx'
-  if (engineKind === 'laya') return false
+export function engineAcceptsFormat(engine: EngineFormatRef, format: ModelFormat): boolean {
+  return engineFormats(engine).includes(format)
+}
+
+/** The formats this row reads: an SDK row's descriptor (ADR-462), else the kind table below. A legacy SDK row (kind
+ *  'turbollm-sdk', no sdkEngine: the M1 single row) keeps reading both of the SDK's formats until it is reconciled. */
+export function engineFormats(engine: EngineFormatRef): ModelFormat[] {
+  if (isSdkRow(engine) && engine.sdkEngine) return [...engine.sdkEngine.formats]
+  return kindFormats(engine.kind)
+}
+
+/** The row is a LiteRT-LM engine by what it reads, not by its kind (architecture §3.5): desktop LiteRT-LM and the
+ *  in-app SDK's LiteRT-LM row. The M1 legacy row, which also reads GGUF, is not. */
+export function readsOnlyLitertlm(engine: EngineFormatRef): boolean {
+  const formats = engineFormats(engine)
+  return formats.includes('litertlm') && !formats.includes('gguf')
+}
+
+function kindFormats(engineKind: string): ModelFormat[] {
+  if (MODEL_DIRECTORY_KINDS.has(engineKind)) return ['mlx']
+  if (engineKind === 'laya') return []
   // .litertlm is LiteRT-LM's alone, and LiteRT-LM reads nothing else.
-  if (engineKind === 'litert-lm') return format === 'litertlm'
+  if (engineKind === 'litert-lm') return ['litertlm']
+  if (engineKind === TURBOLLM_SDK_KIND) return ['gguf', 'litertlm']
   // llama-server / forks, llamafile, koboldcpp — all GGUF.
-  return format === 'gguf'
+  return ['gguf']
+}
+
+const MODEL_DIRECTORY_KINDS: ReadonlySet<string> = new Set(['mlx', 'rapid-mlx', 'mlx-vlm', 'vllm', 'sglang'])
+
+/** A row of the Android app's in-app TurboLLM SDK (ADR-462). */
+export function isSdkRow(engine: Pick<Engine, 'kind'>): boolean {
+  return engine.kind === TURBOLLM_SDK_KIND
 }
 
 /**
@@ -197,6 +235,48 @@ export function engineAcceptsFormat(engineKind: string, format: ModelFormat): bo
 export function engineRejectsAudioModel(engineKind: string): boolean {
   return engineKind === 'rapid-mlx' || engineKind === 'mlx-vlm'
 }
+
+/** The Android app's in-app engine (the TurboLLM SDK), reached over HTTP rather than spawned. */
+export const TURBOLLM_SDK_KIND = 'turbollm-sdk'
+
+/** True when requests to `engineKind` must go without tools, tool_choice and a non-text response_format: the SDK
+ *  refuses them with a 400 in this version, so every in-app agent turn would fail (ADR-447 point 7's precedent). */
+export function engineWithholdsTools(engineKind: string): boolean {
+  return engineKind === TURBOLLM_SDK_KIND
+}
+
+/** True when `engineKind` takes a past turn's reasoning as the message's `reasoning_content` and not folded into its
+ *  text as <think>: the SDK serves LiteRT-LM bundles whose templates put the text in verbatim, so the fold derailed
+ *  Qwen3-0.6B's second turn (QA re-run R3). The SDK reads no such field and leaves the reasoning out, as a LiteRT-LM
+ *  conversation's own history does. */
+export function engineTakesReasoningAsField(engineKind: string): boolean {
+  return engineKind === 'litert-lm' || engineKind === TURBOLLM_SDK_KIND
+}
+
+/** True when `engineKind` cannot read image parts, so an image must be refused or replaced before it is sent. The
+ *  SDK has no vision in this version. */
+export function engineWithholdsVision(engineKind: string): boolean {
+  return engineKind === TURBOLLM_SDK_KIND
+}
+
+/** True when `engineKind` has no embeddings: the gateway refuses an embeddings request bound for it before routing,
+ *  so nothing is loaded or evicted for it, and the router refuses to load an embedding model on it. The SDK has no
+ *  embeddings in this version. */
+export function engineWithholdsEmbeddings(engineKind: string): boolean {
+  return engineKind === TURBOLLM_SDK_KIND
+}
+
+/** The message of both refusals {@link engineWithholdsEmbeddings} decides: the gateway's (an embeddings request) and
+ *  the router's (an embedding model load). */
+export const EMBEDDINGS_UNAVAILABLE = 'The TurboLLM SDK engine runs one chat model at a time and has no embeddings in this version.'
+
+/** True when `engineKind` loads one model at a time, so a second load replaces the first: the SDK. */
+export function engineHoldsOneModel(engineKind: string): boolean {
+  return engineKind === TURBOLLM_SDK_KIND
+}
+
+/** The `vision_unavailable` refusal of an image sent to an engine that {@link engineWithholdsVision}. */
+export const VISION_UNAVAILABLE = 'The in-app engine can\'t read images in this version. Switch to llama.cpp server (CPU) in Engines to use images.'
 
 /**
  * The value an OpenAI-compatible request must put in its `model` field for this engine.
@@ -234,6 +314,8 @@ export function engineModelAlias(engineKind: string, modelPath?: string | null):
   // LiteRT-LM is the same shape as MLX-VLM: its `model` field is a real, load-bearing reference (here the .litertlm
   // file path), not a name it ignores and not an alias it was launched under.
   if (engineKind === 'litert-lm') return modelPath ?? null
+  // The SDK serves the model it loaded from a path, and names it by that path in /v1/models.
+  if (engineKind === TURBOLLM_SDK_KIND) return modelPath ?? null
   return engineKind === 'mlx' || engineKind === 'vllm' || engineKind === 'sglang' ? ENGINE_MODEL_ALIAS : null
 }
 
@@ -263,7 +345,24 @@ export function engineModelAlias(engineKind: string, modelPath?: string | null):
 export function shapeForEngine<T extends Record<string, unknown>>(engineKind: string, body: T): T {
   applyEngineTokenLimit(engineKind, body)
   if (engineKind === 'litert-lm') shapeLitertLmRequest(body)
+  if (engineKind === TURBOLLM_SDK_KIND) capSdkStopList(body)
   return body
+}
+
+/** The most stop strings the SDK accepts (OpenAI's own limit). It answers more with a 400, so a thread with five
+ *  would fail every turn. */
+const SDK_MAX_STOP_STRINGS = 4
+let sdkStopDropLogged = false
+
+/** Keeps the first SDK_MAX_STOP_STRINGS of an array `stop` and logs, the first time per process, what was dropped.
+ *  A string `stop` is one entry and stays as it is. Mutates `body`. */
+function capSdkStopList(body: Record<string, unknown>): void {
+  if (!Array.isArray(body.stop) || body.stop.length <= SDK_MAX_STOP_STRINGS) return
+  const dropped = body.stop.slice(SDK_MAX_STOP_STRINGS)
+  body.stop = body.stop.slice(0, SDK_MAX_STOP_STRINGS)
+  if (sdkStopDropLogged) return
+  sdkStopDropLogged = true
+  console.warn(`[engine] TurboLLM SDK takes at most ${SDK_MAX_STOP_STRINGS} stop strings; not sent: ${JSON.stringify(dropped)}`)
 }
 
 export function applyEngineTokenLimit<T extends Record<string, unknown>>(engineKind: string, body: T): T {

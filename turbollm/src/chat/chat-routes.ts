@@ -25,6 +25,7 @@ import { extractMemoryFacts } from './memory'
 import { codeGateBlocks } from '../routines/routine-routes'
 import { callChatUpstream, resolveChatUpstream, type ChatUpstream } from './chat-upstream'
 import { servingEngineKind } from '../engines/serving'
+import { engineTakesReasoningAsField, engineWithholdsVision, VISION_UNAVAILABLE } from '../engines/compat'
 import { runGenerationCore } from './generation-core'
 import { nonStringField } from '../util/string-fields'
 
@@ -612,6 +613,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // model swapped between the recording and the send, or an API caller.
     if (audio.length > 0 && !upstream.hearsAudio)
       return err(c, 409, 'audio_unsupported', `${upstream.modelName} cannot take audio. Convert the recording to text and send that.`)
+    // An image is refused likewise, before any file is written: this machine's engine reads none (G-2), so no reply
+    // could be generated.
+    if (images.length && localEngineWithholdsVision(d, upstream)) return err(c, 400, 'vision_unavailable', VISION_UNAVAILABLE)
 
     // Each image and clip to its file before the row names it (attachments.ts); the engine is sent the bytes (below).
     // Before the conversation is read again and the busy check, so nothing they decide goes stale across this await.
@@ -791,7 +795,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // `lastUser` is the turn being answered: it goes out with its images and documents, as
       // POST /messages first sent it — the text alone is not what the user asked about.
       const allMsgs = (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id)
-      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id, { reasoningField: reasoningAsField(d, upstream), hearsAudio: upstream.hearsAudio })
+      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id, {
+        reasoningField: reasoningAsField(d, upstream), withholdImages: localEngineWithholdsVision(d, upstream), hearsAudio: upstream.hearsAudio,
+      })
       // Its stored images and clips as the bytes the first send carried (a local engine and a Turbo Link host alike).
       await db.attachments.resolveMedia(engineMessages)
 
@@ -1246,10 +1252,16 @@ interface GenerationCtx {
 export { resilientSink, EngineStreamError } from './generation-core'
 
 /** Whether this turn's past reasoning goes to the engine as each message's `reasoning_content` rather than folded into
- *  its text (buildEngineMessages): this machine's LiteRT-LM engine, whose bundle templates decide what of it the model
+ *  its text (buildEngineMessages): this machine's LiteRT-LM engine or in-app SDK engine, whose bundle templates decide what of it the model
  *  sees. A linked host's engine is not this machine's to judge: it keeps the fold. */
 function reasoningAsField(d: Deps, upstream: ChatUpstream): boolean {
-  return !upstream.remote && servingEngineKind(d) === 'litert-lm'
+  return !upstream.remote && engineTakesReasoningAsField(servingEngineKind(d))
+}
+
+/** Whether this turn's images must not reach the engine: this machine's engine reads none (the in-app SDK engine,
+ *  G-2). A linked host's engine is its own (ADR-376), so a remote turn keeps its images. */
+function localEngineWithholdsVision(d: Deps, upstream: ChatUpstream): boolean {
+  return !upstream.remote && engineWithholdsVision(servingEngineKind(d))
 }
 
 // The engine's error, read and shown as every path shows it (engines/engine-error.ts).

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { pickKvQuants, betterBySpeed, ttfMs, TTF_OUTPUT_TOKENS, probeVerdict, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, parseRocmGttUsed, benchPromptTokens, benchSlotCtx, buildBenchMessages, parseNvidiaVramUsed, vramCardFor, cardThatGrew } from './bench'
+import { BenchError, BenchRunner, pickKvQuants, betterBySpeed, ttfMs, TTF_OUTPUT_TOKENS, probeVerdict, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, parseRocmGttUsed, benchPromptTokens, benchSlotCtx, buildBenchMessages, parseNvidiaVramUsed, vramCardFor, cardThatGrew } from './bench'
 import { SPILL_TOLERANCE_MB } from './spill'
 
 // ---- pickKvQuants: quality-preserving KV sweep, base-first ------------------
@@ -521,4 +521,41 @@ test('buildBenchMessages: never overshoots its target, so a 2k/4k-ctx model\'s p
     // +64: the fixed final question (~33 tokens), which the filler target does not count.
     assert.ok(estTokens <= benchPromptTokens(ctx) + 64, `ctx ${ctx}: ~${estTokens} tokens vs target ${benchPromptTokens(ctx)}`)
   }
+})
+
+// ---- start(): which engines auto-tune refuses (G-8) ------------------------
+
+/** A runner whose engine is stopped and whose active engine is `engineKind`. The scanner knows no model, so a start
+ *  that gets past the engine checks stops at `no_such_model` instead of beginning a run. */
+function stoppedRunnerOn(engineKind: string): BenchRunner {
+  const manager = { status: () => ({ state: 'stopped' }) }
+  const registry = { active: () => ({ id: 'e', kind: engineKind }) }
+  const scanner = { get: () => undefined }
+  return new BenchRunner(manager as never, {} as never, scanner as never, registry as never, 'test', {} as never)
+}
+
+function refusalOf(start: () => void): BenchError {
+  try {
+    start()
+  } catch (e) {
+    if (e instanceof BenchError) return e
+    throw e
+  }
+  throw new Error('start() did not refuse')
+}
+
+test('start: the in-app SDK engine is refused with unsupported_model and its own message', () => {
+  const refusal = refusalOf(() => stoppedRunnerOn('turbollm-sdk').start('m'))
+  assert.equal(refusal.code, 'unsupported_model')
+  assert.equal(refusal.message, 'Auto-tune is not available for the in-app engine.')
+})
+
+test('start: llama-server gets past the engine checks to the model lookup', () => {
+  assert.equal(refusalOf(() => stoppedRunnerOn('llama-server').start('m')).code, 'no_such_model')
+})
+
+test('start: an MLX engine keeps its existing refusal', () => {
+  const refusal = refusalOf(() => stoppedRunnerOn('mlx').start('m'))
+  assert.equal(refusal.code, 'unsupported_model')
+  assert.equal(refusal.message, 'Auto-tune supports llama.cpp / llamafile (GGUF) engines only.')
 })

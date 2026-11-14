@@ -50,6 +50,16 @@ test('a .litertlm loaded by path names no backend and no context: the server run
   assert.equal(opts.litertLmConfig.default.max_num_tokens, undefined)
 })
 
+test('m-6: a .litertlm loaded by path on the in-app SDK\'s LiteRT-LM row gets the LiteRT-LM config too', async () => {
+  const sdkLitert = {
+    ...LITERT, id: 'sdk-lrt', kind: 'turbollm-sdk', binPath: '', baseUrl: 'http://127.0.0.1:1',
+    sdkEngine: { id: 'litert-lm', kind: 'litert-lm', formats: ['litertlm'], backends: ['gpu', 'cpu'] },
+  } as Engine
+  const opts = await loadByPath(sdkLitert, { modelPath: '/models/gemma-4-E2B-it-gpu.litertlm' })
+  assert.ok(opts.litertLmConfig, 'a LiteRT-LM config is built for it, as on desktop')
+  assert.equal(opts.litertLmConfig.default.backend, undefined)
+})
+
 test('a load by path on another engine is left as it was: no LiteRT-LM config', async () => {
   const llama = { ...LITERT, id: 'll', kind: 'llama-server', binPath: 'llama-server' } as Engine
   const opts = await loadByPath(llama, { modelPath: '/models/m.gguf', extraArgs: ['-c', '4096'] })

@@ -36,7 +36,9 @@ import {
 } from './app-update-apply'
 import { applyEngineUpdate } from './engines/update-apply'
 import { engineWorkBusy } from './api/routes'
-import { seedDefaultEngines, ensureAndroidBundledEngine, ensureAndroidModelsDir } from './engines/seed'
+import { seedDefaultEngines, ensureAndroidModelsDir } from './engines/seed'
+import { reconcileAndroidEngines } from './engines/android-engines'
+import { readSdkEngines } from './engines/sdk-engines'
 import { packagedAndroidApp, restoreParkedInstalls } from './engines/zip-install'
 import { restoreInterruptedBuilds } from './engines/build-runner'
 import { runAutoLoad } from './engines/auto-load'
@@ -223,11 +225,22 @@ export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
   // Honest update checker (ADR-085): per-engine installed/latest/hasUpdate, in-memory cached.
   const updates = new UpdateChecker()
   const enginesDir = join(store.dir(), 'engines')
-  // Android's own bundled-engine bootstrap (BUG-01, QA_BUGS.md) — a no-op everywhere else —
-  // runs first: it must land before seedDefaultEngines' "any engine already configured?"
-  // gate so a repaired/first-registered Android engine correctly short-circuits the
-  // network-download seed path instead of racing it.
-  void ensureAndroidBundledEngine(registry)
+  // Android's own engine rows (BUG-01, QA_BUGS.md; ADR-462): the in-app SDK's engines, the spawned engines the APK
+  // ships, and which one is active. A no-op everywhere else, returning before any await. It runs first: it must land
+  // before seedDefaultEngines' "any engine already configured?" gate so a repaired/first-registered Android engine
+  // correctly short-circuits the network-download seed path instead of racing it. `initialScan` and `scanner` are
+  // declared below: the reconciler calls formatOf only after its first await.
+  const androidEngineSetup = reconcileAndroidEngines({
+    registry,
+    store,
+    env: process.env,
+    readSdk: readSdkEngines,
+    formatOf: async () => {
+      await initialScan
+      return (key) => scanner.get(key)?.format
+    },
+  })
+  void androidEngineSetup
     .then(() => seedDefaultEngines(registry, enginesDir, provision, store))
     .then(() => registry.ensureProbed())
   const manager = new Manager(store)
@@ -1179,12 +1192,14 @@ export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
 
   // ── Auto-load last model on start (spec 05 §7) ────────────────────────────────
   // Not awaited, so boot never stalls. It waits for the boot scan itself, so a key the scan
-  // migrates is resolved; the decision and every skip line live in engines/auto-load.ts.
+  // migrates is resolved, and for the Android engine setup, so it plans on the engine this launch
+  // activates; the decision and every skip line live in engines/auto-load.ts.
   // Started after the rebind is wired and before cli.ts wires the restart and the signal shutdown, as it always was:
   // runAutoLoad awaits the boot scan before it does anything, so cli.ts's wiring is in place before any load starts.
   if (opts.autoLoad !== false) {
     void runAutoLoad({
       initialScan,
+      engineSetup: androidEngineSetup,
       store,
       registry,
       comfy,

@@ -4,8 +4,9 @@
 // degradation. Network/auth failures surface as a typed HfError so routes can map
 // them to a stable error envelope.
 import { quantFromName } from '../gguf/gguf'
+import { isSdkRow, readsOnlyLitertlm, type EngineFormatRef } from '../engines/compat'
 import { detectJev } from '../models/jev'
-import { litertlmQuantFromName } from '../models/litertlm'
+import { litertlmQuantFromName, litertlmTarget, type LitertlmTarget } from '../models/litertlm'
 import type { TextClassifierRuntime } from '../models/text-classifier'
 import { DownloadError } from '../downloads/downloads'
 import { findCheckpoints, MAX_CHECKPOINT_CONFIG_FETCHES, type HfCheckpoint } from './checkpoints'
@@ -53,6 +54,8 @@ export interface HfSearchItem {
   tags: string[]
   /** Only on {@link HfClient.searchTextClassification} rows: the engine the repo loads on (ADR-444). */
   textClassification?: { runtime: TextClassifierRuntime }
+  /** HF's `pipeline_tag` for the repo, when it has one (e.g. 'text-generation', 'automatic-speech-recognition'). */
+  pipelineTag?: string
 }
 
 /** Sort options for both search and browse (spec 10 §7 rewrite). 'best-match' is HF's
@@ -70,19 +73,50 @@ const SORT_PARAM: Record<Exclude<HfSortOption, 'best-match'>, string> = {
   created: 'createdAt',
 }
 
-/** The HF `library` facet to filter by, adapted to the active engine kind (spec 10 §2/§7)
+/** The HF `library` facet to filter by, adapted to the active engine row (spec 10 §2/§7)
  *  — NEVER hardcoded to GGUF, since the format that actually runs depends on the engine:
+ *  - an in-app SDK row (ADR-462) by the formats its SDK engine reads: LiteRT-LM → litert-lm, else gguf
  *  - llama-server / koboldcpp / llamafile / TurboQuant (all llama.cpp-family) → gguf
  *  - mlx / rapid-mlx (same on-disk MLX format)                               → mlx (HF library tag)
  *  - vllm / sglang (HF safetensors directories)                               → no filter (all HF repos)
  *  - litert-lm (`.litertlm` bundles, e.g. the litert-community org)            → litert-lm
  *  Shared by `searchModels` and `browseModels` so the two never drift apart. */
-function libraryFilterFor(engineKind?: string): string {
+function libraryFilterFor(engine?: EngineFormatRef): string {
+  if (engine && isSdkRow(engine) && engine.sdkEngine) {
+    return readsOnlyLitertlm(engine) ? LITERT_LM_FILTER : 'filter=gguf&'
+  }
+  const engineKind = engine?.kind
   if (engineKind === 'mlx' || engineKind === 'rapid-mlx' || engineKind === 'mlx-vlm') return 'filter=mlx&'
   if (engineKind === 'vllm' || engineKind === 'sglang') return ''
-  if (engineKind === 'litert-lm') return 'filter=litert-lm&'
+  if (engineKind === 'litert-lm') return LITERT_LM_FILTER
   return 'filter=gguf&'
 }
+
+const LITERT_LM_FILTER = 'filter=litert-lm&'
+
+/** The rows a search shows for `engine`. On an SDK row searching `.litertlm` (ADR-462), the speech, voice and embedding
+ *  bundles that share the litert-lm facet are dropped: they cannot chat, and that list is the first a new phone user
+ *  sees. Vision-language and any-to-any bundles stay (they may answer text). Every other engine's rows are all kept. */
+function chatRowsFor(engine: EngineFormatRef | undefined, rows: RawSearchItem[]): RawSearchItem[] {
+  if (!engine || !isSdkRow(engine) || !readsOnlyLitertlm(engine)) return rows
+  return rows.filter((m) => !isNonChatBundle(m))
+}
+
+/** A bundle that cannot chat, by its HF pipeline tag, any of its tags, or its name. Community re-uploads of the speech
+ *  and voice bundles carry no pipeline tag at all (QA F-1), so the name of the model family is the only signal left. */
+function isNonChatBundle(m: RawSearchItem): boolean {
+  const tags = [m.pipeline_tag ?? '', ...(Array.isArray(m.tags) ? m.tags : [])]
+  return tags.some((tag) => NON_CHAT_PIPELINES.has(tag)) || NON_CHAT_FAMILY_NAMES.test(repoIdOf(m))
+}
+
+const NON_CHAT_PIPELINES: ReadonlySet<string> = new Set([
+  'automatic-speech-recognition',
+  'text-to-speech',
+  'feature-extraction',
+  'sentence-similarity',
+])
+
+const NON_CHAT_FAMILY_NAMES = /embedding|whisper|parakeet|kokoro|moonshine/i
 
 function toSearchItem(m: RawSearchItem): HfSearchItem {
   return {
@@ -92,6 +126,7 @@ function toSearchItem(m: RawSearchItem): HfSearchItem {
     updatedAt: m.lastModified ?? m.createdAt ?? '',
     gated: m.gated === true || m.gated === 'auto' || m.gated === 'manual',
     tags: Array.isArray(m.tags) ? m.tags : [],
+    ...(typeof m.pipeline_tag === 'string' ? { pipelineTag: m.pipeline_tag } : {}),
   }
 }
 
@@ -115,6 +150,11 @@ export interface HfRepoFile {
    *  'INT4', 'Q8', '?', exactly what the library scanner's litertlmQuantFromName reads),
    *  so no field carries two meanings and Discover and the library agree on a file. */
   variant?: string
+  /** For a `.litertlm` bundle: the hardware it was built for, from its name (ADR-462, litertlmTarget). */
+  target?: LitertlmTarget
+  /** For a `.litertlm` bundle in the repo-detail reply: whether this device runs it (litertlmRunsHere), computed by the
+   *  route from the host it runs on. */
+  runsHere?: boolean
   /** HF LFS sha256 when published in the tree metadata; used for integrity. */
   sha256?: string
   /** Download URL for the first/only part (resolve/main). */
@@ -190,9 +230,9 @@ export class HfClient {
   /** Search repos by text (spec 10 §2). Returns up to 30 rows. `sort` defaults to HF's own
    *  relevance ranking ('best-match' — omits `sort=` entirely, a genuinely different order
    *  from `sort=downloads`, not just an alias for it). Format filter adapts to the active
-   *  engine kind (never hardcoded to GGUF) — see {@link libraryFilterFor}. */
-  async searchModels(query: string, engineKind?: string, sort: HfSortOption = 'best-match'): Promise<HfSearchItem[]> {
-    const filter = libraryFilterFor(engineKind)
+   *  engine row (never hardcoded to GGUF) — see {@link libraryFilterFor}. */
+  async searchModels(query: string, engine?: EngineFormatRef, sort: HfSortOption = 'best-match'): Promise<HfSearchItem[]> {
+    const filter = libraryFilterFor(engine)
     // The Laya engine is never the active engine (ADR-443), so a format-narrowed search would never show a Laya
     // repo it can run. Best-effort: a failed Laya search leaves the search as it was.
     const [raw, laya] = await Promise.all([
@@ -201,7 +241,7 @@ export class HfClient {
     ])
     const runnable = laya.filter(isLayaEngineRepo)
     const listed = new Set(runnable.map(repoIdOf))
-    return [...runnable, ...raw.filter((m) => !listed.has(repoIdOf(m)))].map(toSearchItem)
+    return [...runnable, ...chatRowsFor(engine, raw).filter((m) => !listed.has(repoIdOf(m)))].map(toSearchItem)
   }
 
   /** Discover's "Text classification" category (ADR-444): the Laya bundles and verified Jev (NLI) models matching
@@ -224,14 +264,14 @@ export class HfClient {
   /** Browse repos with no search term (spec 10 §7 rewrite) — the live equivalent of
    *  https://huggingface.co/models?library=gguf&sort=trending, replacing what used to be a
    *  hardcoded "Featured" list. 'best-match' has no meaning without a query, so it falls
-   *  back to 'trending'. Format filter adapts to the active engine kind, same as search. */
-  async browseModels(sort: HfSortOption, engineKind?: string, limit = 30): Promise<HfSearchItem[]> {
+   *  back to 'trending'. Format filter adapts to the active engine row, same as search. */
+  async browseModels(sort: HfSortOption, engine?: EngineFormatRef, limit = 30): Promise<HfSearchItem[]> {
     const effective = sort === 'best-match' ? 'trending' : sort
     const url =
-      `${BASE}/api/models?${libraryFilterFor(engineKind)}` +
+      `${BASE}/api/models?${libraryFilterFor(engine)}` +
       `sort=${SORT_PARAM[effective]}&direction=-1&limit=${limit}&full=false`
     const raw = await this.getJson<RawSearchItem[]>(url)
-    return raw.map(toSearchItem)
+    return chatRowsFor(engine, raw).map(toSearchItem)
   }
 
   /** Repo detail (spec 10 §3): card data + the model file tree — GGUF quants (split parts
@@ -686,6 +726,7 @@ export interface RawSearchItem {
   createdAt?: string
   gated?: boolean | string
   tags?: string[]
+  pipeline_tag?: string
 }
 
 interface RawRepoInfo {
@@ -795,6 +836,7 @@ function litertlmFiles(entries: RawTreeEntry[], urlFor: (path: string) => string
       name: (basenameCount.get(base(e.path)) ?? 0) > 1 ? e.path : base(e.path),
       quant: litertlmQuantFromName(base(e.path)),
       variant: litertlmVariantLabel(prefix, e.path.replace(LITERTLM_RE, '')),
+      target: litertlmTarget(e.path),
       sizeBytes: sizeOf(e),
       parts: 1,
       mmproj: false,

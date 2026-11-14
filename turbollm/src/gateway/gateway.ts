@@ -12,7 +12,10 @@ import type { RetryReason } from './model-router'
 import type { ToolCallRecord } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
 import { GATEWAY_MAX_BODY_MB } from '../config/config-bounds'
-import { applyEngineTokenLimit, engineModelAlias, shapeForEngine } from '../engines/compat'
+import {
+  applyEngineTokenLimit, EMBEDDINGS_UNAVAILABLE, engineModelAlias, engineWithholdsEmbeddings, engineWithholdsTools,
+  engineWithholdsVision, shapeForEngine, VISION_UNAVAILABLE,
+} from '../engines/compat'
 import { litertLmForcedToolChoiceError, litertLmUnappliedParameters, shapeLitertLmRequest } from '../engines/litert-lm-request'
 import { unlistedForLoading } from '../engines/registry'
 import { presentedKey } from '../auth'
@@ -40,6 +43,7 @@ import {
   serverToolSseEvents,
 } from './server-tools'
 import { servingEngineKind } from '../engines/serving'
+import { engineRequestHeaders } from '../engines/engine-headers'
 import { redactLocalPaths } from '../util/redact-paths'
 
 /** Resolve the Code session (if any) a gateway request belongs to, from the same token a
@@ -113,6 +117,31 @@ function anthropicErrorType(status: number): string {
  *  out-of-range status from a misbehaving engine can't crash response construction. */
 function asClientStatus(status: number): ContentfulStatusCode {
   return (status >= 400 && status <= 599 ? status : 500) as ContentfulStatusCode
+}
+
+/** An embeddings request bound for an engine that {@link engineWithholdsEmbeddings}. Permanent: retrying won't help. */
+const EMBEDDINGS_REFUSAL = { message: EMBEDDINGS_UNAVAILABLE, permanent: true }
+
+/** True when an embeddings request would reach an engine with no embeddings through a load: the active engine, which a
+ *  load starts on, withholds them, and the request names no model already running in a pool slot (which keeps its own
+ *  engine). Asked before route(), so the request loads and evicts nothing. A linked machine's id is left to route(). */
+function embeddingsWithheldBeforeRouting(d: Deps, requestedModel: string): boolean {
+  if (!engineWithholdsEmbeddings(d.registry.active()?.kind ?? '')) return false
+  if (d.modelRouter.resolveRemoteTarget(requestedModel)) return false
+  return !runsInPoolSlot(d, requestedModel)
+}
+
+function runsInPoolSlot(d: Deps, requestedModel: string): boolean {
+  const entry = requestedModel.trim() ? d.modelRouter.resolveLocal(requestedModel) : undefined
+  return entry !== undefined && d.modelRouter.aliveSlots().some((s) => !s.primary && s.modelKey === entry.key)
+}
+
+/** The OpenAI-shaped 503 for a request the router could not place; a permanent refusal also tells the client not to
+ *  retry (see the identical line in /v1/messages). */
+function modelNotLoaded(c: Context, refusal: { message: string; permanent?: boolean; reason?: RetryReason }): Response {
+  if (refusal.permanent) c.header('x-should-retry', 'false')
+  setRetryAfter(c, refusal)
+  return c.json({ error: { message: refusal.message, type: 'model_not_loaded', code: 'model_not_loaded' } }, 503)
 }
 
 interface WrongEndpointRefusal {
@@ -541,9 +570,10 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
         headers.set('content-type', 'application/json') // re-serialised body; never inherited
         return proxyStream(remote, '/v1/chat/completions', { method: 'POST', headers, body }, ac.signal)
       }
+      const localKind = routeResult.engineKind ?? servingEngineKind(d)
       return fetch(`${target}/v1/chat/completions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: engineRequestHeaders(localKind, new Headers({ 'Content-Type': 'application/json' })),
         body,
         signal: ac.signal,
       })
@@ -894,7 +924,8 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       .join('\n')
     const estimate = Math.ceil(promptText.length / 3.5)
 
-    if (target) {
+    // The in-app SDK engine serves no /tokenize in this version, so its count is the estimate.
+    if (target && servingEngineKind(d) !== 'turbollm-sdk') {
       try {
         const r = await fetch(`${target}/tokenize`, {
           method: 'POST',
@@ -948,6 +979,23 @@ const HOP_BY_HOP = ['connection', 'keep-alive', 'transfer-encoding', 'te', 'trai
  *  throws on any other, and a garbled value must not turn the request into a 500. */
 function connectionNamed(headers: Headers): string[] {
   return (headers.get('connection') ?? '').split(',').map((t) => t.trim().toLowerCase()).filter((t) => /^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(t))
+}
+
+/** True when any message of an OpenAI chat body holds an `image_url` part. */
+function carriesImage(body: Record<string, unknown>): boolean {
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  return messages.some((m) => Array.isArray(m?.content) && m.content.some(isImagePart))
+}
+
+function isImagePart(part: unknown): boolean {
+  return isJsonObject(part) && part.type === 'image_url'
+}
+
+/** Removes every field that offers the engine tools, the legacy `functions` spelling included. */
+function withholdTools(body: Record<string, unknown>): void {
+  delete body.tools
+  delete body.tool_choice
+  delete body.functions
 }
 
 /** The models and sets of unapplied request fields logged (unappliedNote), so each is logged once. */
@@ -1126,20 +1174,19 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       return c.json({ error: { type: 'invalid_request_error', code, message } }, 400)
     }
   }
+  if (isEmbeddings && embeddingsWithheldBeforeRouting(d, requestedModel)) return modelNotLoaded(c, EMBEDDINGS_REFUSAL)
   // An embeddings request reaches a running embedding model's pool slot even with auto-swap off (see the router).
   const routeResult = await d.modelRouter.route(requestedModel, { embeddings: isEmbeddings })
-  if ('status' in routeResult) {
-    if (routeResult.permanent) c.header('x-should-retry', 'false') // see the identical line in /v1/messages above
-    setRetryAfter(c, routeResult)
-    return c.json(
-      { error: { message: routeResult.message, type: 'model_not_loaded', code: 'model_not_loaded' } },
-      503,
-    )
-  }
+  if ('status' in routeResult) return modelNotLoaded(c, routeResult)
   const target = routeResult.target
   /** Turbo Link (ADR-376) — see the identical binding in the /v1/messages handler above. */
   const remote = routeResult.remote
   const serving = servingEngine(d, routeResult)
+  // The primary can still run on the SDK after another engine was made active: routed there without a load, the SDK
+  // would answer an empty 404.
+  if (isEmbeddings && !remote && engineWithholdsEmbeddings(routeResult.engineKind ?? servingEngineKind(d))) {
+    return modelNotLoaded(c, EMBEDDINGS_REFUSAL)
+  }
 
   // Turbo Link is CHAT-only by design (ADR-376) — the comment below this block used to say
   // a qualified id could never even reach the remote branch for a non-chat endpoint, since
@@ -1227,6 +1274,8 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // engine's own check (main.cc CrossSiteRefusal: a cross-origin POST must be application/json) refused a browser
   // app on another origin that posts its JSON as text/plain, and the daemon relayed the 403.
   if (!remote) for (const h of ['cookie', 'x-turbollm-auth', 'x-turbollm-app', 'origin', 'referer']) headers.delete(h)
+  // The in-app SDK engine takes only its own bearer, never the client's key (engineRequestHeaders); others are unchanged.
+  if (!remote) engineRequestHeaders(routeResult.engineKind ?? servingEngineKind(d), headers)
 
   const maxLimit = d.store.read().modelDefaults.maxTokens ?? 0
   // Cancel the upstream engine request if the client disconnects (same reason as
@@ -1250,6 +1299,13 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // Both shaped for the engine the router actually sent this to: a pool slot's (see RouteResult), else the primary's.
       const localKind = routeResult.engineKind ?? servingEngineKind(d)
       if (parsedBody && !remote) applyEngineTokenLimit(localKind, parsedBody)
+      // A Turbo Link peer chose tools and images by its own engine, not this one (G-5).
+      if (parsedBody && opts.origin === 'link') {
+        if (engineWithholdsVision(localKind) && carriesImage(parsedBody)) {
+          return c.json({ error: { message: VISION_UNAVAILABLE, type: 'invalid_request_error', code: 'vision_unavailable' } }, 400)
+        }
+        if (engineWithholdsTools(localKind)) withholdTools(parsedBody)
+      }
       // LiteRT-LM reads the OpenAI-standard top-level reasoning_effort itself, every OpenAI value being one it takes
       // (none/minimal/low/medium/high/xhigh): a client's own is kept as it is, not parsed through Qwen3.8's aliases
       // ('high' → 'xhigh', 'none' → 'off') into chat_template_kwargs, which `serve` never reads, nor did the Android app's
@@ -1375,7 +1431,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // for the whole session → the engine's reusable prompt prefix is unaffected after turn
       // one); situational nudges go on the trailing user/tool turn, where they cost no prefix
       // reuse and where the model actually acts on them. Same division as the Anthropic path.
-      if (parsedBody && chatGuidance) {
+      if (parsedBody && chatGuidance && declaresTools(parsedBody)) {
         appendSystemRules(parsedBody, chatGuidance.system)
         appendNudges(parsedBody, chatGuidance.nudges)
         // The hard half of the loop breaker: at LOOP_ABORT_AFTER the model physically cannot

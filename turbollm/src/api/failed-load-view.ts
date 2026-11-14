@@ -29,6 +29,6 @@ export function failedLoadView(d: Pick<Deps, 'manager' | 'scanner'>): FailedLoad
     engineName: opts.engine.name,
     modelName: opts.model.name,
     modelKey: opts.model.key,
-    expectedToLoad: !entry || modelIncompatibility(opts.engine.kind, entry) === null,
+    expectedToLoad: !entry || modelIncompatibility(opts.engine, entry) === null,
   }
 }

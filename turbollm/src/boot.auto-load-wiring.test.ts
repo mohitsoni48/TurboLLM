@@ -57,3 +57,13 @@ test('the model dir is seeded before the boot scan, and the boot reads no auto-l
   const preScanReads = ['cfg.autoLoadOnStart', 'cfg.lastLoaded', 'cfg.devModel'].filter((read) => body.includes(read))
   assert.deepEqual(preScanReads, [], 'auto-load decides from the snapshot runAutoLoad takes after the scan')
 })
+
+// QA F4 (B-19): the Android engine repair and registration is kept as a promise and handed to auto-load, so the first
+// launch after an upgrade plans on the engine that setup activates, not the removed row it replaces. A source scan: the
+// reconciler is a no-op off Android, so a test daemon cannot show the wait.
+test('auto-load is handed the Android engine setup promise', () => {
+  const body = bootBody()
+  const keep = 'const androidEngineSetup = reconcileAndroidEngines('
+  assert.equal(body.split(keep).length - 1, 1, `the boot must contain "${keep}" once`)
+  assert.match(body, /void runAutoLoad\(\{[\s\S]*?\bengineSetup: androidEngineSetup\b[\s\S]*?\}\)/)
+})

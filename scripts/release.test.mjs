@@ -14,6 +14,7 @@ import {
   PREPARE_PATHS,
   alreadyRecordedOk,
   androidEngineProblem,
+  androidSubmoduleProblem,
   assertOrder,
   isCliEntry,
   magicCloseCommits,
@@ -245,6 +246,30 @@ test('android refuses to ship when the Vulkan engine was requested but is not st
   assert.match(problem, /--skip-vulkan-engine/);
   assert.doesNotMatch(problem, /then copy/i, 'build-static-engine.sh copies the engine into jniLibs itself');
   assert.doesNotMatch(problem, /build-vulkan-engine\.sh|stage-vulkan-engine\.sh/);
+});
+
+test('android accepts the llama.cpp submodule only when it is checked out at the pinned gitlink', () => {
+  const sha = '72d4bcd102d3b823c2bb1260fdc0e5da1af1f4b1';
+  const fix = /git submodule update --init third_party\/llama\.cpp/;
+
+  assert.equal(androidSubmoduleProblem(` ${sha} third_party/llama.cpp (heads/master)`), null);
+
+  const uninitialised = androidSubmoduleProblem(`-${sha} third_party/llama.cpp`);
+  assert.match(uninitialised, /not initialised/);
+  assert.match(uninitialised, fix);
+
+  const stale = androidSubmoduleProblem(`+${sha} third_party/llama.cpp (heads/x)`);
+  assert.match(stale, new RegExp(`checked out at ${sha}`));
+  assert.match(stale, /not the pinned gitlink/);
+  assert.match(stale, fix);
+
+  const conflicted = androidSubmoduleProblem(`U${sha} third_party/llama.cpp`);
+  assert.match(conflicted, /merge conflict/);
+  assert.match(conflicted, fix);
+
+  const missing = androidSubmoduleProblem(null);
+  assert.match(missing, /not a submodule here/);
+  assert.match(missing, fix);
 });
 
 test('importing the module does not run the CLI', () => {

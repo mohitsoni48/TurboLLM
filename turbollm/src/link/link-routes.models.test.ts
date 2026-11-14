@@ -140,3 +140,23 @@ test('the list takes the config snapshot and registry lookups once per request, 
   assert.deepEqual(many, one)
   assert.ok(one.active <= 1 && one.laya <= 1, JSON.stringify(one))
 })
+
+// ADR-462 (plan D-13): with the in-app LiteRT-LM row selected, a peer's list follows that row's formats: a GGUF is
+// hidden (it runs on the llama.cpp row, not this one), and shown again when the host shows every engine's models.
+test('with the in-app LiteRT-LM row selected, a peer sees the .litertlm model and not the GGUF, unless all are shown', async () => {
+  const models = [entry({ key: 'qwen3-35b' }), entry({ key: 'gemma-3n', format: 'litertlm' })]
+  const d = mkDeps([key('tllm-a', ['models:use'])], models)
+  const litertSdkRow = {
+    id: 'sdk-litert', name: 'LiteRT-LM', kind: 'turbollm-sdk', binPath: '', capabilities: { flags: [] },
+    sdkEngine: { id: 'litert-lm', kind: 'litert-lm', formats: ['litertlm'], backends: ['gpu', 'cpu'] },
+  }
+  ;(d.registry as unknown as { active: () => unknown }).active = () => litertSdkRow
+  const list = async () => {
+    const res = await app(d).request('/api/link/v1/models', { headers: { 'X-TurboLLM-Auth': 'tllm-a' } })
+    return ((await res.json()) as { models: Array<{ key: string }> }).models.map((m) => m.key)
+  }
+
+  assert.deepEqual(await list(), ['gemma-3n'])
+  d.store.update((c) => { c.showAllEngineModels = true })
+  assert.deepEqual(await list(), ['qwen3-35b', 'gemma-3n'])
+})

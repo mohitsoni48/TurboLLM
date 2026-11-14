@@ -5,7 +5,26 @@
 // than one installed variant, surface a second "version" dropdown to pick the build.
 //
 // Pure + framework-free so it is unit-testable on its own (imported by EnginesScreen).
-import type { CustomEngineSource, Engine } from './types'
+import type { CustomEngineSource, Engine, ModelFormat } from './types'
+
+/** A row of the Android app's in-app TurboLLM SDK (ADR-462). */
+export function isSdkRow(e: Pick<Engine, 'kind'>): boolean {
+  return e.kind === 'turbollm-sdk'
+}
+
+/** The SDK's LiteRT-LM row itself, by identity: which card and catalog copy it is. What loads on a row is asked by
+ *  format instead ({@link readsOnlyLitert}). */
+export function isSdkLitertRow(e: Pick<Engine, 'kind' | 'sdkEngine'>): boolean {
+  return isSdkRow(e) && e.sdkEngine?.id === 'litert-lm'
+}
+
+/** A row that reads .litertlm and no GGUF: LiteRT-LM by what it loads (ADR-462), on desktop or in the app. */
+export function readsOnlyLitert(formats: readonly ModelFormat[]): boolean {
+  return formats.includes('litertlm') && !formats.includes('gguf')
+}
+
+/** The spawned CPU llama.cpp server the Android app registers for itself (engines/android-engines.ts). */
+export const ANDROID_CPU_SERVER_NAME = 'llama-server-android'
 
 /** Official llama.cpp builds auto-downloaded by TurboLLM live in
  *  `<config>/engines/llama.cpp-<tag>-<backend>/`. Matches EnginesScreen.isOfficialLlama. */
@@ -60,6 +79,7 @@ export function customSourceIsLive(source: CustomEngineSource, liveEngines: Engi
  *  engines share their kind; TurboQuant builds share `'turboquant'`; everything else is a
  *  distinct user-added engine (`'user:'+id`). */
 export function engineGroupKey(e: Engine): string {
+  if (isSdkRow(e) && e.sdkEngine) return `sdk:${e.sdkEngine.id}`
   if (isOfficialLlama(e.binPath)) {
     const backend = parseLlamaBuild(e.binPath)?.backend
     return backend ? `official-llama-${backend}` : 'official-llama'
@@ -89,25 +109,54 @@ const GROUP_LABEL: Record<string, string> = {
  *  `title` and `detail` head their Built-in card, `label` is their row in the "Running now" selector. Each is a
  *  user-added group (`user:<id>`), whose label fell back to that registered name, so the selector read
  *  "litert-lm-android" — and a model loads only on the engine the user selected, so that is a choice made there. */
-export const BUNDLED_ENGINE_TITLES: Readonly<Record<string, { title: string; detail: string; label: string }>> =
-  // No prototype: it is looked up by any engine's name, and one named "constructor" or "toString" would otherwise
-  // find Object's own function and read as a Built-in engine titled undefined.
-  Object.assign(Object.create(null) as Record<string, { title: string; detail: string; label: string }>, {
-    'llama-server-android': { title: 'llama.cpp', detail: 'CPU', label: 'llama.cpp (CPU)' },
-    'llama-server-android-vulkan': { title: 'llama.cpp', detail: 'Vulkan GPU', label: 'llama.cpp (Vulkan GPU)' },
-    'litert-lm-android': { title: 'LiteRT-LM', detail: 'CPU · GPU', label: 'LiteRT-LM' },
-  })
+export type EngineTitles = { title: string; detail: string; label: string }
+
+/** A titles map with no prototype: it is looked up by any engine's name or SDK id, and one named "constructor" or
+ *  "toString" would otherwise find Object's own function and read as a Built-in engine titled undefined. */
+function titlesByName(titles: Record<string, EngineTitles>): Readonly<Record<string, EngineTitles>> {
+  return Object.assign(Object.create(null) as Record<string, EngineTitles>, titles)
+}
+
+/** The spawned servers say "server", so none shares a label with an in-app SDK engine (ADR-462). */
+export const BUNDLED_ENGINE_TITLES = titlesByName({
+  [ANDROID_CPU_SERVER_NAME]: { title: 'llama.cpp server', detail: 'CPU · tools, images', label: 'llama.cpp server (CPU)' },
+  'llama-server-android-vulkan': { title: 'llama.cpp server', detail: 'Vulkan GPU', label: 'llama.cpp server (Vulkan GPU)' },
+  'litert-lm-android': { title: 'LiteRT-LM server', detail: 'CPU · GPU', label: 'LiteRT-LM server' },
+})
+
+/** The in-app TurboLLM SDK's engines (ADR-462), keyed by the id the SDK reports in `sdkEngine.id`. */
+export const SDK_ENGINE_TITLES = titlesByName({
+  'llama.cpp-cpu': { title: 'llama.cpp', detail: 'CPU', label: 'llama.cpp (CPU)' },
+  'litert-lm': { title: 'LiteRT-LM', detail: 'CPU · GPU', label: 'LiteRT-LM' },
+})
+
+type TitledEngine = Pick<Engine, 'name' | 'kind' | 'sdkEngine'>
+
+/** The Built-in card titles of an engine the Android app ships: an SDK row by its SDK id (an id this build does not
+ *  know reads as the row's name, so a new SDK engine needs no web release), a spawned server by its registered name.
+ *  Undefined for any other engine. */
+export function bundledTitles(e: TitledEngine): EngineTitles | undefined {
+  if (isSdkRow(e) && e.sdkEngine) {
+    return SDK_ENGINE_TITLES[e.sdkEngine.id] ?? { title: e.name, detail: '', label: e.name }
+  }
+  return BUNDLED_ENGINE_TITLES[e.name]
+}
+
+/** The one label for a single engine row: the Android app's engines by their titles, any other by its own name. */
+export function engineLabel(e: TitledEngine): string {
+  return bundledTitles(e)?.label ?? e.name
+}
 
 /** Display label for a logical-engine group. Per-backend llama.cpp groups read as
- *  "llama.cpp (CUDA)"; the Android app's own engines by BUNDLED_ENGINE_TITLES; other
+ *  "llama.cpp (CUDA)"; the Android app's own engines by their titles; other
  *  user-added engines fall back to the engine's own name. */
 export function groupLabel(key: string, members: Engine[]): string {
   if (key.startsWith('official-llama-')) {
     const backend = key.slice('official-llama-'.length)
     return `llama.cpp (${BACKEND_LABEL[backend] ?? backend.toUpperCase()})`
   }
-  const name = members[0]?.name
-  return GROUP_LABEL[key] ?? (name !== undefined ? BUNDLED_ENGINE_TITLES[name]?.label : undefined) ?? name ?? key
+  const first = members[0]
+  return GROUP_LABEL[key] ?? (first ? engineLabel(first) : key)
 }
 
 const BACKEND_LABEL: Record<string, string> = {

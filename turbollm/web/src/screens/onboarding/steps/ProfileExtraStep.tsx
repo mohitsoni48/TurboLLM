@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Check, Cpu, Settings2, Shield } from 'lucide-react'
 import { useEngines } from '../../../lib/queries'
 import { activateEngine } from '../../../lib/api'
+import { engineLabel } from '../../../lib/engine-groups'
 import { CopyButton } from '../../../components/ui/copy-button'
 import type { StepComponentProps } from '../OnboardingScreen'
 
@@ -98,7 +99,7 @@ export default function ProfileExtraStep({ onContinue, ctx }: StepComponentProps
                   : 'border-border bg-panel hover:border-accent/30'
               }`}
             >
-              <span className="text-sm text-ink">{engine.name}</span>
+              <span className="text-sm text-ink">{engineLabel(engine)}</span>
               {engine.id === enginesQuery.data?.activeEngineId && <Check size={14} className="text-accent" />}
             </button>
           ))}

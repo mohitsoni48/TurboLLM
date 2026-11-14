@@ -174,6 +174,7 @@ export function registerEngineManageRoutes(app: Hono, d: Deps, jobs: EngineJobs)
       return err(c, 409, 'engine_running', 'Stop auto-tune before switching the active engine.')
     try {
       d.registry.activate(c.req.param('id'))
+      forgetAndroidSdkFallback(d)
       // Switching engines invalidates any prior load error (e.g. a failed vLLM load on an
       // engine that can't serve here) — clear it so the UI doesn't show a stale error.
       d.manager.clearError()
@@ -360,4 +361,13 @@ function engineInstallDir(eng: Engine, enginesRoot: string): string | null {
     return inside(d) ? d : null
   }
   return null
+}
+
+/** The user's pick ends an Android fallback to the CPU server, so the SDK's return does not undo it (MAJ-1). Called by
+ *  the activate route, not Registry.activate, which the Android reconciler and the update paths call too. */
+function forgetAndroidSdkFallback(d: Deps): void {
+  if (!d.store.snapshot().androidSdkFallback) return
+  d.store.update((cfg) => {
+    delete cfg.androidSdkFallback
+  })
 }

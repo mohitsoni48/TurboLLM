@@ -115,11 +115,26 @@ export type EngineCapabilities = {
   flagInfo?: FlagInfo[]
 }
 
+/** A model file format an engine reads (the daemon's compat.ts ModelFormat). */
+export type ModelFormat = 'gguf' | 'mlx' | 'litertlm'
+
+/** Which of the in-app TurboLLM SDK's engines a row of kind 'turbollm-sdk' is (ADR-462), as the SDK reported it. */
+export type SdkEngineDescriptor = {
+  id: string
+  kind: string
+  formats: ModelFormat[]
+  backends: ('cpu' | 'gpu')[]
+}
+
 export type Engine = {
   id: string
   name: string
   binPath: string
   kind?: string
+  /** Set only on an in-app SDK row (kind 'turbollm-sdk'); absent on the pre-ADR-462 single SDK row. */
+  sdkEngine?: SdkEngineDescriptor
+  /** The model formats this row reads, computed by the daemon's engines list so the web never mirrors compat.ts. */
+  formats?: ModelFormat[]
   version: string
   capabilities: EngineCapabilities
   addedAt?: string
@@ -816,6 +831,12 @@ export type HfSortOption = 'best-match' | 'trending' | 'downloads' | 'likes' | '
  *  entry with summed size and `parts` > 1; safetensors component files each get
  *  their own entry with `safetensors: true`; .litertlm bundles each get their own
  *  self-contained entry with `litertlm: true`. */
+/** The hardware a `.litertlm` bundle targets; `soc` names the one SoC a 'soc' bundle runs on. */
+export type LitertlmTarget = {
+  kind: 'any' | 'gpu' | 'web' | 'npu' | 'soc' | 'desktop'
+  soc?: string
+}
+
 export type HfRepoFile = {
   name: string
   quant: string
@@ -830,6 +851,10 @@ export type HfRepoFile = {
    *  the build this bundle targets. `quant` keeps its usual meaning (the precision the
    *  name states, '?' when none — same as the library), so the two never collide. */
   variant?: string
+  /** For a `.litertlm` bundle: the hardware it was built for, read from its name (ADR-462). */
+  target?: LitertlmTarget
+  /** For a `.litertlm` bundle: whether the device the daemon runs on can run it (ADR-462). */
+  runsHere?: boolean
   sha256?: string
   url: string
   /** True when this exact repo file was downloaded via TurboLLM and is still on

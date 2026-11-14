@@ -28,6 +28,7 @@ import { tmpDir } from '../test-support/tmp'
 const KEY = 'gemma 4 e4b|Q6_K|6217256480'
 const LINKED_MODEL = 'workstation/Qwen3-35B'
 const DEV_MODEL: DevModel = { modelPath: 'D:\\models\\legacy.gguf', extraArgs: ['-c', '4096'], label: 'Legacy' }
+const INTERRUPTED_LOAD_LINE = 'auto-load skipped: the app closed while a model was loading'
 
 function resumableConfig(overrides: Partial<Config> = {}): Config {
   return { ...defaultConfig(), autoLoadOnStart: true, lastLoaded: { modelKey: KEY, engineId: 'eng-1' }, ...overrides }
@@ -106,6 +107,38 @@ test('no active engine skips without consulting the library', () => {
 
   assert.deepEqual(plan, skip({ code: 'no-active-engine' }))
   assert.deepEqual(lookedUp, [])
+})
+
+test('R-6: after an interrupted load, a loadable last model is skipped without consulting the library', () => {
+  const { plan, lookedUp } = planFor({ skipResume: true })
+
+  assert.deepEqual(plan, skip({ code: 'interrupted-load' }))
+  assert.deepEqual(lookedUp, [])
+})
+
+test('R-6: an interrupted load also suppresses the devModel fallback', () => {
+  const { plan } = planFor({ skipResume: true, cfg: resumableConfig({ devModel: DEV_MODEL }) })
+
+  assert.deepEqual(plan, skip({ code: 'interrupted-load' }))
+})
+
+test('R-6: an interrupted load is reported before ComfyUI and a missing engine', () => {
+  const { plan } = planFor({ skipResume: true, comfyBlocked: true, engine: undefined })
+
+  assert.deepEqual(plan, skip({ code: 'interrupted-load' }))
+})
+
+test('R-6: with auto-load off, an interrupted load still plans nothing', () => {
+  const { plan } = planFor({ skipResume: true, cfg: resumableConfig({ autoLoadOnStart: false }) })
+
+  assert.deepEqual(plan, { kind: 'disabled' })
+})
+
+test('R-6: skipResume false plans the same load as no skipResume at all', () => {
+  const withoutFlag = planFor().plan
+
+  assert.equal(withoutFlag.kind, 'load-model')
+  assert.deepEqual(planFor({ skipResume: false }).plan, withoutFlag)
 })
 
 test('a last model missing from the library skips with its key', () => {
@@ -300,6 +333,11 @@ test('skip line: nothing to load', () => {
   assert.equal(skipLine({ code: 'nothing-to-load' }), 'auto-load skipped: no last-loaded model recorded yet')
 })
 
+test('skip line R-6: the app closed while a model was loading', () => {
+  assert.equal(skipLine({ code: 'interrupted-load' }), INTERRUPTED_LOAD_LINE)
+  assert.match(INTERRUPTED_LOAD_LINE, /^[\x20-\x7E]+$/)
+})
+
 test('skip line AC10: linked model selected', () => {
   assert.equal(
     skipLine({ code: 'remote-model-selected', selectedModel: 'workstation/Qwen3-35B' }),
@@ -414,6 +452,7 @@ const LINKED_MODEL_LINE =
 interface RunDepsOptions {
   data?: Config
   initialScan?: Promise<void>
+  engineSetup?: Promise<void>
   activeEngine?: () => Engine | undefined
   comfyBlocked?: () => boolean
   findModel?: (key: string) => ModelEntry | undefined
@@ -500,10 +539,47 @@ test('runAutoLoad AC6: auto-load off is silent and loads nothing', async () => {
   assert.deepEqual(record.loadExplicitCalls, [])
 })
 
+const SKIP_RESUME_ENV = 'TURBOLLM_ANDROID_SDK_SKIP_RESUME'
+
+async function runAutoLoadWithSkipResume(value: string | undefined) {
+  const saved = process.env[SKIP_RESUME_ENV]
+  if (value === undefined) delete process.env[SKIP_RESUME_ENV]
+  else process.env[SKIP_RESUME_ENV] = value
+  try {
+    const { deps, record } = mkRunDeps()
+    const plan = await runAutoLoad(deps)
+    return { plan, record }
+  } finally {
+    if (saved === undefined) delete process.env[SKIP_RESUME_ENV]
+    else process.env[SKIP_RESUME_ENV] = saved
+  }
+}
+
+test('runAutoLoad R-6: TURBOLLM_ANDROID_SDK_SKIP_RESUME=1 prints the interrupted-load line and loads nothing', async () => {
+  const { plan, record } = await runAutoLoadWithSkipResume('1')
+
+  assert.deepEqual(plan, { kind: 'skip', reason: { code: 'interrupted-load' } })
+  assert.deepEqual(record.logs, [INTERRUPTED_LOAD_LINE])
+  assert.deepEqual(record.warns, [])
+  assert.deepEqual(record.loads, [])
+  assert.deepEqual(record.loadExplicitCalls, [])
+  assert.equal(record.updateCalls, 0)
+})
+
+for (const value of [undefined, '0', 'true']) {
+  test(`runAutoLoad R-6: TURBOLLM_ANDROID_SDK_SKIP_RESUME=${value} resumes the last model as before`, async () => {
+    const { plan, record } = await runAutoLoadWithSkipResume(value)
+
+    assert.equal(plan.kind, 'load-model')
+    assert.deepEqual(record.logs, [])
+    assert.equal(record.loads.length, 1)
+  })
+}
+
 test('runAutoLoad: a throw during PLANNING (before any load step) still warns once and never rejects', async () => {
   // architecture.md §3.4 declares runAutoLoad "Never rejects" for the whole function, not just the
   // carry-out phase. registry.active() throwing is the concrete trigger: a future collaborator
-  // failure here must not silently reject the void-called promise in cli.ts and skip printing why.
+  // failure here must not silently reject the void-called promise in boot.ts and skip printing why.
   const { deps, record } = mkRunDeps({
     activeEngine: () => { throw new Error('registry blew up') },
   })
@@ -596,6 +672,29 @@ test('runAutoLoad D8: an engine that becomes active during the scan is used afte
 
   assert.deepEqual(record.logs, [])
   assert.equal(record.loads.length, 1)
+})
+
+// QA F4 (B-19): on the first launch after an upgrade the active engine is still the removed LiteRT-LM row until the
+// Android engine setup unregisters it and activates the SDK. A scan that settles first must not plan on that row.
+test('runAutoLoad B-19: waits for the engine setup, so the last GGUF resumes on the engine it activates', async () => {
+  const setup = deferred()
+  let setupFinished = false
+  const sdk = engineOfKind('turbollm-sdk', 'TurboLLM SDK')
+  const { deps, record } = mkRunDeps({
+    engineSetup: setup.promise,
+    activeEngine: () => (setupFinished ? sdk : engineOfKind('litert-lm', 'litert-lm-android')),
+  })
+
+  const running = runAutoLoad(deps)
+  await flush()
+  assert.equal(record.snapshotCalls, 0)
+  setupFinished = true
+  setup.resolve()
+  await running
+
+  assert.deepEqual(record.logs, [])
+  assert.equal(record.loads.length, 1)
+  assert.equal(record.loads[0].opts.engine, sdk)
 })
 
 // An embedding resume is labelled `trigger: 'gateway_switch'` in `model_load` telemetry, and the router
@@ -740,6 +839,58 @@ test('runAutoLoad AC10: a linked model selected during the scan blocks the local
 
 /** Fakes for every runAutoLoad collaborator. `snapshot()` clones like the real ConfigStore
  *  (config.ts:738-740): a snapshot taken before the scan must NOT see the scan's migration. */
+// ADR-462 (plan D-13): the boot resume runs on the row the Android reconcile activated, and the interrupted-load
+// sentinel (G-9) still holds for it. engineSetup stands for a reconcile that activated the in-app LiteRT-LM row.
+const LITERT_SDK_ROW = {
+  ...engineOfKind('turbollm-sdk', 'LiteRT-LM'), id: 'sdk-litert', binPath: '',
+  sdkEngine: { id: 'litert-lm', kind: 'litert-lm', formats: ['litertlm'], backends: ['gpu', 'cpu'] },
+} as Engine
+const LITERT_BUNDLE = entry({ format: 'litertlm', path: 'D:\\models\\gemma.litertlm' })
+
+/** runAutoLoad after an engine setup that activates the LiteRT-LM row, with `last` as the last model. */
+async function resumeOnLitertRow(last: ModelEntry, skipResume: string | undefined) {
+  const saved = process.env[SKIP_RESUME_ENV]
+  if (skipResume === undefined) delete process.env[SKIP_RESUME_ENV]
+  else process.env[SKIP_RESUME_ENV] = skipResume
+  try {
+    let active: Engine = LLAMA_SERVER
+    const engineSetup = Promise.resolve().then(() => { active = LITERT_SDK_ROW })
+    const { deps, record, data } = mkRunDeps({ engineSetup, activeEngine: () => active, findModel: recordingLibrary(last).findModel })
+    const lastLoadedBefore = structuredClone(data.lastLoaded)
+    const plan = await runAutoLoad(deps)
+    return { plan, record, lastLoadedBefore, lastLoadedAfter: data.lastLoaded }
+  } finally {
+    if (saved === undefined) delete process.env[SKIP_RESUME_ENV]
+    else process.env[SKIP_RESUME_ENV] = saved
+  }
+}
+
+test('G-9 on the LiteRT-LM SDK row: after an interrupted load the .litertlm last model is skipped, lastLoaded unchanged', async () => {
+  const { plan, record, lastLoadedBefore, lastLoadedAfter } = await resumeOnLitertRow(LITERT_BUNDLE, '1')
+
+  assert.deepEqual(plan, { kind: 'skip', reason: { code: 'interrupted-load' } })
+  assert.deepEqual(record.loads, [])
+  assert.deepEqual(lastLoadedAfter, lastLoadedBefore)
+})
+
+test('the boot resume loads a .litertlm last model on the LiteRT-LM SDK row the engine setup activated', async () => {
+  const { plan, record } = await resumeOnLitertRow(LITERT_BUNDLE, undefined)
+
+  assert.equal(plan.kind, 'load-model')
+  assert.equal(record.loads.length, 1)
+  assert.equal(record.loads[0].opts.engine.id, LITERT_SDK_ROW.id)
+})
+
+test('a GGUF last model with the LiteRT-LM SDK row active is engine-incompatible, naming LiteRT-LM', async () => {
+  const { plan, record } = await resumeOnLitertRow(entry(), undefined)
+
+  assert.equal(plan.kind, 'skip')
+  assert.deepEqual(record.loads, [])
+  assert.deepEqual(record.logs, [
+    'auto-load skipped: engine "LiteRT-LM" (turbollm-sdk) can\'t load last model "gemma 4 e4b|Q6_K|6217256480" (format gguf)',
+  ])
+})
+
 function mkRunDeps(options: RunDepsOptions = {}) {
   const data = options.data ?? resumableConfig()
   const record = {
@@ -753,6 +904,7 @@ function mkRunDeps(options: RunDepsOptions = {}) {
   }
   const deps: AutoLoadDeps = {
     initialScan: options.initialScan ?? Promise.resolve(),
+    engineSetup: options.engineSetup ?? Promise.resolve(),
     store,
     registry: { active: options.activeEngine ?? (() => LLAMA_SERVER) },
     comfy: {

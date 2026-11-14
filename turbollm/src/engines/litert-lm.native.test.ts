@@ -12,7 +12,8 @@ import { tmpDir } from '../test-support/tmp'
 import { isNativeLitertLm, LITERT_LM_NATIVE_SERVER, LITERT_LM_SERVE_SHIM, litertLmNativeVersion, litertLmProfileToConfig, litertLmServerCommand, parseLitertLmNativeVersion } from './litert-lm'
 import { pyEngineEnv } from './manager'
 import { engineForModel, Registry } from './registry'
-import { ensureAndroidBundledEngine, ensureAndroidModelsDir } from './seed'
+import { ensureAndroidModelsDir } from './seed'
+import { reconcileAndroidEngines } from './android-engines'
 import { planAutoLoad } from './auto-load'
 import { engineInUse, servingEngineKind, stopEngineUsers } from './serving'
 import { buildStartOpts } from './start-opts'
@@ -32,6 +33,27 @@ function fakeNativeServer(dir: string, litertVersion = '0.18.0'): string {
 
 function engine(over: Partial<Engine>): Engine {
   return { id: 'x', name: 'x', binPath: '/x', kind: 'llama-server', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '', ...over }
+}
+
+/** An empty Android config and its registry, for a start's engine reconcile. */
+function emptyAndroidApp(): { reg: Registry; store: ConfigStore } {
+  const store = ConfigStore.load(join(tmpDir('tllm-litert-native-'), 'config.json'))
+  store.update((c) => {
+    c.engines = []
+    c.activeEngineId = ''
+  })
+  return { reg: new Registry(store), store }
+}
+
+/** One Android start's engine reconcile, with no SDK this launch (none is under test here). */
+function reconcileAndroidStart({ reg, store }: { reg: Registry; store: ConfigStore }): Promise<void> {
+  return reconcileAndroidEngines({
+    registry: reg,
+    store,
+    env: process.env,
+    readSdk: async () => null,
+    formatOf: async () => () => undefined,
+  })
 }
 
 function registry(engines: Engine[], activeEngineId: string): Registry {
@@ -122,7 +144,7 @@ test('repairBinPath: a non-llama engine is re-pointed without a llama-server pro
   assert.deepEqual(out.capabilities, { kvTypes: [], flags: [] })
 })
 
-test('ensureAndroidBundledEngine: registers the bundled LiteRT-LM server, then follows the APK to a new path', async (t) => {
+test('reconcileAndroidEngines: registers the bundled LiteRT-LM server, then follows the APK to a new path', async (t) => {
   const prev = process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
   t.after(() => {
     if (prev === undefined) delete process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
@@ -130,17 +152,18 @@ test('ensureAndroidBundledEngine: registers the bundled LiteRT-LM server, then f
   })
   t.mock.method(console, 'warn', () => {}) // the (absent) llama.cpp engine fails its probe; not under test here
   t.mock.method(console, 'log', () => {})
-  const reg = registry([], '')
+  const app = emptyAndroidApp()
+  const reg = app.reg
 
   // The version probe runs the stub above, so its result is platform-dependent: Windows can't execute the `#!` file
-  // and seed.ts then stores its documented 'litert-lm (bundled)' placeholder instead of losing the engine over a
+  // and the reconciler then stores its documented 'litert-lm (bundled)' placeholder instead of losing the engine over a
   // --version that cannot run there. Name, id and binPath stay asserted identically on both platforms.
   const versionOf = (stub: string) => (process.platform === 'win32' ? 'litert-lm (bundled)' : `litert-lm ${stub}`)
 
   const first = join(tmpDir('tllm-litert-native-'), 'lib')
   fakeNativeServer(first)
   process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = first
-  await ensureAndroidBundledEngine(reg)
+  await reconcileAndroidStart(app)
   let mine = reg.list().engines.filter((e) => e.kind === 'litert-lm')
   assert.equal(mine.length, 1)
   assert.equal(mine[0].name, 'litert-lm-android')
@@ -152,7 +175,7 @@ test('ensureAndroidBundledEngine: registers the bundled LiteRT-LM server, then f
   const second = join(tmpDir('tllm-litert-native-'), 'lib')
   fakeNativeServer(second, '0.19.0')
   process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = second
-  await ensureAndroidBundledEngine(reg)
+  await reconcileAndroidStart(app)
   mine = reg.list().engines.filter((e) => e.kind === 'litert-lm')
   assert.equal(mine.length, 1)
   assert.equal(mine[0].id, id)
@@ -160,18 +183,19 @@ test('ensureAndroidBundledEngine: registers the bundled LiteRT-LM server, then f
   assert.equal(mine[0].version, versionOf('0.19.0'))
 })
 
-test('ensureAndroidBundledEngine: an APK built without LiteRT-LM registers no LiteRT-LM engine', async (t) => {
+test('reconcileAndroidEngines: an APK built without LiteRT-LM registers no LiteRT-LM engine', async (t) => {
   const prev = process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
   t.after(() => {
     if (prev === undefined) delete process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
     else process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = prev
   })
   t.mock.method(console, 'warn', () => {})
-  const reg = registry([], '')
+  const app = emptyAndroidApp()
+  const reg = app.reg
   const dir = join(tmpDir('tllm-litert-native-'), 'lib')
   mkdirSync(dir, { recursive: true })
   process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = dir
-  await ensureAndroidBundledEngine(reg)
+  await reconcileAndroidStart(app)
   assert.equal(reg.list().engines.filter((e) => e.kind === 'litert-lm').length, 0)
 })
 

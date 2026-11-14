@@ -19,7 +19,16 @@ import { emitInvalidation } from '../events/bus'
 import { probeAudioInput } from './modalities'
 import { rememberLitertLmModel, type LitertLmRequestInfo } from './litert-lm-request'
 import { litertlmHeaderFromFile } from '../models/litertlm'
-import { isTetheredGroupLeader, killTetheredTree, spawnTethered } from '../util/tether'
+import { isTetheredGroupLeader, spawnTethered } from '../util/tether'
+import {
+  AttachedTransport,
+  exitedWithin,
+  SDK_ENGINE_UNAVAILABLE,
+  SdkEngineError,
+  SpawnedTransport,
+  type EngineTransport,
+  type SdkLoadRequest,
+} from './transport'
 import { START_TIME_TOLERANCE_MS, processStartTimes } from '../util/process-start-time'
 import { hostUname, vllmModelRunnerEnv, vllmServerCommand, vllmServeBlocker } from './vllm'
 import { sglangServerCommand, sgLangServeBlocker } from './sglang'
@@ -223,6 +232,8 @@ export class Manager {
   private port = 0
   private pid = 0
   private child: ChildProcess | null = null
+  /** How the engine is reached and stopped; set while an engine, spawned (with `child`) or attached, is live. */
+  private transport: EngineTransport | null = null
   private startedAt = 0
   private errInfo: ErrInfo | null = null
   /** Optional observer for load outcomes, wired in cli.ts (ADR-299). Kept as a
@@ -262,7 +273,7 @@ export class Manager {
   /** Whether the running engine says its model takes audio (modalities.ts); null until it has answered, and for an
    *  engine that does not say. */
   private audioInput: boolean | null = null
-  /** The idle watchdog (watchdogTick), armed only while an engine process is alive. An interval armed for the
+  /** The idle watchdog (watchdogTick), armed only while an engine is live. An interval armed for the
    *  Manager's whole life kept every pool-slot Manager the gateway dropped (and its per-minute config clone) alive
    *  forever; armed this way, a stopped Manager holds no timer and is collected once nothing references it. */
   private watchdog: ReturnType<typeof setInterval> | null = null
@@ -272,10 +283,14 @@ export class Manager {
    *  guard's hooks refuse does not (LoadPausedError), and the guard reports the reload of it instead. */
   private reporting: { paused: boolean } | null = null
 
+  /** How the in-app SDK engine is reached (AttachedTransport); a test injects a fake SDK here. */
+  private readonly sdkFetch: typeof globalThis.fetch
+
   /** `poolSlot`: this Manager runs a gateway pool slot (ModelRouter) beside the primary, often on the same
    *  engine, so its engine log gets a file of its own (see startInternal). */
-  constructor(private store: ConfigStore, options: { poolSlot?: boolean } = {}) {
+  constructor(private store: ConfigStore, options: { poolSlot?: boolean; fetch?: typeof globalThis.fetch } = {}) {
     this.poolSlot = options.poolSlot ?? false
+    this.sdkFetch = options.fetch ?? globalThis.fetch
   }
 
   /** Load a model, freeing any currently-loaded one first — the single atomic
@@ -418,6 +433,7 @@ export class Manager {
     // previous model's.
     this.opts = opts
     this.lastCommand = null
+    if (opts.engine.kind === TURBOLLM_SDK) return this.startAttached(opts)
     if (!opts.engine.binPath) throw new Error('no_active_engine')
     if (!opts.modelPath) throw new Error('no_such_model')
 
@@ -569,17 +585,90 @@ export class Manager {
     this.errInfo = null
     this.lastActivity = Date.now()
     this.logPathStr = logPath
-    if (!this.watchdog) {
-      this.watchdog = setInterval(() => this.watchdogTick(), 60_000)
-      this.watchdog.unref()
-    }
+    this.armWatchdog()
     this.exited = new Promise<void>((res) => {
       this.resolveExited = res
     })
+    this.transport = new SpawnedTransport(child, port, this.exited)
 
     child.on('error', (e) => this.onTerminated(child, -1, logStream, e.message))
     child.on('close', (code) => this.onTerminated(child, code ?? -1, logStream, null))
     void this.readiness(child, port)
+  }
+
+  /** The in-app SDK engine (kind 'turbollm-sdk', architecture §6.3): the app runs it, so nothing is spawned and no pid,
+   *  pidfile, tether or command line is kept. Its load is asked for over HTTP and awaited in the background inside the
+   *  same readiness budget, as readiness() awaits a spawned engine. No token (the app did not start the SDK this
+   *  session) fails at once. */
+  private startAttached(opts: StartOpts): void {
+    if (!opts.modelPath) throw new Error('no_such_model')
+    if (!opts.engine.baseUrl || !sdkToken()) {
+      this.state = 'error'
+      this.errInfo = { code: 'engine_unavailable', message: SDK_ENGINE_UNAVAILABLE, exitCode: -1, logTail: [] }
+      return
+    }
+    const transport = new AttachedTransport(opts.engine.baseUrl, sdkToken, this.sdkFetch)
+    this.beginAttachedSession(transport, opts)
+    void this.attachedReadiness(transport, opts)
+  }
+
+  private beginAttachedSession(transport: AttachedTransport, opts: StartOpts): void {
+    this.state = 'starting'
+    this.session = freshSession()
+    // The SDK says nothing of audio input: the model is reported without it (learnAudioInput asks a spawned engine only).
+    this.audioInput = null
+    this.port = 0
+    this.pid = 0
+    this.startedAt = Date.now()
+    this.errInfo = null
+    this.lastActivity = Date.now()
+    this.logPathStr = this.writeAttachedEngineLog(opts)
+    this.armWatchdog()
+    this.transport = transport
+    this.exited = transport.ended.then(() => this.onDetached(transport))
+  }
+
+  /** Ready: the running model takes the context the SDK really loaded (E-51), so the chat's context meter and its
+   *  compaction count against it rather than the daemon's default. A failure is the engine's error, and the SDK is
+   *  asked to unload what it holds. */
+  private async attachedReadiness(transport: AttachedTransport, opts: StartOpts): Promise<void> {
+    try {
+      const loaded = await transport.start(sdkLoadRequest(opts), READINESS_TIMEOUT_MS)
+      if (this.transport !== transport || this.state !== 'starting') return
+      this.opts = withLoadedContext(opts, loaded.contextSize)
+      this.state = 'running'
+      this.lastActivity = Date.now()
+    } catch (e) {
+      if (this.transport !== transport || this.state !== 'starting') return
+      this.state = 'error'
+      const code = e instanceof SdkEngineError ? e.code : 'model_load_failed'
+      this.errInfo = { code, message: e instanceof Error ? e.message : String(e), exitCode: -1, logTail: [] }
+      transport.kill()
+    }
+  }
+
+  /** The attached engine's unload has settled (onTerminated's counterpart): a stop ends 'stopped', a failed load
+   *  keeps its error. */
+  private onDetached(transport: AttachedTransport): void {
+    if (this.transport !== transport) return
+    if (this.state === 'stopping') this.state = 'stopped'
+    this.transport = null
+    if (this.watchdog) clearInterval(this.watchdog)
+    this.watchdog = null
+    this.session = freshSession()
+  }
+
+  /** The engine log the logs route reads: there is no engine output to show, so it says so, and names the launch
+   *  settings the SDK does not apply (§6.6). Best-effort, as the spawned engine's log is. */
+  private writeAttachedEngineLog(opts: StartOpts): string {
+    const logPath = join(this.store.dir(), 'logs', `engine-${opts.engine.id}.log`)
+    try {
+      mkdirSync(dirname(logPath), { recursive: true })
+      writeFileSync(logPath, `${[SDK_ENGINE_LOG_LINE, ...ignoredLaunchSettings(opts)].join('\n')}\n`)
+    } catch (e) {
+      console.warn(`[engine] log write failed: ${e instanceof Error ? e.message : String(e)}`)
+    }
+    return logPath
   }
 
   stop(): void {
@@ -587,19 +676,19 @@ export class Manager {
       this.state = 'stopped'
       this.errInfo = null
     }
-    const child = this.child
-    if (!child || (this.state !== 'running' && this.state !== 'starting')) return
+    const transport = this.transport
+    if (!transport || (this.state !== 'running' && this.state !== 'starting')) return
     this.state = 'stopping'
-    void gracefulStop(child, this.exited)
+    void transport.stop()
   }
 
   /** Kill the engine immediately (SIGKILL / taskkill /F) to free VRAM without the
    *  graceful grace period. The `close` handler still runs and resolves `exited`. */
   private forceStop(): void {
-    const child = this.child
-    if (!child || (this.state !== 'running' && this.state !== 'starting')) return
+    const transport = this.transport
+    if (!transport || (this.state !== 'running' && this.state !== 'starting')) return
     this.state = 'stopping'
-    forceKill(child)
+    transport.kill()
   }
 
   /** `onPausedLoad`: the ComfyUI guard's stop for a render. A load() still starting, or up and not yet reported, is
@@ -624,9 +713,9 @@ export class Manager {
       // A force request landing while a graceful stop is ALREADY in flight (e.g. auto-tune's
       // cancel arriving in the narrow window right after a probe's own non-forced stop already
       // started) must not just passively wait out the remainder of that graceful timer — kill
-      // now. Bypasses forceStop()'s running/starting-only guard by calling the module-level
-      // forceKill directly, since state is already 'stopping' (ADR-220).
-      if (opts?.force && this.child) forceKill(this.child)
+      // now. Bypasses forceStop()'s running/starting-only guard by killing through the
+      // transport directly, since state is already 'stopping' (ADR-220).
+      if (opts?.force) this.transport?.kill()
       await this.waitForExit(exited)
     } else if (this.state === 'error') {
       this.state = 'stopped'
@@ -635,16 +724,23 @@ export class Manager {
   }
 
   /** Wait for `exited` up to 10s; if it hasn't resolved by then, force-kill and wait
-   *  unconditionally. A bare timeout here previously let stopAndWait() return with the
+   *  unconditionally (an engine whose stop cannot be forced, the in-app SDK, is waited for within the load budget). A bare timeout here previously let stopAndWait() return with the
    *  process still alive and `state` stuck at 'stopping' (e.g. a slow Windows tree-kill) —
    *  the very next startInternal() would then throw BusyError, silently abandoning a model
    *  swap (the caller in routes.ts fires load() without awaiting and only logs the
-   *  rejection). Bypasses forceStop()'s running/starting-only guard by calling the
-   *  module-level forceKill directly, since by this point state is already 'stopping'. */
+   *  rejection). Bypasses forceStop()'s running/starting-only guard by killing through the
+   *  transport directly, since by this point state is already 'stopping'. */
   private async waitForExit(exited: Promise<void>): Promise<void> {
+    // An engine whose stop cannot be forced (the SDK's unload waits out a native load in progress) is waited for
+    // within the budget a load gets: bounded, so the gate still cannot deadlock, and long enough that a Stop during a
+    // slow load does not leave the next load to BusyError (review C-3). The unload's own failure settles it sooner.
+    if (this.transport?.forcesStop() === false) {
+      await exitedWithin(exited, READINESS_TIMEOUT_MS)
+      return
+    }
     const result = await exitedWithin(exited, 10_000)
-    if (result === 'timeout' && this.child) {
-      forceKill(this.child)
+    if (result === 'timeout' && this.transport) {
+      this.transport.kill()
       // Bounded too: forceKill's taskkill is fire-and-forget (failures swallowed), so an
       // unbounded await here on an unkillable/zombie process would wedge this forever —
       // and since stopAndWait() runs inside the exclusive load gate, that deadlocks every
@@ -713,6 +809,8 @@ export class Manager {
    *  prompt-cache reuse; it is not free. */
   parallelSlots(): number | null {
     if (this.state !== 'running' && this.state !== 'starting') return null
+    // The SDK serves one generation at a time (its own gate queues 8, then answers 429): the daemon queues instead.
+    if (this.opts?.engine.kind === TURBOLLM_SDK) return 1
     const args = this.lastCommand?.args
     if (!args) return null
     const i = args.indexOf('--parallel')
@@ -750,7 +848,7 @@ export class Manager {
   }
 
   target(): string | null {
-    return this.state === 'running' ? `http://127.0.0.1:${this.port}` : null
+    return this.state === 'running' ? this.transport?.target() ?? null : null
   }
 
   /** The StartOpts of the currently loaded (or loading) model, or null when nothing
@@ -858,15 +956,15 @@ export class Manager {
   }
 
   async shutdown(): Promise<void> {
-    const child = this.child
+    const transport = this.transport
     // A stop already under way (a Stop, an eject, the idle unload, a restart's teardown: SIGTERM sent) is waited out.
     // Returning at once let the daemon exit about 1.5 s into that stop's 8 s grace, and the exit handler SIGKILLed the
     // engine's group before it could exit by itself. gracefulStop's own force kill bounds the wait, waitForExit too.
-    if (child && this.state === 'stopping') return this.waitForExit(this.exited)
+    if (transport && this.state === 'stopping') return this.waitForExit(this.exited)
     const running = this.state === 'running' || this.state === 'starting'
-    if (!child || !running) return
+    if (!transport || !running) return
     this.state = 'stopping'
-    await gracefulStop(child, this.exited)
+    await transport.stop()
   }
 
   // ---- internal ----------------------------------------------------------
@@ -915,6 +1013,7 @@ export class Manager {
       }
     }
     this.child = null
+    this.transport = null
     this.pid = 0
     if (this.watchdog) clearInterval(this.watchdog)
     this.watchdog = null
@@ -1029,6 +1128,13 @@ export class Manager {
     }
   }
 
+  /** One idle watchdog per Manager, armed when an engine (spawned or attached) starts. */
+  private armWatchdog(): void {
+    if (this.watchdog) return
+    this.watchdog = setInterval(() => this.watchdogTick(), 60_000)
+    this.watchdog.unref()
+  }
+
   private watchdogTick(): void {
     const ttl = this.store.snapshot().daemon.idleTtlMinutes
     if (ttl <= 0) return
@@ -1107,6 +1213,39 @@ export function engineCommand(opts: StartOpts, port: number, slotSavePath?: stri
  *  Strix Halo APU still hadn't finished loading at 120s). Flat-bumped to 600s for every
  *  kind rather than trying to model disk throughput. */
 const READINESS_TIMEOUT_MS = 600_000
+
+const TURBOLLM_SDK = 'turbollm-sdk'
+const SDK_ENGINE_LOG_LINE = 'Engine is managed in-app by the TurboLLM SDK; there is no engine log.'
+
+/** The app mints a new SDK token per process and hands it over in the environment: read on every call, never kept. */
+function sdkToken(): string | undefined {
+  return process.env.TURBOLLM_ANDROID_SDK_TOKEN
+}
+
+/** The profile as the SDK's load takes it (architecture §6.6). An unset (0) ctx or threads is left to the SDK; ngl and
+ *  the llama-server flags in extraArgs have no SDK equivalent (ignoredLaunchSettings). An SDK row names its SDK engine
+ *  (ADR-462), so the SDK refuses a model that engine cannot read; the M1 legacy row names none and the SDK routes by
+ *  format. */
+export function sdkLoadRequest(opts: StartOpts): SdkLoadRequest {
+  const engine = opts.engine.sdkEngine?.id
+  return {
+    path: opts.modelPath,
+    contextSize: opts.profile?.ctx || undefined,
+    threads: opts.profile?.threads || undefined,
+    backend: opts.litertLmConfig?.default.backend ?? 'auto',
+    ...(engine ? { engine } : {}),
+  }
+}
+
+function ignoredLaunchSettings(opts: StartOpts): string[] {
+  if (opts.extraArgs.length === 0) return []
+  return [`[turbollm] The in-app engine ignores these launch settings: ${opts.extraArgs.join(' ')}`]
+}
+
+function withLoadedContext(opts: StartOpts, contextSize: number | undefined): StartOpts {
+  if (!Number.isInteger(contextSize) || !contextSize || contextSize <= 0) return opts
+  return { ...opts, model: { ...opts.model, ctx: contextSize } }
+}
 
 const MINUTE_MS = 60_000
 
@@ -1358,59 +1497,6 @@ async function probeHealth(port: number): Promise<ProbeResult> {
     return { ready: r.status === 200, answer: `${health}/${r.status}` }
   } catch {
     return { ready: false, answer: `${health}/down` }
-  }
-}
-
-async function gracefulStop(child: ChildProcess, exited: Promise<void>): Promise<void> {
-  signalTerm(child)
-  const result = await exitedWithin(exited, 8000)
-  if (result === 'timeout') {
-    forceKill(child)
-    await exited
-  }
-}
-
-/** 'exited' once `exited` resolves, or 'timeout' after `ms`. The timer is cleared once the race is decided: a bare
- *  sleep() left its ref'd timer running after a prompt exit, which held the event loop (a test file, a CLI run) open
- *  for the rest of it. A prompt exit left two per stopAndWait(): gracefulStop's 8 s grace and waitForExit's 10 s. */
-async function exitedWithin(exited: Promise<void>, ms: number): Promise<'exited' | 'timeout'> {
-  let grace: ReturnType<typeof setTimeout> | undefined
-  try {
-    return await Promise.race([
-      exited.then(() => 'exited' as const),
-      new Promise<'timeout'>((resolve) => { grace = setTimeout(() => resolve('timeout'), ms) }),
-    ])
-  } finally {
-    clearTimeout(grace)
-  }
-}
-
-function signalTerm(child: ChildProcess): void {
-  if (!child.pid) return
-  if (process.platform === 'win32') {
-    // Force the tree at once. A plain `taskkill /PID <pid> /T` (no /F) only posts WM_CLOSE to the process's windows,
-    // and the engines are console programs with none (spawned windowsHide with piped stdio), so Windows refuses it
-    // ("This process can only be terminated forcefully (with /F option)") and every Stop, model swap, pool eviction
-    // and update stop sat out the whole 8 s grace in 'stopping', with every load queued behind the gate waiting too,
-    // before forceKill ended it anyway. llama-server, KoboldCpp and llamafile exit cleanly only on a console
-    // Ctrl+C, which taskkill never sends, so there is no gentler request to make from here.
-    forceKill(child)
-  } else {
-    child.kill('SIGTERM')
-  }
-}
-
-function forceKill(child: ChildProcess): void {
-  if (!child.pid) return
-  if (process.platform === 'win32') {
-    // Not once Node has seen the engine exit (a worker holding its stdout keeps 'close', and so the stop, waiting):
-    // libuv has closed the process handle that kept the pid from being reused, so `/PID <pid> /T` may name another
-    // process tree by then, as in killTetheredTree (util/tether.ts). An exited root is no tree for taskkill anyway.
-    if (child.exitCode !== null || child.signalCode !== null) return
-    execFile('taskkill', ['/PID', String(child.pid), '/F', '/T'], () => {})
-  } else {
-    // The engine's whole group (its workers too); the pid alone when it leads none (the Android helper).
-    killTetheredTree(child, 'SIGKILL')
   }
 }
 

@@ -201,7 +201,7 @@ describe('EnginesScreen — the engine running the model, when it is not the act
 // way to pick it.
 describe('EnginesScreen — the Android app\'s built-in engines', () => {
   const LLAMA_ANDROID = engine({ id: 'llama-a', name: 'llama-server-android', kind: 'llama-server', binPath: '/data/app/lib/arm64/libllama_server.so' })
-  const LITERT_ANDROID = engine({ id: 'litert-a', name: 'litert-lm-android', kind: 'litert-lm', binPath: '/data/app/lib/arm64/liblitertlm_server.so', version: '0.8.0' })
+  const LITERT_ANDROID = engine({ id: 'litert-a', name: 'litert-lm-android', kind: 'litert-lm', binPath: '/data/app/lib/arm64/liblitertlm_server.so', version: '0.8.0', formats: ['litertlm'] })
   const androidApp = () => {
     state.sys = { os: 'android/android', cpu: '', cores: 8, ramMB: 8000, gpus: [], bundledEnginesOnly: true }
     state.engines = [LLAMA_ANDROID, LITERT_ANDROID]
@@ -213,7 +213,7 @@ describe('EnginesScreen — the Android app\'s built-in engines', () => {
     state.activeEngineId = LLAMA_ANDROID.id
     renderScreen()
 
-    const litert = card('LiteRT-LM')
+    const litert = card('LiteRT-LM server')
     expect(within(litert).getByText('Runs .litertlm models once it is selected')).toBeTruthy()
     expect(screen.queryByText(/load on it automatically/)).toBeNull()
     await userEvent.click(within(litert).getByRole('button', { name: 'Use' }))
@@ -225,9 +225,9 @@ describe('EnginesScreen — the Android app\'s built-in engines', () => {
     state.activeEngineId = LITERT_ANDROID.id
     renderScreen()
 
-    const litert = card('LiteRT-LM')
+    const litert = card('LiteRT-LM server')
     expect((within(litert).getByRole('button', { name: 'In use' }) as HTMLButtonElement).disabled).toBe(true)
-    expect(within(card('llama.cpp')).getByRole('button', { name: 'Use' })).toBeTruthy()
+    expect(within(card('llama.cpp server')).getByRole('button', { name: 'Use' })).toBeTruthy()
   })
 
   it('names the built-in engines in the selector, not by their registered names', async () => {
@@ -237,12 +237,106 @@ describe('EnginesScreen — the Android app\'s built-in engines', () => {
 
     const trigger = screen.getByText('Running now').closest('div')!.querySelector('button[aria-haspopup="menu"]')!
     expect(trigger.textContent).toContain('LiteRT-LM')
-    expect(screen.getByText('LiteRT-LM · CPU · GPU')).toBeTruthy()
+    expect(screen.getByText('LiteRT-LM server · CPU · GPU')).toBeTruthy()
     await userEvent.click(trigger)
     const menu = await screen.findByRole('menu')
-    expect(within(menu).getByText('llama.cpp (CPU)')).toBeTruthy()
-    expect(within(menu).getByText('LiteRT-LM')).toBeTruthy()
+    expect(within(menu).getByText('llama.cpp server (CPU)')).toBeTruthy()
+    expect(within(menu).getByText('LiteRT-LM server')).toBeTruthy()
     expect(screen.queryByText(/litert-lm-android|llama-server-android/)).toBeNull()
+  })
+})
+
+// ADR-462: the default Android build ships the SDK's two engines beside the spawned llama.cpp server; each card says
+// what it is, and the SDK's cards never read "TurboLLM SDK" or the raw "in-app".
+describe('EnginesScreen — the in-app SDK engines beside the llama.cpp server', () => {
+  const sdk = (id: string, sdkId: string, name: string, formats: Engine['formats']) =>
+    engine({ id, name, kind: 'turbollm-sdk', version: 'in-app', formats, sdkEngine: { id: sdkId, kind: sdkId, formats: formats ?? [], backends: ['cpu'] } })
+  const SDK_LLAMA = sdk('sdk-llama', 'llama.cpp-cpu', 'llama.cpp (CPU)', ['gguf'])
+  const SDK_LITERT = sdk('sdk-litert', 'litert-lm', 'LiteRT-LM', ['litertlm'])
+  const SERVER = engine({ id: 'srv', name: 'llama-server-android', kind: 'llama-server', binPath: '/data/app/lib/arm64/libllama_server.so', formats: ['gguf'] })
+  const SERVER_FOOTER = "Use this one for tools, image input and embeddings. The in-app engines don't run them yet."
+  const androidApp = (engines: Engine[]) => {
+    state.sys = { os: 'android/android', cpu: '', cores: 8, ramMB: 8000, gpus: [], bundledEnginesOnly: true }
+    state.engines = engines
+  }
+  const cardTitles = () => screen.getAllByText(/./, { selector: 'div.rounded-xl span.text-sm.font-semibold' }).map((s) => s.textContent)
+  const card = (title: string) => screen.getByText(title, { selector: 'span.font-semibold' }).closest('div.rounded-xl') as HTMLElement
+
+  it('lists LiteRT-LM, then llama.cpp (CPU), then the llama.cpp server, each with its detail', () => {
+    androidApp([SERVER, SDK_LLAMA, SDK_LITERT])
+    state.activeEngineId = SDK_LITERT.id
+    renderScreen()
+
+    expect(cardTitles()).toEqual(['LiteRT-LM', 'llama.cpp', 'llama.cpp server'])
+    expect(within(card('LiteRT-LM')).getByText('CPU · GPU')).toBeTruthy()
+    expect(within(card('llama.cpp')).getByText('CPU')).toBeTruthy()
+    expect(within(card('llama.cpp server')).getByText('CPU · tools, images')).toBeTruthy()
+    expect(screen.getByText('LiteRT-LM · CPU · GPU')).toBeTruthy()
+  })
+
+  it('never shows "TurboLLM SDK" or the raw "in-app" version, and says the SDK engines are built into the app', () => {
+    androidApp([SERVER, SDK_LLAMA, SDK_LITERT])
+    state.activeEngineId = SDK_LITERT.id
+    renderScreen()
+
+    expect(screen.queryByText(/TurboLLM SDK/)).toBeNull()
+    expect(screen.queryByText('in-app')).toBeNull()
+    expect(within(card('LiteRT-LM')).getByText('Built into the app')).toBeTruthy()
+    expect(within(card('llama.cpp')).getByText('Built into the app')).toBeTruthy()
+    expect((within(card('LiteRT-LM')).getByRole('button', { name: 'In use' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  // QA F-5b: the packaged app installs nothing, so the selector's "Install more engines below" pointed at nothing.
+  it('does not offer to install more engines in the selector, where the app installs none', async () => {
+    androidApp([SERVER, SDK_LLAMA, SDK_LITERT])
+    state.activeEngineId = SDK_LITERT.id
+    renderScreen()
+
+    await userEvent.click(screen.getByText('Running now').closest('div')!.querySelector('button[aria-haspopup="menu"]')!)
+    const menu = await screen.findByRole('menu')
+    expect(within(menu).getByText('LiteRT-LM')).toBeTruthy()
+    expect(within(menu).queryByText(/Install more engines/)).toBeNull()
+  })
+
+  it('still offers to install more engines in the selector on a desktop', async () => {
+    state.sys = undefined
+    state.engines = [LLAMA_LIVE_ENGINE]
+    state.activeEngineId = LLAMA_LIVE_ENGINE.id
+    renderScreen()
+
+    await userEvent.click(screen.getByText('Running now').closest('div')!.querySelector('button[aria-haspopup="menu"]')!)
+    expect(within(await screen.findByRole('menu')).getByText(/Install more engines below/)).toBeTruthy()
+  })
+
+  it('takes each SDK card\'s copy from the runtime it is, without install, tools or vision lines', () => {
+    androidApp([SERVER, SDK_LLAMA, SDK_LITERT])
+    state.activeEngineId = SDK_LITERT.id
+    renderScreen()
+
+    expect(within(card('LiteRT-LM')).getByText("Google's on-device runtime")).toBeTruthy()
+    expect(within(card('llama.cpp')).getByText('The universal default')).toBeTruthy()
+    for (const title of ['LiteRT-LM', 'llama.cpp']) {
+      expect(within(card(title)).queryByText(/termux|python|cuda|install|tools|tool call|vision|image/i)).toBeNull()
+    }
+  })
+
+  it('says on the LiteRT-LM card that it runs .litertlm models, and on the server why it exists', () => {
+    androidApp([SERVER, SDK_LLAMA, SDK_LITERT])
+    state.activeEngineId = SDK_LITERT.id
+    renderScreen()
+
+    expect(within(card('LiteRT-LM')).getByText('Runs .litertlm models once it is selected')).toBeTruthy()
+    expect(within(card('llama.cpp server')).getByText(SERVER_FOOTER)).toBeTruthy()
+    expect(within(card('llama.cpp')).getByText('Updates with the app')).toBeTruthy()
+  })
+
+  it('keeps the server footer plain when no SDK engine is registered', () => {
+    androidApp([SERVER])
+    state.activeEngineId = SERVER.id
+    renderScreen()
+
+    expect(screen.queryByText(SERVER_FOOTER)).toBeNull()
+    expect(within(card('llama.cpp server')).getByText('Updates with the app')).toBeTruthy()
   })
 })
 

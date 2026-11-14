@@ -9,7 +9,7 @@ import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import type { ComfyGuard } from '../engines/comfy-guard'
 import { placeOnFreeVram, type LoadProfile } from '../models/profile'
-import { manualLoadRefusal, modelIncompatibility, refusedOnEveryEngine, type Incompatibility } from '../engines/compat'
+import { EMBEDDINGS_UNAVAILABLE, engineHoldsOneModel, engineWithholdsEmbeddings, manualLoadRefusal, modelIncompatibility, refusedOnEveryEngine, type Incompatibility } from '../engines/compat'
 import { engineForModel } from '../engines/registry'
 import { buildStartOpts, gpuBlockUserSet } from '../engines/start-opts'
 import { getSysInfo, type SysInfo } from '../sysinfo/sysinfo'
@@ -637,8 +637,8 @@ export class ModelRouter {
    *  not be reached again once evicted. With the setting off they keep modelIncompatibility's refusal. */
   private loadRefusal(engine: Engine, entry: ModelEntry, manual?: boolean): Incompatibility | null {
     return manual || this.store.read().showAllEngineModels
-      ? manualLoadRefusal(engine.kind, entry)
-      : modelIncompatibility(engine.kind, entry)
+      ? manualLoadRefusal(engine, entry)
+      : modelIncompatibility(engine, entry)
   }
 
   /** `explicit`: loadExplicit's options, absent for route(). */
@@ -674,6 +674,7 @@ export class ModelRouter {
 
     const engine = engineForModel(this.registry, entry)
     if (!engine) return { status: 503, message: 'No active engine. Set one up in TurboLLM.' }
+    if (entry.embedding && engineWithholdsEmbeddings(engine.kind)) return NO_EMBEDDINGS_ON_ONE_MODEL_ENGINE
     const inc = this.loadRefusal(engine, entry, explicit?.manual)
     // Stays so until the owner installs or selects an engine that runs it, or shows every engine's models; a retry only
     // delays the message. Anything but a Laya model is refused only by an automatic load with that setting off, which
@@ -686,7 +687,7 @@ export class ModelRouter {
     let opts = this.buildOpts(entry, engine, overrides)
     if (!opts) return { status: 503, message: 'Model is incomplete or unreadable.' }
 
-    const keepN = Math.max(1, this.store.read().gateway.keepN)
+    const keepN = this.chatSlotsOn(engine)
     const ownHolds = explicit?.holdsGate ? 1 : 0
     // Side models (embedding, Laya) don't consume a chat slot — they get their own implicit slot
     // so a loaded chat model is never evicted just because a side model is requested.
@@ -1157,6 +1158,12 @@ export class ModelRouter {
     return this.scanner.list().models.find(e => this.keysMatch(loadedKey, e))
   }
 
+  /** How many chat models the pool may hold on `engine`: keep-N (ADR-060/062), except on an engine that holds one
+   *  model, where a pool slot's load would replace the primary's model behind the router's back. */
+  private chatSlotsOn(engine: Engine): number {
+    return engineHoldsOneModel(engine.kind) ? 1 : Math.max(1, this.store.read().gateway.keepN)
+  }
+
   /** Gateway loads build their StartOpts through the one shared builder (start-opts.ts), like the
    *  manual Load and the boot resume, so a Jev model's launch flags and a pinned port reach
    *  auto-swap loads too. doLoad has already checked compatibility (a manual load's only for a Laya model). */
@@ -1167,6 +1174,14 @@ export class ModelRouter {
     })
   }
 
+}
+
+/** Permanent: the SDK has no embeddings in this version, and an embedding model loaded on it would unload the chat
+ *  model it cannot sit beside. */
+const NO_EMBEDDINGS_ON_ONE_MODEL_ENGINE: RouteResult = {
+  status: 503,
+  message: EMBEDDINGS_UNAVAILABLE,
+  permanent: true,
 }
 
 /** A model that runs beside the chat model instead of in a chat slot: an embedding model (ADR-389) or a Laya

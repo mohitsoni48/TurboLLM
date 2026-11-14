@@ -101,7 +101,7 @@ describe('EngineLoadErrorBanner', () => {
     // The daemon names the engine by its registered name, which for the Android app's own engines is a fixed id.
     it("names the Android app's own engines as the selector does, not by their registered names", () => {
       renderBanner(statusWith('error', { ...archFailure, engineName: 'litert-lm-android', modelName: 'Gemma 3n' }))
-      expect(screen.getByText("LiteRT-LM could not load Gemma 3n: unknown model architecture: 'qwen3next' (exit 1)")).toBeTruthy()
+      expect(screen.getByText("LiteRT-LM server could not load Gemma 3n: unknown model architecture: 'qwen3next' (exit 1)")).toBeTruthy()
       expect(screen.queryByText(/litert-lm-android/)).toBeNull()
     })
 

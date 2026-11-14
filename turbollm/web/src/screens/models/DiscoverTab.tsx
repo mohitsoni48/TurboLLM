@@ -11,10 +11,11 @@ import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, ty
 import { Link2, Lock, Search } from 'lucide-react'
 import { ApiError, track } from '../../lib/api'
 import { textClassificationRuntimeLabel } from '../../lib/model-kind'
-import { useHfSearch, useSysInfo } from '../../lib/queries'
-import type { HfSearchCategory, HfSearchItem, HfSortOption, TextClassificationRuntime } from '../../lib/types'
+import { activeEngineOf, useEngines, useHfSearch, useSysInfo } from '../../lib/queries'
+import type { Engine, HfSearchCategory, HfSearchItem, HfSortOption, ModelFormat, TextClassificationRuntime } from '../../lib/types'
 import { fitBudgetMb, searchRowFitsHardware } from '../../lib/vram'
-import { requiredMb } from '../../lib/onboarding-pick'
+import { LITERT_GEMMA_E2B_PICK, LITERT_SMALLEST_PICK, requiredMb } from '../../lib/onboarding-pick'
+import { engineLabel, readsOnlyLitert } from '../../lib/engine-groups'
 import { isAndroidOs } from '../../lib/platform'
 import { EmptyState, InlineError } from '../../components/common'
 import { Input } from '../../components/ui/input'
@@ -40,12 +41,16 @@ import { ImportUrlDialog } from './ImportUrlDialog'
 // SMALL_DEVICE_LADDER (which shares two entries with an earlier version of this one) — that
 // module picks exactly ONE model to open onboarding with; this is a browsable set, a
 // different job, and keeping them decoupled means changing one doesn't reshuffle the other.
+// The one exception is the smallest LiteRT-LM pick, shared on purpose so that swapping it (founder decision N1) is one
+// line: ANDROID_LITERT_CURATED_PICKS spreads onboarding-pick.ts's LITERT_SMALLEST_PICK.
 //
 // Chosen from real HF search data (author=unsloth/bartowski/lmstudio-community, filter=gguf,
 // sort=downloads), not just recalled: every entry here is both genuinely popular AND launched
 // within the last ~6 months of this list's verification date, spanning 0.8B-4B and three
 // different base-model families so it isn't a Qwen monoculture.
-const ANDROID_CURATED_PICKS: { repo: string; bytes: number; note: string }[] = [
+type CuratedPick = { repo: string; bytes: number; note: string; file?: string }
+
+const ANDROID_CURATED_PICKS: CuratedPick[] = [
   { repo: 'bartowski/Qwen_Qwen3.5-0.8B-GGUF', bytes: 579_615_840, note: 'Fastest — fits even the tightest phones' },
   { repo: 'bartowski/Qwen_Qwen3.5-2B-GGUF', bytes: 1_396_198_496, note: 'Still light, noticeably more capable' },
   { repo: 'lmstudio-community/Ministral-3-3B-Instruct-2512-GGUF', bytes: 2_146_498_240, note: "Mistral's small model — a solid all-rounder" },
@@ -53,7 +58,30 @@ const ANDROID_CURATED_PICKS: { repo: string; bytes: number; note: string }[] = [
   { repo: 'bartowski/Fara1.5-4B-GGUF', bytes: 2_884_850_784, note: 'One of the newest small models available' },
   { repo: 'unsloth/gemma-4-E2B-it-GGUF', bytes: 3_106_738_272, note: 'Most capable pick that still fits most phones' },
 ]
-const ANDROID_CURATED_REPOS = new Set(ANDROID_CURATED_PICKS.map((p) => p.repo))
+
+// The picks while the active engine is LiteRT-LM (ADR-462), read off the live HF tree API on 2026-11-07 like the list
+// above. Each names its `file`: a .litertlm repo has no auto-pick, so the repo details preselect the curated bundle.
+// The gemma-4-E4B GPU bundle and Qwen3.5-2B are Discover-only (their CPU fallback is not documented, and Qwen thinks,
+// which a LiteRT model cannot turn off yet).
+const ANDROID_LITERT_CURATED_PICKS: Required<CuratedPick>[] = [
+  { ...LITERT_SMALLEST_PICK, note: 'Smallest — fits even the tightest phones' },
+  { ...LITERT_GEMMA_E2B_PICK, note: 'Runs on the GPU or the CPU — a solid all-rounder' },
+  { repo: 'litert-community/gemma-4-E4B-it-litert-lm', file: 'gemma-4-E4B-it-gpu.litertlm', bytes: 2_969_059_328, note: 'Most capable pick, for phones with room to spare' },
+  { repo: 'litert-community/Qwen3.5-2B', file: 'Qwen3.5-2B_int8.litertlm', bytes: 2_119_744_416, note: 'Thinks before it answers' },
+]
+
+/** The curated list for what the active engine reads: LiteRT-LM's while it reads only .litertlm, else the GGUF one. */
+function curatedPicksFor(formats: readonly ModelFormat[]): CuratedPick[] {
+  return readsOnlyLitert(formats) ? ANDROID_LITERT_CURATED_PICKS : ANDROID_CURATED_PICKS
+}
+
+/** "Showing .litertlm models for LiteRT-LM": which format the list is in and for which engine, so the per-engine
+ *  filter is visible (ADR-098). Only for a row that reads one format, the only case one line can state honestly. */
+function scopeLine(engine: Engine | undefined): string | null {
+  const formats = engine?.formats ?? []
+  if (!engine || formats.length !== 1) return null
+  return `Showing .${formats[0]} models for ${engineLabel(engine)}`
+}
 
 const SORT_LABEL: Record<HfSortOption, string> = {
   'best-match': 'Best match',
@@ -90,12 +118,18 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
   const [sort, setSort] = useState<HfSortOption>('trending')
   const [category, setCategory] = useState<HfSearchCategory>()
   const [selectedRepo, setSelectedRepo] = useState<string | null>(null)
+  // The bundle a curated LiteRT-LM row names, preselected in the repo details at both render sites (QG-4).
+  const [selectedCuratedFile, setSelectedCuratedFile] = useState<string | null>(null)
   const [importOpen, setImportOpen] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
   const [listWidth, setListWidth] = useState(() => Math.min(Math.max(readSavedListWidth(), LIST_MIN_W), listMaxW()))
   // Below md the split-pane stacks (list over detail); the fixed list width + resize
   // handle only apply on desktop.
   const isDesktop = useIsDesktop()
+  const openRepo = (repo: string | null, curatedFile: string | null = null) => {
+    setSelectedRepo(repo)
+    setSelectedCuratedFile(curatedFile)
+  }
 
   // Seed the search when arriving from a library model's "Find other quants" with
   // no known source repo (imported file). Keyed on presetQuery so re-clicking the
@@ -154,14 +188,20 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
   // See ANDROID_CURATED_PICKS's own comment for why this exists. Excluded from the live list
   // below so a repo that happens to also be trending never renders twice on screen. They are chat
   // models, so they have no place above the Text classification category either.
-  const showCurated = !searching && !category && isAndroidOs(sys?.os ?? '')
+  const android = isAndroidOs(sys?.os ?? '')
+  const enginesList = useEngines().data
+  const activeEngine = activeEngineOf(enginesList) ?? undefined
+  const curatedList = curatedPicksFor(activeEngine?.formats ?? ['gguf'])
+  const scope = android && !category ? scopeLine(activeEngine) : null
+  const showCurated = !searching && !category && android
   // Same requiredMb the onboarding fallback ladder uses: a curated list that recommended
   // something the viewer's own device can't hold would be the exact bug ADR-402 just fixed,
   // one level up. `budgetMb > 0` is already guaranteed by canFilterByFit/showCurated's own
   // isAndroidOs check needing real sysinfo, but stated explicitly here since this filter's
   // correctness — unlike fitsOnly's — isn't optional on whether the checkbox is ticked.
-  const curatedPicks = showCurated ? ANDROID_CURATED_PICKS.filter((p) => requiredMb(p.bytes) <= budgetMb) : []
-  const results = showCurated ? fitFiltered.filter((r) => !ANDROID_CURATED_REPOS.has(r.repo)) : fitFiltered
+  const curatedPicks = showCurated ? curatedList.filter((p) => requiredMb(p.bytes) <= budgetMb) : []
+  const curatedRepos = new Set(curatedList.map((p) => p.repo))
+  const results = showCurated ? fitFiltered.filter((r) => !curatedRepos.has(r.repo)) : fitFiltered
 
   return (
     <div className="flex flex-col md:h-full md:min-h-0">
@@ -194,6 +234,7 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
               <Link2 size={15} />
             </button>
           </div>
+          {scope && <p className="px-1 text-[12px] text-muted">{scope}</p>}
 
           {/* flex-wrap, not overflow-x-auto: at the Android WebView's 360px viewport the
               filter and the sort dropdown stack instead of hiding one behind a scrollbar
@@ -243,7 +284,7 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
                   title={p.repo}
                   secondary={p.note}
                   selected={selectedRepo === p.repo}
-                  onSelect={() => setSelectedRepo(p.repo)}
+                  onSelect={() => openRepo(p.repo, p.file ?? null)}
                 />
               ))}
             </div>
@@ -275,7 +316,7 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
                   key={r.repo}
                   item={r}
                   selected={selectedRepo === r.repo}
-                  onSelect={() => setSelectedRepo(r.repo)}
+                  onSelect={() => openRepo(r.repo)}
                 />
               ))
             )}
@@ -292,9 +333,10 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
             {selectedRepo ? (
               <HfRepoContent
                 repo={selectedRepo}
-                onClose={() => setSelectedRepo(null)}
+                preselectFile={selectedCuratedFile ?? undefined}
+                onClose={() => openRepo(null)}
                 onSearch={(term) => {
-                  setSelectedRepo(null)
+                  openRepo(null)
                   setQuery(term)
                 }}
               />
@@ -311,7 +353,7 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
           page's normal flow — a dedicated "page" with its own close (X), rather than
           burying the content further down the same scroll. Never open at md+ (isDesktop
           gates it), where the inline pane above is already always visible. */}
-      <Sheet open={!isDesktop && !!selectedRepo} onOpenChange={(o) => !o && setSelectedRepo(null)} modal={false}>
+      <Sheet open={!isDesktop && !!selectedRepo} onOpenChange={(o) => !o && openRepo(null)} modal={false}>
         <SheetContent
           className="overflow-y-auto p-5"
           onPointerDownOutside={(e) => e.preventDefault()}
@@ -320,9 +362,10 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
           {selectedRepo && (
             <HfRepoContent
               repo={selectedRepo}
-              onClose={() => setSelectedRepo(null)}
+              preselectFile={selectedCuratedFile ?? undefined}
+              onClose={() => openRepo(null)}
               onSearch={(term) => {
-                setSelectedRepo(null)
+                openRepo(null)
                 setQuery(term)
               }}
             />
@@ -334,7 +377,7 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
         open={importOpen}
         onClose={() => setImportOpen(false)}
         onOpenRepo={(repo) => {
-          setSelectedRepo(repo)
+          openRepo(repo)
           setImportOpen(false)
         }}
       />

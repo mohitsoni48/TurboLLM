@@ -9,6 +9,7 @@ import { TEXT_CLASSIFICATION_CATEGORY } from '../hf/text-classification-search'
 import type { EnqueueInput } from '../downloads/downloads'
 import { enqueueDownload, listDownloads, removeDownload, toDownloadFailure } from '../services/download-lifecycle'
 import { annotateCheckpoint } from '../hf/checkpoints'
+import { litertlmHost, litertlmRunsHere } from '../models/litertlm'
 import { err, body, regErr, type Status } from './http'
 
 /** Model folders, Hugging Face search and repo detail, and the download queue. */
@@ -111,6 +112,7 @@ export function registerDownloadsHfRoutes(app: Hono, d: Deps): void {
       }
 
       let verifying = false
+      const host = litertlmHost()
       const files = detail.files.map((f) => {
         // 1) Provenance: downloaded via TurboLLM. sha256 is the exact-identity key. The
         //    (repo, filename) name fallback is UNCONDITIONAL for every row listed by its
@@ -151,7 +153,9 @@ export function registerDownloadsHfRoutes(app: Hono, d: Deps): void {
             }
           }
         }
-        return { ...f, downloaded: !!local, localKey: local?.key ?? null }
+        // A .litertlm bundle says whether this device runs it (ADR-462): the web and onboarding read this one answer.
+        const runsHere = f.target ? { runsHere: litertlmRunsHere(f.target, host) } : {}
+        return { ...f, downloaded: !!local, localKey: local?.key ?? null, ...runsHere }
       })
       // Checkpoint rows (ADR-434 (h)) are annotated the same way, but by sha or destination
       // path: provenance `filename` is a basename, so two checkpoints' identical
@@ -257,10 +261,11 @@ function modelDirsPayload(d: Deps): { dirs: string[]; primaryDir: string } {
  *  it lists what runs on the Laya engine or vLLM whichever engine is active, so it ignores the active engine. */
 async function searchHf(d: Deps, q: string, sort: HfSortOption, category: string | undefined): Promise<HfSearchItem[]> {
   if (category === TEXT_CLASSIFICATION_CATEGORY) return d.hf.searchTextClassification(q, sort)
-  const engineKind = d.registry.active()?.kind
+  const engine = d.registry.active()
   // Only what the active engine runs, LiteRT-LM included: a .litertlm model loads only while LiteRT-LM is the active
-  // engine (engineForModel), so its repos are searched then and not beside another engine's.
-  return q ? d.hf.searchModels(q, engineKind, sort) : d.hf.browseModels(sort, engineKind)
+  // engine (engineForModel), so its repos are searched then and not beside another engine's. An in-app SDK row
+  // searches by the formats its own SDK engine reads (ADR-462).
+  return q ? d.hf.searchModels(q, engine, sort) : d.hf.browseModels(sort, engine)
 }
 
 /** Heuristic count of local quant variants that plausibly belong to an HF repo

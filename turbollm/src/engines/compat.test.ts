@@ -9,21 +9,21 @@ import { mlxServerCommand, mlxSamplingArgs } from './mlx'
 import { mlxVlmServerCommand } from './mlx-vlm'
 
 test('engineAcceptsFormat: gguf for llama.cpp forks, mlx for python engines', () => {
-  assert.equal(engineAcceptsFormat('llama-server', 'gguf'), true)
-  assert.equal(engineAcceptsFormat('llama-server', 'mlx'), false)
-  assert.equal(engineAcceptsFormat('mlx', 'mlx'), true)
-  assert.equal(engineAcceptsFormat('mlx', 'gguf'), false)
-  assert.equal(engineAcceptsFormat('vllm', 'mlx'), true)
-  assert.equal(engineAcceptsFormat('vllm', 'gguf'), false)
-  assert.equal(engineAcceptsFormat('mlx-vlm', 'mlx'), true)
-  assert.equal(engineAcceptsFormat('mlx-vlm', 'gguf'), false)
+  assert.equal(engineAcceptsFormat({ kind: 'llama-server' }, 'gguf'), true)
+  assert.equal(engineAcceptsFormat({ kind: 'llama-server' }, 'mlx'), false)
+  assert.equal(engineAcceptsFormat({ kind: 'mlx' }, 'mlx'), true)
+  assert.equal(engineAcceptsFormat({ kind: 'mlx' }, 'gguf'), false)
+  assert.equal(engineAcceptsFormat({ kind: 'vllm' }, 'mlx'), true)
+  assert.equal(engineAcceptsFormat({ kind: 'vllm' }, 'gguf'), false)
+  assert.equal(engineAcceptsFormat({ kind: 'mlx-vlm' }, 'mlx'), true)
+  assert.equal(engineAcceptsFormat({ kind: 'mlx-vlm' }, 'gguf'), false)
 })
 
 test('engineAcceptsFormat: koboldcpp + llamafile are GGUF engines (Phase 4)', () => {
-  assert.equal(engineAcceptsFormat('koboldcpp', 'gguf'), true)
-  assert.equal(engineAcceptsFormat('koboldcpp', 'mlx'), false)
-  assert.equal(engineAcceptsFormat('llamafile', 'gguf'), true)
-  assert.equal(engineAcceptsFormat('llamafile', 'mlx'), false)
+  assert.equal(engineAcceptsFormat({ kind: 'koboldcpp' }, 'gguf'), true)
+  assert.equal(engineAcceptsFormat({ kind: 'koboldcpp' }, 'mlx'), false)
+  assert.equal(engineAcceptsFormat({ kind: 'llamafile' }, 'gguf'), true)
+  assert.equal(engineAcceptsFormat({ kind: 'llamafile' }, 'mlx'), false)
 })
 
 // A load the user asks for by hand is started on the selected engine whatever the model's format, audio tower or Jev
@@ -31,16 +31,16 @@ test('engineAcceptsFormat: koboldcpp + llamafile are GGUF engines (Phase 4)', ()
 // is refused for want of the Laya engine. The automatic loads keep modelIncompatibility's refusal.
 test('manualLoadRefusal: only a Laya model with no Laya engine is refused', () => {
   const base = { format: 'gguf' as const, audio: false, jev: undefined, laya: undefined }
-  assert.equal(manualLoadRefusal('koboldcpp', { ...base, format: 'litertlm' }), null)
-  assert.equal(manualLoadRefusal('vllm', base), null)
-  assert.equal(manualLoadRefusal('llama-server', { ...base, format: 'mlx', jev: {} as JevInfo }), null)
-  assert.equal(manualLoadRefusal('rapid-mlx', { ...base, format: 'mlx', audio: true }), null)
-  assert.equal(manualLoadRefusal('llama-server', { ...base, arch: 'ggmlc' }), null)
+  assert.equal(manualLoadRefusal({ kind: 'koboldcpp' }, { ...base, format: 'litertlm' }), null)
+  assert.equal(manualLoadRefusal({ kind: 'vllm' }, base), null)
+  assert.equal(manualLoadRefusal({ kind: 'llama-server' }, { ...base, format: 'mlx', jev: {} as JevInfo }), null)
+  assert.equal(manualLoadRefusal({ kind: 'rapid-mlx' }, { ...base, format: 'mlx', audio: true }), null)
+  assert.equal(manualLoadRefusal({ kind: 'llama-server' }, { ...base, arch: 'ggmlc' }), null)
   const laya = { ...base, format: 'mlx' as const, laya: {} as NonNullable<Parameters<typeof manualLoadRefusal>[1]['laya']> }
-  assert.equal(manualLoadRefusal('llama-server', laya)?.code, 'needs_laya')
-  assert.equal(manualLoadRefusal('laya', laya), null)
+  assert.equal(manualLoadRefusal({ kind: 'llama-server' }, laya)?.code, 'needs_laya')
+  assert.equal(manualLoadRefusal({ kind: 'laya' }, laya), null)
   // The automatic loads' rule is unchanged.
-  assert.equal(modelIncompatibility('koboldcpp', { ...base, format: 'litertlm' })?.code, 'format')
+  assert.equal(modelIncompatibility({ kind: 'koboldcpp' }, { ...base, format: 'litertlm' })?.code, 'format')
 })
 
 // Regression: Rapid-MLX's bundled mlx_vlm double-transposes gemma4's audio-tower conv
@@ -81,7 +81,7 @@ const NEEDS_VLLM_MESSAGES: Record<string, string> = {
 
 for (const [engineKind, message] of Object.entries(NEEDS_VLLM_MESSAGES)) {
   test(`modelIncompatibility: a Jev model on ${engineKind} needs vLLM`, () => {
-    assert.deepEqual(modelIncompatibility(engineKind, JEV_ENTRY), {
+    assert.deepEqual(modelIncompatibility({ kind: engineKind }, JEV_ENTRY), {
       code: 'needs_vllm',
       label: 'Needs vLLM (Linux or WSL2)',
       message,
@@ -90,11 +90,11 @@ for (const [engineKind, message] of Object.entries(NEEDS_VLLM_MESSAGES)) {
 }
 
 test('modelIncompatibility: a Jev model on vLLM is loadable', () => {
-  assert.equal(modelIncompatibility('vllm', JEV_ENTRY), null)
+  assert.equal(modelIncompatibility({ kind: 'vllm' }, JEV_ENTRY), null)
 })
 
 test('modelIncompatibility: a GGUF model on vLLM is a format mismatch that needs llama.cpp', () => {
-  assert.deepEqual(modelIncompatibility('vllm', PLAIN_GGUF), {
+  assert.deepEqual(modelIncompatibility({ kind: 'vllm' }, PLAIN_GGUF), {
     code: 'format',
     label: 'needs llama.cpp',
     message: "vLLM can't run this GGUF model.",
@@ -105,8 +105,8 @@ test('modelIncompatibility: a GGUF model on vLLM is a format mismatch that needs
 // llama.cpp GGUF default: every safetensors model was refused on it, and a GGUF was launched
 // with llama.cpp flags that sglang.launch_server rejects, so nothing could load.
 test('modelIncompatibility: SGLang loads safetensors models and refuses GGUF with its own message', () => {
-  assert.equal(modelIncompatibility('sglang', PLAIN_MLX), null)
-  assert.deepEqual(modelIncompatibility('sglang', PLAIN_GGUF), {
+  assert.equal(modelIncompatibility({ kind: 'sglang' }, PLAIN_MLX), null)
+  assert.deepEqual(modelIncompatibility({ kind: 'sglang' }, PLAIN_GGUF), {
     code: 'format',
     label: 'needs llama.cpp',
     message: "SGLang can't run this GGUF model.",
@@ -114,7 +114,7 @@ test('modelIncompatibility: SGLang loads safetensors models and refuses GGUF wit
 })
 
 test('modelIncompatibility: a safetensors model on llama.cpp is a format mismatch that needs MLX or vLLM', () => {
-  assert.deepEqual(modelIncompatibility('llama-server', PLAIN_MLX), {
+  assert.deepEqual(modelIncompatibility({ kind: 'llama-server' }, PLAIN_MLX), {
     code: 'format',
     label: 'needs MLX or vLLM',
     message: "llama.cpp can't run this safetensors model.",
@@ -123,7 +123,7 @@ test('modelIncompatibility: a safetensors model on llama.cpp is a format mismatc
 
 test('modelIncompatibility: the format messages name the selected engine and the format for every engine kind', () => {
   const messageFor = (engineKind: string, entry: typeof PLAIN_GGUF | typeof PLAIN_MLX) =>
-    modelIncompatibility(engineKind, entry)?.message
+    modelIncompatibility({ kind: engineKind }, entry)?.message
   assert.equal(messageFor('mlx', PLAIN_GGUF), "MLX can't run this GGUF model.")
   assert.equal(messageFor('rapid-mlx', PLAIN_GGUF), "Rapid-MLX can't run this GGUF model.")
   assert.equal(messageFor('mlx-vlm', PLAIN_GGUF), "MLX-VLM can't run this GGUF model.")
@@ -132,14 +132,14 @@ test('modelIncompatibility: the format messages name the selected engine and the
   assert.equal(messageFor('some-new-kind', PLAIN_MLX), "The selected engine can't run this safetensors model.")
   for (const kind of ['llama-server', 'llamafile', 'koboldcpp', 'mlx', 'rapid-mlx', 'mlx-vlm', 'vllm', 'sglang', 'litert-lm']) {
     for (const entry of [PLAIN_GGUF, PLAIN_MLX, { format: 'litertlm', audio: false } as const]) {
-      const message = modelIncompatibility(kind, entry)?.message ?? ''
+      const message = modelIncompatibility({ kind: kind }, entry)?.message ?? ''
       assert.doesNotMatch(message, /activate|switch|pick|instead|another engine/i, `${kind} ${entry.format}: ${message}`)
     }
   }
 })
 
 test('modelIncompatibility: an audio-tower model on Rapid-MLX fails, and needs MLX or vLLM', () => {
-  assert.deepEqual(modelIncompatibility('rapid-mlx', AUDIO_MLX), {
+  assert.deepEqual(modelIncompatibility({ kind: 'rapid-mlx' }, AUDIO_MLX), {
     code: 'audio',
     label: 'needs MLX or vLLM',
     message:
@@ -148,7 +148,7 @@ test('modelIncompatibility: an audio-tower model on Rapid-MLX fails, and needs M
 })
 
 test('modelIncompatibility: an audio-tower model on MLX-VLM is expected to fail', () => {
-  assert.deepEqual(modelIncompatibility('mlx-vlm', AUDIO_MLX), {
+  assert.deepEqual(modelIncompatibility({ kind: 'mlx-vlm' }, AUDIO_MLX), {
     code: 'audio',
     label: 'needs MLX or vLLM',
     message:
@@ -157,11 +157,11 @@ test('modelIncompatibility: an audio-tower model on MLX-VLM is expected to fail'
 })
 
 test('modelIncompatibility: an audio-tower model on plain MLX is loadable', () => {
-  assert.equal(modelIncompatibility('mlx', AUDIO_MLX), null)
+  assert.equal(modelIncompatibility({ kind: 'mlx' }, AUDIO_MLX), null)
 })
 
 test('modelIncompatibility: needs vLLM wins over a format mismatch for a Jev model', () => {
-  assert.equal(modelIncompatibility('llama-server', { ...JEV_ENTRY, audio: true })?.code, 'needs_vllm')
+  assert.equal(modelIncompatibility({ kind: 'llama-server' }, { ...JEV_ENTRY, audio: true })?.code, 'needs_vllm')
 })
 
 test('engineModelAlias: fixed alias for mlx/vllm, null (keep caller value) for llama.cpp', () => {

@@ -7,7 +7,8 @@ import { probe, type ProbeResult } from './probe'
 import type { ReleaseProvenance } from './release-install'
 import { normRepoUrl, sameRepo } from './build-runner'
 import type { ModelEntry } from '../models/scanner'
-import { modelIncompatibility, type Incompatibility } from './compat'
+import { isSdkRow, modelIncompatibility, TURBOLLM_SDK_KIND, type Incompatibility } from './compat'
+import type { SdkEngineInfo } from './sdk-engines'
 
 /** Auto-provisioned official builds live under `<dataDir>/engines/llama.cpp-…/`.
  *  User forks are arbitrary paths and are never auto-removed. */
@@ -301,8 +302,24 @@ export class Registry {
    *  llama-server), so llama.cpp capabilities/flags don't apply — its backend/context/threads go through a
    *  generated --config file instead (see litertLmProfileToConfig). Registration is otherwise identical to a
    *  single-binary engine, so it shares that path. */
-  addLitertLm(name: string, binPath: string, version: string): Engine {
-    return this.addSingleBinary('litert-lm', name || 'LiteRT-LM', binPath, version)
+  addLitertLm(name: string, binPath: string, version: string, opts: { fillEmptySelection?: boolean } = {}): Engine {
+    return this.addSingleBinary('litert-lm', name || 'LiteRT-LM', binPath, version, opts)
+  }
+
+  /** Insert or repair the SDK row for `info.id` (ADR-462). Identity = kind 'turbollm-sdk' + sdkEngine.id; a legacy row
+   *  (no sdkEngine, the M1 single row) is adopted when `adoptLegacy` is set, so it keeps its id and its settings.
+   *  Repairs name, baseUrl and the descriptor in place (same id). It never selects a row: the Android reconciler
+   *  decides that. The bearer token is per app process and read from the environment, so it is never stored. */
+  upsertSdkEngine(info: SdkEngineInfo, baseUrl: string, opts: { adoptLegacy?: boolean } = {}): Engine {
+    let out: Engine | undefined
+    this.store.update((c) => {
+      const row = findSdkRow(c.engines, info.id, opts.adoptLegacy === true) ?? pushNewSdkRow(c.engines)
+      row.name = info.name
+      row.baseUrl = baseUrl
+      row.sdkEngine = { id: info.id, kind: info.kind, formats: [...info.formats], backends: [...info.backends] }
+      out = structuredClone(row)
+    })
+    return out!
   }
 
   /** Register a llamafile engine (kind='llamafile'). binPath is the single llamafile
@@ -315,7 +332,13 @@ export class Registry {
   /** Shared registration for a single-binary, non-llama-server engine kind (koboldcpp,
    *  llamafile, litert-lm). Mirrors addMlx/addVllm: no llama-server probe, empty capabilities, and
    *  replace-in-place when the same path is re-registered. */
-  private addSingleBinary(kind: string, name: string, binPath: string, version: string): Engine {
+  private addSingleBinary(
+    kind: string,
+    name: string,
+    binPath: string,
+    version: string,
+    opts: { fillEmptySelection?: boolean } = {},
+  ): Engine {
     const eng: Engine = {
       id: randomUUID(),
       name: name.trim() || kind,
@@ -332,7 +355,8 @@ export class Registry {
         eng.id = existing.id
       } else {
         c.engines.push(eng)
-        if (!c.activeEngineId) c.activeEngineId = eng.id // a new registration only (see addMlx)
+        // a new registration only (see addMlx)
+        if (!c.activeEngineId && opts.fillEmptySelection !== false) c.activeEngineId = eng.id
       }
     })
     return eng
@@ -583,6 +607,26 @@ export function customSourceKey(s: { sourceRepo?: string; sourceBranch?: string;
   return `${normRepoUrl(s.sourceRepo)}#${(s.sourceBranch ?? '').trim().toLowerCase()}#${(s.sourceCommit ?? '').trim().toLowerCase()}`
 }
 
+/** The row for the SDK engine `sdkEngineId`, else (when adopting) the legacy row that names no SDK engine. */
+function findSdkRow(engines: Engine[], sdkEngineId: string, adoptLegacy: boolean): Engine | undefined {
+  const sdkRows = engines.filter(isSdkRow)
+  return sdkRows.find((e) => e.sdkEngine?.id === sdkEngineId) ?? (adoptLegacy ? sdkRows.find((e) => !e.sdkEngine) : undefined)
+}
+
+function pushNewSdkRow(engines: Engine[]): Engine {
+  const row: Engine = {
+    id: randomUUID(),
+    name: '',
+    binPath: '',
+    kind: TURBOLLM_SDK_KIND,
+    version: 'in-app',
+    capabilities: { kvTypes: [], flags: [] },
+    addedAt: new Date().toISOString(),
+  }
+  engines.push(row)
+  return row
+}
+
 /** True when a saved `capabilities.flags` list was captured by a daemon predating a
  *  fix to how flags are read out of `--help` output, so a stale-but-installed engine
  *  keeps failing the same way after an app upgrade until someone happens to hit
@@ -655,6 +699,6 @@ export function unlistedForLoading(
   const memo = { active: once(() => registry.active()), layaEngine: once(() => registry.layaEngine()) }
   return (e) => {
     const engine = engineForModel(memo, e)
-    return engine ? modelIncompatibility(engine.kind, e) : null
+    return engine ? modelIncompatibility(engine, e) : null
   }
 }

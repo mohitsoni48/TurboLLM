@@ -1,10 +1,12 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Check, Compass, Download, ExternalLink, HardDrive, Loader2, Sparkles } from 'lucide-react'
 import { useOnboardingRecommendation } from '../../../lib/onboarding-queries'
-import { useDownloadMutations, useModels, useShowAllEngineModels, useSysInfo } from '../../../lib/queries'
-import { loadModel, track } from '../../../lib/api'
-import { pickOnboardingModel } from '../../../lib/onboarding-pick'
+import { useDownloadMutations, useEngines, useModels, useShowAllEngineModels, useSysInfo } from '../../../lib/queries'
+import { loadModel, track, type SysInfo } from '../../../lib/api'
+import { onboardingFormats, pickOnboardingModel } from '../../../lib/onboarding-pick'
+import { isAndroidOs } from '../../../lib/platform'
+import type { EnginesList, ModelFormat } from '../../../lib/types'
 import { hiddenByUser, isChatModel, listedForLoading } from '../../../lib/model-kind'
 import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
 import type { StepComponentProps } from '../OnboardingScreen'
@@ -21,6 +23,7 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
   const { patchCtx } = useOnboardingMachine()
   const recommendationQuery = useOnboardingRecommendation(ctx.profile)
   const sysQuery = useSysInfo()
+  const onboardingTarget = useOnboardingFormats(sysQuery.data)
   const modelsQuery = useModels()
   const downloadMutations = useDownloadMutations()
   const [starting, setStarting] = useState(false)
@@ -78,7 +81,10 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
   // your hardware", which is now literally what it is doing. It never blocks for long:
   // that query is `staleTime: Infinity, retry: false`, so a failure resolves rather than
   // hanging, and a null sysinfo just means "trust the daemon" downstream.
-  if (!isPro && (recommendationQuery.isLoading || sysQuery.isLoading || !ctx.profile)) {
+  //
+  // The active engine is waited on too: its format decides the pick (ADR-462), and on a fresh Android install the step
+  // can open before LiteRT-LM is activated (see useOnboardingFormats).
+  if (!isPro && (recommendationQuery.isLoading || sysQuery.isLoading || onboardingTarget.waiting || !ctx.profile)) {
     return (
       <div className="flex items-center justify-center gap-2 text-muted py-8">
         <Loader2 size={20} className="animate-spin" />
@@ -94,7 +100,8 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
   // actually hold and degrades to a smaller real model instead of a 4 GB download that
   // OOMs — see onboarding-pick.ts's header for the phone case that motivates it. `entry`
   // is passed through untouched whenever it fits, which is every desktop with a card.
-  const pick = pickOnboardingModel(entry, sysQuery.data ?? null)
+  // The pick follows the active engine's format: a LiteRT-LM row is never offered the daemon's GGUF entry.
+  const pick = pickOnboardingModel(entry, sysQuery.data ?? null, onboardingTarget.formats)
   const picked = pick.kind === 'pick' ? pick : null
   const sys = sysQuery.data
 
@@ -281,4 +288,34 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
       )}
     </div>
   )
+}
+
+const ENGINE_POLL_MS = 1_000
+/** The Android reconciler's 5 s budget for reading the in-app SDK's engines (READ_BUDGET_MS, src/engines/sdk-engines.ts)
+ *  plus an allowance for the boot scan, which has no bound and has not been measured: the remaining 15 s is a guess.
+ *  Plan Z-2 step 9 (QG-2) measures it on a slow phone. */
+const ENGINE_WAIT_MS = 20_000
+
+/** The formats to pick a model for (onboardingFormats). On a fresh Android install this step can open before the
+ *  reconciler activates LiteRT-LM, and a GGUF offered then would fail its first load: so on Android, while no engine is
+ *  active, it reports `waiting` and refetches the engines list every second, for at most ENGINE_WAIT_MS. The refetch
+ *  is this call site's alone; the engines query keeps its defaults everywhere else. */
+function useOnboardingFormats(sys: SysInfo | undefined): { waiting: boolean; formats: readonly ModelFormat[] } {
+  const android = !!sys && isAndroidOs(sys.os)
+  const [waitedLongEnough, setWaitedLongEnough] = useState(false)
+  const awaitsEngine = (list: EnginesList | undefined) => android && !waitedLongEnough && !list?.activeEngineId
+  const enginesQuery = useEngines({ refetchInterval: (query) => (awaitsEngine(query.state.data) ? ENGINE_POLL_MS : false) })
+  const list = enginesQuery.data
+  const activeEngineId = list?.activeEngineId ?? ''
+
+  useEffect(() => {
+    if (!android || waitedLongEnough || activeEngineId) return
+    const giveUp = setTimeout(() => setWaitedLongEnough(true), ENGINE_WAIT_MS)
+    return () => clearTimeout(giveUp)
+  }, [android, waitedLongEnough, activeEngineId])
+
+  return {
+    waiting: enginesQuery.isLoading || awaitsEngine(list),
+    formats: onboardingFormats(list?.engines ?? [], activeEngineId, android),
+  }
 }

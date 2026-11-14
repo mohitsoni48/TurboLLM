@@ -3,7 +3,7 @@
 // decision order in the run's architecture §3.4 (plus row 3a, AC10). skipLine and
 // fallbackLine give the exact one-line reasons (architecture §4.4). All three are pure:
 // they read only their arguments and print nothing; the caller owns the console.
-// runAutoLoad is that caller at daemon start: it waits for the boot scan, plans once from one post-scan
+// runAutoLoad is that caller at daemon start: it waits for the boot scan and engine setup, plans once from one post-scan
 // snapshot, and loads through the manual Load's chokepoints, printing only through deps.log / deps.warn.
 import type { Config, ConfigStore, DevModel, Engine } from '../config/config'
 import type { ModelRouter } from '../gateway/model-router'
@@ -17,8 +17,11 @@ import { buildStartOpts } from './start-opts'
 import { isTurboLinkEnabledIn } from '../link/gate'
 
 export interface AutoLoadDeps {
-  /** The boot scan's promise (cli.ts). Never rejects (CoalescedRunner C4). */
+  /** The boot scan's promise (boot.ts). Never rejects (CoalescedRunner C4). */
   initialScan: Promise<void>
+  /** The boot's engine repair and registration (boot.ts: the Android bundled engines, then the SDK engine). Planned
+   *  after it, so the active engine is the one this launch runs, not a row an upgrade removed (QA F4, B-19). */
+  engineSetup: Promise<void>
   store: Pick<ConfigStore, 'snapshot'>
   registry: Pick<Registry, 'active'>
   comfy: Pick<ComfyGuard, 'isBlocked' | 'freeComfyUIBeforeLoad'>
@@ -35,17 +38,18 @@ export interface AutoLoadDeps {
 
 /** Resolves once the plan is carried out and any load has settled. Never rejects — a failure
  *  anywhere in this function, including while deciding what to do, is reported through
- *  `deps.warn` rather than left to reject the caller's `void runAutoLoad(...)` (cli.ts). */
+ *  `deps.warn` rather than left to reject the caller's `void runAutoLoad(...)` (boot.ts). */
 export async function runAutoLoad(deps: AutoLoadDeps): Promise<AutoLoadPlan> {
   let plan: AutoLoadPlan = { kind: 'disabled' }
   try {
-    await deps.initialScan
+    await Promise.all([deps.initialScan, deps.engineSetup])
     const cfg = deps.store.snapshot()
     plan = planAutoLoad({
       cfg,
       engine: deps.registry.active(),
       comfyBlocked: deps.comfy.isBlocked(),
       findModel: (key) => deps.scanner.get(key),
+      skipResume: process.env.TURBOLLM_ANDROID_SDK_SKIP_RESUME === '1',
     })
     await carryOut(plan, cfg, deps)
   } catch (e) {
@@ -55,6 +59,7 @@ export async function runAutoLoad(deps: AutoLoadDeps): Promise<AutoLoadPlan> {
 }
 
 export type AutoLoadSkipReason =
+  | { code: 'interrupted-load' }
   | { code: 'comfyui-busy' }
   | { code: 'no-active-engine' }
   | { code: 'nothing-to-load' }
@@ -81,11 +86,15 @@ export interface AutoLoadPlanInput {
   /** `comfy.isBlocked()` */
   comfyBlocked: boolean
   findModel: (key: string) => ModelEntry | undefined
+  /** The previous app process ended during a native model load (Android SDK, risk R1), so this launch must not
+   *  load it again on its own. Per launch: it is never persisted, and `lastLoaded` is kept for the next start. */
+  skipResume?: boolean
 }
 
 export function planAutoLoad(input: AutoLoadPlanInput): AutoLoadPlan {
   const { cfg, engine } = input
   if (!cfg.autoLoadOnStart) return { kind: 'disabled' }
+  if (input.skipResume) return skipBecause({ code: 'interrupted-load' })
   if (input.comfyBlocked) return skipBecause({ code: 'comfyui-busy' })
   if (!engine) return skipBecause({ code: 'no-active-engine' })
   if (isPointedAtLinkedModel(cfg)) {
@@ -171,7 +180,7 @@ function unresolved(reason: AutoLoadSkipReason): LastModelResolution {
  *  engine as a manual Load starts it (compat.ts manualLoadRefusal), and fails there if that engine cannot load it:
  *  once the user shows such models, one is always started on the selected engine. */
 function incompatibilityDetail(engine: Engine, entry: ModelEntry, showAll: boolean): string {
-  const inc = showAll ? manualLoadRefusal(engine.kind, entry) : modelIncompatibility(engine.kind, entry)
+  const inc = showAll ? manualLoadRefusal(engine, entry) : modelIncompatibility(engine, entry)
   if (!inc) return ''
   if (inc.code === 'format') return `format ${entry.format}`
   if (inc.code === 'audio') return 'audio tower not supported'
@@ -180,6 +189,8 @@ function incompatibilityDetail(engine: Engine, entry: ModelEntry, showAll: boole
 
 function whyNothingLoads(reason: AutoLoadSkipReason): string {
   switch (reason.code) {
+    case 'interrupted-load':
+      return 'the app closed while a model was loading'
     case 'comfyui-busy':
       return 'ComfyUI is rendering and holds the GPU; load a model manually once its queue finishes'
     case 'no-active-engine':

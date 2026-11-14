@@ -546,3 +546,68 @@ export function litertlmEntryFor(
     mtime: new Date(mtimeMs || Date.now()).toISOString(),
   }
 }
+
+/** The hardware a `.litertlm` bundle was built for (ADR-462, architecture §3.9). `soc` names the one SoC a 'soc' bundle
+ *  runs on, upper-cased ('SM8550', 'GOOGLE_TENSOR_G5'). */
+export interface LitertlmTarget {
+  kind: 'any' | 'gpu' | 'web' | 'npu' | 'soc' | 'desktop'
+  soc?: string
+}
+
+/** The device a bundle would run on: the packaged Android app (with the SoC it reports, '' when unknown), or not. */
+export interface LitertlmHost {
+  android: boolean
+  soc: string
+}
+
+/** What a bundle's file name says it targets. The rules run on the name's `_`-joined tokens, case-insensitive, and the
+ *  first match wins: a browser build, an NPU build, a build for one SoC, a desktop (Intel) build, a GPU build, else a
+ *  bundle any device can try. */
+export function litertlmTarget(fileName: string): LitertlmTarget {
+  const stem = targetTokens(fileName)
+  if (hasTokens(stem, 'web')) return { kind: 'web' }
+  if (hasTokens(stem, 'npu')) return { kind: 'npu' }
+  const soc = stem.match(SOC_ID)?.[1]
+  if (soc) return { kind: 'soc', soc: soc.toUpperCase() }
+  if (DESKTOP_BUILD.test(stem)) return { kind: 'desktop' }
+  if (hasTokens(stem, 'gpu')) return { kind: 'gpu' }
+  return { kind: 'any' }
+}
+
+/** Whether `host` can run a bundle built for `target`: a phone runs any, GPU, and its own SoC's bundles; a desktop runs
+ *  any, GPU and desktop ones. An unknown SoC matches no SoC bundle. */
+export function litertlmRunsHere(target: LitertlmTarget, host: LitertlmHost): boolean {
+  if (target.kind === 'any' || target.kind === 'gpu') return true
+  if (!host.android) return target.kind === 'desktop'
+  return target.kind === 'soc' && socMatches(target.soc ?? '', host.soc)
+}
+
+/** The host this daemon runs on: the packaged app (TURBOLLM_ANDROID_NATIVE_LIB_DIR, ADR-399 point 2), with the SoC the
+ *  app reports in TURBOLLM_ANDROID_SOC ("Qualcomm SM8350", Build.SOC_MODEL). Not sysinfo's cpu, which prefers the CPU
+ *  model string over the SoC. */
+export function litertlmHost(env: NodeJS.ProcessEnv = process.env): LitertlmHost {
+  return { android: Boolean(env.TURBOLLM_ANDROID_NATIVE_LIB_DIR), soc: env.TURBOLLM_ANDROID_SOC ?? '' }
+}
+
+const SOC_ID = /(?:^|_)(mt\d{4}|sm\d{4}|qcs\d{4}|google_tensor_g\d|tensor_npu)(?=_|$)/
+const DESKTOP_BUILD = /(?:^|_)(?:intel_[a-z0-9]+|lnl|ptl)(?=_|$)/
+
+/** A bundle id matches when it occurs as a whole `_`-delimited token sequence in the device's SoC string, both
+ *  normalised: 'sm8350' in "Qualcomm SM8350", 'google_tensor_g5' in "Google Tensor G5". */
+function socMatches(bundleSoc: string, deviceSoc: string): boolean {
+  const id = normalisedSoc(bundleSoc)
+  return id !== '' && hasTokens(normalisedSoc(deviceSoc), id)
+}
+
+function normalisedSoc(soc: string): string {
+  return soc.trim().toLowerCase().replace(/[\s-]+/g, '_')
+}
+
+/** The file's stem as lower-case tokens joined by '_' (a subfolder, '-' and '.' count as separators too). */
+function targetTokens(fileName: string): string {
+  return fileName.toLowerCase().replace(/\.litertlm$/, '').split(/[-_./\s]+/).filter(Boolean).join('_')
+}
+
+function hasTokens(tokens: string, sequence: string): boolean {
+  return `_${tokens}_`.includes(`_${sequence}_`)
+}

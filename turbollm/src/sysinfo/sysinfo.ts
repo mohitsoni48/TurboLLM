@@ -407,7 +407,7 @@ function enumLinuxGpus(): GpuInfo[] {
   // never exec, so it always failed silently and the app reported "CPU-only" even once this
   // exact engine loaded and served real completions. The engine only ships when its build
   // pipeline embedded `libllama_server_vk.so` (build.gradle.kts's turbollmVulkanEngine flag),
-  // so its presence is the same "was this shipped" signal seed.ts's ensureAndroidBundledEngine
+  // so its presence is the same "was this shipped" signal android-engines.ts's reconcileAndroidEngines
   // already keys its own registration off of.
   const nativeLibDir = process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
   if (process.platform === 'android' && nativeLibDir) {

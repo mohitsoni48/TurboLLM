@@ -5,7 +5,7 @@ import type { Deps } from '../deps'
 import type { ModelEntry as ModelEntryView, ModelsList } from '../contract/models'
 import { engineForModel, type Registry } from '../engines/registry'
 import { isLocalOrAuthenticated } from '../auth'
-import { modelIncompatibility } from '../engines/compat'
+import { engineWithholdsVision, modelIncompatibility } from '../engines/compat'
 import { ScannerError, type ModelEntry } from '../models/scanner'
 import { automaticProfile, configuredCtx, estimateVram, legacySeedProfile, type LoadProfile, resolveProfile, userSetProfile } from '../models/profile'
 import { getSysInfo } from '../sysinfo/sysinfo'
@@ -230,7 +230,7 @@ function overlayModel(
   // `incompatibleReason` is the short row text for why not (e.g. "Needs vLLM (Linux or WSL2)").
   // A Laya model is checked against the Laya engine it loads on, not the active one (engineForModel).
   const engine = engineForModel(registry, e)
-  const inc = engine ? modelIncompatibility(engine.kind, e) : null
+  const inc = engine ? modelIncompatibility(engine, e) : null
   const compatibleWithActiveEngine = !inc
   const incompatibleReason = inc?.label ?? null
   // Source HF repo: confirmed from download provenance, else inferred from the
@@ -254,8 +254,11 @@ function overlayModel(
   const configuredCtxNow = configuredCtx(snap, e, engine?.id ?? '', getSysInfo())
   // Hidden by hand (Models → Library "Hide", config.ts hiddenModels): the web UI leaves it out of its lists and pickers.
   const hidden = isModelHidden(snap, e.key)
+  // An engine that reads no images (the in-app SDK engine, G-2) is not offered a model's vision; the scanned entry
+  // keeps it, for when another engine is selected.
+  const vision = e.vision && !engineWithholdsVision(engine?.kind ?? '')
   return {
-    ...e, loaded, hasProfile, configuredCtx: configuredCtxNow, lastTps, liveTps, benchTps,
+    ...e, vision, loaded, hasProfile, configuredCtx: configuredCtxNow, lastTps, liveTps, benchTps,
     compatibleWithActiveEngine, incompatibleReason, sourceRepo, hidden,
   }
 }

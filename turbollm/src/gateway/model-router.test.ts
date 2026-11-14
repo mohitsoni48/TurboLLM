@@ -476,8 +476,8 @@ test('route: a ggmlc GGUF, or a Laya model with no Laya engine, is refused witho
   const layaResult = await r.route(laya.key)
 
   assert.deepEqual([ggmlcResult, layaResult], [
-    { status: 503, message: modelIncompatibility('llama-server', ggmlc)?.message, permanent: true },
-    { status: 503, message: modelIncompatibility('llama-server', laya)?.message, permanent: true },
+    { status: 503, message: modelIncompatibility({ kind: 'llama-server' }, ggmlc)?.message, permanent: true },
+    { status: 503, message: modelIncompatibility({ kind: 'llama-server' }, laya)?.message, permanent: true },
   ])
   assert.match(String('message' in ggmlcResult && ggmlcResult.message), /ggmlc/)
   assert.match(String('message' in layaResult && layaResult.message), /Install Laya/)
@@ -1292,7 +1292,8 @@ for (const [label, autoSwap, loadEmbedding] of [
     })
     const warns: string[] = []
     await runAutoLoad({
-      initialScan: Promise.resolve(), store, registry, scanner, manager: nextManager, modelRouter: nextRouter,
+      initialScan: Promise.resolve(), engineSetup: Promise.resolve(), store, registry, scanner, manager: nextManager,
+      modelRouter: nextRouter,
       comfy: { isBlocked: () => false, freeComfyUIBeforeLoad: async () => {} },
       sysInfo: getSysInfo, log: () => {}, warn: (line) => { warns.push(line) },
     })
@@ -1339,6 +1340,90 @@ test('shutdownPool() stops every pool slot\'s engine and waits for it to exit', 
   assert.equal(after.length, 1)
   const slotPid = before.find((p) => !after.includes(p))!
   assert.throws(() => process.kill(slotPid, 0), 'the slot\'s engine has exited')
+})
+
+// ── The TurboLLM SDK engine holds one model (R-3) ────────────────────────────────────────────────────────────────
+// The Android app's in-app engine loads one model at a time: a second load replaces the first inside the SDK. A keep-N
+// pool slot beside the primary would therefore unload the primary's model behind the router's back, while /status
+// still listed both. On that engine the pool is one slot, whatever keep-N says, and it has no embeddings to load.
+
+/** A primary that runs `key` and records every model it is asked to load, ending each load running. */
+function runningPrimary(key: string) {
+  let modelKey = key
+  const loads: string[] = []
+  const manager = {
+    status: (): Status => ({
+      state: 'running', err: null, port: 0, pid: 0, loadElapsedMs: 0,
+      model: { key: modelKey, name: modelKey, quant: 'Q4', ctx: 4096, vision: false },
+    }),
+    currentOpts: () => null,
+    restartOpts: () => null,
+    target: () => 'http://engine.invalid:1',
+    touch: () => {},
+    sessionStats: () => ({ activeRequests: 0 }),
+    load: async (o: StartOpts) => { loads.push(o.model.key); modelKey = o.model.key },
+  } as unknown as Manager
+  return { manager, loads }
+}
+
+function ggufEntry(key: string, embedding = false): ModelEntry {
+  return { ...fakeEntry(key), format: 'gguf', arch: embedding ? 'bert' : 'llama', embedding }
+}
+
+/** keepN 3, `running` in the primary, `requested` in the library, `kind` the active engine. */
+function keepThreeRouter(kind: string, requested: ModelEntry) {
+  const primary = runningPrimary('model-p')
+  const newSlots: Manager[] = []
+  const store = {
+    snapshot: () => ({ gateway: { autoSwap: true, keepN: 3 }, modelProfiles: {}, comfyui: {} }),
+    read: () => ({ gateway: { autoSwap: true, keepN: 3 }, modelProfiles: {}, comfyui: {} }),
+    update: (fn: (c: { lastLoaded?: unknown }) => void) => fn({}),
+  } as unknown as ConfigStore
+  const scanner = { list: () => ({ models: [ggufEntry('model-p'), requested] }), get: () => undefined } as unknown as Scanner
+  const registry = { active: () => fakeEngine(kind) } as unknown as Registry
+  const r = new ModelRouter(store, registry, primary.manager, scanner, undefined, undefined, () => {
+    const slot = gatedNewSlot('running')
+    slot.open()
+    newSlots.push(slot.manager)
+    return slot.manager
+  }, async () => null) // no card reading: a pool slot keeps its default profile
+  return { r, primary, newSlots }
+}
+
+test('keep-N 3 on the TurboLLM SDK engine: a second model replaces the first in the primary, with no pool slot', async () => {
+  const { r, primary, newSlots } = keepThreeRouter('turbollm-sdk', ggufEntry('model-b'))
+
+  const routed = await r.route('model-b')
+
+  assert.ok('target' in routed, JSON.stringify(routed))
+  assert.deepEqual(primary.loads, ['model-b'], 'the primary loads it, evicting model-p')
+  assert.equal(newSlots.length, 0, 'no second Manager on the one-model engine')
+  assert.deepEqual([...r.loadedModelKeys()], ['model-b'])
+})
+
+test('an embedding model on the TurboLLM SDK engine is refused for good, and nothing is unloaded', async () => {
+  const { r, primary, newSlots } = keepThreeRouter('turbollm-sdk', ggufEntry('bge-m3', true))
+
+  for (const routed of [await r.route('bge-m3', { embeddings: true }), await r.loadExplicit('bge-m3', undefined, { manual: true })]) {
+    assert.deepEqual(routed, {
+      status: 503,
+      permanent: true,
+      message: 'The TurboLLM SDK engine runs one chat model at a time and has no embeddings in this version.',
+    })
+  }
+  assert.deepEqual(primary.loads, [])
+  assert.equal(newSlots.length, 0)
+})
+
+test('keep-N 3 on llama-server is unchanged: a second model loads into a pool slot beside the first', async () => {
+  const { r, primary, newSlots } = keepThreeRouter('llama-server', ggufEntry('model-b'))
+
+  const routed = await r.route('model-b')
+
+  assert.ok('target' in routed, JSON.stringify(routed))
+  assert.deepEqual(primary.loads, [])
+  assert.equal(newSlots.length, 1)
+  assert.deepEqual([...r.loadedModelKeys()].sort(), ['model-b', 'model-p'])
 })
 
 // ── keep-N eviction never stops an engine mid-generation (scalability review 1.4) ──────────────

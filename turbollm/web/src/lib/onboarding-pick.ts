@@ -19,7 +19,9 @@
  *  mocks. The budget math itself is NOT re-implemented; `fitBudgetMb` is the one source of
  *  truth for "how much model can this machine hold", Android carve-out included. */
 
+import { isSdkRow, readsOnlyLitert } from './engine-groups'
 import { fitBudgetMb, type FitHardware } from './vram'
+import type { Engine, ModelFormat } from './types'
 
 export interface CandidateModel {
   repo: string
@@ -65,6 +67,42 @@ export const SMALL_DEVICE_LADDER: readonly CandidateModel[] = [
   { repo: 'unsloth/gemma-4-E2B-it-GGUF', file: 'gemma-4-E2B-it-Q4_K_M.gguf', bytes: 3_106_738_272 },
 ]
 
+/** The smallest LiteRT-LM pick, for a phone whose active engine is LiteRT-LM (ADR-462). Founder decision N1
+ *  (2026-11-07): LFM2.5-1.2B-Instruct, under the LFM Open License v1.0, accepted. Its model card says this file runs on
+ *  both GPU and CPU. Swap = edit this one constant (and the one evidence test that pins it); Discover's curated list
+ *  spreads this same constant. Read off the live HF tree API on 2026-11-07. */
+export const LITERT_SMALLEST_PICK: CandidateModel = {
+  repo: 'litert-community/LFM2.5-1.2B-Instruct',
+  file: 'LFM2.5-1.2B-Instruct_int4_gpu.litertlm',
+  bytes: 736_220_768,
+}
+
+/** The second LiteRT-LM rung. gemma-4-E2B's model card benchmarks this file on both CPU and GPU, so the SDK's
+ *  GPU-then-CPU choice can fall back. Discover's curated list spreads this same constant. */
+export const LITERT_GEMMA_E2B_PICK: CandidateModel = {
+  repo: 'litert-community/gemma-4-E2B-it-litert-lm',
+  file: 'gemma-4-E2B-it.litertlm',
+  bytes: 2_588_147_712,
+}
+
+/** The LiteRT-LM ladder, the same floor-not-catalog idea as SMALL_DEVICE_LADDER. No thinking model: a LiteRT model's
+ *  thinking cannot be turned off yet. */
+export const LITERT_SMALL_DEVICE_LADDER: readonly CandidateModel[] = [LITERT_SMALLEST_PICK, LITERT_GEMMA_E2B_PICK]
+
+/** The formats onboarding picks for: the active row's. On Android, before the reconciler has activated a row, those of
+ *  the fresh-install default (ADR-462 rule 4): LiteRT-LM when the in-app SDK registered it, else the llama.cpp rows'
+ *  GGUF. Anywhere else with nothing active, GGUF, as before. */
+export function onboardingFormats(engines: Engine[], activeEngineId: string, android: boolean): readonly ModelFormat[] {
+  const active = engines.find((e) => e.id === activeEngineId)
+  if (active) return active.formats ?? ['gguf']
+  if (android && engines.some(isInAppLitertRow)) return ['litertlm']
+  return ['gguf']
+}
+
+function isInAppLitertRow(e: Engine): boolean {
+  return isSdkRow(e) && readsOnlyLitert(e.formats ?? [])
+}
+
 export type OnboardingPick =
   | {
       kind: 'pick'
@@ -87,7 +125,7 @@ export type OnboardingPick =
  *  is the one label the user has to be able to match against a repo page. */
 export function modelDisplayName(repo: string): string {
   const tail = repo.slice(repo.lastIndexOf('/') + 1)
-  return tail.replace(/[-_]?GGUF$/i, '') || tail
+  return tail.replace(/[-_]?(GGUF|litert-lm)$/i, '') || tail
 }
 
 function fitsBudget(c: CandidateModel, budgetMb: number): boolean {
@@ -110,7 +148,12 @@ function asPick(c: CandidateModel, source: 'blessed' | 'small-device', budgetMb:
  *  retries). We then trust the blessed entry and print no fit claim — the daemon computed
  *  it against the same machine, and blocking first-run on a second query would be a
  *  regression, not a guard. */
-export function pickOnboardingModel(blessed: CandidateModel | null, sys: FitHardware | null): OnboardingPick {
+export function pickOnboardingModel(
+  blessed: CandidateModel | null,
+  sys: FitHardware | null,
+  formats: readonly ModelFormat[] = ['gguf'],
+): OnboardingPick {
+  if (readsOnlyLitert(formats)) return pickLitertModel(blessed, sys)
   const budgetMb = sys ? fitBudgetMb(sys) : 0
 
   // `fitBudgetMb` returns 0 for two very different situations, and conflating them is how
@@ -122,8 +165,19 @@ export function pickOnboardingModel(blessed: CandidateModel | null, sys: FitHard
 
   if (blessed && fitsBudget(blessed, budgetMb)) return asPick(blessed, 'blessed', budgetMb)
 
-  const fallback = [...SMALL_DEVICE_LADDER].filter((c) => fitsBudget(c, budgetMb)).sort((a, b) => a.bytes - b.bytes).pop()
-  if (fallback) return asPick(fallback, 'small-device', budgetMb)
+  return largestThatFits(SMALL_DEVICE_LADDER, blessed, budgetMb)
+}
 
+/** The daemon's blessed entry is GGUF, so a row that reads only .litertlm (LiteRT-LM, ADR-462) never sees it: the pick
+ *  is the LiteRT ladder's largest rung that fits. With hardware unknown there is no budget to screen against, and the
+ *  smallest rung is offered with no fit claim rather than the blessed GGUF the engine cannot read. */
+function pickLitertModel(blessed: CandidateModel | null, sys: FitHardware | null): OnboardingPick {
+  if (!sys || sys.ramMB <= 0) return asPick(LITERT_SMALLEST_PICK, 'small-device', 0)
+  return largestThatFits(LITERT_SMALL_DEVICE_LADDER, blessed, fitBudgetMb(sys))
+}
+
+function largestThatFits(ladder: readonly CandidateModel[], blessed: CandidateModel | null, budgetMb: number): OnboardingPick {
+  const fallback = [...ladder].filter((c) => fitsBudget(c, budgetMb)).sort((a, b) => a.bytes - b.bytes).pop()
+  if (fallback) return asPick(fallback, 'small-device', budgetMb)
   return { kind: 'none', reason: blessed ? 'too-big-for-hardware' : 'no-candidate' }
 }

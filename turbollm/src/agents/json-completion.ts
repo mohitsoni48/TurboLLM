@@ -15,9 +15,10 @@
 // the callers strip fences and find the object, so a LiteRT-LM model is not sent it and writes its JSON its own way.
 // llama.cpp and the other engines keep it.
 import type { Deps } from '../deps'
-import { shapeForEngine } from '../engines/compat'
+import { engineWithholdsTools, shapeForEngine } from '../engines/compat'
 import { engineErrorReason, engineErrorText } from '../engines/engine-error'
 import { servingEngineKind } from '../engines/serving'
+import { engineRequestHeaders } from '../engines/engine-headers'
 
 /** The model's text for `body` (a non-streaming chat request), or why there is none: the engine's own reason when it
  *  refused the request. */
@@ -29,11 +30,13 @@ export async function jsonCompletion(
 ): Promise<{ content: string } | { error: string }> {
   const kind = servingEngineKind(d)
   const b: Record<string, unknown> = { ...body }
-  if (kind === 'litert-lm') delete b.response_format
+  // The in-app SDK engine refuses response_format and tools with a 400 (ADR-447 point 7).
+  if (kind === 'litert-lm' || kind === 'turbollm-sdk') delete b.response_format
+  if (engineWithholdsTools(kind)) delete b.tools
   try {
     const res = await fetch(`${target}/v1/chat/completions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: engineRequestHeaders(kind, new Headers({ 'Content-Type': 'application/json' })),
       body: JSON.stringify(shapeForEngine(kind, b)),
       signal: AbortSignal.timeout(timeoutMs),
     })

@@ -42,7 +42,7 @@ const JEV_MODEL = entry({
 const GGUF_MODEL = entry({})
 const LITERT_MODEL = entry({ key: 'gemma-litert', format: 'litertlm', path: 'D:\\models\\gemma.litertlm' } as Partial<ModelEntry>)
 
-type ModelRow = { key: string; compatibleWithActiveEngine: boolean; incompatibleReason: string | null; jev?: JevInfo }
+type ModelRow = { key: string; compatibleWithActiveEngine: boolean; incompatibleReason: string | null; jev?: JevInfo; vision?: boolean }
 
 function appWithActiveEngine(engineKind: string | null, models: ModelEntry[], registry: Record<string, unknown> = {}) {
   const cfg: Record<string, unknown> = {
@@ -121,6 +121,21 @@ test('with no active engine every model is compatible, with no reason', async ()
     { compatibleWithActiveEngine: true, incompatibleReason: null },
     { compatibleWithActiveEngine: true, incompatibleReason: null },
   ])
+})
+
+const VISION_MODEL = entry({ key: 'gemma-vision', vision: true, mmprojPath: '/models/mmproj.gguf' } as Partial<ModelEntry>)
+
+test('while the SDK engine is active a vision model is listed without vision, and the scanned entry keeps it (G-2)', async () => {
+  const [row] = await listModels('turbollm-sdk', [VISION_MODEL])
+
+  assert.equal(row.vision, false)
+  assert.equal(VISION_MODEL.vision, true)
+})
+
+test('under llama.cpp a vision model is listed with vision', async () => {
+  const [row] = await listModels('llama-server', [VISION_MODEL])
+
+  assert.equal(row.vision, true)
 })
 
 test('GET /models takes the config snapshot and registry lookups once per request, not once per model', async () => {
@@ -307,7 +322,7 @@ test('GET /api/v1/hf/search searches only what the active engine runs, a LiteRT-
   const res = await app.request('/api/v1/hf/search?q=gemma')
 
   assert.equal(res.status, 200)
-  assert.deepEqual(calls, [['gemma', 'llama-server', 'best-match']])
+  assert.deepEqual(calls, [['gemma', { kind: 'llama-server' }, 'best-match']])
 })
 
 test('GET /api/v1/hf/search ignores an unknown category and searches as before', async () => {
@@ -317,7 +332,7 @@ test('GET /api/v1/hf/search ignores an unknown category and searches as before',
   const res = await appWithHfSearch(hf).request('/api/v1/hf/search?q=qwen&category=sentiment')
 
   assert.equal(res.status, 200)
-  assert.deepEqual(calls, [['qwen', 'llama-server', 'best-match']])
+  assert.deepEqual(calls, [['qwen', { kind: 'llama-server' }, 'best-match']])
 })
 
 // The HF repo-detail route overlays each checkpoint row with "is it already downloaded, and
@@ -506,6 +521,7 @@ test('POST /api/v1/engines/:id/activate refuses a switch while auto-tune runs', 
   const d = {
     manager: { status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }), clearError: () => {} },
     bench: { isRunning: () => tuning },
+    store: { snapshot: () => ({}) },
     registry: {
       active: () => engines.find((e) => e.id === activeId),
       get: (id: string) => engines.find((e) => e.id === id),
@@ -614,3 +630,79 @@ for (const [label, bind, requestUrl, base] of [
     assert.match(node, new RegExp(`^TURBOLLM_URL = ${JSON.stringify(base).replace(/[.[\]]/g, '\\$&')}$`, 'm'))
   })
 }
+
+// ADR-462 (plan D-11): each engine row carries the formats it reads, computed by the daemon (compat.ts engineFormats),
+// so the web learns that the two SDK rows read different formats without mirroring compat.ts.
+test('GET /api/v1/engines gives each row its formats, passes the SDK descriptor through, and keeps customDisabled', async () => {
+  const sdkRow = (id: string, name: string, sdkId: string, formats: string[]) => ({
+    id, name, kind: 'turbollm-sdk', binPath: '', version: 'in-app', capabilities: { kvTypes: [], flags: [] }, addedAt: '',
+    sdkEngine: { id: sdkId, kind: sdkId, formats, backends: ['cpu'] },
+  })
+  const litert = sdkRow('litert', 'LiteRT-LM', 'litert-lm', ['litertlm'])
+  const llama = sdkRow('llama', 'llama.cpp (CPU)', 'llama.cpp-cpu', ['gguf'])
+  const server = { id: 'cpu', name: 'llama-server-android', kind: 'llama-server', binPath: '/lib/libllama_server.so', version: 'b1', capabilities: { kvTypes: [], flags: [] }, addedAt: '' }
+  const disabled = { name: 'my build', binPath: join(tmpDir('tllm-engines-list-'), 'gone', 'llama-server'), sourceRepo: 'https://github.com/x/y', addedAt: '' }
+  const d = {
+    store: { snapshot: () => ({}) },
+    registry: { list: () => ({ engines: [litert, llama, server], activeEngineId: 'litert' }), customSources: () => [disabled] },
+  } as unknown as Deps
+  const app = new Hono()
+  registerApi(app, d)
+
+  const body = (await (await app.request('/api/v1/engines')).json()) as {
+    engines: { id: string; formats: string[]; sdkEngine?: unknown }[]
+    activeEngineId: string
+    customDisabled: unknown[]
+  }
+
+  assert.deepEqual(body.engines.map((e) => [e.id, e.formats]), [['litert', ['litertlm']], ['llama', ['gguf']], ['cpu', ['gguf']]])
+  assert.deepEqual(body.engines[0].sdkEngine, litert.sdkEngine)
+  assert.equal(body.activeEngineId, 'litert')
+  assert.deepEqual(body.customDisabled, [{ ...disabled, binPathExists: false }])
+})
+
+// ADR-462 (plan D-12): the repo detail says, per .litertlm bundle, whether this device runs it. It is computed here,
+// from the host the daemon runs on (the app hands over its SoC), so the web and onboarding share one rule.
+test('GET /api/v1/hf/models/:owner/:name marks which .litertlm bundles run on this device', async (t) => {
+  const saved = { lib: process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR, soc: process.env.TURBOLLM_ANDROID_SOC }
+  t.after(() => {
+    for (const [name, value] of [['TURBOLLM_ANDROID_NATIVE_LIB_DIR', saved.lib], ['TURBOLLM_ANDROID_SOC', saved.soc]] as const) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  })
+  process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = '/data/app/com.turbollm/lib/arm64'
+  process.env.TURBOLLM_ANDROID_SOC = 'Qualcomm SM8550'
+  const bundle = (name: string, target: unknown) => ({ name, quant: '?', sizeBytes: 1, parts: 1, mmproj: false, litertlm: true, url: 'u', target })
+  const detail = {
+    repo: 'litert-community/Gemma3-1B-IT', gated: false, license: 'gemma', downloads: 1, likes: 1, card: '', litertlm: true,
+    files: [
+      bundle('Gemma3-1B-IT_int4.litertlm', { kind: 'any' }),
+      bundle('Gemma3-1B-IT_q4_ekv1280_sm8550.litertlm', { kind: 'soc', soc: 'SM8550' }),
+      bundle('Gemma3-1B-IT_q4_ekv1280_sm8650.litertlm', { kind: 'soc', soc: 'SM8650' }),
+      bundle('Gemma3-1B-IT-web.litertlm', { kind: 'web' }),
+    ],
+  }
+
+  const res = await appWithRepoDetail(detail, [], []).request('/api/v1/hf/models/litert-community/Gemma3-1B-IT')
+
+  assert.equal(res.status, 200)
+  const body = (await res.json()) as { files: { name: string; runsHere?: boolean }[] }
+  assert.deepEqual(body.files.map((f) => [f.name, f.runsHere]), [
+    ['Gemma3-1B-IT_int4.litertlm', true],
+    ['Gemma3-1B-IT_q4_ekv1280_sm8550.litertlm', true],
+    ['Gemma3-1B-IT_q4_ekv1280_sm8650.litertlm', false],
+    ['Gemma3-1B-IT-web.litertlm', false],
+  ])
+})
+
+test('GET /api/v1/hf/models/:owner/:name adds no runsHere to a GGUF file', async () => {
+  const detail = {
+    repo: 'unsloth/Qwen3-GGUF', gated: false, license: 'apache-2.0', downloads: 1, likes: 1, card: '',
+    files: [{ name: 'Qwen3-Q4_K_M.gguf', quant: 'Q4_K_M', sizeBytes: 1, parts: 1, mmproj: false, url: 'u' }],
+  }
+  const body = (await (await appWithRepoDetail(detail, [], []).request('/api/v1/hf/models/unsloth/Qwen3-GGUF')).json()) as {
+    files: Record<string, unknown>[]
+  }
+  assert.equal('runsHere' in body.files[0], false)
+})

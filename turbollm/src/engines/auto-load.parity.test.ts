@@ -118,6 +118,7 @@ async function driveResume(side: EngineSide): Promise<void> {
   const deps: AutoLoadDeps = {
     ...side,
     initialScan: Promise.resolve(),
+    engineSetup: Promise.resolve(),
     comfy: { isBlocked: () => false, freeComfyUIBeforeLoad: () => Promise.resolve() },
     sysInfo: getSysInfo,
     log: (line) => { printed.push(line) },

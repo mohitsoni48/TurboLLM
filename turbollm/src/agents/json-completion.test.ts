@@ -15,6 +15,7 @@ import { distillFromConversation } from './distiller'
 import { reviewConversation } from './reviewer'
 import { saveSkillFromConversation } from './skill-jobs'
 import { AgentTaskState } from './task-state'
+import { jsonCompletion } from './json-completion'
 import { tmpDir } from '../test-support/tmp'
 
 const SKILL = '{"name": "csv-summary", "description": "Summarise a CSV.", "procedure": "1. Read it.\\n2. Sum it."}'
@@ -125,4 +126,37 @@ test('learning from a folder the engine refused fails with the reason, not "No s
   assert.equal(task?.status, 'failed')
   assert.equal(task?.error, 'Could not learn skills from the folder: 1 file could not be read by the model ' +
     '(csv.md: Engine returned 500: RuntimeError: Failed to create conversation)')
+})
+
+// The in-app SDK engine answers only its own per-process bearer (plan D-3).
+test('the JSON request to the SDK engine carries its bearer; llama.cpp gets no authorization', async (t) => {
+  const realFetch = globalThis.fetch
+  const realToken = process.env.TURBOLLM_ANDROID_SDK_TOKEN
+  process.env.TURBOLLM_ANDROID_SDK_TOKEN = 'sdk-process-token'
+  const seen: Array<string | null> = []
+  globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+    seen.push(new Headers(init?.headers).get('authorization'))
+    return ok(SKILL)()
+  }) as typeof fetch
+  t.after(() => {
+    globalThis.fetch = realFetch
+    if (realToken === undefined) delete process.env.TURBOLLM_ANDROID_SDK_TOKEN
+    else process.env.TURBOLLM_ANDROID_SDK_TOKEN = realToken
+  })
+  await jsonCompletion(deps('turbollm-sdk'), 'http://engine.invalid', { messages: [] }, 5000)
+  await jsonCompletion(deps('llama-server'), 'http://engine.invalid', { messages: [] }, 5000)
+  assert.deepEqual(seen, ['Bearer sdk-process-token', null])
+})
+
+// The in-app SDK engine refuses response_format and tools with a 400 (plan D-4, ADR-447 point 7), so the distiller and
+// the reviewer never send it either; the callers already find the object in whatever the model writes.
+test('the SDK engine is sent no response_format and no tools; llama.cpp keeps both', async (t) => {
+  const sent = engine(t, [ok(SKILL)])
+  const body = { messages: [], response_format: { type: 'json_object' }, tools: [{ type: 'function', function: { name: 'x' } }] }
+  await jsonCompletion(deps('turbollm-sdk'), 'http://engine.invalid', body, 5000)
+  await jsonCompletion(deps('llama-server'), 'http://engine.invalid', body, 5000)
+  assert.equal('response_format' in sent[0], false)
+  assert.equal('tools' in sent[0], false)
+  assert.deepEqual(sent[1].response_format, { type: 'json_object' })
+  assert.deepEqual(sent[1].tools, body.tools)
 })

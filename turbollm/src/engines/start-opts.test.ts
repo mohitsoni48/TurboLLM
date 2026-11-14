@@ -12,7 +12,8 @@ import { type SysInfo, primaryVendor } from '../sysinfo/sysinfo'
 import { koboldcppProfileToArgs } from './koboldcpp'
 import type { StartOpts } from './manager'
 import { mlxSamplingArgs } from './mlx'
-import { buildStartOpts } from './start-opts'
+import { buildStartOpts, launchFormat } from './start-opts'
+import type { ModelFormat } from './compat'
 
 const NO_GPU_MACHINE: SysInfo = { os: 'win32', cpu: 'test', cores: 8, ramMB: 32768, gpus: [] }
 
@@ -161,6 +162,48 @@ test("a model the engine does not read is launched with that engine's own option
   const litert = resumeLoad(ggufModel(), 'litert-lm')
   assert.ok(litert.litertLmConfig, 'the LiteRT-LM engine reads its options from --config')
 })
+
+// QG-3 (ADR-462, plan D-8): a hand-loaded model the selected SDK row does not read is launched with that row's own
+// options, as for every other engine. The fallback asked the kind, so a GGUF loaded on the LiteRT-LM SDK row was built
+// as a model directory ('mlx').
+test('a GGUF loaded on the LiteRT-LM SDK row is built through the LiteRT-LM path, not the model-directory one', () => {
+  const opts = buildStartOpts({ entry: ggufModel(), engine: sdkRowEngine(['litertlm']), cfg: defaultConfig(), sys: NO_GPU_MACHINE, trigger: 'resume' })
+  assert.ok(opts.litertLmConfig, 'LiteRT-LM options')
+})
+
+test('a .litertlm loaded on the llama.cpp SDK row is built through the GGUF path', () => {
+  const litertlm = ggufModel({ format: 'litertlm', path: 'D:\\models\\gemma.litertlm' })
+  const opts = buildStartOpts({ entry: litertlm, engine: sdkRowEngine(['gguf']), cfg: defaultConfig(), sys: NO_GPU_MACHINE, trigger: 'resume' })
+  assert.equal(opts.litertLmConfig, undefined)
+  assert.deepEqual(opts.extraArgs.slice(0, 2), ['-c', String(opts.profile!.ctx)])
+})
+
+/** launchFormat before D-8, pasted verbatim (with the kind table it read): every kind still launches as it did. */
+function launchFormatBefore(engineKind: string, format: ModelFormat): ModelFormat {
+  const accepts = (f: ModelFormat) => {
+    if (['mlx', 'rapid-mlx', 'mlx-vlm', 'vllm', 'sglang'].includes(engineKind)) return f === 'mlx'
+    if (engineKind === 'laya') return false
+    if (engineKind === 'litert-lm') return f === 'litertlm'
+    if (engineKind === 'turbollm-sdk') return f === 'gguf' || f === 'litertlm'
+    return f === 'gguf'
+  }
+  if (accepts(format)) return format
+  if (engineKind === 'litert-lm') return 'litertlm'
+  return accepts('gguf') ? 'gguf' : 'mlx'
+}
+
+test('launchFormat is unchanged for every kind and format (the legacy SDK row included)', () => {
+  const kinds = ['llama-server', 'llamafile', 'koboldcpp', 'mlx', 'rapid-mlx', 'mlx-vlm', 'vllm', 'sglang', 'litert-lm', 'laya', 'turbollm-sdk', 'a-future-kind']
+  for (const kind of kinds) {
+    for (const format of ['gguf', 'mlx', 'litertlm'] as ModelFormat[]) {
+      assert.equal(launchFormat({ kind }, format), launchFormatBefore(kind, format), `${kind} ${format}`)
+    }
+  }
+})
+
+function sdkRowEngine(formats: ModelFormat[]): Engine {
+  return { ...testEngine('turbollm-sdk'), sdkEngine: { id: 'sdk-engine', kind: 'sdk-runtime', formats, backends: ['cpu'] } }
+}
 
 function resumeLoad(entry: ModelEntry, kind: string, cfg: Config = defaultConfig()): StartOpts {
   return buildStartOpts({ entry, engine: testEngine(kind), cfg, sys: NO_GPU_MACHINE, trigger: 'resume' })

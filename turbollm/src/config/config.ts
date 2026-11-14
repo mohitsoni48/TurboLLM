@@ -6,9 +6,11 @@ import { randomUUID } from 'node:crypto'
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import type { LinkGrant, LinkRecord } from '../link/types'
 import type { ChatStoreConfig } from '../chat/store/load-adapter.js'
 import type { ReleaseProvenance } from '../engines/release-install'
+import type { ModelFormat } from '../engines/compat'
 import { CHAT_APPROVAL_WAIT_MINUTES, DOWNLOAD_CONCURRENCY, ENGINE_LOAD_STALL_SECONDS, GATEWAY_MAX_BODY_MB, RETENTION_BOUNDS, loadBounded } from './config-bounds'
 import { writeFileAtomicSync } from '../util/atomic-write'
 import { isWhisperLanguage } from '../voice/whisper-catalog'
@@ -90,6 +92,33 @@ export interface Engine {
    *  check reads it instead of the disk. Deliberately NOT sourceRepo/sourceBranch (ADR-088): those
    *  mean "built from source" and would send a prebuilt down the rebuild path. */
   release?: ReleaseProvenance
+  /** Set only on the Android app's in-app engine (kind 'turbollm-sdk'): where its HTTP server listens. Its bearer
+   *  token is deliberately not stored here: it changes every app process and is read from the environment. */
+  baseUrl?: string
+  /** Set only on a row of kind 'turbollm-sdk': which of the SDK's engines this row is, as the SDK reported it
+   *  (GET /sdk/v1/engines). Refreshed at every start. Absent on a row registered before ADR-462 (the M1 single row),
+   *  which the Android reconciler adopts as the llama.cpp row on its next start. */
+  sdkEngine?: SdkEngineDescriptor
+}
+
+export interface SdkEngineDescriptor {
+  /** 'llama.cpp-cpu' | 'litert-lm' | a future id: opaque to the daemon. */
+  id: string
+  /** The SDK runtime family: 'llama.cpp' | 'litert-lm'. */
+  kind: string
+  formats: ModelFormat[]
+  backends: Array<'cpu' | 'gpu'>
+}
+
+/** A row the Android reconciler retired, remembered so it can come back under its id. `copiedTo` names the row its
+ *  settings were already copied onto, so the one copy (ADR-462) happens once. */
+export type RetiredEngine = Engine & { copiedTo?: string }
+
+/** The Android app's fallback to its CPU server on a start without the in-app SDK: `from` is the row that was active
+ *  ('' on a fresh install), `to` the CPU server's row. */
+export interface AndroidSdkFallback {
+  from: string
+  to: string
 }
 
 /** A custom (non-catalog) engine's identity, remembered independent of its live
@@ -610,6 +639,14 @@ export interface Config {
   engines: Engine[]
   /** Custom (non-catalog) engine identities, kept across Disable — see {@link CustomEngineSource}. */
   customEngineSources: CustomEngineSource[]
+  /** Android only: app-owned engine rows the reconciler retired (an APK that does not ship a bundled file, an SDK
+   *  engine that stopped being available), so a later start that has them again reinstates the same id, and with it
+   *  the profiles, presets and lastLoaded still keyed on that id (ADR-462). Keyed by the bundled name, or
+   *  `sdk:<sdk engine id>`. Bounded: one entry per bundled name plus one per SDK engine id ever listed. */
+  androidRetiredEngines?: Record<string, RetiredEngine>
+  /** Android only: set when a start without the in-app SDK moved the selection to the CPU server, so the next start
+   *  whose SDK engine list is readable restores the earlier pick (founder Q2, I-5). Any pick by the user ends it. */
+  androidSdkFallback?: AndroidSdkFallback
   activeEngineId: string
   /** The first-run seed (engines/seed.ts seedDefaultEngines) has run: it installed and selected the default llama.cpp
    *  build, or the config had an engine (or a custom engine's identity) when it was loaded. The seed runs only while
@@ -1626,7 +1663,10 @@ function normalize(c: Config): void {
     // Per-engine auto-update policy (ADR-085): absent/garbage in pre-Phase-6 configs
     // → 'notify' (the safe default — surface updates, never silently auto-apply).
     e.updatePolicy = e.updatePolicy === 'off' || e.updatePolicy === 'auto' ? e.updatePolicy : 'notify'
+    if ('sdkEngine' in e && !isSdkEngineDescriptor(e.sdkEngine)) delete e.sdkEngine
   }
+  if (c.androidRetiredEngines !== undefined) c.androidRetiredEngines = wellFormedRetiredEngines(c.androidRetiredEngines)
+  if ('androidSdkFallback' in c && !isAndroidSdkFallback(c.androidSdkFallback)) delete c.androidSdkFallback
   // A selected engine that is gone leaves none selected, as Registry.remove does, and an empty selection stays empty:
   // filling it with the first engine on every load selected one the user never picked. Only a file with no selection
   // on record at all (hand-written, or from before the key) starts on the first engine that can be active. A first run
@@ -1911,6 +1951,37 @@ export function isUnsafeMapKey(key: string): boolean {
   return key === '__proto__' || key === 'constructor' || key === 'prototype'
 }
 
+function isSdkEngineDescriptor(value: unknown): value is SdkEngineDescriptor {
+  if (typeof value !== 'object' || value === null) return false
+  const { id, formats } = value as Partial<SdkEngineDescriptor>
+  return typeof id === 'string' && Array.isArray(formats) && formats.every((f) => typeof f === 'string')
+}
+
+/** The remembered retired rows a hand-edited or damaged file can hold safely: a safe key, and a value that is at least
+ *  an engine (a string id, name and kind). A `copiedTo` that is not a string is dropped, the entry kept. */
+function wellFormedRetiredEngines(value: unknown): Record<string, RetiredEngine> {
+  const kept: Record<string, RetiredEngine> = {}
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return kept
+  for (const [key, entry] of Object.entries(value)) {
+    if (isUnsafeMapKey(key) || !isRetiredEngine(entry)) continue
+    if ('copiedTo' in entry && typeof entry.copiedTo !== 'string') delete entry.copiedTo
+    kept[key] = entry
+  }
+  return kept
+}
+
+function isAndroidSdkFallback(value: unknown): value is AndroidSdkFallback {
+  if (typeof value !== 'object' || value === null) return false
+  const { from, to } = value as Partial<AndroidSdkFallback>
+  return typeof from === 'string' && typeof to === 'string' && !isUnsafeMapKey(from) && !isUnsafeMapKey(to)
+}
+
+function isRetiredEngine(value: unknown): value is RetiredEngine {
+  if (typeof value !== 'object' || value === null) return false
+  const { id, name, kind } = value as Partial<Engine>
+  return typeof id === 'string' && typeof name === 'string' && typeof kind === 'string'
+}
+
 export function getModelProfile(cfg: DeepReadonly<Config>, modelKey: string, engineId: string): unknown {
   // Pinned preset (ADR-353 D4) outranks the saved per-engine profiles — but ONLY when its
   // engine matches. The engine check is load-bearing: engines keep independent tunes per model
@@ -2002,19 +2073,79 @@ export function migrateModelKey(cfg: Config, oldKey: string, newKey: string): bo
  *  backend's, in its own tag-keyed folder) and unregisters the old one: those stayed under the old id, so the next load
  *  on the updated backend ran untuned defaults (auto-tune's result included), a preset pinned for it stopped applying,
  *  and the startup resume named an engine that no longer exists. As in migrateModelKey, a model `newId` already has a
- *  profile for keeps it. */
-export function migrateEngineId(cfg: Config, oldId: string, newId: string): void {
+ *  profile for keeps it.
+ *
+ *  `onlyModel` limits it to the models it accepts. `copy` leaves everything under `oldId` in place and adds a clone
+ *  under `newId` instead, never over an entry `newId` already has, and leaves lastLoaded alone; a preset pin follows its
+ *  preset to `newId`'s copy. The Android reconciler copies one row's `.litertlm` settings onto the SDK's LiteRT-LM row
+ *  this way (ADR-462). */
+export function migrateEngineId(cfg: Config, oldId: string, newId: string, opts: EngineMigrationOptions = {}): void {
   if (oldId === newId || isUnsafeMapKey(newId)) return
-  for (const byEngine of Object.values(cfg.modelProfiles)) {
+  const isSelected = opts.onlyModel ?? (() => true)
+  if (opts.copy) copyEngineSettings(cfg, { oldId, newId, isSelected })
+  else moveEngineSettings(cfg, { oldId, newId, isSelected })
+}
+
+export interface EngineMigrationOptions {
+  onlyModel?: (modelKey: string) => boolean
+  copy?: boolean
+}
+
+interface EngineMigration {
+  oldId: string
+  newId: string
+  isSelected: (modelKey: string) => boolean
+}
+
+function moveEngineSettings(cfg: Config, { oldId, newId, isSelected }: EngineMigration): void {
+  for (const [modelKey, byEngine] of Object.entries(cfg.modelProfiles)) {
     const entry = ownEntry(byEngine, oldId)
-    if (!entry) continue
+    if (!entry || !isSelected(modelKey)) continue
     if (!ownEntry(byEngine, newId)) byEngine[newId] = entry
     delete byEngine[oldId]
   }
-  for (const presets of Object.values(cfg.modelPresets)) {
+  for (const [modelKey, presets] of Object.entries(cfg.modelPresets)) {
+    if (!isSelected(modelKey)) continue
     for (const p of presets) if (p.engineId === oldId) p.engineId = newId
   }
-  if (cfg.lastLoaded.engineId === oldId) cfg.lastLoaded = { ...cfg.lastLoaded, engineId: newId }
+  if (cfg.lastLoaded.engineId === oldId && isSelected(cfg.lastLoaded.modelKey)) {
+    cfg.lastLoaded = { ...cfg.lastLoaded, engineId: newId }
+  }
+}
+
+function copyEngineSettings(cfg: Config, { oldId, newId, isSelected }: EngineMigration): void {
+  for (const [modelKey, byEngine] of Object.entries(cfg.modelProfiles)) {
+    const entry = ownEntry(byEngine, oldId)
+    if (!entry || !isSelected(modelKey) || ownEntry(byEngine, newId)) continue
+    byEngine[newId] = structuredClone(entry)
+  }
+  for (const [modelKey, presets] of Object.entries(cfg.modelPresets)) {
+    if (!isSelected(modelKey)) continue
+    movePinToCopy(cfg, modelKey, copyPresets(presets, oldId, newId))
+  }
+}
+
+/** Each preset tuned on `oldId` gets its copy on `newId`, by source preset id: a clone under a new id, or a preset
+ *  `newId` already has with the same name and the same settings (an earlier copy, or the same tune), which is not
+ *  cloned again. A same-name preset with other settings is never a copy: presets may share a name (FD-3). */
+function copyPresets(presets: ModelPreset[], oldId: string, newId: string): ReadonlyMap<string, string> {
+  const copies = new Map<string, string>()
+  for (const p of presets.filter((q) => q.engineId === oldId)) {
+    const same = presets.find((q) => q.engineId === newId && q.name === p.name && isDeepStrictEqual(q.profile, p.profile))
+    const copy = same ?? { ...structuredClone(p), id: randomUUID(), engineId: newId }
+    if (!same) presets.push(copy)
+    copies.set(p.id, copy.id)
+  }
+  return copies
+}
+
+/** A pin naming a preset tuned on `oldId` moves to that preset's own copy on `newId`. There is one pin per model and
+ *  getModelProfile applies it only on its preset's engine, so a pin left on the source stopped applying on the row the
+ *  user now runs (m-2). */
+function movePinToCopy(cfg: Config, modelKey: string, copies: ReadonlyMap<string, string>): void {
+  const pinnedId = ownEntry(cfg.lastPresetId, modelKey)
+  const copyId = pinnedId === undefined ? undefined : copies.get(pinnedId)
+  if (copyId) cfg.lastPresetId[modelKey] = copyId
 }
 
 /** Delete a model's saved profile for one engine only (issue #35). Prunes the per-model
