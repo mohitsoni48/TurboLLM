@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { describeRun, documentsFrom, filesFor, pythonError, RUN_PYTHON_TOOL, safeName, sandboxTurn, turnFiles } from './run-python'
+import { describeRun, documentsFrom, filesFor, imageType, pythonError, RUN_PYTHON_TOOL, safeName, sandboxTurn, turnFiles } from './run-python'
 import type { SandboxManager } from './sandbox-manager'
 import { SandboxError, type SandboxFile, type SandboxRunResult } from './sandbox-process'
 
@@ -115,6 +115,25 @@ test('describeRun: a module the runtime does not ship is not sent to micropip', 
   assert.doesNotMatch(r, /micropip|loadPackage/)
   assert.match(pythonError("ModuleNotFoundError: No module named 'sklearn.linear_model'"), /'sklearn' cannot be installed/)
   assert.equal(pythonError('ZeroDivisionError: division by zero'), 'ZeroDivisionError: division by zero')
+})
+
+// Found attacking run_python by hand: a "chart.png" holding a web page with a <script>, and a "logo.png" holding an SVG
+// with onload, were stored and shown as images. Served as image/png with nosniff, nothing ran; they are no longer kept.
+test('describeRun: a .png or .jpg that is not really one is not stored or shown', async () => {
+  const saved: string[] = []
+  const counting = { save: async (u: string[]) => { saved.push(...u); return u.map(() => `attachment:${'0'.repeat(64)}.png`) } }
+  const JPEG = Buffer.from('ffd8ffe000104a464946', 'hex')
+  const r = await describeRun(result({ files: [
+    { name: 'chart.png', bytes: Buffer.from("<html><body><script>alert('x')</script></body></html>") },
+    { name: 'logo.png', bytes: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"></svg>') },
+    { name: 'photo.png', bytes: JPEG },
+    { name: 'real.png', bytes: PNG },
+  ] }), counting)
+  assert.match(r.result, /chart\.png is not a PNG or JPEG image, so it was not shown\./)
+  assert.match(r.result, /logo\.png is not a PNG or JPEG image/)
+  assert.match(r.result, /Shown to the user in the chat: photo\.png, real\.png/)
+  assert.deepEqual(saved.map((u) => u.slice(0, u.indexOf(';'))), ['data:image/jpeg', 'data:image/png'], 'the bytes decide the type, not the name')
+  assert.equal(imageType(Buffer.from('89504e47', 'hex')), null, 'a cut-off signature is not a PNG')
 })
 
 test('describeRun: an image the store could not keep is not claimed as shown', async () => {

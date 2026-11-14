@@ -148,6 +148,15 @@ export function pythonError(error: string): string {
     + `library and ${PACKAGES} are available; write the code with those.`
 }
 
+const PNG_SIGNATURE = Buffer.from('89504e470d0a1a0a', 'hex')
+
+/** image/png or image/jpeg by the file's own first bytes, or null when it is neither. */
+export function imageType(bytes: Buffer): 'image/png' | 'image/jpeg' | null {
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(PNG_SIGNATURE)) return 'image/png'
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg'
+  return null
+}
+
 /** The tool result the model reads, and the image references the reply row keeps. */
 export async function describeRun(r: SandboxRunResult, store: Pick<AttachmentStore, 'save'>): Promise<{ result: string; files: string[] }> {
   const lines: string[] = []
@@ -158,8 +167,14 @@ export async function describeRun(r: SandboxRunResult, store: Pick<AttachmentSto
   const shown: string[] = []
   for (const f of r.files) {
     const ext = f.name.slice(f.name.lastIndexOf('.') + 1).toLowerCase()
-    const mime = IMAGE_MIME[ext]
-    if (mime) {
+    if (IMAGE_MIME[ext]) {
+      // The bytes decide, not the name: a "chart.png" that is really a web page or an SVG with a script is not kept.
+      // The store would serve it as image/png with nosniff, which browsers obey; this keeps it out of the store anyway.
+      const mime = imageType(f.bytes)
+      if (!mime) {
+        lines.push(`${f.name} is not a PNG or JPEG image, so it was not shown.`)
+        continue
+      }
       const [saved] = await store.save([`data:${mime};base64,${f.bytes.toString('base64')}`])
       if (saved?.startsWith('attachment:')) {
         refs.push(saved)
