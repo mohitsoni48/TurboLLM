@@ -4,7 +4,7 @@ import { ChevronRight, ShieldCheck } from 'lucide-react'
 import { useSettings } from '../../lib/queries'
 import { ApiError, track, type ToolPolicy } from '../../lib/api'
 import { fetchAvailableTools } from '../../lib/chat-api'
-import { friendlyName } from '../../lib/tool-explain'
+import { ALWAYS_ASK_TOOLS, friendlyName } from '../../lib/tool-explain'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../../components/ui/collapsible'
 import { Switch } from '../../components/ui/switch'
 import { toast } from '../../components/ui/sonner'
@@ -149,7 +149,10 @@ export function ToolPermissionsSection() {
         {tools.length > 0 && (
           <div className="divide-y divide-border rounded-md border border-border">
             {tools.map((t) => {
-              const current = policies[t.name] ?? 'ask'
+              // A tool that asks before every call (run_python) takes Ask or Deny only: an Allow would not be honored.
+              const alwaysAsk = ALWAYS_ASK_TOOLS.has(t.name)
+              const current = alwaysAsk && policies[t.name] !== 'deny' ? 'ask' : policies[t.name] ?? 'ask'
+              const options = alwaysAsk ? POLICY_OPTIONS.filter((o) => o.value !== 'allow') : POLICY_OPTIONS
               return (
                 <div key={t.name} className="flex items-center justify-between gap-3 px-3 py-2.5">
                   <div className="min-w-0">
@@ -159,7 +162,7 @@ export function ToolPermissionsSection() {
                     )}
                   </div>
                   <div className="flex shrink-0 overflow-hidden rounded-lg border border-border">
-                    {POLICY_OPTIONS.map(({ value, label }) => (
+                    {options.map(({ value, label }) => (
                       <button
                         key={value}
                         type="button"
