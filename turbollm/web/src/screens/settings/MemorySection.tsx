@@ -5,6 +5,7 @@ import { useMemoryFacts, useMemoryFactMutations } from '../../lib/chat-queries'
 import { ApiError, track } from '../../lib/api'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../../components/ui/collapsible'
 import { Badge } from '../../components/ui/badge'
+import { LoadMore } from '../../components/LoadMore'
 import { toast } from '../../components/ui/sonner'
 import { cn } from '../../lib/utils'
 
@@ -96,6 +97,11 @@ export function MemorySection() {
                 </button>
               </div>
             ))}
+          </div>
+        )}
+        {factsQ.hasNextPage && (
+          <div className="mt-2">
+            <LoadMore label="Load more" onLoadMore={() => void factsQ.fetchNextPage()} loading={factsQ.isFetchingNextPage} />
           </div>
         )}
       </CollapsibleContent>

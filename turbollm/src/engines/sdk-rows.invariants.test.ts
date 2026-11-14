@@ -66,6 +66,7 @@ function sdkRouter(active: Engine) {
   const newSlots: string[] = []
   const store = {
     snapshot: () => ({ gateway: { autoSwap: true, keepN: 3 }, modelProfiles: {}, comfyui: {}, showAllEngineModels: false }),
+    read: () => ({ gateway: { autoSwap: true, keepN: 3 }, modelProfiles: {}, comfyui: {}, showAllEngineModels: false }),
     update: (fn: (c: { lastLoaded?: unknown }) => void) => fn({}),
   } as unknown as ConfigStore
   const scanner = {
@@ -76,7 +77,7 @@ function sdkRouter(active: Engine) {
   const router = new ModelRouter(store, registry, primary.manager, scanner, undefined, undefined, () => {
     newSlots.push('slot')
     return primary.manager
-  })
+  }, async () => null) // no card reading: a pool slot keeps its default profile
   return { router, primary, newSlots }
 }
 

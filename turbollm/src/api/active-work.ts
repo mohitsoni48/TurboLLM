@@ -11,7 +11,6 @@
 import type { Hono } from 'hono'
 import type { Deps } from '../deps'
 import { mayAlsoRead } from '../auth'
-import { afterReplyChatIds, inFlightChatIds, parkedChatIds, parkedEngineTurns } from '../chat/chat-routes'
 import type { DownloadRecord } from '../downloads/downloads'
 import { jevStatus } from './jev-status'
 import { layaStatus } from './laya-status'
@@ -37,7 +36,7 @@ export interface ActiveWork {
   engineGenerating: boolean
 }
 
-/** Where the chats come from (chat-routes.ts). A test seam only — every caller takes the default. */
+/** Where the chats come from (d.chatTurns). A test seam only — every caller takes the default. */
 export interface ChatSources {
   /** Chats whose turn holds their in-flight slot (parked ones included). */
   inFlight: () => string[]
@@ -49,12 +48,16 @@ export interface ChatSources {
   parkedGenerations: () => number
 }
 
-const CHAT_SOURCES: ChatSources = { inFlight: inFlightChatIds, parked: parkedChatIds, afterReply: afterReplyChatIds, parkedGenerations: parkedEngineTurns }
-
 const UNTITLED = 'Untitled'
 
 export function activeWork(d: Deps, sources: Partial<ChatSources> = {}): ActiveWork {
-  const chats = { ...CHAT_SOURCES, ...sources }
+  const chats: ChatSources = {
+    inFlight: () => d.chatTurns.inFlightChatIds(),
+    parked: () => d.chatTurns.parkedChatIds(),
+    afterReply: () => d.chatTurns.afterReplyChatIds(),
+    parkedGenerations: () => d.chatTurns.parkedEngineTurns(),
+    ...sources,
+  }
   const parked = new Set(chats.parked())
   // A chat is listed once: running (a turn, or its title or memory call), else waiting.
   const running = [...new Set([...chats.inFlight().filter((id) => !parked.has(id)), ...chats.afterReply()])]
@@ -165,7 +168,12 @@ function conversationTitle(d: Deps, convId: string): string {
 }
 
 /** A local chat turn counts as a generation from its first request to its end, its approval waits
- *  included; `parked` of them wait on a person (they are in `waiting`), so they do not count here. */
+ *  included; `parked` of them wait on a person (they are in `waiting`), so they do not count here. A keep-N pool
+ *  slot's API traffic is counted on its own Manager, not the primary's (scalability review 1.5), and is read beside
+ *  it; no chat turn runs there, so nothing of it is parked. A routine holding the primary between its own requests
+ *  (Manager.hold, scalability review 4.13) is active work too: a restart in that gap would kill its next turn. */
 function engineIsGenerating(d: Deps, parked: number): boolean {
-  return d.manager.status().state === 'running' && (d.manager.sessionStats()?.activeRequests ?? 0) - parked > 0
+  const running = d.manager.status().state === 'running'
+  const primary = running && ((d.manager.sessionStats()?.activeRequests ?? 0) - parked > 0 || !!d.manager.hasHolds?.())
+  return primary || (d.modelRouter?.poolGenerating?.() ?? false)
 }

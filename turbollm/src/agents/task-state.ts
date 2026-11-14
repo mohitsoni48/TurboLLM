@@ -7,6 +7,7 @@
 // (`agentTasks`), mirroring BuildState/ProvisionState. The UI shows them inline in the
 // conversation and opens a side panel on click.
 import { randomUUID } from 'node:crypto'
+import { emitInvalidation } from '../events/bus'
 
 export type AgentTaskKind = 'review' | 'skill_from_conversation' | 'skill_from_folder'
 export type AgentTaskStatus = 'running' | 'done' | 'failed'
@@ -35,27 +36,37 @@ const KEEP_DONE_MS = 5 * 60_000 // keep finished tasks visible for 5 min
 export class AgentTaskState {
   private tasks = new Map<string, AgentTask>()
 
+  /** @param announce Where a change to a task is announced; the daemon's invalidation bus by default. */
+  constructor(private readonly announce: (key: string) => void = emitInvalidation) {}
+
   /** Begin a task; returns its id (use it for step/finish). */
   start(kind: AgentTaskKind, agentId: string, label: string, convId?: string): string {
     this.gc()
     const id = randomUUID()
     this.tasks.set(id, { id, kind, convId, agentId, label, status: 'running', steps: [], startedAt: Date.now() })
+    this.announceChange()
     return id
   }
 
   step(id: string, message: string): void {
     const t = this.tasks.get(id)
-    if (t && t.status === 'running') t.steps.push(message)
+    if (!t || t.status !== 'running') return
+    t.steps.push(message)
+    this.announceChange()
   }
 
   done(id: string, result: string): void {
     const t = this.tasks.get(id)
-    if (t) { t.status = 'done'; t.result = result; t.endedAt = Date.now() }
+    if (!t) return
+    t.status = 'done'; t.result = result; t.endedAt = Date.now()
+    this.announceChange()
   }
 
   fail(id: string, error: string): void {
     const t = this.tasks.get(id)
-    if (t) { t.status = 'failed'; t.error = error; t.endedAt = Date.now() }
+    if (!t) return
+    t.status = 'failed'; t.error = error; t.endedAt = Date.now()
+    this.announceChange()
   }
 
   /** All tasks (running first, then recently finished). For GET /status. */
@@ -66,6 +77,10 @@ export class AgentTaskState {
 
   get(id: string): AgentTask | undefined {
     return this.tasks.get(id)
+  }
+
+  private announceChange(): void {
+    this.announce('status')
   }
 
   /** Drop finished tasks older than KEEP_DONE_MS and enforce the ring cap. */

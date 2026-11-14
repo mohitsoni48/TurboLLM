@@ -788,3 +788,30 @@ test('parseGitRepo stays reachable from update.ts as the shared github-repo help
   assert.equal(parseGitRepo('https://github.com/o/r.git'), 'o/r')
   assert.equal(parseGitRepo, parseGitRepoFromLeaf)
 })
+
+// A keep-N pool slot's gateway traffic is counted on the pool slot's own Manager (scalability review 1.5), so the
+// primary reads idle while a pool slot generates. An update stops the pool slots on the engine it replaces, so it
+// waits for those generations too, as it did while they were (wrongly) counted on the primary.
+test('UpdateScheduler: no engine is auto-updated while a pool slot is generating', async () => {
+  const e = eng({ id: 'cuda', updatePolicy: 'auto' })
+  let poolBusy = true
+  const updates = {
+    prune() {},
+    checkAll: async () => {},
+    get: () => ({ installed: 'b100', latest: 'b200', hasUpdate: true, checkedAt: '', comparable: true }),
+  } as unknown as UpdateChecker
+  const applied: string[] = []
+  const scheduler = new UpdateScheduler({
+    store: {} as ConfigStore,
+    registry: { list: () => ({ engines: [e], activeEngineId: '' }) } as unknown as Registry,
+    manager: managerStub('stopped'),
+    updates,
+    poolGenerating: () => poolBusy,
+    applyUpdate: async (x) => { applied.push(x.id) },
+  })
+  await scheduler.runOnce()
+  assert.deepEqual(applied, [], 'held while the pool slot generates')
+  poolBusy = false
+  await scheduler.runOnce()
+  assert.deepEqual(applied, ['cuda'])
+})

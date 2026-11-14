@@ -63,7 +63,7 @@ test('PATCH /api/v1/settings: saving an unrelated field with the SAME telemetryL
       const app = new Hono()
       registerApi(app, {
         version: 'test',
-        store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
+        store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
         manager: { status: () => ({ state: 'stopped', model: null }) },
       } as unknown as Deps)
 

@@ -11,7 +11,7 @@ import { tmpDir } from '../test-support/tmp'
 function mkDeps(links: LinkRecord[], telemetry?: Emitter): { d: Deps; cfg: { links: LinkRecord[] } } {
   const cfg = { links, daemon: {}, apiKeys: [] }
   const d = {
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     ...(telemetry ? { telemetry } : {}),
   } as unknown as Deps
   return { d, cfg: cfg as { links: LinkRecord[] } }
@@ -23,7 +23,7 @@ function mkTelemetry(): { telemetry: Emitter; dir: string; cleanup: () => void }
   const cfg = { telemetry: { level: 'anon', machineId: '44444444-4444-4444-4444-444444444444' } }
   const telemetry = new Emitter({
     dataDir: dir,
-    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } as never,
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } as never,
     version: '1.11.2',
     os: 'win32/x64',
   })
@@ -195,7 +195,7 @@ function mkCountingDeps(links: LinkRecord[]): { d: Deps; cfg: { links: LinkRecor
   let writes = 0
   const d = {
     store: {
-      snapshot: () => cfg,
+      snapshot: () => cfg, read: () => cfg,
       update: (fn: (c: never) => void) => { writes++; fn(cfg as never) },
     },
   } as unknown as Deps

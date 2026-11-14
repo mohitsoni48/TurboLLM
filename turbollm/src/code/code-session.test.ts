@@ -604,6 +604,29 @@ test('resolveEffectiveHistory: after a compaction marker — a wrapped summary p
   assert.equal(messages[1].content, 'new reply 2')
 })
 
+test('resolveEffectiveHistory: after a compaction marker, only the rows after it are read (scalability review 2.9)', () => {
+  const { store, convId, sessionId } = makeCodeConv()
+  for (let i = 0; i < 20; i++) store.addMessage(convId, i % 2 ? 'assistant' : 'user', `old ${i}`)
+  const cut = store.addMessage(convId, 'assistant', 'cut here')
+  const tail = store.addMessage(convId, 'user', 'new task')
+  store.updateAgentRun(sessionId, { compactionSummary: 'summary', compactionUpToMessageId: cut.id })
+  const wholeConversationLoads: string[] = []
+  const db = new Proxy(store, {
+    get(target, prop) {
+      const v = Reflect.get(target, prop) as unknown
+      if (typeof v !== 'function') return v
+      return (...args: unknown[]) => {
+        if (prop === 'getMessages' || (prop === 'getConversation' && args[1] === true)) wholeConversationLoads.push(String(prop))
+        return (v as (...a: unknown[]) => unknown).apply(target, args)
+      }
+    },
+  })
+
+  const { messages } = resolveEffectiveHistory({ db } as unknown as Deps, convId, sessionId)
+  assert.deepEqual(messages.map((m) => m.id), [tail.id])
+  assert.deepEqual(wholeConversationLoads, [])
+})
+
 test('resolveEffectiveHistory: a compaction marker pointing at a deleted/missing message id degrades to replaying everything raw', () => {
   const { d, store, convId, sessionId } = makeCodeConv()
   store.addMessage(convId, 'user', 'task')

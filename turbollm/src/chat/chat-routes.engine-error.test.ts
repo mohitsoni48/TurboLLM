@@ -10,6 +10,7 @@ import { registerChatRoutes } from './chat-routes.js'
 import { ConversationStore } from './db.js'
 import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
+import { chatRegistries } from '../test-support/chat-registries'
 
 const MODEL = '/models/Qwen3-0.6B_dynamic.litertlm'
 
@@ -32,8 +33,9 @@ function routes(t: TestContext) {
   }
   const engine = { kind: 'litert-lm', id: 'lrt', capabilities: {} }
   const d = {
+    ...chatRegistries(),
     db: store,
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
     registry: { active: () => engine },
     manager: {

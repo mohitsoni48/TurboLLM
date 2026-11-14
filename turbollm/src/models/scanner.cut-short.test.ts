@@ -13,7 +13,7 @@ import { ggufFile, ggufVocabOnly } from '../test-support/gguf-file'
 import { tmpDir } from '../test-support/tmp'
 
 function stubStore(root: string): ConfigStore {
-  return { dir: () => root, snapshot: () => ({ modelDirs: [root] }) } as unknown as ConfigStore
+  return { dir: () => root, snapshot: () => ({ modelDirs: [root] }), read: () => ({ modelDirs: [root] }) } as unknown as ConfigStore
 }
 
 test('a GGUF cut short is listed incomplete; the whole file is not', async () => {

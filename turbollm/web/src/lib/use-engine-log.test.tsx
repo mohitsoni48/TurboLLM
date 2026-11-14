@@ -156,3 +156,52 @@ describe('useEngineLog', () => {
     }
   })
 })
+
+describe('useEngineLog: pool-slot selector', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('lists the slots the daemon reports, tails the picked slot\'s log, and falls back to the primary when it goes', async () => {
+    let slots = ['embed-model']
+    const urls: string[] = []
+    const fetchMock = vi.fn(async (url: string) => {
+      urls.push(url)
+      if (url.startsWith('/api/v1/engine/logs/stream')) {
+        return new Response(new ReadableStream({ start() { /* stays open */ } }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+      }
+      const model = new URL(url, 'http://x').searchParams.get('model')
+      return new Response(JSON.stringify({ lines: [model ? `log of ${model}` : 'primary log'], slots }), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { result, unmount } = renderHook(() => useEngineLog(true))
+    await waitFor(() => expect(result.current.lines).toEqual(['primary log']))
+    expect(result.current.slots).toEqual(['embed-model'])
+    expect(urls.some((u) => u.includes('model='))).toBe(false)
+
+    act(() => result.current.setModel('embed-model'))
+    await waitFor(() => expect(result.current.lines).toEqual(['log of embed-model']))
+    expect(urls).toContain('/api/v1/engine/logs/stream?model=embed-model')
+
+    slots = []
+    act(() => result.current.setModel('embed-model')) // same pick again: no change
+    unmount()
+  })
+
+  it('a selected slot that is no longer offered reverts to the primary log', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.startsWith('/api/v1/engine/logs/stream')) {
+        return new Response(new ReadableStream({ start() { /* stays open */ } }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+      }
+      const model = new URL(url, 'http://x').searchParams.get('model')
+      // The slot answered once, then was ejected: its log 404s and the list is empty.
+      return model ? new Response('{}', { status: 404 }) : new Response(JSON.stringify({ lines: ['primary log'], slots: [] }), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const { result, unmount } = renderHook(() => useEngineLog(true))
+    await waitFor(() => expect(result.current.lines).toEqual(['primary log']))
+    act(() => result.current.setModel('gone'))
+    await waitFor(() => expect(result.current.model).toBe(''))
+    await waitFor(() => expect(result.current.lines).toEqual(['primary log']))
+    unmount()
+  })
+})

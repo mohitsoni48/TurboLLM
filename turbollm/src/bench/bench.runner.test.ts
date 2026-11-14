@@ -151,7 +151,7 @@ test('a ComfyUI render cancels auto-tune: a probe waiting for the load gate star
   r.deadline = Date.now() + 60_000
   r.state = { running: true }
   r.engine = registry.active()
-  const comfyStore = { snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn', url: '', reverseGate: false, cachePersist: false } }), dir: () => '/tmp' }
+  const comfyStore = { snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn', url: '', reverseGate: false, cachePersist: false } }), read: () => ({ comfyui: { enabled: true, gatePath: '/cn', url: '', reverseGate: false, cachePersist: false } }), dir: () => '/tmp' }
   const comfy = new ComfyGuard(comfyStore as never, manager as never)
   comfy.setAutoTune(bench)
 
@@ -193,7 +193,7 @@ test('auto-tune starts every probe on the engine it started with, and stops when
   }
   const registry = { active: () => engines[activeId] }
   const m = model({ blockCount: 2 })
-  const store = { snapshot: () => ({ modelProfiles: {}, vramHeadroomMb: 1024, modelDirs: [] }) }
+  const store = { snapshot: () => ({ modelProfiles: {}, vramHeadroomMb: 1024, modelDirs: [] }), read: () => ({ modelProfiles: {}, vramHeadroomMb: 1024, modelDirs: [] }) }
   const scanner = { get: (key: string) => (key === m.key ? m : undefined) }
   const bench = new BenchRunner(manager as never, store as never, scanner as never, registry as never, 'test', {} as never)
   const r = bench as unknown as RunnerInternals
@@ -233,7 +233,7 @@ test('auto-tune stops when its engine is removed during the run, and says so', a
   }
   const registry = { active: () => selected }
   const m = model({ blockCount: 2 })
-  const store = { snapshot: () => ({ modelProfiles: {}, vramHeadroomMb: 1024, modelDirs: [] }) }
+  const store = { snapshot: () => ({ modelProfiles: {}, vramHeadroomMb: 1024, modelDirs: [] }), read: () => ({ modelProfiles: {}, vramHeadroomMb: 1024, modelDirs: [] }) }
   const scanner = { get: (key: string) => (key === m.key ? m : undefined) }
   const bench = new BenchRunner(manager as never, store as never, scanner as never, registry as never, 'test', {} as never)
   const r = bench as unknown as RunnerInternals
@@ -265,7 +265,7 @@ test('auto-tune names the engine it tunes while it runs, between its probes too,
     target: () => null,
   }
   const m = model({ blockCount: 2 })
-  const store = { snapshot: () => ({ modelProfiles: {}, vramHeadroomMb: 1024, modelDirs: [] }) }
+  const store = { snapshot: () => ({ modelProfiles: {}, vramHeadroomMb: 1024, modelDirs: [] }), read: () => ({ modelProfiles: {}, vramHeadroomMb: 1024, modelDirs: [] }) }
   const scanner = { get: (key: string) => (key === m.key ? m : undefined) }
   const bench = new BenchRunner(manager as never, store as never, scanner as never, { active: () => cuda } as never, 'test', {} as never)
   const r = bench as unknown as RunnerInternals
@@ -293,7 +293,7 @@ test('saved auto-tune result is queued even when the CPU/GPU names are not ident
   const dir = tmpDir('turbollm-bench-telemetry-')
   try {
     const cfg = { telemetry: { level: 'anon', machineId: '00000000-0000-0000-0000-000000000000' } }
-    const { r } = runner({ snapshot: () => cfg, update: () => {}, dir: () => dir })
+    const { r } = runner({ snapshot: () => cfg, read: () => cfg, update: () => {}, dir: () => dir })
     const sys: SysInfo = {
       os: 'linux/x64', cpu: 'Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz', cores: 12, ramMB: 32000,
       gpus: [{ name: 'Navi 48 [Radeon RX 9070/9070 XT]', vramMb: 16304, vendor: 'amd' }],
@@ -314,7 +314,7 @@ test('auto-tune telemetry sends a path-shaped model name and engine version as u
   const dir = tmpDir('turbollm-bench-telemetry-')
   try {
     const cfg = { telemetry: { level: 'anon', machineId: '00000000-0000-0000-0000-000000000000' } }
-    const { r } = runner({ snapshot: () => cfg, update: () => {}, dir: () => dir })
+    const { r } = runner({ snapshot: () => cfg, read: () => cfg, update: () => {}, dir: () => dir })
     const sys: SysInfo = { os: 'win32/x64', cpu: 'Test CPU', cores: 12, ramMB: 32000, gpus: [{ name: 'Test GPU', vramMb: 16000, vendor: 'nvidia' }] }
     const record = { modelKey: 'm|q4|1', tps: 40, ttftMs: 200, vramMb: 9000, ts: '2026-10-13T00:00:00.000Z', params: { ctx: 8192, ngl: 33, nCpuMoe: 0, parallel: 1, kvTypeK: 'f16', flashAttn: 'auto' } }
 
@@ -328,4 +328,33 @@ test('auto-tune telemetry sends a path-shaped model name and engine version as u
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// A model resident beside the primary (a keep-N pool slot, an embedding or Laya model) holds VRAM the probe's
+// whole-card reading counts as its own, so the tune would save a too-conservative profile (scalability review 1.7).
+test('auto-tune refuses to start while another model is loaded beside the primary, and starts once it is gone', async () => {
+  const m = model({ blockCount: 2 })
+  const manager = { start: async () => {}, stopAndWait: async () => {}, status: () => ({ state: 'stopped', err: null }), logPath: () => null, target: () => null }
+  const store = { snapshot: () => ({ modelProfiles: {}, vramHeadroomMb: 1024, modelDirs: [] }), read: () => ({ modelProfiles: {}, vramHeadroomMb: 1024, modelDirs: [] }) }
+  const scanner = { get: (key: string) => (key === m.key ? m : undefined) }
+  const registry = { active: () => ({ id: 'cuda', kind: 'llama-server', binPath: '', version: 'b1', capabilities: CAPS }) }
+  const bench = new BenchRunner(manager as never, store as never, scanner as never, registry as never, 'test', {} as never)
+  let resident = 1
+  bench.setPool({ poolModelCount: () => resident })
+
+  assert.throws(() => bench.start(m.key), {
+    name: 'BenchError',
+    code: 'engine_in_use',
+    message: 'Unload the other loaded models before auto-tuning: the GPU memory they hold would be counted against this model.',
+  })
+  assert.equal(bench.isRunning(), false)
+
+  resident = 0
+  const r = bench as unknown as RunnerInternals
+  r.settleGpu = async () => {}
+  r.denseSearch = async () => null
+  bench.start(m.key)
+  assert.equal(bench.isRunning(), true)
+  bench.cancel()
+  while (bench.isRunning()) await new Promise((res) => setTimeout(res, 20))
 })

@@ -567,7 +567,7 @@ test('applier: an SDK read that throws is logged and the start goes on, repairin
   assert.equal(app.registry.active()?.id, LLAMA_SDK_ROW.id)
 })
 
-test('applier: the scan lookup is never called synchronously (cli.ts declares the scanner after the call)', async (t) => {
+test('applier: the scan lookup is never called synchronously (boot.ts declares the scanner after the call)', async (t) => {
   quietAndroidLog(t)
   for (const sdkUrl of [SDK_URL, undefined]) {
     const app = appAt(t, configWith([], ''))

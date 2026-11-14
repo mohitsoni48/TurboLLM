@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 import { Hono } from 'hono'
 import { createHash, randomUUID } from 'node:crypto'
 import { registerLinkApi } from './link-routes'
-import { buildModelStatus } from '../api/status-view'
+import { buildModelStatus } from '../services/status-view'
 import { LinkClient } from './link-client'
 import type { Deps } from '../deps'
 import type { ApiKey } from '../config/config'
@@ -49,7 +49,7 @@ function mkDeps(keys: ApiKey[], opts?: { state?: string; err?: unknown }): Deps 
   }
   return {
     version: '1.11.2',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     manager: {
       currentOpts: () => null,
       status: () => ({

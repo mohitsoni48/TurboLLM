@@ -2,69 +2,63 @@
 //
 // The production generation body for the public API's send/stream route (spec 27 §5, §6, §8).
 // `routes.runs.ts` only knows the injected `RunDeps.makeBody` seam; this file is the one place
-// that wires it to a real engine call. It is NOT independently unit-tested (there is no model to
-// test against in this task) — its contract is exercised only through the interface routes.runs.ts
-// depends on, per the route tests (which inject a fake `makeBody`). It must compile cleanly and
-// match the design below.
+// that wires it to a real engine call. Its loop is the chat's own: runGenerationCore
+// (chat/generation-core.ts; ADR-112: one loop behind an event sink, never forked — scalability
+// 5.6), the same loop the live chat and Chat Routines run, so an engine quirk is patched once for
+// all three. generation.loop.test.ts drives it end to end against a loopback engine.
 //
-// ── Why this does NOT call chat-routes.ts's runGeneration() ────────────────────────────────────
-// The brief's own Step 4 sketch assumes `runGeneration` is an importable, reusable core. Three
-// confirmed facts about the real function rule that out, not just as a style preference:
+// What the public API needs of that loop, each through a port or a defaulted-off option:
 //
-//  1. COMPILE BLOCKER: `runGeneration` and its `GenerationCtx` type are both unexported (private
-//     to chat-routes.ts). There is nothing to import.
-//  2. DATA LOSS for any real deployment: `runGeneration`'s terminal persistence
-//     (`db.updateMessage(assistantMsg.id, ...)`, `db.touchConversation`, the `db.getMessage(...)!`
-//     that builds its own 'done' payload) all write straight to `d.db` — the LOCAL
-//     ConversationStore — with NO awareness of `d.chatStore` at all. `d.chatStore` only serves
-//     'local' tenant chats from that same handle; every other tenant is served either by a
-//     `not_supported` error (default config, no adapter — see chat/store/load-adapter.ts:
-//     `kind:'sqlite'` resolves the adapter to `null`) or, in any real multi-tenant deployment, by
-//     a genuinely separate adapter store. Either way `assistantMsg.id` (a public ChatMessage id)
-//     was never written into `d.db`'s tables, so `db.updateMessage` silently affects 0 rows and
-//     the public assistant message would never leave status:'streaming'. This is the exact same
-//     shape of trap the task brief already flagged for `d.db.getConversation()` — just on the
-//     WRITE side, and not something a synthetic `ctx` can route around, since it's hardcoded
-//     inside runGeneration's own body.
-//  3. HANG risk: runGeneration's one call to `executeToolCallWithApproval` hardcodes
-//     `interactive: true` unconditionally — there is no ctx field that reaches it. Every tool
-//     defaults to 'ask' policy unless explicitly configured (tools/tool-policy.ts's own doc
-//     comment), so routing a public run through it would, by default, hang forever on the first
-//     tool call waiting on `waitForToolApproval` (a chat turn's wait ends only after Settings'
-//     chatApprovalWaitMinutes, and never at 0) — an approval endpoint no external caller can ever
-//     reach.
-//
-// This is exactly the problem routines/chat-runner.ts already solved for a different detached
-// caller (Chat Routines), and its own header comment says as much: "NOT a reuse of
-// chat-routes.ts's runGeneration(): that function is hard-coupled to a live Hono SSE
-// StreamHandle... and has no live client to stream to here." That file built its own loop
-// instead of forcing a fit into the shared one; this file follows the same precedent, adding
-// real SSE streaming (chat-runner.ts's own loop is deliberately non-streaming — "nobody is
-// watching deltas live" — which does not hold for the public API's live SSE/JSON modes).
-//
-// Tool execution reuses `executeToolCallWithApproval` (tools/execute-with-approval.ts) directly
-// — the exact function chat-runner.ts already reuses for the identical non-interactive-caller
-// problem — with `interactive: false` and an empty `agentAllowedTools`. An 'ask'-policy tool
-// resolves as an instant "Blocked" deny in that branch, never a wait (spec 27 §5.1: "public runs
-// execute allow-policy tools only; anything resolving to ask is treated as deny").
+//  - PERSISTENCE in the tenant's store. A public message lives in `d.chatStore` (the local store for
+//    the 'local' tenant, a separate adapter store for any other); `d.db` — the LOCAL
+//    ConversationStore — never holds it, so a write there would affect 0 rows and leave the public
+//    message at status:'streaming' forever. The core never touches `d.db`: this file's persistence
+//    port checkpoints into `d.chatStore` on its own cadence (progressCadence 'everyChange' +
+//    shouldFlushCheckpoint), and the terminal write runs here, after the gate is released.
+//  - NO WAITING ON APPROVALS. The approval policy is non-interactive with an empty
+//    `agentAllowedTools`, so an 'ask'-policy tool resolves as an instant "Blocked" deny, never a
+//    wait on an approval endpoint no external caller can reach (spec 27 §5.1: "public runs execute
+//    allow-policy tools only; anything resolving to ask is treated as deny").
+//  - THE TENANT'S SAMPLING CANNOT STEER THE REQUEST: mapSampling drops the control keys, and what
+//    is left goes UNDER the request's own fields (GenerationTurn.engineSampling).
+//  - THE PUBLIC WIRE: the run's events are the loop's deltas, reasoning and tool-call events, then
+//    the engine's raw `usage`; the loop's own progress, notice, error and done events stay off it
+//    (the run manager sends its own error and done frames). See PUBLIC_LOOP and publicSink.
+//  - THIS MACHINE'S LEDGERS: the run holds the gate ('bg') and counts itself in-flight
+//    (generationStart) here; the loop writes nothing more (`ledgers: false`: no live readout,
+//    completion stats, bench result or request-log entry, as a public run never had).
 import type { Deps } from '../deps.js'
 import type { EmitSink } from '../chat/emit-sink.js'
 import type { ChatStore } from '../chat/store/chat-store.js'
 import type { Chat, ChatMessage, Scope } from '../chat/store/types.js'
+import type { ChatUpstream } from '../chat/chat-upstream.js'
 import type { RunDeps } from './routes.runs.js'
 import { withCurrentDate } from '../chat/chat-compaction.js'
-import { engineModelAlias, engineWithholdsTools, shapeForEngine } from '../engines/compat.js'
-import { litertLmIgnoredFieldsNote, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request.js'
-import { engineErrorReason, engineErrorText } from '../engines/engine-error.js'
-import { clampMaxTokens } from '../config/config.js'
-import { executeToolCallWithApproval } from '../tools/execute-with-approval.js'
-import { initParseState, feedChunk, flushState, type ParseState } from '../chat/parser.js'
+import { runGenerationCore, type GenerationOutcome, type LoopOptions, type ReplySnapshot } from '../chat/generation-core.js'
+import { engineModelAlias } from '../engines/compat.js'
 import { servingEngineKind } from '../engines/serving'
-import { engineRequestHeaders } from '../engines/engine-headers'
 
 /** Mirrors chat-routes.ts's own MAX_TOOL_ITER / chat-runner.ts's identical constant — a
  *  ceiling, not a target. Ordinary chats finish in 1 round; this only bounds a runaway loop. */
 const MAX_TOOL_ITER = 16
+
+/** How a public run drives the shared loop: every option is what this API has always done.
+ *  The 16-round ceiling, every round's calls run, then the run fails (`exceeded`); no BUG-001 extra
+ *  pass; the run's own accounting only (`ledgers: false`, see the header); a stop lets the round's
+ *  remaining calls run and ends the run before its next request; no prompt-progress request and no
+ *  pending announcement of a call still streaming (neither is on the public wire); an error chunk
+ *  in the stream read past; the stored reply exactly what was streamed. Tools are withheld on
+ *  vLLM/SGLang, as in the live chat (no toolsOnEveryEngine). */
+const PUBLIC_LOOP: LoopOptions = {
+  toolRoundCeiling: MAX_TOOL_ITER,
+  extraPass: false,
+  ledgers: false,
+  stopBetweenToolCalls: false,
+  returnProgress: false,
+  announceToolCalls: false,
+  streamErrors: 'ignore',
+  interruptedTail: 'asStreamed',
+}
 /** Per-page size when walking chat history (see `loadFullHistory`). This is NOT a cap on how
  *  much history is sent to the engine — `SqliteChatStore.listMessages` internally clamps any
  *  requested `limit` to 200 regardless (`clampLimit` in sqlite-chat-store.ts), so raising this
@@ -75,8 +69,6 @@ const DEFAULT_PAGE_SIZE = 200
 const MAX_PAGES = 1000
 
 interface WireMessage { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string; reasoning_content?: string }
-
-interface ToolCallRecord { id: string; name: string; args: Record<string, unknown>; result?: string; error?: string }
 
 /** Loads the ENTIRE message history for a chat, paging forward via `cursor` until
  *  `hasMore` is false — matching `runGeneration`'s own genuinely unbounded history source
@@ -109,7 +101,7 @@ export async function loadFullHistory(
 
 /** The minimal per-turn context a public-API generation needs, built from the PUBLIC `Chat` DTO
  *  the route already confirmed exists (`d.chatStore.getChat`) — never from `d.db.getConversation`
- *  (see file header, point 2). Intentionally thin: the public `Chat` type has no fields for the
+ *  (see the file header, PERSISTENCE). Intentionally thin: the public `Chat` type has no fields for the
  *  UI-only concepts chat-routes.ts's internal `Conversation` carries (agentId, skillIds,
  *  expertMode, readScope, toolOverrides, agentMode, force_web_search-style toolPolicy) — public
  *  chats simply don't have them, and public runs get no per-conversation override machinery
@@ -150,41 +142,31 @@ const SAMPLING_KEYS: Record<string, string> = {
   presencePenalty: 'presence_penalty', frequencyPenalty: 'frequency_penalty',
 }
 
-/** Merges a caller-supplied sampling override UNDER this route's own control fields
- *  (release-gate I7) — `samplingOverride` is unvalidated integrator JSON (`chat.sampling`,
- *  stored verbatim; `mapSampling`'s own trailing loop copies through any key it doesn't
- *  recognize), so a tenant setting `sampling.model`/`.messages`/`.stream`/`.stream_options`
- *  must never be able to override what THIS route sends — e.g. `stream: false` would silently
- *  break the SSE read loop, and `messages: [...]` would hand the shared engine a prompt that
- *  skipped this route's own history assembly and context-window check entirely. Exported so the
- *  precedence itself is directly testable without a live engine (the loop that actually calls
- *  this does real HTTP and isn't unit-testable, per this file's header comment). */
-export function buildEngineRequestBody(
-  controlFields: Record<string, unknown>,
-  samplingOverride: Record<string, unknown>,
-): Record<string, unknown> {
-  return { ...samplingOverride, ...controlFields }
-}
-
-// Round-2 release-gate finding H2: buildEngineRequestBody's control-field precedence (I7) only
-// protects the fields the caller explicitly names as controlFields (model/messages/stream/
-// stream_options) — it does nothing for a control-plane key this trailing passthrough loop lets
-// through that the ROUTE never happens to re-set afterward. `tool_choice` is exactly that case:
-// no route ever sets it explicitly, so there is no control field for a tenant's own
+// A tenant's sampling goes UNDER the request's own fields (release-gate I7;
+// GenerationTurn.engineSampling): `chat.sampling` is unvalidated integrator JSON, stored verbatim,
+// and `mapSampling`'s own trailing loop copies through any key it doesn't recognize, so a tenant
+// setting `sampling.model`/`.messages`/`.stream`/`.stream_options` must never be able to override
+// what THIS route sends — e.g. `stream: false` would silently break the SSE read loop, and
+// `messages: [...]` would hand the shared engine a prompt that skipped this route's own history
+// assembly and context-window check entirely.
+//
+// Round-2 release-gate finding H2: that precedence (I7) only protects the fields the request
+// actually sets (model/messages/stream/stream_options) — it does nothing for a control-plane key
+// this trailing passthrough loop lets through that the ROUTE never happens to set. `tool_choice`
+// is exactly that case: no route ever sets it explicitly, so there is no control field for a tenant's own
 // `sampling.tool_choice` to lose to, and it reached the engine verbatim (live-reproduced: a
 // tenant setting `tool_choice: 'required'` can COMPEL a tool call every turn, not just hope for
 // one — those calls then execute under the LOCAL install's own tool policy, sharpening I10's
 // already-accepted risk). `tools` has the same gap specifically on vLLM/SGLang, where the route
 // deliberately withholds `reqBody.tools` (`toolsSupported` false) — a tenant's own `sampling.tools`
 // reached the engine anyway on exactly the engines the route chose to suppress it on. Denylisted
-// here, not left to buildEngineRequestBody's spread order, since spread order alone only protects
-// fields the route actually sets — this protects a field even when the route sets nothing.
+// here, not left to the request's spread order, since spread order alone only protects fields the
+// route actually sets — this protects a field even when the route sets nothing.
 const RESERVED_ENGINE_KEYS = new Set(['model', 'messages', 'stream', 'stream_options', 'tools', 'tool_choice'])
 
-/** Same camelCase → engine snake_case mapping chat-routes.ts's runGeneration applies to
- *  `conv.sampling`, applied here to the public `Chat.sampling` passthrough field. Exported so the
- *  reserved-key denylist (RESERVED_ENGINE_KEYS, above) is directly testable — same reasoning as
- *  `buildEngineRequestBody`: the loop that actually calls this does real HTTP. */
+/** The same camelCase → engine snake_case mapping the generation core applies to a chat's
+ *  `conv.sampling`, applied here to the public `Chat.sampling` passthrough field, less every
+ *  reserved key (RESERVED_ENGINE_KEYS, above). Exported so the denylist is directly testable. */
 export function mapSampling(sampling: Record<string, unknown>, repeatPenaltyKey: string): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   for (const [camel, snake] of Object.entries(SAMPLING_KEYS)) {
@@ -200,8 +182,7 @@ export function mapSampling(sampling: Record<string, unknown>, repeatPenaltyKey:
 /** Periodic mid-stream checkpoint thresholds (spec 27 §4.7, C2 fix): flush whichever comes
  *  first — roughly every ~500ms of wall-clock time since the last successful flush, or roughly
  *  every ~256 new characters of content+reasoning accumulated since the last flush. Exported so
- *  the decision itself is directly unit-testable without a live engine (see generation.test.ts;
- *  this file's own header comment explains why a full live-streaming test isn't feasible here). */
+ *  the decision itself is directly unit-testable without a live engine (see generation.test.ts). */
 export const FLUSH_INTERVAL_MS = 500
 export const FLUSH_MIN_CHARS = 256
 
@@ -221,16 +202,14 @@ export function shouldFlushCheckpoint(
   return elapsedMsSinceLastFlush >= intervalMs || charsSinceLastFlush >= minChars
 }
 
-/** Pure "is this chunk's usage worth capturing" check, mirroring chat-routes.ts's own
- *  `if (chunk.usage) finalUsage = chunk.usage as typeof finalUsage` (final-review Critical
- *  finding: that line's equivalent never existed in this file's loop at all). The engine's final
- *  per-round SSE chunk — the one `stream_options: { include_usage: true }` on the outbound
- *  request asks for — carries a real `usage` object alongside an EMPTY `choices` array, so this
- *  must be checked before/independent of the `if (!choices?.length) continue` gate below; that
- *  gate is exactly what silently discarded it before this fix. Returns the raw object unchanged
- *  — no field renaming, no derived fields — because that IS the real wire shape the engine
- *  sends, per chat-routes.ts's own identical, untransformed capture. Exported so the decision is
- *  directly unit-testable without a live engine. */
+/** Pure "is this chunk's usage worth capturing" check, applied to each usage object the loop
+ *  reports (GenerationPorts.onUsage; final-review Critical finding: this file's own loop once never
+ *  captured it at all). The engine's final per-round SSE chunk — the one
+ *  `stream_options: { include_usage: true }` on the outbound request asks for — carries a real
+ *  `usage` object alongside an EMPTY `choices` array, which the loop reports before its
+ *  `choices` gate. Returns the raw object unchanged — no field renaming, no derived fields —
+ *  because that IS the real wire shape the engine sends. Exported so the decision is directly
+ *  unit-testable without a live engine. */
 export function extractChunkUsage(chunk: Record<string, unknown>): Record<string, unknown> | undefined {
   const usage = chunk.usage
   if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return undefined
@@ -249,257 +228,131 @@ export function buildUsagePatch(usage: Record<string, unknown> | undefined): { u
   return usage !== undefined ? { usage } : {}
 }
 
+/** What a run hears of its loop. */
 interface LoopHooks {
-  onDelta: (text: string) => void
-  onReasoning: (text: string) => void
+  /** The reply so far, at each change to it; `toolCall` when a tool call has just settled. */
+  onProgress: (reply: ReplySnapshot, toolCall: boolean) => void
+  /** The reply as the loop ends: what the terminal write stores. */
+  onFinal: (reply: ReplySnapshot) => void
   onError: (message: string) => void
-  onToolCall: (tc: ToolCallRecord) => void
   onUsage: (usage: Record<string, unknown>) => void
 }
 
-/** Drives the engine for one turn, including any tool-call rounds, streaming deltas/reasoning
- *  out via `emit` as they arrive and reporting the final outcome via `hooks`. Never throws for an
- *  engine-side failure (mirrors runGeneration's own contract of "swallow, emit 'error',
- *  finish") — `hooks.onError` is the sole failure signal, so the caller decides what a failure
- *  means for the run's terminal status. Only a genuinely unexpected exception outside the
- *  fetch/stream handling would propagate. */
-async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, signal: AbortSignal, hooks: LoopHooks): Promise<void> {
+/** This machine's engine as the run's upstream: the loaded model, under its engine's alias (engineModelAlias). A
+ *  public run always generates on the local engine. Undefined when no model is loaded. */
+function localUpstream(d: Deps): ChatUpstream | undefined {
   const ms = d.manager.status()
   const target = d.manager.target()
-  if (ms.state !== 'running' || !ms.model || !target) {
+  if (ms.state !== 'running' || !ms.model || !target) return undefined
+  const engineKind = servingEngineKind(d)
+  return {
+    modelField: engineModelAlias(engineKind, d.manager.currentOpts()?.modelPath) ?? ms.model.key,
+    modelName: ms.model.name,
+    ctxMax: ms.model.ctx,
+    target,
+    engineKind,
+  }
+}
+
+/** The loop's events no public client reads: its prompt progress, and its own error and done (the run manager sends
+ *  the run's error and done frames, run-manager.ts). */
+const LOOP_ONLY_EVENTS = new Set(['progress', 'error', 'done'])
+
+/** The run's event stream, from the loop's: a note the chat would show its user goes to the log (this API has no note
+ *  event), the loop-only events stay off it, and the rest (deltas, reasoning, tool calls) goes through as it is. */
+function publicSink(emit: EmitSink): EmitSink {
+  return (ev) => {
+    if (ev.event === 'notice') {
+      console.log(`[ext] ${(ev.data as { message: string }).message}`)
+      return
+    }
+    if (LOOP_ONLY_EVENTS.has(ev.event)) return
+    return emit(ev)
+  }
+}
+
+/** The error a run the loop finished reports, if it failed. */
+function outcomeError(outcome: GenerationOutcome): string | undefined {
+  const failure = outcome.failure
+  // The engine's reason, as the chat gives it: it said only the status code.
+  if (failure?.kind === 'http') return failure.reason ? `Engine returned ${failure.status}: ${failure.reason}` : `Engine returned ${failure.status}`
+  if (failure?.kind === 'thrown') return failure.request ? `Engine request failed: ${failure.message}` : failure.message
+  if (failure) return failure.message
+  if (outcome.exceeded) return `Exceeded the ${MAX_TOOL_ITER}-round tool-call ceiling without finishing.`
+  return undefined
+}
+
+/** Drives the engine for one turn on the shared loop, including any tool-call rounds, streaming deltas/reasoning out
+ *  via `emit` as they arrive and reporting the reply and the final outcome via `hooks`. Never throws for an
+ *  engine-side failure (the loop's own contract: swallow, report, finish) — `hooks.onError` is the sole failure
+ *  signal, so the caller decides what a failure means for the run's terminal status. */
+async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, signal: AbortSignal, hooks: LoopHooks): Promise<void> {
+  const upstream = localUpstream(d)
+  if (!upstream) {
     hooks.onError('No model loaded.')
     return
   }
-  const loadedModel = ms.model
-
-  const engineKind = servingEngineKind(d)
-  // BUG-006 (chat-routes.ts): vLLM/SGLang/mlx-vlm require the OpenAI-spec `repetition_penalty`
+  // BUG-006 (generation-core.ts): vLLM/SGLang/mlx-vlm require the OpenAI-spec `repetition_penalty`
   // name, not llama.cpp's `repeat_penalty`. Same mapping, same reason; LiteRT-LM keeps llama.cpp's
-  // name, whose window the Android app's server applies as llama.cpp does (chat-routes.ts).
+  // name, whose window the Android app's server applies as llama.cpp does.
+  const engineKind = upstream.engineKind
   const repeatPenaltyKey = (engineKind === 'vllm' || engineKind === 'sglang' || engineKind === 'mlx-vlm') ? 'repetition_penalty' : 'repeat_penalty'
   const sampling = ctx.chat.sampling ?? {}
-  const samplingOverride = mapSampling(sampling, repeatPenaltyKey)
-  const stopStrings = Array.isArray(sampling.stop) ? sampling.stop as string[] : undefined
-  const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
 
-  // vLLM is strict about a `tools` array defaulting tool_choice to "auto" unless launched with
-  // --enable-auto-tool-choice (chat-routes.ts's own BUG note) — same engine-kind gate here.
-  // A LiteRT-LM model gets them when it calls tools and they fit, as in chat (litertLmToolsFor); they
-  // were withheld from every LiteRT-LM model. What it is not sent is logged: this API has no note event.
-  const toolDefs = d.tools ? await d.tools.buildToolDefinitions() : []
-  // The in-app SDK engine refuses a request's tools (ADR-447 point 7); an extension run there goes without them.
-  const toolsSupported = engineKind !== 'vllm' && engineKind !== 'sglang' && !engineWithholdsTools(engineKind) && toolDefs.length > 0
-  const litertModel = engineKind === 'litert-lm' ? d.scanner?.get?.(loadedModel.key) : undefined
-  let toolsNoted = false
-
-  const messages: WireMessage[] = ctx.engineMessages.map((m) => ({
-    role: m.role, content: m.content, ...(m.reasoning_content ? { reasoning_content: m.reasoning_content } : {}),
-  }))
-
-  let iter = 0
-  let finishedCleanly = false
-  while (iter < MAX_TOOL_ITER) {
-    iter++
-    if (signal.aborted) return
-
-    const reqBody: Record<string, unknown> = buildEngineRequestBody(
-      {
-        model: engineModelAlias(engineKind, d.manager.currentOpts()?.modelPath) ?? loadedModel.key,
-        messages, stream: true, stream_options: { include_usage: true },
+  // The loop stops on its own controller, as a routine's run does (chat-runner.ts); the run's signal fires it.
+  const ac = new AbortController()
+  const abort = () => ac.abort()
+  if (signal.aborted) abort()
+  else signal.addEventListener('abort', abort, { once: true })
+  try {
+    const outcome = await runGenerationCore(d, {
+      convId: ctx.chat.id,
+      // Public chats have no skills, agent tool list, persona tool policy or thinking toggle (spec 27 §5.1).
+      conv: { id: ctx.chat.id, sampling: {} },
+      engineMessages: ctx.engineMessages,
+      upstream,
+      ac,
+      thinkingBudget: -1,
+      reasoningEffort: undefined,
+      engineSampling: { fields: mapSampling(sampling, repeatPenaltyKey), stop: Array.isArray(sampling.stop) ? sampling.stop as string[] : undefined },
+      loop: PUBLIC_LOOP,
+    }, {
+      persistence: {
+        progressCadence: 'everyChange',
+        saveProgress: (reply, change) => hooks.onProgress(reply, change === 'toolCall'),
+        restoreUnproduced: () => false,
+        // The terminal write is the run's own, after the gate is released (createMakeBody): never under it.
+        finalize: (reply) => { hooks.onFinal(reply) },
       },
-      samplingOverride,
-    )
-    if (stopStrings?.length) reqBody.stop = stopStrings
-    const cappedMax = clampMaxTokens(reqBody.max_tokens as number | undefined, maxLimit)
-    if (cappedMax != null) reqBody.max_tokens = cappedMax
-    else delete reqBody.max_tokens
-    shapeForEngine(engineKind, reqBody)
-    const samplingNote = engineKind === 'litert-lm' && iter === 1 ? litertLmSamplingNote(reqBody) : undefined
-    if (samplingNote) console.log(`[ext] ${samplingNote}`)
-    const ignoredNote = engineKind === 'litert-lm' && iter === 1 ? litertLmIgnoredFieldsNote(reqBody) : undefined
-    if (ignoredNote) console.log(`[ext] ${ignoredNote}`)
-    if (toolsSupported && engineKind === 'litert-lm') {
-      const pick = litertLmToolsFor(litertModel, toolDefs, messages, loadedModel.ctx)
-      if (pick.tools.length) reqBody.tools = pick.tools
-      if (pick.note && !toolsNoted) { toolsNoted = true; console.log(`[ext] ${pick.note}`) }
-    } else if (toolsSupported) reqBody.tools = toolDefs
-
-    let res: Response
-    try {
-      res = await fetch(`${target}/v1/chat/completions`, {
-        method: 'POST',
-        headers: engineRequestHeaders(engineKind, new Headers({ 'Content-Type': 'application/json' })),
-        body: JSON.stringify(reqBody),
-        signal,
-        duplex: 'half',
-      })
-    } catch (e) {
-      if (signal.aborted) return
-      hooks.onError(`Engine request failed: ${(e as Error).message}`)
-      return
-    }
-    if (!res.ok || !res.body) {
-      // The engine's reason, as the chat gives it: it said only the status code.
-      const reason = res.ok ? '' : await engineErrorReason(res)
-      hooks.onError(reason ? `Engine returned ${res.status}: ${engineErrorText(d, engineKind, reason)}` : `Engine returned ${res.status}`)
-      return
-    }
-
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder()
-    let buf = ''
-    let roundContent = ''
-    let finishReason = ''
-    const pendingToolCalls = new Map<number, { id: string; name: string; argsBuffer: string }>()
-    // Per-round parse state (reset each round, matching chat-routes.ts's own convention) for
-    // stripping inline reasoning markup — `<think>...</think>` and the gpt-oss
-    // `<|channel|>analysis...<|end|>` format — out of plain `content` and re-routing it into
-    // `reasoning`. Models/engines that emit reasoning via the dedicated `reasoning_content`/
-    // `reasoning` delta field (handled separately below) never touch this; this only matters
-    // for engines that inline reasoning into `content` instead.
-    let parseState: ParseState = initParseState()
-
-    const cancelReader = () => void reader.cancel()
-    if (signal.aborted) cancelReader()
-    else signal.addEventListener('abort', cancelReader, { once: true })
-
-    try {
-      readLoop: while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buf += decoder.decode(value, { stream: true })
-        const lines = buf.split('\n')
-        buf = lines.pop() ?? ''
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          const raw = line.slice(6).trim()
-          if (raw === '[DONE]') break readLoop
-
-          let chunk: Record<string, unknown>
-          try { chunk = JSON.parse(raw) as Record<string, unknown> } catch { continue }
-
-          // Must run BEFORE the `choices?.length` gate below — see extractChunkUsage's own
-          // comment for why the usage chunk would otherwise be silently discarded there.
-          const usage = extractChunkUsage(chunk)
-          if (usage) hooks.onUsage(usage)
-
-          const choices = chunk.choices as Array<{
-            delta?: { content?: string; reasoning_content?: string; reasoning?: string; tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> }
-            finish_reason?: string
-          }> | undefined
-          if (!choices?.length) continue
-
-          if (choices[0].finish_reason) finishReason = choices[0].finish_reason
-          const delta = choices[0].delta ?? {}
-
-          if (delta.tool_calls?.length) {
-            for (const tc of delta.tool_calls) {
-              if (!pendingToolCalls.has(tc.index)) pendingToolCalls.set(tc.index, { id: '', name: '', argsBuffer: '' })
-              const entry = pendingToolCalls.get(tc.index)!
-              if (tc.id && !entry.id) entry.id = tc.id
-              if (tc.function?.name && !entry.name) entry.name = tc.function.name
-              if (tc.function?.arguments) entry.argsBuffer += tc.function.arguments
-            }
-            continue
-          }
-
-          const rc = delta.reasoning_content ?? delta.reasoning
-          if (rc) {
-            hooks.onReasoning(rc)
-            await emit({ event: 'reasoning', data: { delta: rc } })
-            continue
-          }
-
-          const rawContent = delta.content ?? ''
-          if (rawContent) {
-            const { state: nextState, events: parseEvents } = feedChunk(parseState, rawContent)
-            parseState = nextState
-            for (const ev of parseEvents) {
-              if (ev.type === 'reasoning') {
-                hooks.onReasoning(ev.text)
-                await emit({ event: 'reasoning', data: { delta: ev.text } })
-              } else {
-                roundContent += ev.text
-                hooks.onDelta(ev.text)
-                await emit({ event: 'delta', data: { delta: ev.text } })
-              }
-            }
-          }
-        }
-      }
-    } finally {
-      signal.removeEventListener('abort', cancelReader)
-    }
-
-    // Flush any remaining lookahead buffer at end-of-stream (e.g. a partial `<think>` tag
-    // that never got a chance to resolve because the round ended mid-buffer) — mirrors
-    // chat-routes.ts's identical end-of-round flush.
-    for (const ev of flushState(parseState)) {
-      if (ev.type === 'reasoning') {
-        hooks.onReasoning(ev.text)
-        await emit({ event: 'reasoning', data: { delta: ev.text } })
-      } else {
-        roundContent += ev.text
-        hooks.onDelta(ev.text)
-        await emit({ event: 'delta', data: { delta: ev.text } })
-      }
-    }
-
-    if (signal.aborted) return
-
-    if ((finishReason === 'tool_calls' || pendingToolCalls.size > 0) && d.tools) {
-      const calls = [...pendingToolCalls.values()]
-      messages.push({
-        role: 'assistant',
-        content: roundContent || null,
-        tool_calls: calls.map((tc) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.argsBuffer } })),
-      })
-
-      for (const tc of calls) {
-        let args: Record<string, unknown>
-        try { args = JSON.parse(tc.argsBuffer || '{}') as Record<string, unknown> } catch { args = {} }
-
-        // Public runs execute allow-policy tools only (spec 27 §5.1). `interactive: false` +
-        // an empty `agentAllowedTools` means an 'ask'-policy tool (the default for anything not
-        // explicitly configured — tool-policy.ts) resolves as an instant "Blocked" deny inside
-        // executeToolCallWithApproval, never a wait on `waitForToolApproval` — there is no
-        // interactive approval endpoint an external caller could ever reach.
-        const approved = await executeToolCallWithApproval({
-          tools: d.tools,
-          sink: emit,
-          convId: ctx.chat.id,
-          id: tc.id,
-          name: tc.name,
-          args,
-          globalPolicies: d.store.snapshot().tools.toolPolicies ?? {},
-          convOverrides: {}, // public chats carry no per-conversation override machinery (§5.1)
-          autoAllowAll: d.store.snapshot().tools.autoAllowAll ?? false,
-          signal,
-          interactive: false,
-          agentAllowedTools: [],
-          isCodeAuthorized: false, // no HTTP request to authorize against here (§5.1) — fail closed
-          // A tenant's run may not author, edit or fire a chat routine on an agent that lists one of
-          // the owner's MCP tools, nor create such an agent, as a routine's own unattended run may
-          // not (chat-runner.ts): the routine then runs that MCP tool with no approval. Without it a
-          // tenant whose install had update_routine and run_routine_now on Allow rewrote the
-          // prompt of the owner's MCP routine and fired it, running an MCP tool left on Ask (which
-          // the tenant could not call itself) on the tenant's prompt, then on every later fire.
-          // MCP tools themselves still run under their own policy.
-          refuseMcpAgentsAndRoutines: true,
-        })
-        hooks.onToolCall({ id: tc.id, name: tc.name, args, result: approved.error ? undefined : approved.result, error: approved.error })
-        messages.push({ role: 'tool', content: approved.result, tool_call_id: tc.id })
-      }
-      continue
-    }
-
-    finishedCleanly = true
-    break
-  }
-
-  if (!finishedCleanly && !signal.aborted) {
-    hooks.onError(`Exceeded the ${MAX_TOOL_ITER}-round tool-call ceiling without finishing.`)
+      sink: publicSink(emit),
+      // Public runs execute allow-policy tools only (spec 27 §5.1). `interactive: false` +
+      // an empty `agentAllowedTools` means an 'ask'-policy tool (the default for anything not
+      // explicitly configured — tool-policy.ts) resolves as an instant "Blocked" deny inside
+      // executeToolCallWithApproval, never a wait on `waitForToolApproval` — there is no
+      // interactive approval endpoint an external caller could ever reach.
+      approval: {
+        interactive: false,
+        agentAllowedTools: [],
+        isCodeAuthorized: false, // no HTTP request to authorize against here (§5.1) — fail closed
+        // A tenant's run may not author, edit or fire a chat routine on an agent that lists one of
+        // the owner's MCP tools, nor create such an agent, as a routine's own unattended run may
+        // not (chat-runner.ts): the routine then runs that MCP tool with no approval. Without it a
+        // tenant whose install had update_routine and run_routine_now on Allow rewrote the
+        // prompt of the owner's MCP routine and fired it, running an MCP tool left on Ask (which
+        // the tenant could not call itself) on the tenant's prompt, then on every later fire.
+        // MCP tools themselves still run under their own policy.
+        refuseMcpAgentsAndRoutines: true,
+        convOverrides: () => ({}), // public chats carry no per-conversation override machinery (§5.1)
+      },
+      onUsage: (usage) => {
+        const captured = extractChunkUsage({ usage })
+        if (captured) hooks.onUsage(captured)
+      },
+    })
+    const error = outcomeError(outcome)
+    if (error) hooks.onError(error)
+  } finally {
+    signal.removeEventListener('abort', abort)
   }
 }
 
@@ -515,9 +368,8 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
  *  at status:'streaming' forever. */
 export function createMakeBody(d: Deps): RunDeps['makeBody'] {
   return ({ chatId, messageId, scope }) => async ({ emit, signal }) => {
-    let finalContent = ''
-    let finalReasoning = ''
-    const toolCalls: ToolCallRecord[] = []
+    /** The reply as the loop last reported it (LoopHooks): what every checkpoint and the terminal write store. */
+    let reply: ReplySnapshot = { content: '', reasoning: '', toolCalls: [] }
     // undefined (not {}) until the engine's usage chunk actually arrives — see
     // buildUsagePatch's doc comment for why that distinction is load-bearing, not cosmetic.
     let finalUsage: Record<string, unknown> | undefined
@@ -530,12 +382,12 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
     // §6.4's guarantee ("nothing generated is lost — only resumability"). This is additive: the
     // existing terminal `updateMessage` write below still runs on every exit path unchanged.
     //
-    // Event-driven rather than a literal `setInterval`: content only ever changes inside the
-    // onDelta/onReasoning/onToolCall hooks below, so checking at those call sites (using a real
+    // Event-driven rather than a literal `setInterval`: content only ever changes where the loop
+    // reports it (onProgress below: progressCadence 'everyChange'), so checking there (using a real
     // `Date.now()` elapsed-time comparison, not a token/event count) is exactly as timely as a
     // background timer would be — and there is no timer handle to leak or clean up on any exit
-    // path (normal completion, an engine error, or an aborted signal all just stop calling the
-    // hooks, so the checks simply stop happening; nothing to clearInterval). The extracted
+    // path (normal completion, an engine error, or an aborted signal all just stop the reports,
+    // so the checks simply stop happening; nothing to clearInterval). The extracted
     // decision (`shouldFlushCheckpoint`) is directly unit-tested in generation.test.ts.
     //
     // Flushes are fire-and-forget from the hot loop (never awaited inline) so a slow adapter
@@ -560,18 +412,18 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
 
     const maybeFlush = (force = false) => {
       if (flushInFlight) return // a flush is already in progress; the next check picks up anything newer
-      const charsSinceLastFlush = finalContent.length + finalReasoning.length - lastFlushChars
-      const toolCallsSinceLastFlush = toolCalls.length - lastFlushToolCalls
+      const charsSinceLastFlush = reply.content.length + reply.reasoning.length - lastFlushChars
+      const toolCallsSinceLastFlush = reply.toolCalls.length - lastFlushToolCalls
       if (charsSinceLastFlush <= 0 && toolCallsSinceLastFlush <= 0) return // nothing new to persist
       if (!force && !shouldFlushCheckpoint(Date.now() - lastFlushAt, charsSinceLastFlush)) return
 
       lastFlushAt = Date.now()
-      lastFlushChars = finalContent.length + finalReasoning.length
-      lastFlushToolCalls = toolCalls.length
+      lastFlushChars = reply.content.length + reply.reasoning.length
+      lastFlushToolCalls = reply.toolCalls.length
       flushInFlight = d.chatStore.updateMessage(scope, messageId, {
-        content: finalContent,
-        reasoning: finalReasoning,
-        toolCalls,
+        content: reply.content,
+        reasoning: reply.reasoning,
+        toolCalls: reply.toolCalls,
         status: 'streaming',
         ...buildUsagePatch(finalUsage),
       }).then(
@@ -601,10 +453,9 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
       d.manager.generationStart()
       try {
         await runGenerationLoop(d, ctx, emit, signal, {
-          onDelta: (t) => { finalContent += t; maybeFlush() },
-          onReasoning: (t) => { finalReasoning += t; maybeFlush() },
+          onProgress: (r, toolCall) => { reply = r; maybeFlush(toolCall) },
+          onFinal: (r) => { reply = r },
           onError: (m) => { errorMessage = m },
-          onToolCall: (tc) => { toolCalls.push(tc); maybeFlush(true) },
           onUsage: (u) => { finalUsage = u },
         })
       } finally {
@@ -634,9 +485,9 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
     const aborted = signal.aborted
     const status = aborted ? 'aborted' as const : errorMessage ? 'failed' as const : 'complete' as const
     await d.chatStore.updateMessage(scope, messageId, {
-      content: finalContent,
-      reasoning: finalReasoning,
-      toolCalls,
+      content: reply.content,
+      reasoning: reply.reasoning,
+      toolCalls: reply.toolCalls,
       status,
       ...buildUsagePatch(finalUsage),
     }).catch(() => {

@@ -939,3 +939,23 @@ test('an existingRun is used for the session token identity too', async () => {
   }))
   assert.equal(resolved, run.id)
 })
+
+// Review L1: the router's retryable busy / auto-tune refusals stopped nothing; a routine skips them as a busy engine
+// (model_busy) instead of logging a failed load and restoring a model that never stopped.
+for (const reason of ['busy', 'autotune'] as const) {
+  test(`a swap the router refuses as ${reason} skips as model_busy, never spawns, restores nothing`, async () => {
+    const store = freshStore()
+    const routine = codeRoutine(store)
+    const loadCalls: string[] = []
+    await runCliCodeRoutine(routine, baseDeps({
+      store,
+      getLoadedModelKey: () => 'some-other-model',
+      loadExplicit: async (k) => { loadCalls.push(k); return { status: 503, message: 'refused', reason } },
+      runProcess: neverSpawns(),
+    }))
+    const runs = store.listRoutineRuns(routine.id)
+    assert.equal(runs[0].status, 'skipped')
+    assert.equal(runs[0].skipReason, 'model_busy')
+    assert.deepEqual(loadCalls, ['pinned-model'])
+  })
+}

@@ -25,8 +25,12 @@ export interface SysInfoGpu { name: string; vramMb: number }
 export interface SysInfo { gpus: SysInfoGpu[]; ramMB: number; cpu: string; os: string; cores: number }
 export function fetchSysInfo(): Promise<SysInfo> { return req<SysInfo>('/api/v1/sysinfo') }
 
-export function listConversations(q?: string): Promise<{ conversations: Conversation[] }> {
-  return req(`/api/v1/conversations${q ? `?q=${encodeURIComponent(q)}` : ''}`)
+/** One page of conversations, newest first. `nextCursor` is what to pass back as `cursor` for the next page,
+ *  null on the last one. A search (`q`) is never paged — the daemon answers it in full — so no cursor is sent. */
+export interface ConversationPage { conversations: Conversation[]; nextCursor: string | null }
+export function listConversations(q?: string, cursor?: string | null): Promise<ConversationPage> {
+  if (q) return req(`/api/v1/conversations?q=${encodeURIComponent(q)}`)
+  return req(`/api/v1/conversations${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`)
 }
 
 export function createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy' | 'skillIds' | 'allowedTools' | 'sampling' | 'preserveThinking'>>): Promise<Conversation> {
@@ -99,8 +103,10 @@ export function undoCompaction(id: string): Promise<Conversation> {
 
 // ── Auto-memory (Release 3) ─────────────────────────────────────────────────────
 
-export function listMemoryFacts(): Promise<{ facts: MemoryFact[] }> {
-  return req('/api/v1/memory')
+export interface MemoryFactPage { facts: MemoryFact[]; nextCursor: string | null }
+/** One page of saved facts, newest first (the daemon's page is 200); pass the previous page's `nextCursor`. */
+export function listMemoryFacts(cursor?: string | null): Promise<MemoryFactPage> {
+  return req(`/api/v1/memory${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`)
 }
 
 export function deleteMemoryFact(id: string): Promise<{ ok: true }> {

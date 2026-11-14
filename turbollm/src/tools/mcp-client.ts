@@ -1,7 +1,7 @@
 // MCP host/client. Implements stdio (subprocess JSON-RPC) and Streamable HTTP
 // (MCP 2025-03-26) transports. All modern hosted MCPs use Streamable HTTP.
 import type { ChildProcess } from 'node:child_process'
-import { spawnTethered } from '../util/tether'
+import { killTetheredTree, spawnTethered } from '../util/tether'
 
 // ── MCP protocol types ────────────────────────────────────────────────────
 
@@ -223,7 +223,8 @@ export class StdioMcpClient implements IMcpClient {
       p.resolve({ jsonrpc: '2.0', id: -1, error: { code: -1, message: 'MCP server disconnected' } })
     }
     this.pending.clear()
-    try { this.proc?.kill() } catch { /* ignore */ }
+    // The tree, not the pid: on Windows the pid is cmd.exe's, and killing it alone left the server under it running.
+    try { if (this.proc) killTetheredTree(this.proc, 'SIGTERM') } catch { /* ignore */ }
     this.proc = null
     this.initialized = false
   }
@@ -243,6 +244,8 @@ export class SseMcpClient implements IMcpClient {
   private msgId = 0
   private sessionId: string | null = null
   private initialized = false
+  private handshake: Promise<void> | null = null
+  private generation = 0
 
   constructor(opts: { id: string; name: string; url: string; headers?: Record<string, string> }) {
     this.serverId = opts.id
@@ -251,8 +254,25 @@ export class SseMcpClient implements IMcpClient {
     this.headers = opts.headers ?? {}
   }
 
-  async connect(): Promise<void> {
-    if (this.initialized) return
+  connect(): Promise<void> {
+    if (this.initialized) return Promise.resolve()
+    if (this.handshake) return this.handshake
+    const generation = this.generation
+    const handshake = this.start().catch((error) => {
+      if (this.generation === generation) {
+        this.sessionId = null
+        this.initialized = false
+      }
+      throw error
+    }).finally(() => {
+      if (this.handshake === handshake) this.handshake = null
+    })
+    this.handshake = handshake
+    return handshake
+  }
+
+  private async start(): Promise<void> {
+    const generation = this.generation
     // protocolVersion is the MCP message-protocol version (distinct from the Streamable HTTP
     // transport). 2024-11-05 is the broadest version every hosted server accepts; servers that
     // prefer a newer one negotiate down, so this stays maximally compatible.
@@ -261,11 +281,15 @@ export class SseMcpClient implements IMcpClient {
       capabilities: { tools: {} },
       clientInfo: { name: 'turbollm', version: '0.7.0' },
     })
-    void this.postNotification({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })
+    if (this.generation !== generation) throw new Error('MCP server disconnected')
+    await this.postNotification({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })
+    if (this.generation !== generation) throw new Error('MCP server disconnected')
     this.initialized = true
   }
 
   disconnect(): void {
+    this.generation++
+    this.handshake = null
     this.sessionId = null
     this.initialized = false
   }
@@ -287,6 +311,7 @@ export class SseMcpClient implements IMcpClient {
   }
 
   private async sendRequest(method: string, params: unknown, retried = false): Promise<unknown> {
+    const generation = this.generation
     const id = ++this.msgId
     const req: JsonRpcRequest = { jsonrpc: '2.0', id, method, params }
     const reqHeaders: Record<string, string> = {
@@ -303,6 +328,11 @@ export class SseMcpClient implements IMcpClient {
       body: JSON.stringify(req),
       signal: AbortSignal.timeout(30_000),
     })
+
+    if (this.generation !== generation) {
+      await resp.body?.cancel().catch(() => {})
+      throw new Error('MCP server disconnected')
+    }
 
     // MCP 2025-03-26: a 404 to a request carrying a session id means the server ended that session
     // (restart, idle expiry) and the client MUST start a new one. Once per request, so a server
@@ -369,12 +399,27 @@ export class SseMcpClient implements IMcpClient {
   }
 
   private async postNotification(msg: JsonRpcNotification): Promise<void> {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json', ...this.headers }
+    // The streamable-HTTP spec requires this Accept header on EVERY POST, notifications
+    // included (2025-06-18 transports, "Sending Messages to the Server": item 2 sets the
+    // header, item 3 allows the body to be a notification). Servers built on the official
+    // MCP SDK reject a POST without it with 406 before parsing the body.
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream',
+      ...this.headers,
+    }
     if (this.sessionId) headers['Mcp-Session-Id'] = this.sessionId
-    await fetch(this.baseUrl, {
+    const resp = await fetch(this.baseUrl, {
       method: 'POST', headers, body: JSON.stringify(msg),
       signal: AbortSignal.timeout(10_000),
-    }).catch(() => {})
+    })
+    if (!resp.ok) {
+      // Include the body's first bytes (like sendRequest) so a rejected notification says
+      // WHY — a bare status made SDK servers' 406s read as silent handshake failures.
+      const txt = await resp.text().catch(() => '')
+      throw new Error(`MCP HTTP ${resp.status}: ${txt.slice(0, 200)}`)
+    }
+    await resp.body?.cancel().catch(() => {})
   }
 }
 

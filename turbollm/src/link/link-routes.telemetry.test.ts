@@ -45,7 +45,7 @@ function mkTelemetry(): { telemetry: Emitter; dir: string } {
   const cfg = { telemetry: { level: 'anon', machineId: '44444444-4444-4444-4444-444444444444' } }
   const telemetry = new Emitter({
     dataDir: dir,
-    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } as never,
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } as never,
     version: '1.11.2',
     os: 'win32/x64',
   })
@@ -71,7 +71,7 @@ function hostDeps(keys: ApiKey[], telemetry?: Emitter): Deps {
   }
   return {
     version: '1.11.2',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     db: { recordApiUsage: () => {} },
     registry: { active: () => ({ kind: 'llama.cpp' }) },
@@ -186,7 +186,7 @@ function peerDeps(telemetry: Emitter): Deps {
   return {
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     modelRouter: { targetEntry: () => undefined, route: async () => ({ target: remote.baseUrl, remote }) },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     manager: {
       status: () => ({ state: 'stopped', model: null }),
       target: () => null, currentOpts: () => null,

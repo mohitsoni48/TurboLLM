@@ -18,6 +18,7 @@ import {
 import { parseGitRepo } from './github-repo'
 import type { ReleaseProvenance } from './release-install'
 import { compareBuildTags, parseBuildTag } from './version-compare'
+import { API_TIMEOUT_MS, withTimeout } from '../util/fetch-timeout'
 
 export type AssetOs = 'windows' | 'linux' | 'macos' | 'android'
 export type AssetBackend = 'cuda' | 'rocm' | 'sycl' | 'vulkan' | 'metal' | 'cpu' | 'opencl' | 'other'
@@ -533,7 +534,7 @@ async function getGithubJson<T>(
   signal: AbortSignal | undefined,
   fetchImpl: typeof fetch,
 ): Promise<T | null> {
-  const res = await fetchImpl(`https://api.github.com/repos/${repo}/${path}`, { headers: githubHeaders(), signal })
+  const res = await fetchImpl(`https://api.github.com/repos/${repo}/${path}`, { headers: githubHeaders(), signal: withTimeout(signal, API_TIMEOUT_MS) })
   if (isRateLimited(res)) throw new GithubRateLimitError(repo)
   if (res.status === 404) return null
   if (!res.ok) throw new Error(`could not query ${repo} ${path}: HTTP ${res.status}`)

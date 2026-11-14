@@ -10,7 +10,7 @@ import { mountExtApi } from './mount.js'
 
 test('the api is not mounted when the flag is off', async () => {
   const app = new Hono()
-  mountExtApi(app, { store: { snapshot: () => ({ api: { ext: { enabled: false } }, apiKeys: [] }) } } as never, null as never, null as never)
+  mountExtApi(app, { store: { snapshot: () => ({ api: { ext: { enabled: false } }, apiKeys: [] }), read: () => ({ api: { ext: { enabled: false } }, apiKeys: [] }) } } as never, null as never, null as never)
   const res = await app.request('/api/ext/v1/capabilities')
   assert.equal(res.status, 404, 'a disabled feature must not answer at all')
 })

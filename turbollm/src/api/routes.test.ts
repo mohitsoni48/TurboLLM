@@ -13,6 +13,7 @@ import type { Deps } from '../deps'
 import type { ModelEntry } from '../models/scanner'
 import type { JevInfo } from '../models/jev'
 import { tmpDir } from '../test-support/tmp'
+import { chatRegistries } from '../test-support/chat-registries'
 
 const OPENJEV: JevInfo = {
   labels: ['contradiction', 'entailment', 'neutral'],
@@ -55,7 +56,7 @@ function appWithActiveEngine(engineKind: string | null, models: ModelEntry[], re
   }
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '/tmp/unused' },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '/tmp/unused' },
     scanner: { list: () => ({ models, scanning: false, lastScanAt: '' }) },
     manager: { status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }) },
     modelRouter: { loadedModelKeys: () => new Set<string>() },
@@ -147,7 +148,7 @@ test('GET /models takes the config snapshot and registry lookups once per reques
       entry({ key: `m${i}|Q4_K_M|1`, ...(i % 3 === 1 ? { laya: true } : i % 3 === 2 ? { format: 'litertlm' } : {}) } as Partial<ModelEntry>))
     const d = {
       version: 'test',
-      store: { snapshot: () => (calls.snapshot++, cfg), dir: () => '/tmp/unused' },
+      store: { snapshot: () => (calls.snapshot++, cfg), read: () => (calls.snapshot++, cfg), dir: () => '/tmp/unused' },
       scanner: { list: () => ({ models, scanning: false, lastScanAt: '' }) },
       manager: { status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }) },
       modelRouter: { loadedModelKeys: () => new Set<string>() },
@@ -183,7 +184,7 @@ function appWithPrimary(primaryKey: string | null) {
   const library = new Map([JEV_MODEL, GGUF_MODEL].map((m) => [m.key, m]))
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '/tmp/unused' },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '/tmp/unused' },
     manager: {
       status: () => ({ state: primaryKey ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }),
       launchCommand: () => undefined,
@@ -248,12 +249,13 @@ test('GET /api/v1/status reports a loaded Jev model as the vLLM text classifier'
 // can never fall behind the SPA fallback (ADR-421).
 test('registerApi registers GET /api/v1/activity', async () => {
   const d = {
-    store: { snapshot: () => ({ apiKeys: [] }) },
+    store: { snapshot: () => ({ apiKeys: [] }), read: () => ({ apiKeys: [] }) },
     manager: { status: () => ({ state: 'stopped' }), sessionStats: () => ({ activeRequests: 0 }) },
     db: { getConversation: () => null, getAgentRun: () => null, getRoutine: () => null },
     downloads: { list: () => [] },
     modelRouter: { aliveSlots: () => [], poolModelCount: () => 0 },
     scanner: { get: () => undefined },
+    ...chatRegistries(),
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
@@ -270,7 +272,7 @@ test('registerApi registers GET /api/v1/activity', async () => {
 // ADR-444: Discover's "Text classification" category is `?category=text-classification` on the same search route.
 function appWithHfSearch(hf: Record<string, unknown>, registry: Record<string, unknown> = {}) {
   const d = {
-    store: { snapshot: () => ({}) },
+    store: { snapshot: () => ({}), read: () => ({}) },
     hf,
     registry: { active: () => ({ kind: 'llama-server' }), ...registry },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
@@ -338,7 +340,7 @@ test('GET /api/v1/hf/search ignores an unknown category and searches as before',
 // overlay.
 function appWithRepoDetail(detail: unknown, provenance: unknown[], models: ModelEntry[]) {
   const d = {
-    store: { snapshot: () => ({}) },
+    store: { snapshot: () => ({}), read: () => ({}) },
     hf: { getRepo: async () => detail },
     downloads: { provenance: () => provenance },
     scanner: { list: () => ({ models, scanning: false, lastScanAt: '' }) },
@@ -488,7 +490,7 @@ test('provenance fallback: unconditional by name, full-path rows resolve by sha2
 test('POST /api/v1/bench answers 409 comfyui_busy when the ComfyUI pre-load hook refuses', async () => {
   let started = false
   const d = {
-    store: { snapshot: () => ({}) },
+    store: { snapshot: () => ({}), read: () => ({}) },
     comfy: {
       isBlocked: () => false,
       freeComfyUIBeforeLoad: async () => { throw new Error('ComfyUI is rendering — model loading is paused until its queue finishes.') },
@@ -566,13 +568,13 @@ test('POST /api/v1/comfyui/release answers once loads are unblocked, before the 
   }
   // The model's engine is the selected one: release() reloads a model only on the selected engine.
   const comfyStore = {
-    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn', url: '', reverseGate: false, cachePersist: false }, activeEngineId: 'e' }),
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn', url: '', reverseGate: false, cachePersist: false }, activeEngineId: 'e' }), read: () => ({ comfyui: { enabled: true, gatePath: '/cn', url: '', reverseGate: false, cachePersist: false }, activeEngineId: 'e' }),
     dir: () => '/tmp',
   }
   const comfy = new ComfyGuard(comfyStore as never, manager as never)
   await comfy.acquire()
   const app = new Hono()
-  registerApi(app, { store: { snapshot: () => ({}) }, comfy } as unknown as Deps)
+  registerApi(app, { store: { snapshot: () => ({}), read: () => ({}) }, comfy } as unknown as Deps)
 
   let timer: ReturnType<typeof setTimeout> | undefined
   const res = await Promise.race([
@@ -612,7 +614,7 @@ for (const [label, bind, requestUrl, base] of [
     }
     const app = new Hono()
     registerApi(app, {
-      store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) },
+      store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) },
       ...bind,
     } as unknown as Deps)
 

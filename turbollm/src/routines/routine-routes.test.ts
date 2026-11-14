@@ -11,6 +11,7 @@ import type { Deps } from '../deps'
 import type { Manager } from '../engines/manager'
 import type { ModelRouter } from '../gateway/model-router'
 import type { GenerationGate } from '../agents/gate'
+import { chatRegistries } from '../test-support/chat-registries'
 
 const JEV_KEY = 'jev-fake-v2'
 const LAYA_KEY = 'laya|laya|1455'
@@ -44,9 +45,13 @@ function testApp(opts: { lanBind?: boolean; hasKey?: boolean; routinesEnabled?: 
   // experimental gate itself, keeps working unchanged — the gate's own off-by-default behavior is
   // covered by a dedicated test that passes `routinesEnabled: false` explicitly.
   const d = {
+    ...chatRegistries(),
     db,
     store: {
       snapshot: () => ({
+        daemon: { lanBind: opts.lanBind ?? false, requireApiKey: false, experimental: { routines: opts.routinesEnabled ?? true } },
+        apiKeys,
+      }), read: () => ({
         daemon: { lanBind: opts.lanBind ?? false, requireApiKey: false, experimental: { routines: opts.routinesEnabled ?? true } },
         apiKeys,
       }),
@@ -464,7 +469,7 @@ test('POST /api/v1/routines/:id/run-now fires immediately via the shared schedul
   const fired: string[] = []
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async (r) => { fired.push(r.id); return 'ok' } })
   const app2 = new Hono()
-  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }), read: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
 
   const res = await app2.request(`/api/v1/routines/${created.id}/run-now`, { method: 'POST' })
   assert.equal(res.status, 202)
@@ -477,7 +482,7 @@ test('POST /api/v1/routines/:id/run-now on a pending_confirmation routine return
   const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async () => 'ok' })
   const app2 = new Hono()
-  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }), read: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
   const res = await app2.request(`/api/v1/routines/${created.id}/run-now`, { method: 'POST' })
   assert.equal(res.status, 409)
 })
@@ -492,7 +497,7 @@ test('POST /api/v1/routines/:id/run-now refuses to trigger an already-armed rout
   const fired: string[] = []
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async (r) => { fired.push(r.id); return 'ok' } })
   const app2 = new Hono()
-  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: false } } }) } } as unknown as Deps)
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: false } } }), read: () => ({ daemon: { experimental: { routines: false } } }) } } as unknown as Deps)
   const res = await app2.request(`/api/v1/routines/${created.id}/run-now`, { method: 'POST' })
   assert.equal(res.status, 403)
   const problem = (await res.json()) as { error: { code: string } }
@@ -513,7 +518,7 @@ test('POST /api/v1/routines/:id/run-now on an unknown routine returns 404', asyn
   const { db } = testApp()
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async () => 'ok' })
   const app2 = new Hono()
-  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }), read: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
   const res = await app2.request('/api/v1/routines/missing/run-now', { method: 'POST' })
   assert.equal(res.status, 404)
 })
@@ -567,7 +572,7 @@ test('approve releases the scheduler-parked routine once resumeRoutineRun settle
     store: db, now: () => new Date(),
     runRoutine: async (r) => { fired.push(r.id); return 'needs_approval' },
   })
-  registerRoutineRoutes(app, { db, routineScheduler: scheduler, store: { snapshot: () => ({ customAgents: [] }) } } as unknown as Deps)
+  registerRoutineRoutes(app, { db, routineScheduler: scheduler, store: { snapshot: () => ({ customAgents: [] }), read: () => ({ customAgents: [] }) } } as unknown as Deps)
 
   await scheduler.tick() // fires and parks — inFlight now holds the routine
   await new Promise((resolve) => setImmediate(resolve))
@@ -627,9 +632,10 @@ test('approve does NOT release the parked guard on a retryable resume failure (g
     },
   } as unknown as GenerationGate
   const d = {
+    ...chatRegistries(),
     db, manager, modelRouter, gate,
     registry: { active: () => ({ kind: 'llama-server' }) },
-    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), read: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
   } as unknown as Deps
 
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: (r, run) => executeRoutine(d, r, run) })
@@ -679,9 +685,10 @@ test('a parked run an Approve is resuming is listed as running until the resume 
   let holdGate: Promise<void> = Promise.resolve()
   const gate = { acquire: async () => { await holdGate; return () => {} } } as unknown as GenerationGate
   const d = {
+    ...chatRegistries(),
     db, manager, modelRouter, gate,
     registry: { active: () => ({ kind: 'llama-server' }) },
-    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), read: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
   } as unknown as Deps
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: (r, run) => executeRoutine(d, r, run) })
   registerRoutineRoutes(app, { ...d, routineScheduler: scheduler } as unknown as Deps)
@@ -726,9 +733,10 @@ test('POST /api/v1/routines/:id/run-now on a code routine from a non-host device
   const app = new Hono()
   const apiKeys: unknown[] = []
   const d = {
+    ...chatRegistries(),
     db,
     store: {
-      snapshot: () => ({ daemon: { lanBind: true, requireApiKey: false, experimental: { routines: true } }, apiKeys }),
+      snapshot: () => ({ daemon: { lanBind: true, requireApiKey: false, experimental: { routines: true } }, apiKeys }), read: () => ({ daemon: { lanBind: true, requireApiKey: false, experimental: { routines: true } }, apiKeys }),
       update: (fn: (cfg: { apiKeys: typeof apiKeys }) => void) => fn({ apiKeys }),
     },
   } as unknown as Deps
@@ -746,7 +754,7 @@ test('POST /api/v1/routines/:id/run-now on a code routine from a non-host device
 test('POST /api/v1/routines/:id/run-now on a code routine from the host (loopback-only bind) needs no key (I2)', async () => {
   const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const app = new Hono()
-  const d = { db, store: { snapshot: () => ({ daemon: { lanBind: false, requireApiKey: false, experimental: { routines: true } }, apiKeys: [] }) } } as unknown as Deps
+  const d = { db, store: { snapshot: () => ({ daemon: { lanBind: false, requireApiKey: false, experimental: { routines: true } }, apiKeys: [] }), read: () => ({ daemon: { lanBind: false, requireApiKey: false, experimental: { routines: true } }, apiKeys: [] }) } } as unknown as Deps
   const routine = db.createRoutine({
     flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 },
     modelKey: 'm', workspacePath: 'D:/repo', codingAgent: 'pi',
@@ -905,9 +913,10 @@ test('POST .../runs/:runId/approve returns a shaped 500 (not a raw crash) if res
   } as unknown as Manager
   const modelRouter = { loadExplicit: async () => ({ target: 'http://x' }) } as unknown as ModelRouter
   const d = {
+    ...chatRegistries(),
     db, manager: workingManager, modelRouter,
     registry: { active: () => ({ kind: 'llama-server' }) },
-    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), read: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
   } as unknown as Deps
 
   // Genuinely stall via a real tool-call round so pendingToolCall is parseable.
@@ -959,9 +968,10 @@ test('two concurrent approve calls on the same stalled run: only one executes, a
   const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
   const gate = { acquire: async () => () => {} } as unknown as GenerationGate
   const d = {
+    ...chatRegistries(),
     db, manager, modelRouter, gate,
     registry: { active: () => ({ kind: 'llama-server' }) },
-    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), read: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
   } as unknown as Deps
 
   const fired: string[] = []
@@ -1039,7 +1049,7 @@ test('a stale approve on an OLD needs_approval run does not release a DIFFERENT,
 
   const fired: string[] = []
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async (r) => { fired.push(r.id); return 'needs_approval' } })
-  registerRoutineRoutes(app, { db, routineScheduler: scheduler, store: { snapshot: () => ({ customAgents: [] }) } } as unknown as Deps)
+  registerRoutineRoutes(app, { db, routineScheduler: scheduler, store: { snapshot: () => ({ customAgents: [] }), read: () => ({ customAgents: [] }) } } as unknown as Deps)
 
   // A REAL fire happens and genuinely parks — this is the run the scheduler's guard belongs to.
   await scheduler.tick()
@@ -1215,4 +1225,44 @@ test('PUT /api/v1/routines/:id refuses a text field that is not a string with 40
   // Strings still update.
   assert.equal((await put(chat.id, { prompt: 'new', scheduleDisplay: 'e', modelKey: 'qwen3-coder-32b' })).status, 200)
   assert.deepEqual([db.getRoutine(chat.id)?.prompt, db.getRoutine(chat.id)?.modelKey], ['new', 'qwen3-coder-32b'])
+})
+
+// Scalability review 2.5: a routine's run history grows by one row per fire, forever. The list
+// is newest-first pages over (started_at, id): `?limit` (default 50, at most 200) and `?before`
+// (the opaque cursor the previous page returned in the X-Next-Cursor header). The body stays a
+// plain array of full runs, which RoutineEditPage reads `result` from.
+test('GET /api/v1/routines/:id/runs pages newest-first with ?limit and ?before', async () => {
+  const { app, db } = testApp()
+  const r = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  const ids = Array.from({ length: 5 }, () => db.createRoutineRun({ routineId: r.id, configSnapshot: '{}' }).id)
+  const runsUrl = `/api/v1/routines/${r.id}/runs`
+
+  const p1 = await app.request(`${runsUrl}?limit=2`)
+  const page1 = await p1.json() as Array<{ id: string; configSnapshot: string }>
+  assert.equal(page1.length, 2)
+  assert.equal(page1[0].configSnapshot, '{}', 'full rows')
+  const next = p1.headers.get('x-next-cursor')
+  assert.ok(next)
+  const rest: string[] = []
+  let cursor: string | null = next
+  while (cursor) {
+    const res = await app.request(`${runsUrl}?limit=2&before=${encodeURIComponent(cursor)}`)
+    rest.push(...(await res.json() as Array<{ id: string }>).map((x) => x.id))
+    cursor = res.headers.get('x-next-cursor')
+  }
+  const seen = [...page1.map((x) => x.id), ...rest]
+  assert.deepEqual([...seen].sort(), [...ids].sort(), 'every run once')
+  assert.equal(new Set(seen).size, 5)
+
+  assert.equal((await app.request(`${runsUrl}?before=garbage`)).status, 400)
+})
+
+test('GET /api/v1/routines/:id/runs returns at most 50 runs by default', async () => {
+  const { app, db } = testApp()
+  const r = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  for (let i = 0; i < 55; i++) db.createRoutineRun({ routineId: r.id, configSnapshot: '{}' })
+  const res = await app.request(`/api/v1/routines/${r.id}/runs`)
+  assert.equal((await res.json() as unknown[]).length, 50)
+  assert.ok(res.headers.get('x-next-cursor'))
+  assert.equal(db.countRoutineRuns(r.id), 55)
 })

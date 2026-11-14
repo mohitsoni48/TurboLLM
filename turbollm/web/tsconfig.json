@@ -15,7 +15,8 @@
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "types": ["vite/client"]
+    "types": ["vite/client"],
+    "paths": { "@contract/*": ["../src/contract/*"] }
   },
   "include": ["src", "vite.config.ts"]
 }

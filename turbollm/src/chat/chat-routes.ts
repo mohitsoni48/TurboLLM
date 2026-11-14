@@ -1,44 +1,31 @@
 // Chat API routes (spec 07). Conversations CRUD + SSE streaming send + message actions.
+import { readFile } from 'node:fs/promises'
 import type { Context, Hono, MiddlewareHandler } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
 import { resolveKey, grantKind, holdOpen, holdTurn, hostGate, isLocalOrAuthenticated } from '../auth'
 import { getAdvertisedHost, getLanIp } from '../net'
-import { clampMaxTokens } from '../config/config'
 import { CHAT_APPROVAL_WAIT_MINUTES } from '../config/config-bounds'
-import { feedChunk, flushState, initParseState, type ParseState } from './parser'
-import { needsExtraPass } from './think-utils'
 import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import type { EmitSink } from './emit-sink.js'
-import { chatRuns, type ChatRun, type ChatRunMeta } from './chat-runs.js'
+import type { ChatRun, ChatRunMeta } from './chat-runs.js'
+import type { ChatTurns } from './chat-turns.js'
 import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent, type EngineMessage } from './chat-compaction.js'
 
-import type { ClaimVerdict, ConversationStore, Message, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
-import { checkReply } from '../tools/research-referee.js'
+import type { ConversationStore, Message, PageOpts, ToolCallRecord } from './db'
+import { InvalidCursorError } from './db'
 import { buildSnapshot } from './chat-export'
 import type { ExportFormat } from './chat-export'
-import { executeToolCallWithApproval, newApprovalWaitBudget } from '../tools/execute-with-approval'
 import { pendingToolApprovalName, resolveToolApproval } from '../tools/approval-gate'
 import { isMcpToolName, listsMcpTool, MCP_APPROVAL_REFUSED_MESSAGE } from '../tools/tool-registry'
-import { buildSaveSkillTool } from '../agents/agent-tools'
 import { SkillStore } from '../agents/skills'
 import { saveSkillFromConversation, SKILL_AUTHORING_REFUSED } from '../agents/skill-jobs'
 import { extractMemoryFacts } from './memory'
 import { codeGateBlocks } from '../routines/routine-routes'
-import { emitBenchResult } from '../telemetry/runtime/typed-emit'
-import { buildBenchResultConfig } from '../telemetry/events/perf'
-import { shouldEmitBenchResult, benchRateLimitKey, MIN_GEN_TOKENS_FOR_BENCH } from '../telemetry/runtime/bench-rate-limit'
-import { resolveProfile, type LoadProfile } from '../models/profile'
-import type { ModelInfo } from '../engines/manager'
-import { litertLmPrefillStats } from '../engines/litert-lm'
-import { engineErrorReason, engineErrorText, streamChunkError } from '../engines/engine-error'
-import { LITERT_LM_RESEARCH_NOTE, litertLmIgnoredFieldsNote, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request'
-import { engineTakesReasoningAsField, engineWithholdsTools, engineWithholdsVision, VISION_UNAVAILABLE } from '../engines/compat'
-import { getModelProfile } from '../config/config'
-import { getSysInfo } from '../sysinfo/sysinfo'
-import { noteLocalActivity } from '../link/host-idle'
 import { callChatUpstream, resolveChatUpstream, type ChatUpstream } from './chat-upstream'
-import { servingEngine, servingEngineKind } from '../engines/serving'
+import { servingEngineKind } from '../engines/serving'
+import { engineTakesReasoningAsField, engineWithholdsVision, VISION_UNAVAILABLE } from '../engines/compat'
+import { runGenerationCore } from './generation-core'
 import { nonStringField } from '../util/string-fields'
 
 /** The per-request code-routine trust decision. Exported ONLY so it can be behaviourally
@@ -61,158 +48,31 @@ export function chatCodeAuthorization(c: Context, d: Deps): boolean {
  *  not let into Code. */
 const CODE_APPROVAL_REFUSED_MESSAGE = 'Allowing a Code tool call requires a valid API key from a non-host device.'
 
-// Track in-flight abort controllers per conversation id.
-const inflight = new Map<string, AbortController>()
-
-/** Abort every in-flight chat generation. Called when the user takes over the engine
- *  (load / stop / restart) — those are kill switches: they must stop all other in-app
- *  model calls, not leave streams hanging against an engine that's going away. */
-export function abortAllInFlightChats(): number {
-  const n = inflight.size
-  for (const ac of inflight.values()) ac.abort()
-  inflight.clear()
-  return n
-}
-
-/** The conversations with a generation in flight — exactly the chats abortAllInFlightChats()
- *  would abort. Read by the active-work probe (ADR-434 (i)(3)). */
-export function inFlightChatIds(): string[] {
-  return [...inflight.keys()]
-}
-
-/** The in-flight entries of turns parked on a tool-call approval (execute-with-approval.ts's
- *  wait, from its awaiting_approval frame until the wait ends). Keyed by the entry, as
- *  `compactions` is, so the mark goes with it. Read by parkedChatIds. */
-const approvalWaits = new WeakSet<AbortController>()
-
-/** The chats whose turn is parked on a tool-call approval: those of inFlightChatIds() that wait on
- *  a person, not the engine. The active-work probe lists them apart, in `waiting`:
- *  Android's EngineService counts only `items`, so the phone may sleep while a person is awaited,
- *  as routines.scheduler's runningRoutineIds leaves a parked routine run out. They are still in
- *  flight: a load, Stop or the approval wait running out ends them (a denied call). */
-export function parkedChatIds(): string[] {
-  return [...inflight].filter(([, ac]) => approvalWaits.has(ac)).map(([convId]) => convId)
-}
-
-/** How many of the engine's in-progress generations (manager.generationStart, which a local turn
- *  holds from its first request to its end) are turns parked on an approval: no request of theirs
- *  is on the engine meanwhile. The active-work probe takes them out of `engineGenerating`, which
- *  Android's EngineService reads as busy as it does `items`. */
-let parkedLocalTurns = 0
-export function parkedEngineTurns(): number {
-  return parkedLocalTurns
-}
-
-/** Chats whose auto-title or auto-memory call is still pending, from their reply's `done` until
- *  the call settles; a count per chat, as both can be. Each call starts 1 s or 1.5 s after the
- *  reply, outside the turn's in-flight entry and with no generationStart, so nothing said the
- *  engine was still wanted: on Android with notifications off EngineService read idle in that
- *  second and unloaded the model under the call, and the title and memory were lost.
- *  The active-work probe lists them as `chat` items. Read by afterReplyChatIds. */
-const afterReply = new Map<string, number>()
-
-/** Runs `call` `delayMs` after now, the chat counted in afterReply from now until it settles. */
-function afterReplyCall(convId: string, delayMs: number, call: () => Promise<void>): void {
-  afterReply.set(convId, (afterReply.get(convId) ?? 0) + 1)
-  const settled = () => {
-    const left = (afterReply.get(convId) ?? 1) - 1
-    if (left > 0) afterReply.set(convId, left)
-    else afterReply.delete(convId)
-  }
-  setTimeout(() => { void call().finally(settled) }, delayMs)
-}
-
-/** The chats whose reply's auto-title or auto-memory call is still pending (afterReply). */
-export function afterReplyChatIds(): string[] {
-  return [...afterReply.keys()]
-}
-
-/** Whether a chat still needs the engine's model: a turn holds its chat's slot (generating, its
- *  auto-compaction, a manual compaction, or waiting for a tool-call approval within its wait), or a
- *  finished reply's auto-title or memory call is pending. The idle watchdog asks it
- *  (Manager.holdsEngine, wired in cli.ts) and does not unload meanwhile. A Turbo Link turn counts
- *  too, though it runs on its host: the in-flight entry does not say where a turn runs, and the
- *  local model then waits a reply longer for its TTL. */
-export function chatHoldsEngine(): boolean {
-  return inflight.size > 0 || afterReply.size > 0
-}
-
-/** Removes `convId`'s entry only while it is still `ac`'s own. Stop or a kill switch drops the
- *  entry at once, but the aborted turn can keep unwinding for a long time
- *  (a tool call is not interrupted by the abort) — by the time it does, the entry may belong
- *  to the NEXT turn, which an unconditional delete would leave untracked: unreachable by Stop
- *  and the kill switches, invisible to inFlightChatIds, and no longer a 409 guard. */
-function releaseInflight(convId: string, ac: AbortController): void {
-  if (inflight.get(convId) === ac) inflight.delete(convId)
-}
-
-/** The in-flight entries POST /compact took. A manual compaction holds the chat's slot as a turn
- *  does, so every route refuses meanwhile, but with a turn's text ('Stop generation first.', 'A
- *  generation is already running') the web UI toasted it over a chat showing only its Compacting
- *  banner and no Stop. Keyed by the entry itself, not the chat, so the tag goes with it. */
-const compactions = new WeakSet<AbortController>()
 const COMPACTING_MESSAGE = 'This chat is being compacted. Try again when it finishes.'
-
-/** The reply each turn's in-flight entry generates (its placeholder's id). Keyed by the entry, as
- *  `compactions` is, so it goes with it. Read by slotState. */
-const turnReplies = new WeakMap<AbortController, string>()
-
-/** What holds `convId`'s in-flight slot, as GET /conversations(/:id) report it, so a page opened or
- *  reopened on the chat (another tab or device) can tell a running reply, and which one, from a manual
- *  compaction: the page's own state knew that only for the turns and compactions it started. */
-function slotState(convId: string): { runningReplyId: string | null; compacting: boolean } {
-  const held = inflight.get(convId)
-  if (!held) return { runningReplyId: null, compacting: false }
-  if (compactions.has(held)) return { runningReplyId: null, compacting: true }
-  return { runningReplyId: turnReplies.get(held) ?? null, compacting: false }
-}
-
-/** The in-flight entries of turns whose own auto-compaction (maybeAutoCompact) is running. Only
- *  compaction Undo reads it (the other routes answer such a turn as a running one), since that
- *  compaction stores its summary over an Undo made meanwhile, as a manual one does. */
-const autoCompactions = new WeakSet<AbortController>()
-/** A turn's maybeAutoCompact phase callback: tags the turn's entry while its compaction runs,
- *  then tells the turn's viewers. Tagged first, so a write that fails still tags it;
- *  maybeAutoCompact sends 'end' after every 'start', the compaction failed or not. */
-function autoCompactionPhase(ac: AbortController, write: (phase: 'start' | 'end') => Promise<void>) {
-  return (phase: 'start' | 'end') => {
-    if (phase === 'start') autoCompactions.add(ac)
-    else autoCompactions.delete(ac)
-    return write(phase)
-  }
-}
 
 /** The 409 for a chat whose in-flight slot is taken, or null when it is free: compaction_in_progress
  *  while a manual compaction holds it, otherwise generation_in_flight with the route's own text. */
-function inflightRefusal(c: Context, convId: string, turnMessage: string) {
-  const held = inflight.get(convId)
+function inflightRefusal(c: Context, d: Deps, convId: string, turnMessage: string) {
+  const held = d.chatTurns.held(convId)
   if (!held) return null
-  if (compactions.has(held)) return err(c, 409, 'compaction_in_progress', COMPACTING_MESSAGE)
+  if (d.chatTurns.isCompaction(held)) return err(c, 409, 'compaction_in_progress', COMPACTING_MESSAGE)
   return err(c, 409, 'generation_in_flight', turnMessage)
 }
 
 /** A turn's body, releasing its in-flight entry however the body exits: runGeneration's own
  *  finally only covers a turn that reached it, and a throw before that (e.g. a malformed request
  *  body) left the chat answering 409 until a restart. */
-function releasingInflight<T>(convId: string, ac: AbortController, cb: (arg: T) => Promise<void>): (arg: T) => Promise<void> {
+function releasingInflight<T>(turns: ChatTurns, convId: string, ac: AbortController, cb: (arg: T) => Promise<void>): (arg: T) => Promise<void> {
   return async (arg) => {
-    try { await cb(arg) } finally { releaseInflight(convId, ac) }
+    try { await cb(arg) } finally { turns.release(convId, ac) }
   }
-}
-
-/** Stops a turn as POST /chat/stop does: aborts it and frees the chat at once. The turn's own
- *  unwind (a tool call that ignores the abort runs to its end) then releases nothing of the next
- *  turn's (releaseInflight's identity check). */
-function stopTurn(convId: string, ac: AbortController): void {
-  ac.abort()
-  releaseInflight(convId, ac)
 }
 
 /** Runs a turn in the daemon (the owner's rule: the web UI is a frontend, and closing, reloading
  *  or leaving the page, Android's Back or a dropped connection never stops a reply). Its in-flight
  *  entry and its run (chat-runs.ts) own it, not the request: the request that started it, like
  *  every GET .../stream after it, is only a viewer of the run's frames (respondWithChatRun). What
- *  stops it: Stop, deleting the chat, the engine kill switches (abortAllInFlightChats), and its
+ *  stops it: Stop, deleting the chat, the engine kill switches (ChatTurns.abortAll), and its
  *  caller's way in going away (holdTurn): LAN access turned off or remote access stopped, which
  *  used to end the request and, with it, the turn, and now also the key revoked or a key now
  *  required, which never stopped a turn while it ran in its request. `c` is read here, before the
@@ -220,65 +80,20 @@ function stopTurn(convId: string, ac: AbortController): void {
  *  throw before the turn reached runGeneration (which saves on every path) is told to the viewers
  *  as an `error` frame rather than becoming an unhandled rejection. */
 function startDetachedTurn(c: Context, d: Deps, convId: string, ac: AbortController, meta: ChatRunMeta, body: (sink: EmitSink) => Promise<void>): ChatRun {
-  const { run, sink } = chatRuns.start(convId, ac, meta)
-  const release = holdTurn(c, d, () => stopTurn(convId, ac))
-  const turn: Promise<void> = releasingInflight(convId, ac, body)(sink)
+  const { run, sink } = d.chatRuns.start(convId, ac, meta)
+  const release = holdTurn(c, d, () => d.chatTurns.stop(convId, ac))
+  const turn: Promise<void> = releasingInflight(d.chatTurns, convId, ac, body)(sink)
     .catch(async (e) => {
       console.error(`[chat] turn for ${convId} failed`, e)
       await sink({ event: 'error', data: { code: 'turn_failed', message: 'The reply could not be generated.' } })
     })
     .finally(() => {
       release()
-      chatRuns.end(run)
-      runningTurns.delete(turn)
+      d.chatRuns.end(run)
+      d.chatTurns.untrackTurn(turn)
     })
-  runningTurns.add(turn)
+  d.chatTurns.trackTurn(turn)
   return run
-}
-
-/** The running turns (startDetachedTurn), each until it has ended: its reply saved, its run ended. Read by
- *  chatTurnsEnded. */
-const runningTurns = new Set<Promise<void>>()
-
-/** How long chatTurnsEnded waits at most by default: well inside `turbollm --stop`'s 10 s and the restart's 14 s
- *  watchdog. A stopped turn that is streaming saves its reply at once; only a tool call it is running holds it. */
-const TURNS_END_WAIT_MS = 3_000
-
-/** Resolves once every turn running now has ended, or after `maxMs`, whichever is first. The daemon's teardowns
- *  (cli.ts) wait for it, beside the engine's shutdown, before they close the store. A turn abortAllInFlightChats
- *  stopped saves its reply as it unwinds, and one running a tool call unwinds only once the call ends (a tool call
- *  does not end at the abort): the store closed as soon as the engine had stopped, at once with no local engine (a
- *  Turbo Link chat), so such a reply kept only its last 10 s save. Bounded: a stop does not wait out a long tool
- *  call; the next start marks that reply stopped (db.ts abortUnfinishedReplies). */
-export function chatTurnsEnded(maxMs = TURNS_END_WAIT_MS): Promise<void> {
-  if (runningTurns.size === 0) return Promise.resolve()
-  return new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, maxMs)
-    timer.unref?.()
-    void Promise.allSettled([...runningTurns]).then(() => {
-      clearTimeout(timer)
-      resolve()
-    })
-  })
-}
-
-/** How often a reply's text so far is saved into its placeholder while its turn runs, when it changed since the
- *  last save (runGeneration's partial saves). Each save is one UPDATE of the row, about 1 ms on Android's sql.js with
- *  2,000 messages (Node 18.20.4), and on Android the export it then brings about a second later (sql-js-database.ts):
- *  about 11 ms for a 5 MB database and 47 ms for 24 MB on an idle disk here, a few hundred ms under heavy I/O. Every
- *  10 s that is under 1% of the time and a few MB written per 10 s of streaming, while a kill loses at most the last
- *  10 s of a reply. */
-const PARTIAL_SAVE_MS = 10_000
-
-/** The running turns' partial saves: runGeneration adds its savePartial while its turn runs and removes it as the
- *  turn ends. POST /api/v1/daemon/flush runs them first (saveRunningReplies), so the database it writes holds each
- *  running reply's text up to that moment. The Android app calls the flush before its Quit ends the process; without
- *  this, a reply running at Quit kept only what its last 10 s save had written. */
-const runningReplySaves = new Set<() => void>()
-
-/** Saves every running reply's text so far into its placeholder now (see runningReplySaves). */
-export function saveRunningReplies(): void {
-  for (const save of runningReplySaves) save()
 }
 
 /** How often a viewer's stream gets an SSE comment while no frame is due (a turn waiting on an
@@ -294,10 +109,10 @@ const KEEPALIVE_MS = 20_000
  *  (as Code's stream does), so it can tell which reply the frames belong to even when frame 0 has
  *  left the window. A viewer that falls too far behind gets a `lagged` frame and is ended: it
  *  resumes from its cursor. `run` null: nothing to attach to, an empty stream. */
-function respondWithChatRun(c: Context, run: ChatRun | null, fromSeq: number, opts: { synthMeta: boolean }): Response {
+function respondWithChatRun(c: Context, d: Deps, run: ChatRun | null, fromSeq: number, opts: { synthMeta: boolean }): Response {
   return streamSSE(c, holdOpen(c, async (stream) => {
     if (!run) return
-    const sub = chatRuns.subscribe(run, fromSeq)
+    const sub = d.chatRuns.subscribe(run, fromSeq)
     stream.onAbort(() => { sub.close() })
     let writing = false
     const write = async (msg: { id?: string; event: string; data: string }) => {
@@ -325,6 +140,17 @@ function respondWithChatRun(c: Context, run: ChatRun | null, fromSeq: number, op
 type S = 200 | 201 | 202 | 400 | 403 | 404 | 409 | 500 | 503
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
+
+/** One page of a keyset-paged list, from the request's ?limit and ?cursor — or the 400 a
+ *  cursor the list never issued gets. */
+function listPage<T>(c: Context, read: (page: PageOpts) => T): T | Response {
+  try {
+    return read({ limit: Number(c.req.query('limit')), cursor: c.req.query('cursor') })
+  } catch (e) {
+    if (e instanceof InvalidCursorError) return err(c, 400, 'invalid_cursor', 'That cursor is not one this list issued.')
+    throw e
+  }
+}
 
 const STALE_MESSAGE = 'This message is no longer on the shown branch: the chat changed in another tab or device.'
 
@@ -410,7 +236,12 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   // ── auto-memory (Release 3) ────────────────────────────────────────────────
 
-  app.get('/api/v1/memory', (c) => c.json({ facts: db.listMemoryFacts() }))
+  // Newest first, a page at a time (?limit, 200 by default and at most; ?cursor, the previous
+  // page's nextCursor, which is null on the last page).
+  app.get('/api/v1/memory', (c) => {
+    const page = listPage(c, (p) => db.listMemoryFactsPage(p))
+    return page instanceof Response ? page : c.json(page)
+  })
 
   app.delete('/api/v1/memory/:id', (c) => {
     const ok = db.deleteMemoryFact(c.req.param('id'))
@@ -471,11 +302,18 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   app.use('/api/v1/conversations/:id', conversationGate)
   app.use('/api/v1/conversations/:id/*', conversationGate)
 
+  // Without `q`: most recently updated first, a page at a time (?limit, 200 by default and at
+  // most; ?cursor, the previous page's nextCursor, null on the last page). A search (`q`) is one
+  // capped result list, with nextCursor null.
   app.get('/api/v1/conversations', (c) => {
     const q = c.req.query('q')
-    // `running`: a turn holds the chat's slot (slotState), for the sidebar of a page that did not start it.
-    const conversations = db.listConversations(q, 'chat').map((conv) => ({ ...conv, running: slotState(conv.id).runningReplyId !== null }))
-    return c.json({ conversations })
+    const page = q
+      ? { conversations: db.listConversations(q, 'chat'), nextCursor: null }
+      : listPage(c, (p) => db.listConversationsPage('chat', p))
+    if (page instanceof Response) return page
+    // `running`: a turn holds the chat's slot (ChatTurns.slotState), for the sidebar of a page that did not start it.
+    const conversations = page.conversations.map((conv) => ({ ...conv, running: d.chatTurns.slotState(conv.id).runningReplyId !== null }))
+    return c.json({ conversations, nextCursor: page.nextCursor })
   })
 
   app.post('/api/v1/conversations', async (c) => {
@@ -510,15 +348,33 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.get('/api/v1/conversations/:id', (c) => {
-    const conv = db.getConversation(c.req.param('id'), true)
+    const conv = db.getConversation(c.req.param('id'))
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
+    // Every active message, each image as its short reference (2.7). Not paged within the conversation: a very long
+    // chat still sends all its text on each open and poll (left for a later change).
+    conv.messages = db.getMessagesForDisplay(conv.id)
     // The compaction as the turns see it: one cut on a branch the user left is not this
     // branch's, so the chat shows no divider, summary or Undo for it (Undo would delete the
     // other branch's compaction) and the meter shows its measured reading, no projection. (The
     // daemon's auto-compaction gate can judge this branch larger than that reading: see
     // maybeAutoCompact, which raises it to the estimated size of the full history replayed.)
     const shown = setAsideFrozenCut(db, conv)
-    return c.json({ ...shown, messages: forClient(shown.messages ?? []), ...slotState(conv.id) })
+    return c.json({ ...shown, messages: forClient(shown.messages ?? []), ...d.chatTurns.slotState(conv.id) })
+  })
+
+  // A chat image (attachments.ts), for the web UI to show. Under /api/v1 like the conversation that names it, so
+  // lanAuth admits the same callers, and a remote-access token needs models:use (auth.ts requiredCapability). The id
+  // is checked against the one shape the store writes, so it can only name a file in the attachments folder. Its
+  // name is the hash of its bytes, so it never changes: cacheable for good.
+  app.get('/api/v1/attachments/:id', async (c) => {
+    const file = db.attachments.file(c.req.param('id'))
+    const bytes = file ? await readFile(file.path).catch(() => null) : null
+    if (!file || !bytes) return err(c, 404, 'not_found', 'Attachment not found.')
+    return c.body(new Uint8Array(bytes), 200, {
+      'Content-Type': file.mime,
+      'Cache-Control': 'private, max-age=31536000, immutable',
+      'X-Content-Type-Options': 'nosniff',
+    })
   })
 
   app.patch('/api/v1/conversations/:id', async (c) => {
@@ -536,7 +392,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // Stop a generation still running for it (a background chat deleted from the sidebar, or
     // from another device) — otherwise it keeps the engine busy, tool rounds and all, for a
     // conversation that no longer exists. Its own unwind releases the in-flight entry.
-    inflight.get(c.req.param('id'))?.abort()
+    d.chatTurns.abort(c.req.param('id'))
     const ok = db.deleteConversation(c.req.param('id'))
     if (!ok) return err(c, 404, 'not_found', 'Conversation not found.')
     return c.json({ ok: true })
@@ -682,6 +538,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // attachment — image-only / file-only sends are allowed.
     if (!content && images.length === 0 && textAttachments.length === 0)
       return err(c, 400, 'invalid_input', 'Type a message or attach an image or file.')
+    // Each image to its file before the row names it (attachments.ts); the engine is sent data URLs (below).
+    // Before the conversation is read and the busy check, so nothing they decide goes stale across this await.
+    const storedImages = await db.attachments.save(images)
 
     const conv = db.getConversation(convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
@@ -694,24 +553,23 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const resolved = resolveChatUpstream(d, b.model)
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
     const upstream = resolved.upstream
-    // Refused before anything is stored: the engine would refuse the image part, and no reply could be generated.
+    // Refused before the turn is stored: the engine would refuse the image part, and no reply could be generated.
     if (images.length && localEngineWithholdsVision(d, upstream)) return err(c, 400, 'vision_unavailable', VISION_UNAVAILABLE)
 
-    const busy = inflightRefusal(c, convId, 'A generation is already running for this conversation.')
+    const busy = inflightRefusal(c, d, convId, 'A generation is already running for this conversation.')
     if (busy) return busy
 
     // Persist user message — only the typed text is stored as content; images are
     // kept in attachments (the full doc context is folded into the engine prompt below,
     // and kept in docContext so /continue can send this turn again with it).
-    const userMsg = db.addMessage(convId, 'user', content, { attachments: images, textAttachments, docContext: b.docContext })
+    const userMsg = db.addMessage(convId, 'user', content, { attachments: storedImages, textAttachments, docContext: b.docContext })
 
     // Create a placeholder assistant message
     db.addMessage(convId, 'assistant', '', { stats: { aborted: false } })
     const assistantMsg = db.getLastMessage(convId)!
 
     const ac = new AbortController()
-    inflight.set(convId, ac)
-    turnReplies.set(ac, assistantMsg.id)
+    d.chatTurns.claim(convId, ac, assistantMsg.id)
 
     // Phase 4 / C1: the code-flavor routine gate, decided HERE because this is the last point
     // that still has the Hono Context. `chatCodeAuthorization` wraps routine-routes.ts's own
@@ -730,7 +588,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // `upstream` is THIS turn's already-resolved upstream (local or linked host) and `ac`
       // is its abort — both are handed down rather than re-derived, so a Turbo Link chat
       // summarizes on the host it is actually talking to and Stop can interrupt the wait.
-      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, autoCompactionPhase(ac, async (phase) => { await sink({ event: 'compaction', data: { phase } }) }))
+      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, d.chatTurns.autoCompactionPhase(ac, async (phase) => { await sink({ event: 'compaction', data: { phase } }) }))
 
       // Build messages array for engine (chat-compaction.ts — folds in the compaction
       // summary + cut when one is resolvable; a plain passthrough when not).
@@ -739,10 +597,13 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, undefined, { reasoningField: reasoningAsField(d, upstream) })
       // Fold any attached document text into the prompt; attach images as multimodal parts.
       engineMessages.push({ role: 'user', content: userTurnContent(content, b.docContext, images) })
+      // Every stored reference as its data URL, as /continue does: the history's, and this turn's when a caller sent
+      // references it was shown (`attachment:<id>`) rather than the image itself. No engine understands a reference.
+      await db.attachments.resolveImages(engineMessages)
 
       await runGeneration(d, sink, { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), userText: content, isCodeAuthorized })
     })
-    return respondWithChatRun(c, run, 0, { synthMeta: false })
+    return respondWithChatRun(c, d, run, 0, { synthMeta: false })
   })
 
   // ── continue (regenerate last assistant response for the existing last user
@@ -764,7 +625,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
     const upstream = resolved.upstream
 
-    const busy = inflightRefusal(c, convId, 'A generation is already running for this conversation.')
+    const busy = inflightRefusal(c, d, convId, 'A generation is already running for this conversation.')
     if (busy) return busy
 
     // Save & Resend (`edit`): the question is branched only here, once nothing above refused the
@@ -833,8 +694,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const assistantMsg = db.getLastMessage(convId)!
 
     const ac = new AbortController()
-    inflight.set(convId, ac)
-    turnReplies.set(ac, assistantMsg.id)
+    d.chatTurns.claim(convId, ac, assistantMsg.id)
 
     // Same per-request code-routine gate as the /messages route above — a regenerated turn can
     // emit tool calls too, so it must not be a softer door onto code-flavor routine authoring.
@@ -846,7 +706,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // history as it stood before this turn's own user+placeholder rows were added —
       // exactly the "last completed turn's usage" the 80% threshold is meant to judge.
       // Same upstream/abort hand-down as the /messages route above — see its comment.
-      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, autoCompactionPhase(ac, async (phase) => { await sink({ event: 'compaction', data: { phase } }) }))
+      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, d.chatTurns.autoCompactionPhase(ac, async (phase) => { await sink({ event: 'compaction', data: { phase } }) }))
 
       // Build messages array for engine from the existing (already-trimmed) history
       // (chat-compaction.ts — folds in the compaction summary + cut when one is
@@ -857,10 +717,12 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id, {
         reasoningField: reasoningAsField(d, upstream), withholdImages: localEngineWithholdsVision(d, upstream),
       })
+      // Its stored images as the data URLs the first send carried (a local engine and a Turbo Link host alike).
+      await db.attachments.resolveImages(engineMessages)
 
       await runGeneration(d, sink, { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), replacedId: replaced?.role === 'assistant' ? replaced.id : undefined, edited, isCodeAuthorized })
     })
-    return respondWithChatRun(c, run, 0, { synthMeta: false })
+    return respondWithChatRun(c, d, run, 0, { synthMeta: false })
   })
 
   // ── stop (spec 07 §2) ──────────────────────────────────────────────────────
@@ -878,9 +740,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (notString) return err(c, 400, 'invalid_input', `${notString} must be a string.`)
     const convId = b.conversationId
     if (!convId) return err(c, 400, 'invalid_input', 'conversationId required.')
-    const ac = inflight.get(convId)
-    const target = ac && (b.messageId === undefined || (!compactions.has(ac) && turnReplies.get(ac) === b.messageId)) ? ac : undefined
-    if (target) stopTurn(convId, target)
+    const ac = d.chatTurns.held(convId)
+    const target = ac && (b.messageId === undefined || (!d.chatTurns.isCompaction(ac) && d.chatTurns.replyOf(ac) === b.messageId)) ? ac : undefined
+    if (target) d.chatTurns.stop(convId, target)
     return c.json({ ok: true, stopped: !!target })
   })
 
@@ -898,11 +760,11 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const runId = c.req.query('run') || undefined
     const n = Number.parseInt(c.req.query('fromSeq') ?? '', 10)
     const fromSeq = Number.isFinite(n) && n >= 0 ? n : 0
-    const latest = chatRuns.latestRun(convId)
+    const latest = d.chatRuns.latestRun(convId)
     const run = runId !== undefined
-      ? chatRuns.find(convId, runId) ?? null
-      : latest && !latest.ended && inflight.get(convId) === latest.ac ? latest : null
-    return respondWithChatRun(c, run, fromSeq, { synthMeta: true })
+      ? d.chatRuns.find(convId, runId) ?? null
+      : latest && !latest.ended && d.chatTurns.held(convId) === latest.ac ? latest : null
+    return respondWithChatRun(c, d, run, fromSeq, { synthMeta: true })
   })
 
   // ── message actions B2 ─────────────────────────────────────────────────────
@@ -915,7 +777,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (!trimmed) return err(c, 400, 'invalid_input', 'content required.')
     const msg = db.getMessage(msgId)
     if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
-    const busy = inflightRefusal(c, convId, 'Stop generation first.')
+    const busy = inflightRefusal(c, d, convId, 'Stop generation first.')
     if (busy) return busy
 
     if (msg.role === 'assistant') {
@@ -974,7 +836,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (nonStringField(b, ['model'])) return err(c, 400, 'invalid_input', 'model must be a string.')
     const resolved = resolveChatUpstream(d, b.model)
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
-    const busy = inflightRefusal(c, convId, 'Stop generation first.')
+    const busy = inflightRefusal(c, d, convId, 'Stop generation first.')
     if (busy) return busy
     // The compaction holds the conversation's in-flight slot, as a turn does, until it ends: up to
     // a 60 s gate wait plus a 60 s summary call. Only checked before, a version switch, an edit or
@@ -984,8 +846,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // the chat abort it too. Tagged, so what it holds back answers compaction_in_progress rather
     // than a running turn's text (inflightRefusal).
     const ac = new AbortController()
-    compactions.add(ac)
-    inflight.set(convId, ac)
+    d.chatTurns.claimForCompaction(convId, ac)
     try {
       await compactConversation(d, convId, { upstream: resolved.upstream, signal: ac.signal })
     } catch (e) {
@@ -993,7 +854,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       if (code === 'nothing_to_compact') return err(c, 400, 'nothing_to_compact', 'Not enough history yet to compact.')
       return err(c, 500, 'compaction_failed', 'Could not summarize this conversation.')
     } finally {
-      releaseInflight(convId, ac)
+      d.chatTurns.release(convId, ac)
     }
     return c.json(db.getConversation(convId)!)
   })
@@ -1006,15 +867,15 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // Not while a compaction runs (POST /compact, or a turn's own auto-compaction): it stores its
     // summary when it ends, over the columns cleared here, so an Undo made meanwhile was undone.
     // A turn past its compaction stores none, so Undo still goes ahead while a reply streams.
-    const held = inflight.get(convId)
-    if (held && (compactions.has(held) || autoCompactions.has(held))) return err(c, 409, 'compaction_in_progress', COMPACTING_MESSAGE)
+    const held = d.chatTurns.held(convId)
+    if (held && (d.chatTurns.isCompaction(held) || d.chatTurns.isAutoCompacting(held))) return err(c, 409, 'compaction_in_progress', COMPACTING_MESSAGE)
     db.clearConversationCompaction(convId)
     return c.json(db.getConversation(convId)!)
   })
 
   app.post('/api/v1/conversations/:id/regenerate', (c) => {
     const convId = c.req.param('id')
-    const busy = inflightRefusal(c, convId, 'Stop generation first.')
+    const busy = inflightRefusal(c, d, convId, 'Stop generation first.')
     if (busy) return busy
     const last = db.getLastMessage(convId)
     // Chat branching (GitHub #52): deactivate rather than delete — the old reply is kept
@@ -1043,7 +904,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const msg = db.getMessage(msgId)
     if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
     if (!msg.variantGroup) return err(c, 400, 'invalid_input', 'Message has no alternate versions.')
-    const busy = inflightRefusal(c, convId, 'Stop generation first.')
+    const busy = inflightRefusal(c, d, convId, 'Stop generation first.')
     if (busy) return busy
     if (msg.isActive) return c.json({ messages: forClient(db.getMessages(convId)) }) // already active, no-op
 
@@ -1306,100 +1167,8 @@ interface GenerationCtx {
   isCodeAuthorized: boolean
 }
 
-/**
- * Streams an assistant turn with optional agentic tool-calling loop. Posts to the
- * engine, relays delta/reasoning/progress/tool_call SSE events, parses inline <think>
- * tags, executes tool calls and loops (up to MAX_TOOL_ITER rounds), persists the final
- * message + stats, and fires auto-title. Shared by the messages and continue endpoints.
- */
-
-/**
- * `bench_result{source:'chat'}` (spec 23 §3.7, ADR-333, founder-directed
- * 2026-08-05): a real chat reply's own measured t/s, alongside the
- * synthetic autotune sweep bench_result already sent. llama.cpp's own
- * `predicted_per_second` is measured on EVERY generation already (`stats.tps`
- * above) — this only wires it to leave the machine, subject to the same
- * rate limit and short-run floor every real-run source shares
- * (`bench-rate-limit.ts`).
- *
- * Best-effort by contract (ADR-009): a lookup miss (model swapped mid-turn,
- * scanner not yet caught up) or any other failure here must never surface
- * to the user or affect the chat response already streamed.
- */
-function reportChatBenchResult(d: Deps, ms: ModelInfo, stats: Partial<MessageStats>): void {
-  try {
-    if (!d.telemetry?.canSend('bench_result')) return
-    if (stats.tps === undefined || stats.genTokens === undefined || stats.genTokens < MIN_GEN_TOKENS_FOR_BENCH) return
-
-    const entry = d.scanner.get(ms.key)
-    const engine = servingEngine(d)
-    if (!entry || !engine) return
-
-    const cfg = d.store.snapshot()
-    const saved = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
-    const profile = resolveProfile(entry, getSysInfo(), saved, undefined, cfg.modelDefaults)
-
-    const key = benchRateLimitKey(entry.key, entry.quant, profile.ctx, profile.ngl, profile.nCpuMoe, profile.kvTypeK, 'chat')
-    if (!shouldEmitBenchResult(d.store.dir(), key)) return
-
-    const config = buildBenchResultConfig(entry, profile, engine.version, getSysInfo())
-    emitBenchResult(
-      d.telemetry,
-      {
-        source: 'chat',
-        model: config.model,
-        engine: config.engine,
-        params: config.params,
-        result: { tps: stats.tps, ttftMs: stats.ttftMs ?? 0, vramMb: null, outcome: 'ok' },
-      },
-      config.hw,
-    )
-  } catch {
-    // Best-effort by contract (ADR-009).
-  }
-}
-
-/** Wraps an emit sink so a failing sink can never cost us generated output (GitHub #177).
- *
- *  The turn routes' sink is now the turn's run (chat-runs.ts), whose push never throws: a viewer
- *  that goes away only closes its own subscription. This stays the seam's guard for a sink that
- *  can fail, as the live SSE stream it was written for did. Every `await emit(...)` in
- *  runGeneration wrote to that stream, and writing to a torn-down stream REJECTS. Any one of those
- *  rejections used to unwind the whole function —
- *  past the single `db.updateMessage(...)` that persists `fullContent` at the end — leaving the
- *  placeholder assistant row (inserted empty, `stats: { aborted: false }`, before the first
- *  token) permanently blank with `aborted: false`. That is exactly the reporter's third bucket:
- *  rows that are empty but not flagged aborted, with the model's real output thrown away.
- *  The done-path emit was individually guarded for this reason; the error-path emit was not, and
- *  neither were the ten emits inside the streaming loops.
- *
- *  So the guard belongs on the SEAM, not on individual call sites: the first failure latches the
- *  client as gone and every later emit becomes a no-op. A dead client degrades to "keep
- *  generating, keep persisting, stop writing to the socket" instead of unwinding. Abort semantics
- *  are untouched — Stop aborts via the AbortController, which is what sets `aborted: true`; this
- *  only stops write failures from being fatal. PURE-ish and exported so the latch behaviour is
- *  pinned by tests. */
-export function resilientSink(sink: EmitSink): EmitSink & { clientGone: () => boolean } {
-  let gone = false
-  const wrapped = async (ev: { event: string; data: unknown }): Promise<void> => {
-    if (gone) return
-    try {
-      await sink(ev)
-    } catch {
-      // The sink is gone. Nothing to flush to, ever again — and an unhandled rejection here
-      // would crash the daemon.
-      gone = true
-    }
-  }
-  return Object.assign(wrapped, { clientGone: () => gone })
-}
-
-/** An error the engine reported INSIDE a 200 stream, as `data: {"error": ...}`. llama-server does this when a
- *  request fails after streaming began, and LiteRT-LM does it for every runtime failure (a prompt longer than the
- *  bundle's context, for one). Such a chunk has no `choices`, so the round loop skipped it and the turn ended as an
- *  empty message with no reason given. Also thrown for a non-OK response, so that one is handled (and the turn's
- *  earlier rounds saved) by the same catch. */
-export class EngineStreamError extends Error {}
+// The sink guard and the engine-error type live with the loop (generation-core.ts); exported here as before.
+export { resilientSink, EngineStreamError } from './generation-core'
 
 /** Whether this turn's past reasoning goes to the engine as each message's `reasoning_content` rather than folded into
  *  its text (buildEngineMessages): this machine's LiteRT-LM engine or in-app SDK engine, whose bundle templates decide what of it the model
@@ -1422,161 +1191,11 @@ export { streamChunkError, engineErrorText } from '../engines/engine-error'
  *  invariant this function owns (GitHub #177: generated output must survive a failing sink, an
  *  engine that dies mid-stream, and a Stop click) is not reachable through the route, whose sink
  *  is the turn's run (chat-runs.ts), which never fails. Not part of any public API. */
-export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationCtx): Promise<void> {
+export async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promise<void> {
   const { db } = d
-  const { convId, conv, assistantMsg, upstream, ac, thinkingBudget, reasoningEffort } = ctx
-  // GitHub #177: never let a write to a torn-down stream unwind past the persistence write
-  // below. See resilientSink's doc comment — this is the invariant, not the individual
-  // try/catch at the two emit sites that happened to have one.
-  const emit = resilientSink(rawEmit)
-  // A remote turn ran on ANOTHER machine: nothing below may write its numbers into this
-  // one's engine state. Same rule the gateway's own remote branch follows (I-4) — the
-  // peer's engine card must not read "Generating…" for work its engine is not doing, and
-  // `hostIdleState` reads sessionStats().activeRequests, so a false busy here would block a
-  // third machine's legitimate wake.
+  const { convId, conv, assistantMsg, upstream, ac } = ctx
+  // A remote turn's approval wait is not this machine's engine work (chatTurns.setApprovalWait).
   const localAccounting = !upstream.remote
-
-  // Map conversation sampling overrides (camelCase) to the engine's snake_case names.
-  const convS = conv.sampling ?? {}
-  const engineKind = servingEngineKind(d)
-  // BUG-006: vLLM and SGLang reject `repeat_penalty` (the llama.cpp name) and require
-  // `repetition_penalty` — the OpenAI-spec name. mlx-vlm's request schema (server/schemas.py)
-  // only declares `repetition_penalty` too — `repeat_penalty` isn't rejected (the schema
-  // allows extra fields) but is silently ignored, a no-op. Map per engine kind. LiteRT-LM keeps
-  // `repeat_penalty`: the Repeat penalty is llama.cpp's, and the Android app's server applies that
-  // name as llama.cpp does, over the last 64 tokens (`repetition_penalty` over the whole reply);
-  // `serve` reads neither, which litertLmIgnoredFieldsNote says.
-  const repeatPenaltyKey =
-    (engineKind === 'vllm' || engineKind === 'sglang' || engineKind === 'mlx-vlm') ? 'repetition_penalty' : 'repeat_penalty'
-  const SAMPLING_KEYS: Record<string, string> = {
-    temp: 'temperature', topP: 'top_p', topK: 'top_k', minP: 'min_p',
-    repeatPenalty: repeatPenaltyKey, presencePenalty: 'presence_penalty',
-    frequencyPenalty: 'frequency_penalty',
-  }
-  const samplingOverride: Record<string, unknown> = {}
-  for (const [camel, snake] of Object.entries(SAMPLING_KEYS)) {
-    if (camel in convS) samplingOverride[snake] = convS[camel]
-  }
-  for (const [k, v] of Object.entries(convS)) {
-    if (!(k in SAMPLING_KEYS) && k !== 'stop') samplingOverride[k] = v
-  }
-  const stopStrings = convS.stop as string[] | undefined
-
-  const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
-
-  // ── Agentic tool loop ──────────────────────────────────────────────────────
-  // engineMessages is extended each round with tool results. Start from ctx copy
-  // so the original array is never mutated (continue endpoint reuses it).
-  const iterMessages: { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string; reasoning_content?: string }[] =
-    ctx.engineMessages.map((m) => ({ role: m.role, content: m.content, ...(m.reasoning_content ? { reasoning_content: m.reasoning_content } : {}) }))
-
-  // Skills enabled for this conversation (the shared SKILL.md library, picked via
-  // Thread settings or the '/' picker): inject their instructions into the system
-  // prompt. No-op for a plain chat with no skills enabled — byte-identical to today.
-  const enabledSkillIds = new Set(conv.skillIds ?? [])
-  if (enabledSkillIds.size > 0) {
-    const enabledSkills = new SkillStore(d.store.dir()).list().filter((s) => enabledSkillIds.has(s.id))
-    if (enabledSkills.length) {
-      // Full instructions, formatting intact — a real skill's procedure can run to
-      // several KB and a 300-char preview was silently dropping nearly all of it.
-      // MAX_SKILL_INSTRUCTIONS_CHARS is a safety cap against a pathological file,
-      // not an everyday limit (real skills should always fit under it whole).
-      const MAX_SKILL_INSTRUCTIONS_CHARS = 20_000
-      const skillSys = 'Skills enabled for this chat (apply the relevant ones):\n\n' +
-        enabledSkills.map((s) => `## ${s.name}\n${s.description}\n\n${s.instructions.trim().slice(0, MAX_SKILL_INSTRUCTIONS_CHARS)}`).join('\n\n---\n\n')
-      const sysIdx = iterMessages.findIndex((m) => m.role === 'system')
-      if (sysIdx >= 0) {
-        const existing = typeof iterMessages[sysIdx].content === 'string' ? iterMessages[sysIdx].content : ''
-        iterMessages[sysIdx] = { ...iterMessages[sysIdx], content: `${skillSys}\n\n${existing}`.trim() }
-      } else {
-        iterMessages.unshift({ role: 'system', content: skillSys })
-      }
-    }
-  }
-
-  // Search budget for a force_web_search turn. The Research persona plans 3–5 targeted
-  // queries; at 3 the model got exactly ONE discretionary search (iterations 1–2 are
-  // tool_choice-forced) and the confidence re-loop below had no room left to fire at all,
-  // so the advertised strategy was not executable. 6 = 5 planned + at least one
-  // confidence-driven refinement (ADR-230: quality over latency). SINGLE SOURCE OF TRUTH —
-  // the instruction text the model is told and the guard the code enforces must never
-  // disagree again, so both read this constant.
-  const MAX_SEARCH_CALLS = 6
-  // Bounds how many times a low-confidence answer may be folded back for refinement. The
-  // re-loop does not force a tool call, so a model that keeps answering without searching
-  // would otherwise never advance searchCallCount and would spin until MAX_TOOL_ITER.
-  const MAX_CONFIDENCE_RETRIES = 2
-
-  // F-021: inject confidence-loop instruction into Research persona system prompt.
-  // Appends to the existing system message (or inserts one if absent).
-  const CONFIDENCE_INSTRUCTION =
-    `\n\nAfter reviewing the search results, include a confidence assessment on a line by itself before your final answer: \`[confidence: 0.XX]\` where XX is your confidence (0.0–1.0) that your answer is accurate and current. If your confidence is below 0.8, call web_search again with a more specific query first. Maximum ${MAX_SEARCH_CALLS} search calls per response.`
-  if (conv.toolPolicy === 'force_web_search') {
-    const sysIdx = iterMessages.findIndex((m) => m.role === 'system')
-    if (sysIdx >= 0) {
-      const existing = typeof iterMessages[sysIdx].content === 'string' ? iterMessages[sysIdx].content : ''
-      iterMessages[sysIdx] = { ...iterMessages[sysIdx], content: existing + CONFIDENCE_INSTRUCTION }
-    } else {
-      iterMessages.unshift({ role: 'system', content: CONFIDENCE_INSTRUCTION.trim() })
-    }
-  }
-
-  // Outer ceiling on tool rounds. Worst case for a research turn that actually uses its
-  // budget: 6 web_search rounds + up to 6 fetch_url/MCP rounds (the persona tells the model
-  // to fetch_url any authoritative-looking result whose excerpt is thin) + 3 answer-
-  // composition rounds (initial + MAX_CONFIDENCE_RETRIES refinements) = 15. 16 leaves one
-  // round of headroom so a legitimate investigation is never truncated mid-flight. This is
-  // a ceiling, not a target — ordinary chats still finish in 1–2 rounds and are unaffected.
-  const MAX_TOOL_ITER = 16
-  let toolIter = 0
-  /** The reply's wait for its tool-call approvals, shared by all its calls (ApprovalWaitBudget). */
-  const approvalWait = newApprovalWaitBudget()
-  /** Number of web_search tool calls made this turn (caps the confidence re-loop). */
-  let searchCallCount = 0
-  /** Confidence-driven refinement passes taken this turn (capped at MAX_CONFIDENCE_RETRIES). */
-  let confidenceRetries = 0
-  /** Accumulated ResearchResult[] from all web_search calls this turn (F-021). */
-  const allResearchSources: ResearchSource[] = []
-  /** Confidence score parsed from model output (F-021); undefined for non-research turns. */
-  let parsedConfidence: number | undefined
-
-  // Accumulated across all tool iterations for persistence
-  let fullContent = ''
-  let fullReasoning = ''
-  const allToolCalls: ToolCallRecord[] = []
-
-  // Stats from the final (non-tool) round
-  const requestStart = Date.now()
-  let ttftMs = 0
-  let thinkStart = 0
-  let thinkEnd = 0
-  let finalUsage: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } = {}
-  let finalTimings: Record<string, number> = {}
-  let aborted = false
-  // Distinct from `aborted`: a thrown, non-AbortError exception mid-stream (e.g. the
-  // engine process died) is neither a success nor a user-initiated cancellation.
-  // `aborted` alone can't tell the two apart (both leave AbortError-only checks
-  // false/true respectively), and first_chat needs the real three-way split.
-  let engineFailed = false
-  let liveOut = 0
-  /** The live round's parser state, or null once its end-of-stream flush has already run.
-   *  GitHub #177: the streaming parser legitimately withholds up to 29 characters as lookahead
-   *  (it cannot know yet whether they are the start of a `<|channel|>analysis…` tag), and that
-   *  tail is only released by `flushState` at end-of-stream. An abort or an engine death THROWS
-   *  out of the round loop before that flush ever runs, so every short interrupted reply — the
-   *  common case when a user hits Stop early — had its text dropped on the floor even though the
-   *  model really did produce it. Held here so the finalizer below can drain it. */
-  let pendingParse: ParseState | null = null
-  /** GitHub #52 item 9: the authoritative prompt-token count only arrives at the END of a round
-   *  (`usage.prompt_tokens` / `timings.prompt_n`), so a mid-stream abort leaves it at 0 — the UI
-   *  renders "0+147 tokens" and `ctxUsed` understates context by the entire prompt even though
-   *  those prompt tokens really are sitting in the KV cache. The engine streams `prompt_progress`
-   *  chunks WHILE it ingests the prompt (`{ processed, total }`, surfaced to the client as the
-   *  `progress` event), and that `total` IS the prompt size — the same number `prompt_tokens`
-   *  would have reported. Remember the last one seen and use it as the fallback. This is a
-   *  measured value from the engine, never an invented one: it stays 0 when the engine sends no
-   *  progress at all (e.g. `return_progress` unsupported), which is exactly today's behavior. */
-  let lastPromptTotal = 0
 
   /** Regenerate (`ctx.replacedId`): /continue sets the old reply aside only once the turn can run,
    *  but the engine or a linked host can still refuse it after that: an HTTP error (a 503 while a
@@ -1586,14 +1205,13 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
    *  text, reasoning or tool call, nothing still held back by the parser), the empty placeholder is
    *  deleted and the old reply shown again, before the error is sent, so the client's refetch on it
    *  already sees the reply back. Only while both rows are as this turn left them (a DELETE of
-   *  either during the turn stands). Never throws: the catch below calls it, where nothing may.
+   *  either during the turn stands). Never throws: the core's catch calls it, where nothing may.
    *  Save & Resend (`ctx.edited`) the same: such a turn left the new question shown with an empty
    *  reply, and the old version and its replies behind the question's switcher. The new version is
    *  deleted with the placeholder, not kept beside the old one: switched to, it would show a
    *  question with no reply, and the next send would go out as user, user. */
-  let restored = false
-  const restoreReplaced = (): boolean => {
-    if ((!ctx.replacedId && !ctx.edited) || fullContent || fullReasoning || allToolCalls.length > 0 || pendingParse?.buf) return false
+  const restoreUnproduced = (): boolean => {
+    if (!ctx.replacedId && !ctx.edited) return false
     try {
       const placeholder = db.getMessage(assistantMsg.id)
       if (!placeholder?.isActive) return false
@@ -1623,810 +1241,54 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
     }
   }
 
-  // In-app chat is the owner using their own machine — the signal Turbo Link's wake
-  // gate reads to refuse a peer's model swap (link/host-idle.ts). The gateway records
-  // the terminal-agent paths; this is the only local path that never goes through it.
-  // Still local activity even for a remote turn: the OWNER of this machine is at the
-  // keyboard, which is exactly what the wake ledger records.
-  noteLocalActivity()
-  if (localAccounting) d.manager.generationStart()
-  // The reply's text so far (and its reasoning and finished tool calls) is saved into its placeholder every
-  // PARTIAL_SAVE_MS while the turn runs, when it changed. It was written only at the end of the turn, so a daemon
-  // or Android process killed mid-reply lost everything it had streamed, and the restart reconcile then marked an
-  // empty reply stopped. The stats stay the placeholder's `{"aborted":false}` until the end-of-turn save below,
-  // which is what tells that reconcile (db.ts abortUnfinishedReplies) the reply never finished.
-  let partial = { content: '', reasoning: '', toolCalls: 0 }
-  const savePartial = () => {
-    if (fullContent === partial.content && fullReasoning === partial.reasoning && allToolCalls.length === partial.toolCalls) return
-    partial = { content: fullContent, reasoning: fullReasoning, toolCalls: allToolCalls.length }
-    try {
-      db.updateMessage(assistantMsg.id, { content: fullContent, reasoning: fullReasoning, toolCalls: allToolCalls })
-    } catch { /* best-effort: the end-of-turn save writes it all */ }
-  }
-  const partialSaves = setInterval(savePartial, PARTIAL_SAVE_MS)
-  partialSaves.unref?.()
-  runningReplySaves.add(savePartial)
-  try {
-    // Get tool definitions once (or empty for engines that don't support tools)
-    // MCP server tools are left out (and refused below) for a caller that may not act on the host:
-    // isCodeAuthorized is the same isLocalRequest || real-key decision as adding an MCP server.
-    const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions({ forGeneration: true, refuseMcp: !ctx.isCodeAuthorized }) : []
-    // 'skill-creator' grants save_skill — the one tool a skill can add beyond the base
-    // registry (every other skill is instructions text only). No-op unless enabled.
-    // save_skill writes to the shared skill library, as POST /api/v1/skills and the Save as skill
-    // route do, and both refuse a caller isLocalOrAuthenticated fails. isCodeAuthorized is that
-    // same decision for this turn's caller (isLocalRequest || a real key), so a turn without it
-    // is not offered save_skill, and a call the model makes anyway is refused here, before the
-    // skill author starts (the tool skips the approval gate, so this is the only check).
-    const skillTools = enabledSkillIds.has('skill-creator')
-      ? buildSaveSkillTool(() => {
-          if (!ctx.isCodeAuthorized) return `Error: ${SKILL_AUTHORING_REFUSED}`
-          // In-chat skill author: read THIS conversation in the background and write a
-          // SKILL.md to the shared library.
-          const tid = saveSkillFromConversation(d, conv.id)
-          return tid
-            ? 'Started writing a skill from this conversation in the background. It will appear in the skill library shortly.'
-            : 'There is nothing to turn into a skill yet.'
-        })
-      : undefined
-    // Custom chat Agent tool allow-list (Customize → Agents), baked in at conversation
-    // creation. Undefined (never set) = unrestricted — every untouched built-in persona's
-    // conversations take this branch, so their tool list is byte-identical to before this
-    // feature. An EXPLICIT empty array is different from unset, though — it means a
-    // built-in deliberately fixed its tool list to none (e.g. the Blank persona: "raw model
-    // output, no instructions injected" has to mean no tool-calling preamble too, not just
-    // an empty system prompt — GitHub #52) — so it must actually filter down to zero tools,
-    // not fall through to unrestricted the way a merely-absent list does.
-    // Applied ONLY to the base (built-in + MCP) registry: skill-granted tools like
-    // save_skill are never enumerated by /api/v1/tools (they only exist once their
-    // skill is enabled), so they can never appear in the allow-list checklist — gating
-    // them a second time here would silently strip save_skill from any agent that has
-    // 'skill-creator' enabled. Enabling the skill IS the allow decision for its tools.
-    const scopedBaseToolDefs = conv.allowedTools !== undefined
-      ? baseToolDefs.filter((t) => conv.allowedTools!.includes(t.function.name))
-      : baseToolDefs
-    const toolDefs = skillTools && ctx.isCodeAuthorized ? [...scopedBaseToolDefs, ...skillTools.defs] : scopedBaseToolDefs
-    // This machine's LiteRT-LM engine and the model it serves (a Turbo Link host shapes for its own engine).
-    const localLitert = engineKind === 'litert-lm' && !upstream.remote
-    const litertModel = localLitert ? d.scanner?.get?.(d.manager.status?.().model?.key ?? '') : undefined
-    /** A note for the user about this turn, once per turn: the chat shows it (ChatScreen's 'notice'). */
-    const notes = new Set<string>()
-    const noteOnce = async (message: string): Promise<void> => {
-      if (notes.has(message)) return
-      notes.add(message)
-      await emit({ event: 'notice', data: { message } })
-    }
-
-    while (toolIter <= MAX_TOOL_ITER) {
-      toolIter++
-
-      const reqBody: Record<string, unknown> = {
-        model: upstream.modelField,
-        messages: iterMessages,
-        stream: true,
-        stream_options: { include_usage: true },
-        return_progress: true,
-        ...samplingOverride,
-      }
-      if (stopStrings?.length) reqBody.stop = stopStrings
-      const cappedMax = clampMaxTokens(reqBody.max_tokens as number | undefined, maxLimit)
-      if (cappedMax != null) reqBody.max_tokens = cappedMax
-      else delete reqBody.max_tokens
-      // GitHub #52: thinkingBudget (this turn) and preserveThinking (past turns) are
-      // independent and can both be relevant at once, so merge rather than overwrite.
-      // thinking_budget_tokens (not the unrecognized `reasoning_budget`) is the field the
-      // engine's sampler actually reads — see reasoning-budget.cpp in the TurboQuant fork.
-      const templateKwargs: Record<string, unknown> = {}
-      if (thinkingBudget === 0) {
-        reqBody.thinking_budget_tokens = 0
-        templateKwargs.enable_thinking = false
-      } else if (thinkingBudget > 0) {
-        reqBody.thinking_budget_tokens = thinkingBudget
-      }
-      if (conv.preserveThinking) templateKwargs.preserve_thinking = true
-      // Independent of thinkingBudget/enable_thinking above — only sent when the caller
-      // passed a value that survived parseReasoningEffort (chat-routes.ts's body parsing),
-      // so a client typo or an unsupported model can never make it into a request the
-      // engine's chat template would raise_exception on. 'off' is this control's own way of
-      // disabling thinking (see reasoning-effort.ts) — never forwarded as literal
-      // reasoning_effort:"off"; it collapses onto the exact same fields thinkingBudget===0
-      // above already sets.
-      if (reasoningEffort === 'off') {
-        reqBody.thinking_budget_tokens = 0
-        templateKwargs.enable_thinking = false
-      } else if (reasoningEffort) {
-        templateKwargs.reasoning_effort = reasoningEffort
-      }
-      if (Object.keys(templateKwargs).length) reqBody.chat_template_kwargs = templateKwargs
-      // Attach tools only to engines whose OpenAI server accepts a `tools` array as
-      // passthrough. vLLM is strict: a `tools` array (which defaults tool_choice to
-      // "auto") is REJECTED with HTTP 400 — "auto tool choice requires
-      // --enable-auto-tool-choice and --tool-call-parser to be set" — unless the
-      // server was launched with those flags (which we don't, and no built-in parser
-      // matches Gemma's tool format). Sending tools there breaks ALL vLLM chat, so we
-      // skip them. llama.cpp/forks accept them; mlx-lm ignores them harmlessly. mlx-vlm
-      // also accepts them without erroring, but whether a tool call actually comes back
-      // depends on the loaded model's chat template matching one of mlx-vlm's built-in
-      // tool parsers (see the MLX-VLM catalog note) — not a crash risk, just a
-      // per-architecture no-op some of the time.
-      // A local LiteRT-LM model gets them when it calls tools and they fit (litertLmToolsFor), and the
-      // user is told when it gets none. They were withheld from every LiteRT-LM model (PR #271, before
-      // its servers took them), so the thread's tools, MCP and skill tools and the Research persona's
-      // web_search never reached LFM2.5, Qwen3 or Gemma 4, whose templates show them to the model.
-      // A temperature or top_p a LiteRT-LM model ignores (no sampler of its own: greedy without a top_k) is said.
-      const samplingNote = localLitert ? litertLmSamplingNote(reqBody) : undefined
-      if (samplingNote) await noteOnce(samplingNote)
-      // So is a setting the server does not apply (Min P; on `serve`, stop strings and penalties). The request's own
-      // sampling is the thread's (samplingOverride), so a Min P it sets is named as the thread's.
-      const ignoredNote = localLitert ? litertLmIgnoredFieldsNote(reqBody, { fromThread: true }) : undefined
-      if (ignoredNote) await noteOnce(ignoredNote)
-      let roundTools = toolDefs
-      if (localLitert && toolDefs.length > 0) {
-        const pick = litertLmToolsFor(litertModel, toolDefs, iterMessages, upstream.ctxMax)
-        roundTools = pick.tools
-        if (pick.note) await noteOnce(pick.note)
-      }
-      // The in-app SDK engine refuses a request's tools (ADR-447 point 7), so a local turn there goes without them. A
-      // turn to a Turbo Link host keeps them: the host's engine runs them, whatever this machine's engine is (G-6).
-      const localWithholdsTools = engineWithholdsTools(engineKind) && !upstream.remote
-      const toolsSupported = engineKind !== 'vllm' && engineKind !== 'sglang' && !localWithholdsTools && roundTools.length > 0
-      if (toolsSupported) reqBody.tools = roundTools
-      // Force web_search on the first two iterations when the conversation has a
-      // force_web_search policy (e.g. Research persona). This guarantees at least
-      // two distinct searches before the model composes its answer. Iteration 3+
-      // use "auto" so the model can continue searching or finish as it sees fit.
-      // Not on LiteRT-LM: `serve` ignores tool_choice and the Android server refuses a forced call it
-      // cannot honour, so its model chooses, and the user is told.
-      if (
-        toolsSupported &&
-        conv.toolPolicy === 'force_web_search' &&
-        toolIter <= 2 &&
-        roundTools.some((t) => t.function.name === 'web_search')
-      ) {
-        if (localLitert) await noteOnce(LITERT_LM_RESEARCH_NOTE)
-        else reqBody.tool_choice = { type: 'function', function: { name: 'web_search' } }
-      }
-
-      const res = await callChatUpstream(upstream, reqBody, ac.signal, undefined, d)
-
-      if (!res.ok || !res.body) {
-        // The engine's own reason, from its body or (LiteRT-LM) its status line, says far more than the status code.
-        let reason = await engineErrorReason(res)
-        if (reason) reason = engineErrorText(d, engineKind, reason)
-        // Thrown, not returned: the catch below sends it as engine_error, puts back a Regenerate's
-        // or a Save & Resend's old turn when this one produced nothing (restoreReplaced), and
-        // otherwise falls through to the one save. A return here skipped that save, so a later tool
-        // round refused this way (its request past n_ctx with round 1's tool result in it, a 503
-        // after a model swap, a linked host's host_busy) lost round 1's text, reasoning and tool
-        // calls, all already streamed, and left the reply empty.
-        throw new EngineStreamError(reason ? `Engine returned ${res.status}: ${reason}` : `Engine returned ${res.status}`)
-      }
-
-      const reader = res.body.getReader()
-      const decoder = new TextDecoder()
-      let buf = ''
-
-      // `.catch()` is load-bearing (GitHub #177): on abort, the fetch layer ERRORS the body
-      // stream first (undici rejects the pending read with AbortError), and cancelling an
-      // already-errored stream returns a REJECTED promise. Bare `void reader.cancel()` left that
-      // floating — an unhandled rejection, i.e. a daemon crash mid-generation, which loses the
-      // turn's output the same way the unguarded emits did.
-      const cancelReader = () => { void reader.cancel().catch(() => {}) }
-      if (ac.signal.aborted) {
-        cancelReader()
-      } else {
-        ac.signal.addEventListener('abort', cancelReader, { once: true })
-      }
-
-      // Per-round state
-      let roundContent = ''
-      let parseState = initParseState()
-      pendingParse = parseState
-      let finishReason = ''
-      // Accumulate streaming tool_calls by index (OpenAI format: fragmented across chunks)
-      const pendingToolCalls = new Map<number, { id: string; name: string; argsBuffer: string }>()
-      // Indices we've already told the UI about (so the long tool-arg generation that
-      // follows the model's text shows an inline "running…" step instead of looking frozen).
-      const announcedToolCalls = new Set<number>()
-
-      roundLoop: while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buf += decoder.decode(value, { stream: true })
-        const lines = buf.split('\n')
-        buf = lines.pop() ?? ''
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          const raw = line.slice(6).trim()
-          if (raw === '[DONE]') break roundLoop
-
-          let chunk: Record<string, unknown>
-          try { chunk = JSON.parse(raw) as Record<string, unknown> } catch { continue }
-          const engineError = streamChunkError(chunk)
-          if (engineError) {
-            // Nothing more is read from this stream: hang up so the engine stops, and drop the abort hook with it.
-            ac.signal.removeEventListener('abort', cancelReader)
-            cancelReader()
-            throw new EngineStreamError(engineErrorText(d, engineKind, engineError))
-          }
-
-          // Prompt progress
-          const pp = chunk.prompt_progress as { processed?: number; total?: number; tps?: number } | undefined
-          if (pp && pp.total) {
-            // #52 item 9: the only prompt-token number that exists before the round ends.
-            lastPromptTotal = pp.total
-            const pct = Math.round((pp.processed ?? 0) / pp.total * 100)
-            if (localAccounting) d.manager.setLiveGen({ phase: 'prompt', pct, outputTokens: 0 })
-            await emit({ event: 'progress', data: { phase: 'prompt', processed: pp.processed, total: pp.total, pct, tps: pp.tps ?? 0 } })
-            continue
-          }
-
-          if (chunk.usage) finalUsage = chunk.usage as typeof finalUsage
-          if (chunk.timings) finalTimings = chunk.timings as typeof finalTimings
-
-          const choices = chunk.choices as Array<{
-            delta?: { content?: string; reasoning_content?: string; reasoning?: string; tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> }
-            finish_reason?: string
-          }> | undefined
-          if (!choices?.length) continue
-
-          if (choices[0].finish_reason) finishReason = choices[0].finish_reason
-          const delta = choices[0].delta ?? {}
-
-          // Accumulate streaming tool_call fragments (OpenAI: id+name only in first chunk,
-          // arguments fragment across all chunks for that index).
-          if (delta.tool_calls?.length) {
-            for (const tc of delta.tool_calls) {
-              if (!pendingToolCalls.has(tc.index)) {
-                pendingToolCalls.set(tc.index, { id: '', name: '', argsBuffer: '' })
-              }
-              const entry = pendingToolCalls.get(tc.index)!
-              if (tc.id && !entry.id) entry.id = tc.id
-              if (tc.function?.name && !entry.name) entry.name = tc.function.name
-              if (tc.function?.arguments) entry.argsBuffer += tc.function.arguments
-              // The moment we know which tool this is, surface it as pending — the model
-              // may stream a long argument body next, and silence there reads as a freeze.
-              if (entry.id && entry.name && !announcedToolCalls.has(tc.index)) {
-                announcedToolCalls.add(tc.index)
-                await emit({ event: 'tool_call', data: { id: entry.id, name: entry.name, args: {}, status: 'pending' } })
-              }
-            }
-            continue
-          }
-
-          // Reasoning content — llama-server uses `reasoning_content`, mlx-lm uses `reasoning`.
-          const rc = (delta.reasoning_content ?? delta.reasoning) as string | undefined
-          if (rc) {
-            if (!thinkStart) thinkStart = Date.now()
-            thinkEnd = Date.now()
-            fullReasoning += rc
-            await emit({ event: 'reasoning', data: { delta: rc } })
-            continue
-          }
-
-          const raw_content = delta.content ?? ''
-          if (!raw_content) continue
-
-          const { state: nextState, events: parseEvents } = feedChunk(parseState, raw_content)
-          parseState = nextState
-          pendingParse = parseState
-          for (const ev of parseEvents) {
-            if (ev.type === 'reasoning') {
-              if (!thinkStart) thinkStart = Date.now()
-              thinkEnd = Date.now()
-              fullReasoning += ev.text
-              await emit({ event: 'reasoning', data: { delta: ev.text } })
-            } else {
-              fullContent += ev.text
-              roundContent += ev.text
-              if (!ttftMs) ttftMs = Date.now() - requestStart
-              liveOut++
-              if (localAccounting) d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: liveOut })
-              await emit({ event: 'delta', data: { delta: ev.text } })
-            }
-          }
-        }
-      }
-      ac.signal.removeEventListener('abort', cancelReader)
-      // A Stop does not always reach this loop as an AbortError: with the request log on (the default)
-      // the turn reads one branch of a tee'd body (callChatUpstream), and cancelling it on abort ENDS the
-      // pending read (done: true) instead; Node 18's fetch body (the Android app's runtime) does the same
-      // with the log off. Read as the end of the round, a stopped reply was saved as finished (title,
-      // memory and bench result included) and a tool call it was streaming still ran, one set to Allow
-      // without asking. Thrown as the abort it is, before the flush below, so the catch and the drain
-      // after it handle it as they handle an AbortError.
-      ac.signal.throwIfAborted()
-
-      // Flush lookahead buffer at end-of-stream. Clearing `pendingParse` first is what stops the
-      // interrupted-turn drain after the try/catch from flushing this same buffer a SECOND time
-      // (flushState is pure — it does not consume the buffer it reads).
-      pendingParse = null
-      for (const ev of flushState(parseState)) {
-        if (ev.type === 'reasoning') {
-          fullReasoning += ev.text
-          await emit({ event: 'reasoning', data: { delta: ev.text } })
-        } else {
-          fullContent += ev.text
-          roundContent += ev.text
-          await emit({ event: 'delta', data: { delta: ev.text } })
-        }
-      }
-
-      // ── Tool call execution ──────────────────────────────────────────────
-      if ((finishReason === 'tool_calls' || pendingToolCalls.size > 0) && d.tools && toolIter <= MAX_TOOL_ITER) {
-        const roundToolCalls = Array.from(pendingToolCalls.values())
-
-        // Add the assistant message (with tool_calls) to iterMessages for the next round
-        iterMessages.push({
-          role: 'assistant',
-          content: roundContent || null,
-          tool_calls: roundToolCalls.map((tc) => ({
-            id: tc.id,
-            type: 'function',
-            function: { name: tc.name, arguments: tc.argsBuffer },
-          })),
-        })
-
-        for (const tc of roundToolCalls) {
-          // No call starts once the turn is stopped. A tool that does not honour the abort (fetch_url,
-          // run_code, MCP) runs to its end when Stop comes during it, and the round's next call then
-          // started after the Stop, a tool set to Allow included.
-          ac.signal.throwIfAborted()
-          let parsedArgs: Record<string, unknown>
-          try { parsedArgs = JSON.parse(tc.argsBuffer || '{}') as Record<string, unknown> }
-          catch { parsedArgs = {} }
-
-          // save_skill (from the 'skill-creator' skill) is pre-authorized by the user
-          // having enabled that skill for this chat, so it bypasses the approval gate
-          // and routes straight to its own executor. Everything else (normal chat
-          // tools) still goes through the real approval gate below.
-          const isSkillTool = skillTools?.names.has(tc.name) ?? false
-          // The agent's allow-list (conv.allowedTools, scopedBaseToolDefs above) decides what may
-          // RUN, not only what the model is offered: a model can name any tool, offered or not
-          // (small models do hallucinate tool names), and the approval gate below ran such a call
-          // whenever its policy allowed it, so an agent fixed to web_search still ran run_code or
-          // an MCP tool. A base tool the list leaves out is answered as executeTool answers one
-          // that does not exist. Skill tools are never on the list (see scopedBaseToolDefs).
-          const unlisted = !isSkillTool && conv.allowedTools !== undefined && !conv.allowedTools.includes(tc.name)
-
-          let result: string
-          let callError: string | undefined
-
-          if (unlisted) {
-            result = `Error: unknown tool "${tc.name}"`
-            await emit({
-              event: 'tool_call',
-              data: { id: tc.id, name: tc.name, args: parsedArgs, status: 'done', result },
-            })
-          } else if (isSkillTool && skillTools) {
-            // Emit pending event so the frontend can show "calling..."
-            await emit({
-              event: 'tool_call',
-              data: { id: tc.id, name: tc.name, args: parsedArgs, status: 'pending' },
-            })
-            try {
-              result = skillTools.execute({ id: tc.id, name: tc.name, args: parsedArgs })
-            } catch (e) {
-              callError = (e as Error).message
-              result = `Error: ${callError}`
-            }
-            await emit({
-              event: 'tool_call',
-              data: { id: tc.id, name: tc.name, args: parsedArgs, status: callError ? 'error' : 'done', result },
-            })
-          } else {
-            // Live foreground chat gets the real approval gate (interactive: true) — an
-            // 'ask'-policy tool prompts the user via 'tool_call'/'awaiting_approval' and
-            // waits for POST .../tool-calls/:toolCallId/approve to resolve it.
-            const approved = await executeToolCallWithApproval({
-              tools: d.tools,
-              sink: (ev) => emit({ event: ev.event, data: ev.data }),
-              convId,
-              id: tc.id,
-              name: tc.name,
-              args: parsedArgs,
-              globalPolicies: d.store.snapshot().tools.toolPolicies ?? {},
-              // Re-read fresh on every iteration (not the `conv` snapshot captured at request
-              // start) — otherwise a same-turn repeat tool call misses an "Allow for this
-              // chat" decision the user just made via POST .../tool-calls/:id/approve.
-              convOverrides: d.db.getToolOverrides(convId),
-              autoAllowAll: d.store.snapshot().tools.autoAllowAll ?? false,
-              signal: ac.signal,
-              interactive: true,
-              // How long the reply waits for its answers (Settings → Tool permissions), read as its
-              // first call reaches its wait and shared by its calls (approvalBudget): a reply whose
-              // calls nobody answers then goes on as after a deny instead of holding the chat (and on
-              // Android the model and the wake lock), after one wait however often the model asks.
-              approvalWaitMinutes: d.store.snapshot().tools.chatApprovalWaitMinutes ?? CHAT_APPROVAL_WAIT_MINUTES.default,
-              approvalBudget: approvalWait,
-              // Parked on the approval meanwhile: the activity probe lists the chat as waiting.
-              onApprovalWait: (waiting) => {
-                if (waiting) approvalWaits.add(ac)
-                else approvalWaits.delete(ac)
-                if (localAccounting) parkedLocalTurns += waiting ? 1 : -1
-              },
-              // The real per-request trust decision this handler's route computed from its Hono
-              // Context (see the `chatCodeAuthorization(c, d)` call sites) — never a hardcoded true.
-              isCodeAuthorized: ctx.isCodeAuthorized,
-              // An MCP call the model makes anyway, unoffered, is refused before any approval prompt.
-              refuseMcp: !ctx.isCodeAuthorized,
-            })
-            result = approved.result
-            callError = approved.error
-          }
-
-          // F-021: track web_search calls and accumulate research sources.
-          if (tc.name === 'web_search' && !callError && !unlisted) {
-            searchCallCount++
-            // The result string embeds the structured data; also ask the registry
-            // for the raw ResearchResult[] via a direct research call on the same
-            // args (zero extra network cost — the registry already called it).
-            // We parse what we can from the result string as a fallback.
-            try {
-              // Re-parse sources from result text: each [N] block has Domain/Relevance line.
-              // LOCKSTEP: this regex must track the exact line emitted by execWebSearch in
-              // tools/builtin.ts — if they drift, every source silently vanishes from the UI
-              // and from the persisted message. `Published`/`Retrieved` were appended after
-              // `Freshness`, so both trailing groups are optional and this parses the pre-date
-              // format too. m[7] = published label, m[8] = retrieval date, m[9] = passage.
-              const sourceMatches = [...result.matchAll(/\[(\d+)\] (.+?)\nSource: (\S+)\nDomain: (\S+) \| Relevance: ([\d.]+) \| Freshness: (\w+)(?: \| Published: ([^|\n]*?))?(?: \| Retrieved: ([\d-]+))?\nKey passage: ([\s\S]+?)(?=\n\[|\s*$)/g)]
-              for (const m of sourceMatches) {
-                allResearchSources.push({
-                  title: m[2].trim(),
-                  url: m[3].trim(),
-                  domain: m[4].trim(),
-                  relevanceScore: parseFloat(m[5]),
-                  freshnessSignal: (m[6].trim() as 'recent' | 'dated' | 'unknown'),
-                  passage: m[9].trim(),
-                })
-              }
-            } catch { /* parsing is best-effort */ }
-          }
-
-          allToolCalls.push({ id: tc.id, name: tc.name, args: parsedArgs, result: callError ? undefined : result, error: callError })
-
-          // Inject tool result into iterMessages
-          iterMessages.push({ role: 'tool', content: result, tool_call_id: tc.id })
-        }
-
-        // Continue to next round
-        continue
-      }
-
-      // ── F-021: Confidence loop (no tool calls — model gave final answer) ─────
-      // For Research persona: parse [confidence: 0.XX] from accumulated content,
-      // strip it from visible reply, and trigger another search pass if < 0.8
-      // and search budget allows (max MAX_SEARCH_CALLS web_search calls per turn).
-      if (conv.toolPolicy === 'force_web_search' && fullContent && d.tools) {
-        const confMatch = fullContent.match(/\[confidence:\s*([\d.]+)\]/i)
-        if (confMatch) {
-          const conf = parseFloat(confMatch[1])
-          parsedConfidence = conf
-          // Strip confidence marker from visible content regardless
-          fullContent = fullContent.replace(/\[confidence:\s*[\d.]+\]\s*/gi, '').trim()
-
-          if (conf < 0.8 && searchCallCount < MAX_SEARCH_CALLS && confidenceRetries < MAX_CONFIDENCE_RETRIES) {
-            confidenceRetries++
-            console.log(`[chat] F-021: confidence ${conf} < 0.8 (searches: ${searchCallCount}/${MAX_SEARCH_CALLS}, retry ${confidenceRetries}/${MAX_CONFIDENCE_RETRIES}) — re-entering search loop`)
-            const toolDefs2 = await d.tools.buildToolDefinitions()
-            if (toolDefs2.some((t) => t.function.name === 'web_search')) {
-              // Fold the low-confidence answer back and ask the model to refine
-              iterMessages.push({ role: 'assistant', content: fullContent })
-              iterMessages.push({
-                role: 'user',
-                content: `Your confidence is ${conf}. Please search again with a more specific query to improve accuracy, then provide a revised answer with an updated [confidence: X.XX] line.`,
-              })
-              fullContent = ''
-              continue
-            }
-          }
-        }
-      }
-
-      // No tool calls (or tools not available) — done
-      break
-    }
-
-    // ── BUG-001: Qwen3 empty-reply guard ──────────────────────────────────────
-    // Thinking models sometimes produce ONLY <think>…</think> tokens in their
-    // final pass after tool results, leaving visible content empty. Detect this
-    // and make one extra inference pass with tool_choice:'none' so the model is
-    // forced to emit a text answer.
-    console.log(`[chat] tool loop finished after ${toolIter} iteration(s); visible content length: ${fullContent.trim().length}`)
-    if (needsExtraPass(fullContent)) {
-      console.log('[chat] BUG-001: final content is empty after stripping think blocks — making extra pass with tool_choice:none')
-      iterMessages.push({ role: 'user', content: 'Please now write your final answer based on what you found.' })
-      const reqBody: Record<string, unknown> = {
-        model: upstream.modelField,
-        messages: iterMessages,
-        stream: true,
-        stream_options: { include_usage: true },
-        return_progress: true,
-        tool_choice: 'none',
-        ...samplingOverride,
-      }
-      if (stopStrings?.length) reqBody.stop = stopStrings
-      const cappedMax = clampMaxTokens(reqBody.max_tokens as number | undefined, maxLimit)
-      if (cappedMax != null) reqBody.max_tokens = cappedMax
-      else delete reqBody.max_tokens
-      // GitHub #52: thinkingBudget (this turn) and preserveThinking (past turns) are
-      // independent and can both be relevant at once, so merge rather than overwrite.
-      // thinking_budget_tokens (not the unrecognized `reasoning_budget`) is the field the
-      // engine's sampler actually reads — see reasoning-budget.cpp in the TurboQuant fork.
-      const templateKwargs: Record<string, unknown> = {}
-      if (thinkingBudget === 0) {
-        reqBody.thinking_budget_tokens = 0
-        templateKwargs.enable_thinking = false
-      } else if (thinkingBudget > 0) {
-        reqBody.thinking_budget_tokens = thinkingBudget
-      }
-      if (conv.preserveThinking) templateKwargs.preserve_thinking = true
-      // Independent of thinkingBudget/enable_thinking above — only sent when the caller
-      // passed a value that survived parseReasoningEffort (chat-routes.ts's body parsing),
-      // so a client typo or an unsupported model can never make it into a request the
-      // engine's chat template would raise_exception on. 'off' is this control's own way of
-      // disabling thinking (see reasoning-effort.ts) — never forwarded as literal
-      // reasoning_effort:"off"; it collapses onto the exact same fields thinkingBudget===0
-      // above already sets.
-      if (reasoningEffort === 'off') {
-        reqBody.thinking_budget_tokens = 0
-        templateKwargs.enable_thinking = false
-      } else if (reasoningEffort) {
-        templateKwargs.reasoning_effort = reasoningEffort
-      }
-      if (Object.keys(templateKwargs).length) reqBody.chat_template_kwargs = templateKwargs
-
-      const res = await callChatUpstream(upstream, reqBody, ac.signal, undefined, d)
-
-      if (res.ok && res.body) {
-        const reader = res.body.getReader()
-        const decoder = new TextDecoder()
-        let buf = ''
-        // `.catch()` is load-bearing (GitHub #177) — see the identical guard in the main round
-        // loop above: on abort the fetch layer errors the body stream first, and cancelling an
-        // already-errored stream returns a REJECTED promise, which bare `void` left floating.
-        const cancelReader = () => { void reader.cancel().catch(() => {}) }
-        if (ac.signal.aborted) {
-          cancelReader()
-        } else {
-          ac.signal.addEventListener('abort', cancelReader, { once: true })
-        }
-
-        let parseState = initParseState()
-        pendingParse = parseState
-        roundLoop: while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          buf += decoder.decode(value, { stream: true })
-          const lines = buf.split('\n')
-          buf = lines.pop() ?? ''
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue
-            const raw = line.slice(6).trim()
-            if (raw === '[DONE]') break roundLoop
-            let chunk: Record<string, unknown>
-            try { chunk = JSON.parse(raw) as Record<string, unknown> } catch { continue }
-            const engineError = streamChunkError(chunk)
-            if (engineError) {
-              // Nothing more is read from this stream: hang up so the engine stops, and drop the abort hook with it.
-              ac.signal.removeEventListener('abort', cancelReader)
-              cancelReader()
-              throw new EngineStreamError(engineErrorText(d, engineKind, engineError))
-            }
-            if (chunk.usage) finalUsage = chunk.usage as typeof finalUsage
-            if (chunk.timings) finalTimings = chunk.timings as typeof finalTimings
-            // #52 item 9: the extra pass re-sends the whole conversation, so ITS prompt is the
-            // one occupying context when it is interrupted. Captured (not emitted — this pass
-            // has never streamed progress to the client and this fix does not change that).
-            const pp2 = chunk.prompt_progress as { total?: number } | undefined
-            if (pp2?.total) lastPromptTotal = pp2.total
-            const choices = chunk.choices as Array<{ delta?: { content?: string; reasoning_content?: string; reasoning?: string }; finish_reason?: string }> | undefined
-            if (!choices?.length) continue
-            const delta = choices[0].delta ?? {}
-            const rc = (delta.reasoning_content ?? delta.reasoning) as string | undefined
-            if (rc) {
-              fullReasoning += rc
-              await emit({ event: 'reasoning', data: { delta: rc } })
-              continue
-            }
-            const raw_content = delta.content ?? ''
-            if (!raw_content) continue
-            const { state: nextState, events: parseEvents } = feedChunk(parseState, raw_content)
-            parseState = nextState
-            pendingParse = parseState
-            for (const ev of parseEvents) {
-              if (ev.type === 'reasoning') {
-                fullReasoning += ev.text
-                await emit({ event: 'reasoning', data: { delta: ev.text } })
-              } else {
-                fullContent += ev.text
-                if (!ttftMs) ttftMs = Date.now() - requestStart
-                liveOut++
-                if (localAccounting) d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: liveOut })
-                await emit({ event: 'delta', data: { delta: ev.text } })
-              }
-            }
-          }
-        }
-        ac.signal.removeEventListener('abort', cancelReader)
-        ac.signal.throwIfAborted() // a quiet end on Stop, as in the round loop above
-        pendingParse = null
-        for (const ev of flushState(parseState)) {
-          if (ev.type === 'reasoning') {
-            fullReasoning += ev.text
-            await emit({ event: 'reasoning', data: { delta: ev.text } })
-          } else {
-            fullContent += ev.text
-            await emit({ event: 'delta', data: { delta: ev.text } })
-          }
-        }
-      }
-    }
-  } catch (e: unknown) {
-    // Whatever was thrown once the turn was stopped is the Stop's doing (a linked host's leg cut off
-    // under it, a body that errors otherwise than with an AbortError): not an engine failure.
-    const isAbort = (e as Error)?.name === 'AbortError' || ac.signal.aborted
-    aborted = isAbort
-    if (!isAbort) {
-      engineFailed = true
-      restored = restoreReplaced() // a Stop (isAbort) keeps what it stopped
-      // Belt and braces on top of resilientSink (GitHub #177): this emit is the one that used
-      // to throw INSIDE the catch block, which no `finally` can contain — the rejection escaped
-      // the whole function and skipped the `db.updateMessage` below, discarding everything the
-      // model had already generated. Nothing after this point may be allowed to throw.
-      try {
-        const code = e instanceof EngineStreamError ? 'engine_error' : 'engine_stopped'
-        await emit({ event: 'error', data: { code, message: (e as Error).message } })
-      } catch { /* a failing sink — the message is still persisted below */ }
-    }
-  } finally {
-    clearInterval(partialSaves)
-    runningReplySaves.delete(savePartial)
-    if (localAccounting) d.manager.generationEnd()
-    releaseInflight(convId, ac)
-  }
-  // A Stop that came after the last read (while the round's last text was being sent on) is still a
-  // Stop: the reply is saved and reported as stopped, and gets no title, memory or bench result.
-  if (ac.signal.aborted && !engineFailed) aborted = true
-  // The placeholder is gone and the old reply back (restoreReplaced): nothing to fill in, title or
-  // count.
-  if (restored) return
-
-  // GitHub #177: drain whatever the parser was still holding when the round was cut short (see
-  // `pendingParse`). Non-null ONLY on the interrupted paths — a round that reached its own
-  // end-of-stream flush nulls it first, so this can never double-count a normal turn.
-  if (pendingParse) {
-    for (const ev of flushState(pendingParse)) {
-      if (ev.type === 'reasoning') {
-        fullReasoning += ev.text
-      } else {
-        fullContent += ev.text
-        // Counted like any other streamed delta so the #52 `liveOut` token fallback below
-        // doesn't report "0 tokens" for a message that plainly has content.
-        liveOut++
-      }
-    }
-    pendingParse = null
-  }
-
-  const totalMs = Date.now() - requestStart
-  const thinkMs = thinkStart && thinkEnd ? thinkEnd - thinkStart : 0
-  const ctxMax = upstream.ctxMax
-
-  // An aborted turn (Stop, deleting the chat, an engine kill switch) can be cut off
-  // before the engine's final usage/timings chunk ever arrives, leaving completion_tokens at its
-  // default 0 — even though real output WAS generated, IS persisted (fullContent below), and WILL
-  // sit in context for the next turn. liveOut (incremented per streamed delta, above) is the one
-  // number we still have in that case; fall back to it instead of silently reporting "0 tokens"
-  // for a message that plainly has content (GitHub #52: "when you interrupt a model's response,
-  // the token count remains as 0+0, yet the model still sees the message in context, and the
-  // total token count remains unchanged").
-  const genTokensFallback = finalUsage.completion_tokens || liveOut
-  // The prompt half of the same problem (GitHub #52 item 9). `genTokens` has had its liveOut
-  // fallback for a while; `promptTokens` had none, so an interrupted turn rendered "0+147
-  // tokens" and ctxUsed was short by the ENTIRE prompt — the number the next turn's context
-  // budget is judged against. lastPromptTotal is the engine's own streamed prompt size (see its
-  // declaration); 0 when the engine never reported one, which reproduces the old behavior
-  // rather than fabricating a count.
-  const promptTokensFallback = finalUsage.prompt_tokens || lastPromptTotal
-
-  const stats: Partial<MessageStats> = {
-    ttftMs,
-    totalMs,
-    thinkMs,
-    // Full context occupancy: cache-reused prompt tokens still sit in the KV cache / context
-    // window (they're skipped only for recomputation), so they must stay counted here.
-    // Not for a turn that failed before the engine reported its prompt's size: a send refused
-    // on its first round (400 exceed_context_size_error, a 503 while a model loads) has no
-    // measurement, and the 0 it wrote became the reading maybeAutoCompact judges the next turn
-    // by, so a chat refused for its size was never compacted again. With no ctxUsed the gate
-    // reads the last reply that has one (lastCtxUsage).
-    ...(engineFailed && !promptTokensFallback ? {} : { ctxUsed: promptTokensFallback + genTokensFallback }),
-    ctxMax,
-    model: upstream.modelName,
-    aborted,
-  }
-  const fullPrompt = finalUsage.prompt_tokens ?? 0
-  const cachedExplicit = finalUsage.prompt_tokens_details?.cached_tokens
-  if (finalTimings.prompt_n) {
-    const processed = finalTimings.prompt_n
-    stats.promptTokens = fullPrompt || processed
-    stats.promptMs     = finalTimings.prompt_ms
-    stats.promptTps    = finalTimings.prompt_per_second
-    stats.genTokens    = finalTimings.predicted_n
-    stats.genMs        = finalTimings.predicted_ms
-    stats.tps          = finalTimings.predicted_per_second
-    stats.cachedTokens = cachedExplicit ?? Math.max(0, (fullPrompt || processed) - processed)
-  } else {
-    // No final timings — the interrupted/failed case. `fullPrompt` is 0 here whenever the usage
-    // chunk never landed, which is precisely when the streamed prompt total has to stand in.
-    stats.promptTokens = promptTokensFallback
-    stats.genTokens    = genTokensFallback
-    stats.genMs        = totalMs - ttftMs
-    stats.tps          = stats.genMs > 0 ? Math.round((stats.genTokens / stats.genMs) * 1000 * 10) / 10 : 0
-    stats.cachedTokens = cachedExplicit ?? 0
-    // LiteRT-LM sends token counts but no timings, so derive prefill from TTFT. Only for a single-round turn: with tool
-    // calls, `ttftMs` spans earlier rounds too and would understate the speed. Only for the LOCAL engine: a Turbo Link
-    // host's engine is not this machine's, and its own stats stand.
-    if (localAccounting && engineKind === 'litert-lm' && allToolCalls.length === 0) {
-      const pf = litertLmPrefillStats(finalUsage.prompt_tokens, ttftMs)
-      if (pf) {
-        stats.promptMs = pf.promptMs
-        stats.promptTps = pf.promptTps
-      }
-    }
-  }
-
-  // F-022: run the heuristic referee on Research persona replies before persisting.
-  // Pure string/regex — synchronous, < 5ms, no IO.
-  let refereeVerdicts: ClaimVerdict[] | undefined
-  if (conv.toolPolicy === 'force_web_search' && fullContent && allResearchSources.length > 0) {
-    try {
-      refereeVerdicts = checkReply(fullContent, allResearchSources)
-    } catch { /* swallow — referee is best-effort */ }
-  }
-
-  // F-021: persist research metadata alongside the message.
-  const researchMeta: ResearchMeta | undefined =
-    conv.toolPolicy === 'force_web_search' && (parsedConfidence !== undefined || allResearchSources.length > 0 || refereeVerdicts !== undefined)
-      ? {
-          confidence: parsedConfidence,
-          sources: allResearchSources.length > 0 ? allResearchSources : undefined,
-          refereeVerdicts: refereeVerdicts && refereeVerdicts.length > 0 ? refereeVerdicts : undefined,
-        }
-      : undefined
-
-  db.updateMessage(assistantMsg.id, { content: fullContent, reasoning: fullReasoning, toolCalls: allToolCalls, stats, researchMeta })
-  db.touchConversation(convId)
-  // Both are LOCAL measurements of LOCAL hardware. A remote turn's t/s describes the
-  // HOST's GPU: reporting it as a bench_result for this machine's config would poison the
-  // fleet-wide bench corpus, and folding it into this manager's session averages is the
-  // very contamination I-4 closed on the gateway path.
-  if (localAccounting) {
-    const loaded = d.manager.status().model
-    if (!aborted && !engineFailed && loaded) reportChatBenchResult(d, loaded, stats)
-    try {
-      d.manager.recordCompletion({
-        inputTokens: stats.promptTokens,
-        outputTokens: stats.genTokens,
-        promptTps: stats.promptTps,
-        genTps: stats.tps,
-      })
-    } catch { /* swallow — stats are best-effort */ }
-  }
-
-  const finalMsg = db.getMessage(assistantMsg.id)!
-  // A sink that can fail (not the turn's run, which never does) may reject here. Swallow it —
-  // the assistant message is persisted above regardless, and an unhandled rejection here would
-  // crash the daemon (and orphan the engine), which is the root of the reported "requests never
-  // end / model stays loaded".
-  try {
-    await emit({ event: 'done', data: { message: finalMsg } })
-  } catch { /* a failing sink — nothing to flush to */ }
+  const outcome = await runGenerationCore(d, ctx, {
+    sink: emit,
+    persistence: {
+      saveProgress: (reply) => { db.updateMessage(assistantMsg.id, reply) },
+      trackProgressSave: (save) => {
+        d.chatTurns.addReplySave(save)
+        return () => d.chatTurns.removeReplySave(save)
+      },
+      restoreUnproduced,
+      finalize: (reply) => {
+        db.updateMessage(assistantMsg.id, reply)
+        db.touchConversation(convId)
+        return db.getMessage(assistantMsg.id)!
+      },
+    },
+    // Live foreground chat gets the real approval gate (interactive: true) — an
+    // 'ask'-policy tool prompts the user via 'tool_call'/'awaiting_approval' and
+    // waits for POST .../tool-calls/:toolCallId/approve to resolve it.
+    approval: {
+      interactive: true,
+      // Re-read fresh on every iteration (not the `conv` snapshot captured at request
+      // start) — otherwise a same-turn repeat tool call misses an "Allow for this
+      // chat" decision the user just made via POST .../tool-calls/:id/approve.
+      convOverrides: () => db.getToolOverrides(convId),
+      // How long the reply waits for its answers (Settings → Tool permissions), read as its
+      // first call reaches its wait and shared by its calls (approvalBudget): a reply whose
+      // calls nobody answers then goes on as after a deny instead of holding the chat (and on
+      // Android the model and the wake lock), after one wait however often the model asks.
+      approvalWaitMinutes: () => d.store.snapshot().tools.chatApprovalWaitMinutes ?? CHAT_APPROVAL_WAIT_MINUTES.default,
+      // Parked on the approval meanwhile: the activity probe lists the chat as waiting.
+      onApprovalWait: (waiting) => {
+        d.chatTurns.setApprovalWait(ac, waiting, localAccounting)
+      },
+      // The real per-request trust decision this handler's route computed from its Hono
+      // Context (see the `chatCodeAuthorization(c, d)` call sites) — never a hardcoded true.
+      isCodeAuthorized: ctx.isCodeAuthorized,
+      // An MCP call the model makes anyway, unoffered, is refused before any approval prompt.
+      refuseMcp: !ctx.isCodeAuthorized,
+    },
+    onSettled: () => d.chatTurns.release(convId, ac),
+    onSaveSkill: () => saveSkillFromConversation(d, convId),
+  })
+  // The placeholder is gone and the old reply back (restoreUnproduced): nothing to title or remember.
+  if (outcome.restored) return
+  const { aborted, content: fullContent } = outcome
 
   if (!aborted && conv.title === 'New chat' && d.store.snapshot().daemon.autoGenerateTitles) {
-    afterReplyCall(convId, 1000, () => autoTitle(d, convId, ctx.engineMessages, fullContent, upstream))
+    d.chatTurns.afterReplyCall(convId, 1000, () => autoTitle(d, convId, ctx.engineMessages, fullContent, upstream))
   }
 
   // Release 3, auto-memory: extract durable facts from the just-typed user text (never
@@ -2440,9 +1302,8 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
   // hide its settings UI while extraction keeps running underneath.
   const daemonCfg = d.store.snapshot().daemon
   if (!aborted && ctx.userText && daemonCfg.experimental.memory && daemonCfg.autoMemoryEnabled) {
-    afterReplyCall(convId, 1500, () => extractMemoryFacts(d, convId, ctx.userText!, upstream))
-  }
-}
+    d.chatTurns.afterReplyCall(convId, 1500, () => extractMemoryFacts(d, convId, ctx.userText!, upstream))
+  }}
 
 // ── auto title generation ──────────────────────────────────────────────────
 

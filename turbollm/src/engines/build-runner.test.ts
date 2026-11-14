@@ -678,7 +678,7 @@ for (const how of ['fails', 'is cancelled'] as const) {
     const enginesRoot = join(dir, 'engines')
     const repoUrl = 'https://127.0.0.1:9/owner/fork.git' // nothing listens on port 9, so the clone fails at once
     const root = join(enginesRoot, 'build', buildDirName(repoUrl, 'main'))
-    const bin = join(root, 'build', 'bin', 'llama-server')
+    const bin = join(root, 'build', 'bin', serverExe)
     mkdirSync(join(root, 'build', 'bin'), { recursive: true })
     writeFileSync(bin, 'previous working build')
     const ac = new AbortController()
@@ -714,12 +714,12 @@ test('runBuild: a rebuild sweeps what earlier runs left parked beside its direct
   }
   // The build directory works, and the parked build has a binary too (its delete after a successful build failed):
   // only a build directory WITHOUT a binary gets a parked build put back, so this one is swept, not swapped in.
-  writeFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'current build')
+  writeFileSync(join(buildDir, name, 'build', 'bin', serverExe), 'current build')
   mkdirSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin'), { recursive: true })
-  writeFileSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin', 'llama-server'), 'stale build')
+  writeFileSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin', serverExe), 'stale build')
   await assert.rejects(runBuild({ repoUrl, branch: 'main', enginesRoot, toolchainDirs: [fakeBin] }, { phase: () => {}, log: () => {} }, new AbortController().signal))
   assert.deepEqual(readdirSync(buildDir).sort(), [`.${name}-dev-1700000000002.prev`, name].sort())
-  assert.equal(readFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'utf8'), 'current build')
+  assert.equal(readFileSync(join(buildDir, name, 'build', 'bin', serverExe), 'utf8'), 'current build')
 })
 
 // The daemon died mid-build (or a failed build could not move the parked build back): a partial tree sits in the build
@@ -742,12 +742,12 @@ test('runBuild: a parked build that is the only working copy is put back, not sw
   mkdirSync(join(buildDir, name, 'src'), { recursive: true })
   for (const [ms, content] of [['1700000000000', 'older build'], ['1700000000001', 'last working build']]) {
     mkdirSync(join(buildDir, `.${name}-${ms}.prev`, 'build', 'bin'), { recursive: true })
-    writeFileSync(join(buildDir, `.${name}-${ms}.prev`, 'build', 'bin', 'llama-server'), content)
+    writeFileSync(join(buildDir, `.${name}-${ms}.prev`, 'build', 'bin', serverExe), content)
   }
   mkdirSync(join(buildDir, `.${name}-1700000000002.prev`, 'build'), { recursive: true }) // a parked partial tree, no binary
   const logs: string[] = []
   await assert.rejects(runBuild({ repoUrl, branch: 'main', enginesRoot, toolchainDirs: [fakeBin] }, { phase: () => {}, log: (l) => logs.push(l) }, new AbortController().signal))
-  assert.equal(readFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'utf8'), 'last working build')
+  assert.equal(readFileSync(join(buildDir, name, 'build', 'bin', serverExe), 'utf8'), 'last working build')
   assert.deepEqual(readdirSync(buildDir), [name])
   assert.ok(logs.some((l) => l.startsWith('Put back the previous build') && l.includes(`.${name}-1700000000001.prev`)), logs.join('\n'))
 })
@@ -766,7 +766,7 @@ test('runBuild: a failed tree that cannot be deleted is moved aside and the prev
   const enginesRoot = join(dir, 'engines')
   const repoUrl = 'https://127.0.0.1:9/owner/fork.git' // nothing listens on port 9, so the clone fails at once
   const root = join(enginesRoot, 'build', buildDirName(repoUrl, 'main'))
-  const bin = join(root, 'build', 'bin', 'llama-server')
+  const bin = join(root, 'build', 'bin', serverExe)
   mkdirSync(join(root, 'build', 'bin'), { recursive: true })
   writeFileSync(bin, 'previous working build')
   const build = () => runBuild({ repoUrl, branch: 'main', enginesRoot, toolchainDirs: [fakeBin] }, { phase: () => {}, log: () => {} }, new AbortController().signal)
@@ -813,7 +813,7 @@ test('runBuild: the sweep deletes what earlier runs left parked off the event lo
   const name = buildDirName(repoUrl, 'main')
   const buildDir = join(enginesRoot, 'build')
   mkdirSync(join(buildDir, name, 'build', 'bin'), { recursive: true })
-  writeFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'current build')
+  writeFileSync(join(buildDir, name, 'build', 'bin', serverExe), 'current build')
   const leftovers = [`.${name}-1700000000000.prev`, `.${name}-1700000000001.failed`]
   for (const left of leftovers) mkdirSync(join(buildDir, left, 'build', 'bin'), { recursive: true })
   const deletedAsync = t.mock.method(fsp, 'rm')
@@ -851,10 +851,10 @@ test('runBuild: a rebuild waits for the delete of a build an earlier rebuild rep
   const name = buildDirName(repoUrl, 'main')
   const buildDir = join(enginesRoot, 'build')
   mkdirSync(join(buildDir, name, 'build', 'bin'), { recursive: true })
-  writeFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'current build')
+  writeFileSync(join(buildDir, name, 'build', 'bin', serverExe), 'current build')
   const replaced = join(buildDir, `.${name}-1700000000000.prev`)
   mkdirSync(join(replaced, 'build', 'bin'), { recursive: true })
-  writeFileSync(join(replaced, 'build', 'bin', 'llama-server'), 'replaced build')
+  writeFileSync(join(replaced, 'build', 'bin', serverExe), 'replaced build')
   // Hold the background delete (the first rm of the replaced tree) until the test lets it go.
   let letGo = () => {}
   const held = new Promise<void>((resolve) => { letGo = resolve })
@@ -898,7 +898,7 @@ test('runBuild: a rebuild waits for the delete of a build an earlier rebuild rep
   }
   assert.ok(phases.includes('cloning'), 'the build went on once the delete ended')
   assert.deepEqual(readdirSync(buildDir), [name])
-  assert.equal(readFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'utf8'), 'current build')
+  assert.equal(readFileSync(join(buildDir, name, 'build', 'bin', serverExe), 'utf8'), 'current build')
 })
 
 // The daemon's exit kills a running rebuild's compile, but runBuild's restorePreviousBuild never runs: the partial tree
@@ -910,9 +910,9 @@ test('restoreInterruptedBuilds: a rebuild the daemon exit cut short gets its pre
   mkdirSync(join(buildDir, name, 'src'), { recursive: true }) // the partial tree: cloned, never compiled
   for (const [ms, content] of [['1700000000000', 'older build'], ['1700000000001', 'last working build']]) {
     mkdirSync(join(buildDir, `.${name}-${ms}.prev`, 'build', 'bin'), { recursive: true })
-    writeFileSync(join(buildDir, `.${name}-${ms}.prev`, 'build', 'bin', 'llama-server'), content)
+    writeFileSync(join(buildDir, `.${name}-${ms}.prev`, 'build', 'bin', serverExe), content)
   }
-  const bin = join(buildDir, name, 'build', 'bin', 'llama-server')
+  const bin = join(buildDir, name, 'build', 'bin', serverExe)
   const logs: string[] = []
   restoreInterruptedBuilds(join(buildDir, '..'), [bin], (l) => logs.push(l))
   assert.equal(readFileSync(bin, 'utf8'), 'last working build')
@@ -926,16 +926,16 @@ test('restoreInterruptedBuilds: a rebuild the daemon exit cut short gets its pre
 test('restoreInterruptedBuilds: a working build, or a directory no engine claims, is left as it is', () => {
   const buildDir = join(tmpDir('tllm-boot-restore-'), 'engines', 'build')
   mkdirSync(join(buildDir, 'working', 'build', 'bin'), { recursive: true })
-  writeFileSync(join(buildDir, 'working', 'build', 'bin', 'llama-server'), 'current build')
+  writeFileSync(join(buildDir, 'working', 'build', 'bin', serverExe), 'current build')
   mkdirSync(join(buildDir, 'unclaimed', 'src'), { recursive: true })
   for (const name of ['working', 'unclaimed']) {
     mkdirSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin'), { recursive: true })
-    writeFileSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin', 'llama-server'), 'parked build')
+    writeFileSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin', serverExe), 'parked build')
   }
   const before = readdirSync(buildDir).sort()
-  restoreInterruptedBuilds(join(buildDir, '..'), [join(buildDir, 'working', 'build', 'bin', 'llama-server')], () => {})
+  restoreInterruptedBuilds(join(buildDir, '..'), [join(buildDir, 'working', 'build', 'bin', serverExe)], () => {})
   assert.deepEqual(readdirSync(buildDir).sort(), before)
-  assert.equal(readFileSync(join(buildDir, 'working', 'build', 'bin', 'llama-server'), 'utf8'), 'current build')
+  assert.equal(readFileSync(join(buildDir, 'working', 'build', 'bin', serverExe), 'utf8'), 'current build')
   assert.equal(existsSync(join(buildDir, 'unclaimed', 'build')), false)
   // A missing build directory is a no-op, not a throw.
   restoreInterruptedBuilds(join(buildDir, 'nope'), [], () => {})
@@ -950,13 +950,13 @@ test('restoreInterruptedBuilds: a tree still marked unfinished is not the workin
   const name = 'owner-fork-main'
   const tree = (dir: string, content: string, unfinished: boolean) => {
     mkdirSync(join(buildDir, dir, 'build', 'bin'), { recursive: true })
-    writeFileSync(join(buildDir, dir, 'build', 'bin', 'llama-server'), content)
+    writeFileSync(join(buildDir, dir, 'build', 'bin', serverExe), content)
     if (unfinished) writeFileSync(join(buildDir, dir, BUILD_INCOMPLETE_MARKER), '')
   }
   tree(name, 'half-written', true)
   tree(`.${name}-1700000000001.prev`, 'an unfinished tree the next build parked', true)
   tree(`.${name}-1700000000000.prev`, 'last working build', false)
-  const bin = join(buildDir, name, 'build', 'bin', 'llama-server')
+  const bin = join(buildDir, name, 'build', 'bin', serverExe)
   restoreInterruptedBuilds(join(buildDir, '..'), [bin], () => {})
   assert.equal(readFileSync(bin, 'utf8'), 'last working build')
   assert.equal(existsSync(join(buildDir, name, BUILD_INCOMPLETE_MARKER)), false)
@@ -970,13 +970,13 @@ test('restoreInterruptedBuilds: a directory nothing claims that is still marked 
   const buildDir = join(tmpDir('tllm-boot-restore-'), 'engines', 'build')
   const name = 'ikawrakow-ik_llama.cpp-main'
   mkdirSync(join(buildDir, name, 'build', 'bin'), { recursive: true })
-  writeFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'unprobed build')
+  writeFileSync(join(buildDir, name, 'build', 'bin', serverExe), 'unprobed build')
   writeFileSync(join(buildDir, name, BUILD_INCOMPLETE_MARKER), '')
   mkdirSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin'), { recursive: true })
-  writeFileSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin', 'llama-server'), 'last working build')
+  writeFileSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin', serverExe), 'last working build')
   const logs: string[] = []
   restoreInterruptedBuilds(join(buildDir, '..'), [], (l) => logs.push(l))
-  assert.equal(readFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'utf8'), 'last working build')
+  assert.equal(readFileSync(join(buildDir, name, 'build', 'bin', serverExe), 'utf8'), 'last working build')
   assert.equal(existsSync(join(buildDir, name, BUILD_INCOMPLETE_MARKER)), false)
   assert.ok(logs.some((l) => l.startsWith('Put back the previous build')))
 })

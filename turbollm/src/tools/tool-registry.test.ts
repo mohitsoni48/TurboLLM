@@ -17,6 +17,8 @@ import { join } from 'node:path'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpDir } from '../test-support/tmp'
+import { dummyPdf } from '../test-support/dummy-pdf'
+import { stubFetch } from '../test-support/fetch-stub'
 
 const EMPTY_TOOLS_CFG = {} as ToolsConfig
 
@@ -455,6 +457,9 @@ process.stdin.on('data', (c) => {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n')
   }
 })
+// A real MCP server exits when its stdin closes. Without this the stub outlived its client: on Windows, where the
+// client spawns through cmd.exe and killing cmd.exe does not reach it, it kept the whole test process alive.
+process.stdin.on('end', () => process.exit(0))
 setInterval(() => {}, 1000)
 `
 
@@ -552,9 +557,9 @@ test('a Deny on an MCP tool holds for every spelling of its server id', async ()
   } finally { reg.disconnectAll() }
 })
 
-// Not on Windows: there the client spawns through `cmd.exe /c`, and killing cmd.exe does not reach
-// the server under it — a separate, pre-existing gap of every MCP disconnect, not this fix's.
-test('a stdio MCP server whose initialize fails is not left running', { skip: process.platform === 'win32' ? 'cmd.exe-wrapped spawn' : false }, async () => {
+// On Windows the client spawns through `cmd.exe /c`: ending only cmd.exe left the server under it running
+// (and holding its pipes, so this test file never exited).
+test('a stdio MCP server whose initialize fails is not left running', async () => {
   const { server, spawnedPids } = fakeMcpServer({ FAKE_MCP_MODE: 'error-init' })
   const reg = new ToolRegistry(EMPTY_TOOLS_CFG)
   try {
@@ -567,6 +572,21 @@ test('a stdio MCP server whose initialize fails is not left running', { skip: pr
   } finally {
     for (const pid of spawnedPids()) if (isAlive(pid)) process.kill(pid)
     reg.disconnectAll()
+  }
+})
+
+test('disconnectAll ends the stdio MCP server process itself, not only the cmd.exe or shell in front of it', async () => {
+  const { server, spawnedPids } = fakeMcpServer({})
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG)
+  try {
+    await reg.syncMcpServers([server])
+    const [pid] = spawnedPids()
+    assert.ok(pid && isAlive(pid), 'the server is running')
+    reg.disconnectAll()
+    for (let i = 0; i < 100 && isAlive(pid); i++) await new Promise((r) => setTimeout(r, 50))
+    assert.equal(isAlive(pid), false, 'the server process must end with its client')
+  } finally {
+    for (const pid of spawnedPids()) if (isAlive(pid)) process.kill(pid)
   }
 })
 
@@ -614,4 +634,18 @@ test('an HTTP MCP server that expires the session (404) gets a new session and t
     http.closeAllConnections?.()
     await new Promise((r) => http.close(r))
   }
+})
+
+test('executeTool: fetch_url observes tools.pdfReading from config, and updateConfig flips it', async () => {
+  // The disabled note proves the PDF was never parsed; the flip proves the tool path reads the
+  // config updateConfig installed, not the constructor's.
+  const stub = stubFetch(() => new Response(new Uint8Array(dummyPdf), { headers: { 'content-type': 'application/pdf' } }))
+  try {
+    const reg = new ToolRegistry(EMPTY_TOOLS_CFG)
+    const off = await reg.executeTool({ id: 'p1', name: 'fetch_url', args: { url: 'http://files.invalid/dummy.pdf' } })
+    assert.match(off, /PDF reading is disabled/)
+    reg.updateConfig({ pdfReading: true } as ToolsConfig)
+    const on = await reg.executeTool({ id: 'p2', name: 'fetch_url', args: { url: 'http://files.invalid/dummy.pdf' } })
+    assert.match(on, /Dummy PDF file/)
+  } finally { stub.restore() }
 })

@@ -77,16 +77,26 @@ function run(cmd: string, args: string[]): Promise<string> {
   return probeExecFile(cmd, args, { timeout: READER_TIMEOUT_MS, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }).then(({ stdout }) => String(stdout ?? ''))
 }
 
+/** Longest a timing-out reader is left alone, in ticks (one tick is SAMPLE_MS). */
+const MAX_TIMEOUT_BACKOFF_TICKS = 30
+
 /** Wrap a polled sampler with the failure latch. After {@link MAX_CONSECUTIVE_FAILURES} consecutive
- *  failures the reader goes permanently quiet for this process — without it, a box that simply has
- *  no rocm-smi would spawn a doomed process every second for as long as the daemon lives. Mirrors
- *  the latch in bench/spill.ts. A single success resets the count. */
+ *  DEFINITIVE failures (the tool is missing, exits non-zero, or answers with nothing usable) the reader
+ *  goes permanently quiet for this process — without it, a box that simply has no rocm-smi would spawn a
+ *  doomed process every second for as long as the daemon lives. A single success resets the count.
+ *
+ *  A TIMEOUT (the child was killed) is not definitive: nvidia-smi on a busy or 8-GPU box often takes longer than
+ *  READER_TIMEOUT_MS, and the daemon outlives that load. Latching on it blanked usage until restart
+ *  (ADR-349 fixed the same in bench's spill reader). A timeout instead backs the reader off — skip 1, 2,
+ *  4 … up to {@link MAX_TIMEOUT_BACKOFF_TICKS} ticks — and the next probe is still made. */
 export function createLatchingReader(
   kind: string,
   sample: () => Promise<GpuSample[] | null>,
   hooks: { start?: () => void; stop?: () => void } = {},
 ): GpuReader {
   let failures = 0
+  let timeouts = 0
+  let skipTicks = 0
   let dead = false
   return {
     kind,
@@ -94,16 +104,28 @@ export function createLatchingReader(
     stop: () => hooks.stop?.(),
     read: async () => {
       if (dead) return null
+      if (skipTicks > 0) {
+        skipTicks--
+        return null
+      }
+      let timedOut = false
       try {
         const r = await sample()
         if (r && r.length > 0) {
           failures = 0
+          timeouts = 0
           return r
         }
-      } catch {
-        /* fall through to the failure path — readers never surface errors upward */
+      } catch (err) {
+        /* readers never surface errors upward */
+        timedOut = (err as { killed?: boolean } | null)?.killed === true
       }
-      if (++failures >= MAX_CONSECUTIVE_FAILURES) dead = true
+      if (timedOut) {
+        skipTicks = Math.min(2 ** timeouts, MAX_TIMEOUT_BACKOFF_TICKS)
+        timeouts++
+      } else if (++failures >= MAX_CONSECUTIVE_FAILURES) {
+        dead = true
+      }
       return null
     },
   }

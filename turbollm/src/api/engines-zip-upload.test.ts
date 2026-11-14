@@ -45,7 +45,7 @@ function zipApp(o: FakeOverrides, dataDir: string): Hono {
   const refreshLog = o.refreshLog ?? []
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, dir: () => dataDir },
+    store: { snapshot: () => cfg, read: () => cfg, dir: () => dataDir },
     manager: {
       status: () => ({ state: o.runningEngine || o.servingEngine ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }),
       currentOpts: () => (o.servingEngine ? { engine: { id: 'e-serving', kind: 'llama-server', ...o.servingEngine } } : null),

@@ -45,7 +45,7 @@ function fakeApp(requestLog: RequestLog | undefined) {
   // read bodies is server.settings-gate.test.ts's subject.
   const d = {
     version: 'test',
-    store: { snapshot: () => ({ daemon: { lanBind: false } }), update: (fn: (c: unknown) => void) => fn({}) },
+    store: { snapshot: () => ({ daemon: { lanBind: false } }), read: () => ({ daemon: { lanBind: false } }), update: (fn: (c: unknown) => void) => fn({}) },
     manager: { status: () => ({ state: 'stopped', model: null }), logPath: () => '' },
     requestLog,
   } as unknown as Deps

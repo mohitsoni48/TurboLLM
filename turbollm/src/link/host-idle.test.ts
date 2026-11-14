@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { canWake } from './host-idle'
+import { canWake, hostIdleState } from './host-idle'
+import type { Deps } from '../deps'
 
 const NOW = 1_000_000
 
@@ -30,4 +31,21 @@ test('the grace boundary is inclusive-safe and configurable', () => {
 test('a future or clock-skewed timestamp is treated as recent, not as ancient', () => {
   // Fails SAFE: a bad clock must never authorise evicting the owner's model.
   assert.equal(canWake({ generating: false, lastLocalActivityMs: NOW + 10_000, nowMs: NOW }), false)
+})
+
+// A keep-N pool slot's generation is counted on its own Manager (scalability review 1.5): the host is still busy.
+test('hostIdleState: a generating pool slot makes the host busy though the primary is idle', () => {
+  const d = {
+    manager: { sessionStats: () => ({ activeRequests: 0 }) },
+    modelRouter: { poolGenerating: () => true },
+  } as unknown as Deps
+  assert.equal(hostIdleState(d).generating, true)
+})
+
+test('hostIdleState: a routine holding the primary between its requests makes the host busy (scalability 4.13)', () => {
+  const d = {
+    manager: { sessionStats: () => ({ activeRequests: 0 }), hasHolds: () => true },
+    modelRouter: { poolGenerating: () => false },
+  } as unknown as Deps
+  assert.equal(hostIdleState(d).generating, true)
 })

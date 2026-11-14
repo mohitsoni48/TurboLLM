@@ -363,7 +363,7 @@ export interface AndroidEngineDeps {
   store: Pick<ConfigStore, 'snapshot' | 'update'>
   env: NodeJS.ProcessEnv
   readSdk: (baseUrl: string, env: NodeJS.ProcessEnv) => Promise<SdkEngineInfo[] | null>
-  /** The boot scan's format lookup. Called only after the first await: cli.ts declares the scanner after this call. */
+  /** The boot scan's format lookup. Called only after the first await: boot.ts declares the scanner after this call. */
   formatOf: () => Promise<FormatLookup>
 }
 

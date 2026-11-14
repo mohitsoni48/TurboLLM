@@ -579,7 +579,7 @@ for (const value of [undefined, '0', 'true']) {
 test('runAutoLoad: a throw during PLANNING (before any load step) still warns once and never rejects', async () => {
   // architecture.md §3.4 declares runAutoLoad "Never rejects" for the whole function, not just the
   // carry-out phase. registry.active() throwing is the concrete trigger: a future collaborator
-  // failure here must not silently reject the void-called promise in cli.ts and skip printing why.
+  // failure here must not silently reject the void-called promise in boot.ts and skip printing why.
   const { deps, record } = mkRunDeps({
     activeEngine: () => { throw new Error('registry blew up') },
   })
@@ -899,7 +899,7 @@ function mkRunDeps(options: RunDepsOptions = {}) {
   }
   let inLock = false
   const store = {
-    snapshot: () => { record.snapshotCalls++; return structuredClone(data) },
+    snapshot: () => { record.snapshotCalls++; return structuredClone(data) }, read: () => { record.snapshotCalls++; return structuredClone(data) },
     update: (fn: (c: Config) => void) => { record.updateCalls++; fn(data) },
   }
   const deps: AutoLoadDeps = {
@@ -947,7 +947,7 @@ const flush = () => new Promise<void>((r) => setImmediate(r))
 function cloningConfigStore(root: string, data: Config): ConfigStore {
   return {
     dir: () => root,
-    snapshot: () => structuredClone(data),
+    snapshot: () => structuredClone(data), read: () => structuredClone(data),
     update: (fn: (c: Config) => void) => { fn(data) },
   } as unknown as ConfigStore
 }

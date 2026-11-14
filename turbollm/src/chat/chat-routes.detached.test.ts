@@ -8,9 +8,10 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net'
 import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
-import { abortAllInFlightChats, chatHoldsEngine, chatTurnsEnded, inFlightChatIds, registerChatRoutes } from './chat-routes.js'
-import { chatRuns } from './chat-runs.js'
-import { ConversationStore, type Message } from './db.js'
+import { registerChatRoutes } from './chat-routes.js'
+import { ChatRuns } from './chat-runs.js'
+import { ChatTurns } from './chat-turns.js'
+import { ConversationStore, IN_MEMORY_DATA_DIR, type Message } from './db.js'
 import { activeWork } from '../api/active-work.js'
 import { endLanTurns, endStaleStreams, hashKey, lanAuth, provisionRemoteApiKey } from '../auth.js'
 import { defaultConfig, type Config } from '../config/config.js'
@@ -20,7 +21,10 @@ import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
 
 /** Every test here talks to real sockets: one that waits on a frame that never comes fails instead of hanging. */
-const it = (name: string, fn: (t: TestContext) => Promise<void>) => test(name, { timeout: 20_000 }, fn)
+// Only a guard against a hang. On a hosted Windows runner, with other test files competing for its few cores and slow
+// disk, one test here has stalled for over 20 s and the one after it with it; a real hang still fails, a minute on.
+const GUARD_MS = 60_000
+const it = (name: string, fn: (t: TestContext) => Promise<void>) => test(name, { timeout: GUARD_MS }, fn)
 
 // ── a stand-in engine whose every streaming request the test drives by hand ───────────────────────────────────────
 
@@ -101,9 +105,11 @@ const executed: string[] = []
 
 /** The real chat routes over a real store, generating on `engineUrl`. `run_code` is the one tool, with `toolPolicy`;
  *  `executed` lists every call that ran. */
-function routes(engineUrl: string, opts: { titles?: boolean; toolPolicy?: 'ask' | 'allow'; remote?: { id: string; baseUrl: string } } = {}) {
+function routes(engineUrl: string, opts: { titles?: boolean; toolPolicy?: 'ask' | 'allow'; remote?: { id: string; baseUrl: string }; persist?: boolean } = {}) {
   const dir = tmpDir('tllm-chat-detached-')
-  const store = new ConversationStore(dir)
+  // In memory unless the test reads the database back from disk: an on-disk store cost about a second per test (and
+  // multi-second stalls) on a hosted Windows runner, ten times a quiet machine, and nothing here is about the file.
+  const store = new ConversationStore(opts.persist ? dir : IN_MEMORY_DATA_DIR)
   executed.length = 0
   const cfg = {
     modelDefaults: { maxTokens: 0 },
@@ -113,8 +119,9 @@ function routes(engineUrl: string, opts: { titles?: boolean; toolPolicy?: 'ask' 
   }
   const remote = opts.remote ? { linkId: 'lnk1', baseUrl: opts.remote.baseUrl, token: 'tllm-hostsecret', modelKey: 'qwen3' } : undefined
   const d = {
+    chatTurns: new ChatTurns(), chatRuns: new ChatRuns(),
     db: store,
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
     registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
     modelRouter: { resolveRemoteTarget: (id: string) => (remote && id === opts.remote!.id ? { target: remote.baseUrl, remote } : undefined) },
@@ -232,7 +239,7 @@ it('(a) the page closing mid-reply does not stop it: the reply finishes, is save
     assert.equal(r.content, 'Once upon a time, there was a daemon that kept going.')
     assert.equal(r.stats.aborted, false)
     await waitFor(() => h.store.getConversation(conv.id)!.title === 'A Generated Title', 'the auto-title', 4000)
-    assert.deepEqual(inFlightChatIds(), [])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
   } finally {
     h.cleanup()
     await engine.close()
@@ -250,7 +257,7 @@ it('(b) a page opened mid-reply gets its meta, every frame so far in order, then
     const call = await engine.call(1)
     call.word(LONG)
     call.word(LONG)
-    await waitFor(() => (chatRuns.latestRun(conv.id)?.buffer.head() ?? 0) >= 3, 'two deltas in the run')
+    await waitFor(() => (h.d.chatRuns.latestRun(conv.id)?.buffer.head() ?? 0) >= 3, 'two deltas in the run')
     const viewer = sseFrames(await h.app.request(`/api/v1/conversations/${conv.id}/stream`))
     await viewer.until((f) => f.id === 2)
     call.word('The end.')
@@ -278,7 +285,7 @@ it('(c) a resume with run and fromSeq gets only what follows its cursor; a curso
     const { assistantMessageId: run } = await sendAndLeave(h.app, conv.id, 'hi')
     const call = await engine.call(1)
     for (let i = 0; i < 4; i++) call.word(LONG)
-    await waitFor(() => (chatRuns.latestRun(conv.id)?.buffer.head() ?? 0) >= 5, 'four deltas in the run')
+    await waitFor(() => (h.d.chatRuns.latestRun(conv.id)?.buffer.head() ?? 0) >= 5, 'four deltas in the run')
     const base = `/api/v1/conversations/${conv.id}/stream`
     const resumed = sseFrames(await h.app.request(`${base}?run=${run}&fromSeq=3`))
     const pastHead = sseFrames(await h.app.request(`${base}?run=${run}&fromSeq=999`))
@@ -288,7 +295,7 @@ it('(c) a resume with run and fromSeq gets only what follows its cursor; a curso
     call.finish()
     await Promise.all([resumed.done, pastHead.done])
     const ids = (v: ReturnType<typeof sseFrames>) => v.frames.filter((f) => f.id !== undefined).map((f) => f.id)
-    const last = chatRuns.find(conv.id, run)!.buffer.head() - 1
+    const last = h.d.chatRuns.find(conv.id, run)!.buffer.head() - 1
     assert.deepEqual(ids(pastHead), Array.from({ length: last + 1 }, (_, i) => i), 'a cursor past the head replays the whole run')
     assert.deepEqual(ids(resumed), ids(pastHead).slice(3), 'from the cursor, through done')
     assert.equal(resumed.frames.at(-1)!.event, 'done')
@@ -342,18 +349,18 @@ it('(e) Stop names the reply: it reaches the engine, saves the partial as stoppe
     const { assistantMessageId } = await sendAndLeave(h.app, conv.id, 'hi')
     const call = await engine.call(1)
     call.word(LONG)
-    await waitFor(() => (chatRuns.latestRun(conv.id)?.buffer.head() ?? 0) >= 2, 'a delta in the run')
+    await waitFor(() => (h.d.chatRuns.latestRun(conv.id)?.buffer.head() ?? 0) >= 2, 'a delta in the run')
     const viewer = sseFrames(await h.app.request(`/api/v1/conversations/${conv.id}/stream`))
     await viewer.until((f) => f.event === 'delta')
 
     const stale = await (await h.app.request('/api/v1/chat/stop', json({ conversationId: conv.id, messageId: 'an-older-reply' }))).json()
     assert.deepEqual(stale, { ok: true, stopped: false }, 'a reply that does not hold the chat is not stopped')
-    assert.deepEqual(inFlightChatIds(), [conv.id])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [conv.id])
     assert.equal(call.gone, false)
 
     const stop = await (await h.app.request('/api/v1/chat/stop', json({ conversationId: conv.id, messageId: assistantMessageId }))).json()
     assert.deepEqual(stop, { ok: true, stopped: true })
-    assert.deepEqual(inFlightChatIds(), [], 'the chat is free at once')
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [], 'the chat is free at once')
     await waitFor(() => call.gone, 'the engine to see the abort')
     const done = await viewer.until((f) => f.event === 'done')
     assert.equal((done.data.message as Message).stats.aborted, true)
@@ -388,7 +395,7 @@ it('(f) a call waiting for approval keeps waiting with the page gone; a page ope
     await first.cancel() // that page goes too
     await new Promise((r) => setTimeout(r, 50))
     assert.deepEqual(executed, [], 'still waiting: no page is no answer')
-    assert.deepEqual(inFlightChatIds(), [conv.id])
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [conv.id])
 
     const reopened = sseFrames(await h.app.request(`/api/v1/conversations/${conv.id}/stream`))
     await reopened.until((f) => f.event === 'tool_call' && f.data.status === 'awaiting_approval', 'the replayed approval request')
@@ -494,7 +501,7 @@ it('(i) the engine kill switches and deleting the chat stop a turn no page is wa
     const a = h.store.createConversation()
     await sendAndLeave(h.app, a.id, 'one')
     const callA = await engine.call(1)
-    assert.equal(abortAllInFlightChats(), 1)
+    assert.equal(h.d.chatTurns.abortAll(), 1)
     await waitFor(() => callA.gone, 'a kill switch to reach the engine')
     await waitFor(saved(h.store, a.id), 'the stopped reply to be saved')
     assert.equal(reply(h.store, a.id).stats.aborted, true)
@@ -504,7 +511,7 @@ it('(i) the engine kill switches and deleting the chat stop a turn no page is wa
     const callB = await engine.call(2)
     assert.equal((await h.app.request(`/api/v1/conversations/${b.id}`, { method: 'DELETE' })).status, 200)
     await waitFor(() => callB.gone, 'deleting the chat to reach the engine')
-    await waitFor(() => inFlightChatIds().length === 0, 'the deleted chat\'s turn to unwind')
+    await waitFor(() => h.d.chatTurns.inFlightChatIds().length === 0, 'the deleted chat\'s turn to unwind')
   } finally {
     h.cleanup()
     await engine.close()
@@ -531,8 +538,8 @@ it('(i) a daemon stop closes the store once the replies it stopped are saved, on
     await waitFor(() => toolStarted, 'the tool call to start')
     // As cli.ts's teardowns do: stop every reply, then close the store once the engine's shutdown (here one with
     // nothing to stop, as for a Turbo Link chat) and the stopped turns have ended.
-    abortAllInFlightChats()
-    await Promise.all([Promise.resolve(), chatTurnsEnded()])
+    h.d.chatTurns.abortAll()
+    await Promise.all([Promise.resolve(), h.d.chatTurns.turnsEnded()])
     const r = reply(h.store, conv.id)
     assert.equal(r.stats.aborted, true, 'saved as stopped before the store closes')
     assert.equal(r.content, LONG)
@@ -558,15 +565,15 @@ it('(i) chatTurnsEnded waits no longer than its bound for a turn held by a tool 
     round1.toolCall('call_1', 'run_code', '{"code":"6*7"}')
     round1.finish('tool_calls')
     await waitFor(() => releaseTool !== undefined, 'the tool call to start')
-    abortAllInFlightChats()
+    h.d.chatTurns.abortAll()
     const started = Date.now()
-    await Promise.race([chatTurnsEnded(200), new Promise((r) => setTimeout(r, 5_000))])
+    await Promise.race([h.d.chatTurns.turnsEnded(200), new Promise((r) => setTimeout(r, 5_000))])
     const waited = Date.now() - started
     assert.ok(waited >= 150 && waited < 2_000, `waited ${waited} ms`)
-    assert.equal(chatRuns.latestRun(conv.id)?.ended, false, 'the turn still runs its tool call')
+    assert.equal(h.d.chatRuns.latestRun(conv.id)?.ended, false, 'the turn still runs its tool call')
     releaseTool!()
-    await chatTurnsEnded(5_000)
-    assert.equal(chatRuns.latestRun(conv.id)?.ended, true)
+    await h.d.chatTurns.turnsEnded(5_000)
+    assert.equal(h.d.chatRuns.latestRun(conv.id)?.ended, true)
     assert.equal(reply(h.store, conv.id).stats.aborted, true)
   } finally {
     releaseTool?.()
@@ -633,7 +640,7 @@ it('(l) a call waiting for approval moves the chat from the probe\'s items to wa
     assert.equal(activeWork(h.d).engineGenerating, false, 'nor an engine generation, though its turn holds the count')
     assert.equal(generations, 1)
     assert.deepEqual(activeWork(h.d).waiting.map((i) => [i.kind, i.id]), [['chat', conv.id]])
-    assert.deepEqual(inFlightChatIds(), [conv.id], 'still in flight: a load or Stop ends it')
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [conv.id], 'still in flight: a load or Stop ends it')
     const approve = await h.app.request(`/api/v1/conversations/${conv.id}/tool-calls/call_1/approve`, json({ toolName: 'run_code', decision: 'allow' }))
     assert.equal(approve.status, 200)
     const round2 = await engine.call(2)
@@ -661,7 +668,7 @@ it('(l) a reply whose auto-title call is still pending keeps the chat in the pro
     call.word('Once upon a time.')
     call.finish()
     await waitFor(saved(h.store, conv.id), 'the reply to be saved')
-    assert.deepEqual(inFlightChatIds(), [], 'the turn has ended')
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [], 'the turn has ended')
     // From done, before the title call has even started (1 s on), and while the engine answers it.
     assert.deepEqual(activeWork(h.d).items.map((i) => [i.kind, i.id]), [['chat', conv.id]], 'still busy: the title call needs the model')
     await waitFor(() => engine.nonStream.length === 1, 'the title call', 4000)
@@ -695,18 +702,18 @@ it('(l) the idle unload\'s hold covers a turn\'s auto-compaction, which the engi
     h.store.addMessage(conv.id, 'assistant', long)
     h.store.addMessage(conv.id, 'user', long)
     h.store.addMessage(conv.id, 'assistant', long, { stats: { ctxUsed: 7500, ctxMax: 8192 } }) // 92% of the window
-    assert.equal(chatHoldsEngine(), false)
+    assert.equal(h.d.chatTurns.holdsEngine(), false)
     await sendAndLeave(h.app, conv.id, 'q3')
     await waitFor(() => engine.nonStream.length === 1, 'the summary call')
     assert.equal(generations(), 0, 'the summary call holds no generation')
-    assert.equal(chatHoldsEngine(), true, 'the compaction needs the model')
+    assert.equal(h.d.chatTurns.holdsEngine(), true, 'the compaction needs the model')
     release()
     const call = await engine.call(1)
-    assert.equal(chatHoldsEngine(), true)
+    assert.equal(h.d.chatTurns.holdsEngine(), true)
     call.word('a3')
     call.finish()
     await waitFor(saved(h.store, conv.id), 'the reply to be saved')
-    await waitFor(() => !chatHoldsEngine(), 'the hold to end with the turn')
+    await waitFor(() => !h.d.chatTurns.holdsEngine(), 'the hold to end with the turn')
   } finally {
     release()
     h.cleanup()
@@ -723,11 +730,11 @@ it('(l) the idle unload\'s hold covers an approval wait and the reply\'s title c
     const conv = h.store.createConversation()
     await sendAndLeave(h.app, conv.id, 'compute 6*7')
     const round1 = await engine.call(1)
-    assert.equal(chatHoldsEngine(), true, 'generating')
+    assert.equal(h.d.chatTurns.holdsEngine(), true, 'generating')
     round1.toolCall('call_1', 'run_code', '{"code":"6*7"}')
     round1.finish('tool_calls')
     await waitFor(() => activeWork(h.d).waiting.length === 1, 'the approval wait')
-    assert.equal(chatHoldsEngine(), true, 'waiting for an approval within its wait')
+    assert.equal(h.d.chatTurns.holdsEngine(), true, 'waiting for an approval within its wait')
     const approve = await h.app.request(`/api/v1/conversations/${conv.id}/tool-calls/call_1/approve`, json({ toolName: 'run_code', decision: 'allow' }))
     assert.equal(approve.status, 200)
     const round2 = await engine.call(2)
@@ -736,10 +743,10 @@ it('(l) the idle unload\'s hold covers an approval wait and the reply\'s title c
     await waitFor(saved(h.store, conv.id), 'the reply to be saved')
     await waitFor(() => engine.nonStream.length === 1, 'the title call', 4000)
     assert.equal(generations(), 0, 'the turn has ended: no generation')
-    assert.equal(chatHoldsEngine(), true, 'the title call needs the model')
+    assert.equal(h.d.chatTurns.holdsEngine(), true, 'the title call needs the model')
     release()
     await waitFor(() => h.store.getConversation(conv.id)!.title === 'A Generated Title', 'the auto-title')
-    await waitFor(() => !chatHoldsEngine(), 'the hold to end once the title settled')
+    await waitFor(() => !h.d.chatTurns.holdsEngine(), 'the hold to end once the title settled')
   } finally {
     release()
     h.cleanup()
@@ -793,7 +800,7 @@ it('(p) a viewer gets an SSE keepalive comment every 20 s while nothing else is 
 it('(q) a reply\'s text is saved while it streams: a kill leaves it, the restart marks it stopped, and the end replaces it', async (t) => {
   t.mock.timers.enable({ apis: ['setInterval'] }) // the partial saves' 10 s
   const engine = await standInEngine()
-  const h = routes(engine.url)
+  const h = routes(engine.url, { persist: true }) // the restart below reads the database back from disk
   const dir = (h.d.store as unknown as { dir(): string }).dir()
   try {
     const conv = h.store.createConversation()
@@ -819,7 +826,7 @@ it('(q) a reply\'s text is saved while it streams: a kill leaves it, the restart
       const log = console.log
       console.log = () => {}
       try {
-        registerChatRoutes(new Hono(), { db: restarted, store: h.d.store } as unknown as Deps)
+        registerChatRoutes(new Hono(), { chatTurns: new ChatTurns(), chatRuns: new ChatRuns(), db: restarted, store: h.d.store } as unknown as Deps)
       } finally {
         console.log = log
       }
@@ -867,7 +874,7 @@ class FakeProvider implements RemoteProvider {
  *  does what api/routes.ts's does: drop the key and end what it held (endStaleStreams). */
 async function gatedRoutes(engineUrl: string, opts: { requireApiKey?: boolean } = {}) {
   const dir = tmpDir('tllm-chat-detached-gated-')
-  const store = new ConversationStore(dir)
+  const store = new ConversationStore(IN_MEMORY_DATA_DIR)
   const cfg: Config = defaultConfig()
   cfg.daemon.lanBind = true
   cfg.daemon.requireApiKey = opts.requireApiKey ?? cfg.daemon.requireApiKey
@@ -878,8 +885,9 @@ async function gatedRoutes(engineUrl: string, opts: { requireApiKey?: boolean } 
   )
   const app = new Hono()
   const d = {
+    chatTurns: new ChatTurns(), chatRuns: new ChatRuns(),
     db: store,
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
     registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
     modelRouter: { resolveRemoteTarget: () => undefined },

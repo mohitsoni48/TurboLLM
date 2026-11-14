@@ -149,6 +149,7 @@ export function catalogIdFor(e: Engine, catalog?: Pick<CatalogEngine, 'id' | 're
   const repo = repoSlug(e.sourceRepo)
   if (repo === 'atomicbot-ai/atomic-llama-cpp-turboquant') return 'turboquant'
   if (repo === 'ikawrakow/ik_llama.cpp') return 'ik_llama.cpp'
+  if (repo === 'turbo-tan/llama.cpp-tq3') return 'llama.cpp-tq3'
   if (/[\\/]engines[\\/]turboquant[\\/]/.test(e.binPath)) return 'turboquant'
   return 'llama.cpp'
 }
@@ -271,6 +272,17 @@ const ENGINE_META: Record<string, EngineMeta> = {
       'Same llama-server + GGUF flow',
     ],
     cons: ['No prebuilts — build from source', 'CPU + CUDA only (no ROCm/Metal)', 'Some quant types are fork-only'],
+  },
+  'llama.cpp-tq3': {
+    icon: Gauge,
+    tagline: 'Runs TurboQuant TQ3 weight GGUFs',
+    format: 'GGUF',
+    pros: [
+      'Runs TQ3_1S/TQ3_4S model-weight GGUFs',
+      'TQ3_4S stores weights at 4.0 bits each',
+      'Same llama-server + GGUF flow',
+    ],
+    cons: ['No prebuilts — build from source', 'Backend support depends on your build', 'Fork-only weight formats'],
   },
   koboldcpp: {
     icon: Feather,

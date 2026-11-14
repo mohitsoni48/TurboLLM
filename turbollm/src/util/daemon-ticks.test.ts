@@ -15,17 +15,19 @@ import { daemonTick, stopDaemonTicks } from './daemon-ticks'
 import { sourceFilesUnder } from '../test-support/raw-spawn-sites'
 
 const SRC_ROOT = fileURLToPath(new URL('..', import.meta.url))
-const RESTART = 'stopped by the restart handler (cli.ts deps.requestRestart) before the keeper starts its replacement'
+const RESTART = 'stopped by the daemon\'s teardown (boot.ts close), which the restart runs before the keeper starts its replacement'
 
 /** `<file>` → how many setInterval calls it has, and what stops each before the keeper's replacement starts. */
 const OWNED_INTERVALS: Record<string, { count: number; why: string }> = {
   'util/daemon-ticks.ts': { count: 1, why: 'daemonTick itself: stopDaemonTicks, in becomeKeeper' },
-  'cli.ts': { count: 1, why: `the interactive-run sweep (cliInteractiveSweepTimer): ${RESTART}` },
+  'boot.ts': { count: 1, why: `the interactive-run sweep (cliInteractiveSweepTimer): ${RESTART}` },
   'engines/update-scheduler.ts': { count: 1, why: `UpdateScheduler.stop(), which cancels its first pass too: ${RESTART}` },
   'routines/scheduler.ts': { count: 1, why: `RoutineScheduler.stop(): ${RESTART}` },
   'remote/manager.ts': { count: 1, why: 'a tunnel\'s health loop: cleared synchronously by remote.disable(), which the restart teardown calls' },
   'engines/manager.ts': { count: 1, why: 'an engine\'s idle watchdog, armed only while its process lives: the restart stops the engines, and the keeper\'s exit net kills what is left' },
-  'chat/chat-routes.ts': { count: 2, why: 'a reply stream\'s keepalive and a turn\'s partial saves: each ends with its run, and the restart stops every run first (abortAllInFlightChats)' },
+  'chat/chat-routes.ts': { count: 1, why: 'a reply stream\'s keepalive: it ends with its run, and the restart stops every run first (chatTurns.abortAll)' },
+  'chat/generation-core.ts': { count: 1, why: 'a turn\'s partial saves: cleared when its run ends, and the restart stops every run first (chatTurns.abortAll)' },
+  'events/events-routes.ts': { count: 1, why: 'a client\'s SSE heartbeat: armed per connection and cleared when it disconnects (onAbort); the restart closes every open connection with the listener' },
   'link/link-manager.ts': { count: 1, why: 'the Turbo Link poll: LinkManager.stop(), in becomeKeeper' },
   'sysinfo/usage.ts': { count: 1, why: 'the usage sampler: stopUsageMonitor(), in becomeKeeper (it also stops itself 6 s after its last reader)' },
   'util/tether.ts': { count: 1, why: 'the held-group re-count: it stops itself once nothing is held, and the keeper\'s closeAllLifelines closes every hold' },

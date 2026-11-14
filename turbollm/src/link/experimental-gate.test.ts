@@ -62,7 +62,7 @@ function mkDeps(turboLink: boolean, over: { keys?: ApiKey[]; links?: LinkRecord[
   }
   const d = {
     version: '1.11.2',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
   } as unknown as Deps
   return { d, cfg }
 }
@@ -86,7 +86,7 @@ test('isTurboLinkEnabled reads daemon.experimental.turboLink and fails closed', 
   assert.equal(isTurboLinkEnabled(mkDeps(false).d), false)
   // A config shape with no `experimental` block cannot come out of normalize(), but a
   // half-written file must never read as "on".
-  const bare = { store: { snapshot: () => ({ daemon: {} }) } } as unknown as Deps
+  const bare = { store: { snapshot: () => ({ daemon: {} }), read: () => ({ daemon: {} }) } } as unknown as Deps
   assert.equal(isTurboLinkEnabled(bare), false)
 })
 
@@ -330,7 +330,7 @@ test('ModelRouter treats a qualified id as NOT remote while the flag is off', as
   const cat = catalogFor(false, [rec()])
   await cat.refresh()
   const router = new ModelRouter(
-    { snapshot: () => ({ daemon: {} }) } as never, {} as never, {} as never,
+    { snapshot: () => ({ daemon: {} }), read: () => ({ daemon: {} }) } as never, {} as never, {} as never,
     { list: () => ({ models: [] }) } as never, undefined as never, cat,
   )
   // `undefined` means "not a remote id" — resolution falls through to the local library,
@@ -342,7 +342,7 @@ test('ModelRouter still resolves a qualified id while the flag is on', async () 
   const cat = catalogFor(true, [rec()])
   await cat.refresh()
   const router = new ModelRouter(
-    { snapshot: () => ({ daemon: {} }) } as never, {} as never, {} as never,
+    { snapshot: () => ({ daemon: {} }), read: () => ({ daemon: {} }) } as never, {} as never, {} as never,
     { list: () => ({ models: [] }) } as never, undefined as never, cat,
   )
   const route = router.resolveRemoteTarget('workstation/Qwen3-35B')

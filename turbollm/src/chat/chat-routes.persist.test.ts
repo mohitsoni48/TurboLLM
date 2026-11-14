@@ -14,6 +14,8 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { rmSync } from 'node:fs'
 import { runGeneration, resilientSink } from './chat-routes.js'
+import { ChatRuns } from './chat-runs.js'
+import { ChatTurns } from './chat-turns.js'
 import { ConversationStore } from './db.js'
 import type { Deps } from '../deps.js'
 import type { EmitSink } from './emit-sink.js'
@@ -35,8 +37,9 @@ function mkHarness(): Harness {
     tools: { toolPolicies: {}, autoAllowAll: false },
   }
   const d = {
+    chatTurns: new ChatTurns(), chatRuns: new ChatRuns(),
     db: store,
-    store: { snapshot: () => cfg, dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, dir: () => dir },
     scanner: { get: () => undefined },
     registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
     manager: {

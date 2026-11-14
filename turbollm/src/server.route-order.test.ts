@@ -39,7 +39,7 @@ function mkDeps(): Deps {
   }
   return {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '.' },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '.' },
     db,
     telemetry: { firstUse: () => {}, useFeature: () => {} },
   } as unknown as Deps

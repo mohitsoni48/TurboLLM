@@ -65,6 +65,9 @@ const EXIT_STDIO_GRACE_MS = 100
  *  `timeoutMs + CLI_KILL_GRACE_MS` no matter what the child does afterwards. See `armGrace`. */
 export const CLI_KILL_GRACE_MS = 1_000
 
+/** How much of a child's stderr is kept (its tail — the last words before a failure are the useful ones). */
+const STDERR_TAIL_MAX_CHARS = 64 * 1024
+
 export interface CliProcessResult {
   exitCode: number | null
   stdout: string
@@ -239,7 +242,16 @@ export function realSpawnCliProcess(
  *  aborted signal spawns nothing, and a later abort kills the child exactly as the timeout does. */
 export function runClaudeCliProcess(
   args: string[],
-  opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number; signal?: AbortSignal },
+  opts: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    stdin?: string
+    timeoutMs?: number
+    signal?: AbortSignal
+    /** Receives stdout as it arrives INSTEAD of it being accumulated into the result (`stdout` comes back
+     *  empty) — for a caller that folds a long stream as it goes rather than holding all of it. */
+    onStdout?: (chunk: string) => void
+  },
   _spawn: SpawnCliProcess = realSpawnCliProcess,
   _killTree: (pid: number, onDone?: () => void) => void = killCliProcessTree,
 ): Promise<CliProcessResult> {
@@ -247,6 +259,7 @@ export function runClaudeCliProcess(
     const timeoutMs = opts.timeoutMs ?? CLI_ROUTINE_TIMEOUT_MS
     let stdout = ''
     let stderr = ''
+    const appendStderr = (s: string) => { stderr = (stderr + s).slice(-STDERR_TAIL_MAX_CHARS) }
     let timedOut = false
     let settled = false
 
@@ -357,26 +370,30 @@ export function runClaudeCliProcess(
     // would otherwise become U+FFFD on both sides of the boundary in the recorded result.
     child.stdout?.setEncoding('utf8')
     child.stderr?.setEncoding('utf8')
-    child.stdout?.on('data', (s: string) => { stdout += s; if (exited) armGrace(EXIT_STDIO_GRACE_MS) })
-    child.stderr?.on('data', (s: string) => { stderr += s; if (exited) armGrace(EXIT_STDIO_GRACE_MS) })
+    child.stdout?.on('data', (s: string) => {
+      if (opts.onStdout) opts.onStdout(s)
+      else stdout += s
+      if (exited) armGrace(EXIT_STDIO_GRACE_MS)
+    })
+    child.stderr?.on('data', (s: string) => { appendStderr(s); if (exited) armGrace(EXIT_STDIO_GRACE_MS) })
     child.stdout?.once('end', () => { stdoutEnded = true; finishIfDrained() })
     child.stderr?.once('end', () => { stderrEnded = true; finishIfDrained() })
     // A stream-level error (EPIPE on a killed child is the common one) would otherwise throw out
     // of band with no handler attached. Record it and treat that pipe as finished — it will never
     // emit 'end' now, and the run's outcome is decided by the child's exit, not by the pipe.
-    child.stdout?.on('error', (e: Error) => { stderr += `\n${e.message}`; stdoutEnded = true; finishIfDrained() })
-    child.stderr?.on('error', (e: Error) => { stderr += `\n${e.message}`; stderrEnded = true; finishIfDrained() })
+    child.stdout?.on('error', (e: Error) => { appendStderr(`\n${e.message}`); stdoutEnded = true; finishIfDrained() })
+    child.stderr?.on('error', (e: Error) => { appendStderr(`\n${e.message}`); stderrEnded = true; finishIfDrained() })
 
     // The prompt. Always end stdin, even when there is nothing to send, so a child that reads it
     // sees EOF instead of blocking forever.
     if (child.stdin) {
-      child.stdin.on('error', (e: Error) => { stderr += `\n${e.message}` })
+      child.stdin.on('error', (e: Error) => { appendStderr(`\n${e.message}`) })
       child.stdin.end(opts.stdin ?? '')
     }
 
     child.on('error', (e: Error) => {
       if (settled) return
-      stderr += `\n${e.message}`
+      appendStderr(`\n${e.message}`)
       exitCode = null
       finish()
     })

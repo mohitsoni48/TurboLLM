@@ -20,6 +20,7 @@ import { toolsForMode } from '../code/persona'
 import { stallRoutineRun, type PendingRoutineToolCall } from './approval'
 import { resolveToolApproval } from '../tools/approval-gate'
 import { releaseTetherScope } from '../util/tether'
+import { lspPool } from '../code/lsp-pool'
 
 export type CodeRunOutcome =
   | { status: 'ok'; result: string }
@@ -64,6 +65,7 @@ export async function resumeCodeRoutine(
   // kept in the session's scope for this resume, ends with it, as at the end of any other run.
   const ended = (outcome: CodeRunOutcome): CodeRunOutcome => {
     void releaseTetherScope(`code-session:${sessionId}`)
+    lspPool.disposeConv(pending.convId)
     return outcome
   }
   if (decision === 'deny') {
@@ -146,7 +148,10 @@ async function driveCodeSession(
     outcome = await driveTurn(d, run, sessionId, convId, repoRoot, task, userMsgId, signal, approvedCall)
     return outcome
   } finally {
-    if (outcome?.status !== 'needs_approval') void releaseTetherScope(`code-session:${sessionId}`)
+    if (outcome?.status !== 'needs_approval') {
+      void releaseTetherScope(`code-session:${sessionId}`)
+      lspPool.disposeConv(convId) // its language servers too; a parked run keeps both for its resume
+    }
   }
 }
 

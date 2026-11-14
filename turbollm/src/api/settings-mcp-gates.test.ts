@@ -14,7 +14,7 @@ function fakeApp(cfg: Config, remote?: { kind: RemoteState['kind'] }): Hono {
   const app = new Hono()
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
     manager: { status: () => ({ state: 'stopped', model: null }) },
     ...(remote ? { remote: { ingressPort: () => undefined, state: () => remote } } : {}),
   } as unknown as Deps

@@ -31,7 +31,7 @@ function depsFor(engineKind: string): Deps {
       routeTo: async () => ({ target: ENGINE }),
       aliveSlots: () => [],
     },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     manager: {
       status: () => ({ state: 'running', model: { key: KEY, name: ENTRY.name } }),
       target: () => ENGINE,
@@ -188,6 +188,7 @@ function sdkGatewayWithLoadedModel(running: string, library: ModelEntry[]) {
   } as unknown as Manager
   const store = {
     snapshot: () => ({ gateway: { autoSwap: true, keepN: 1 }, modelDefaults: { maxTokens: 0 }, modelProfiles: {}, comfyui: {} }),
+    read: () => ({ gateway: { autoSwap: true, keepN: 1 }, modelDefaults: { maxTokens: 0 }, modelProfiles: {}, comfyui: {} }),
     update: (fn: (c: Record<string, unknown>) => void) => fn({}),
   } as unknown as ConfigStore
   const scanner = { list: () => ({ models: library }), get: () => undefined } as unknown as Scanner

@@ -2,15 +2,15 @@ import type { Hono } from 'hono'
 import { randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
 import type { Deps } from '../deps'
-import type { ApiKey } from '../config/config'
+import type { ApiKey, DeepReadonly } from '../config/config'
 // A VALUE import, not a type one: `ValueError.field` is the only part of a failed
 // `validate()` that may cross the façade (see the `invalid_config` branch below).
 import { ValueError } from '../config/config'
 import { linkAuth, requireCapability } from './link-auth'
-import { gatewayV1Handler } from '../gateway/gateway'
+import { gatewayBodyLimit, gatewayV1Handler } from '../gateway/gateway'
 import { isJsonObject, NOT_A_JSON_OBJECT } from '../gateway/jev-serving'
-import { buildModelStatus } from '../api/status-view'
-import { startEngine, stopEngine } from '../api/engine-lifecycle'
+import { buildModelStatus } from '../services/status-view'
+import { startEngine, stopEngine } from '../services/engine-lifecycle'
 import type { Incompatibility } from '../engines/compat'
 import { unlistedForLoading } from '../engines/registry'
 import type { ModelEntry } from '../models/scanner'
@@ -19,7 +19,7 @@ import {
   listDownloads,
   removeDownload,
   type DownloadFailure,
-} from '../api/download-lifecycle'
+} from '../services/download-lifecycle'
 // The single-file model formats a repo-file download may produce — the SAME set the
 // download manager's own enqueue guards enforce, imported rather than restated so the
 // façade can never accept (or reject) a format the local route treats differently.
@@ -38,7 +38,7 @@ import { inferenceServed } from '../telemetry/events/link'
 // plain `Hono` type in this function's signature carries no Variables — so route
 // handlers below see it through this narrowed local alias rather than widening the
 // exported signature (which task 6's interface pins to `Hono`).
-type LinkEnv = { Variables: { linkKey: ApiKey } }
+type LinkEnv = { Variables: { linkKey: DeepReadonly<ApiKey> } }
 
 /** Stable identity for THIS install, minted once and persisted. The peer keeps it so it
  *  can tell "the tunnel URL changed but it's the same box" (normal, every Kaggle session)
@@ -203,13 +203,16 @@ export function registerLinkAuth(app: Hono, d: Deps): void {
 export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegistered?: boolean }): void {
   const linkApp = app as unknown as Hono<LinkEnv>
   if (!opts?.authAlreadyRegistered) registerLinkAuth(app, d)
+  // The gateway's body cap on everything a peer key can POST, registered right after linkAuth (Hono runs middleware in
+  // registration order) so a caller without a valid key is refused before a byte is buffered.
+  app.use('/api/link/v1/*', gatewayBodyLimit(d))
 
   linkApp.post('/api/link/v1/hello', (c) => {
     const key = c.get('linkKey')
     // A legacy key (no grant) is full-access, so it must report EVERY capability —
     // reporting [] would grey out every control on the peer for an otherwise valid key.
-    const capabilities = key.grant ? key.grant.capabilities : [...LINK_CAPABILITIES]
-    const models = key.grant?.models?.length ? key.grant.models : undefined
+    const capabilities = key.grant ? [...key.grant.capabilities] : [...LINK_CAPABILITIES]
+    const models = key.grant?.models?.length ? [...key.grant.models] : undefined
     const daemon = d.store.snapshot().daemon as { machineName?: string }
     const body: HelloResponse = {
       machineId: machineId(d),

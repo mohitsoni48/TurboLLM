@@ -47,7 +47,7 @@ const LITERT_SMALL_TUNE = profileEntry({ ctx: 2048 })
 const LITERT_CPU_TUNE = profileEntry({ ctx: 4096, backend: 'cpu' })
 const LITERT_PINNED_TUNE = profileEntry({ ctx: 8192, backend: 'gpu' })
 
-/** One Android start, as cli.ts runs it: the files the APK ships, and the SDK's engine list when the app started it. */
+/** One Android start, as boot.ts runs it: the files the APK ships, and the SDK's engine list when the app started it. */
 interface AndroidStart {
   shippedFiles: string[]
   sdkEngines?: SdkEngineInfo[] | null

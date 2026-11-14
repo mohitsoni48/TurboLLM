@@ -17,9 +17,9 @@ import { buildStartOpts } from './start-opts'
 import { isTurboLinkEnabledIn } from '../link/gate'
 
 export interface AutoLoadDeps {
-  /** The boot scan's promise (cli.ts). Never rejects (CoalescedRunner C4). */
+  /** The boot scan's promise (boot.ts). Never rejects (CoalescedRunner C4). */
   initialScan: Promise<void>
-  /** The boot's engine repair and registration (cli.ts: the Android bundled engines, then the SDK engine). Planned
+  /** The boot's engine repair and registration (boot.ts: the Android bundled engines, then the SDK engine). Planned
    *  after it, so the active engine is the one this launch runs, not a row an upgrade removed (QA F4, B-19). */
   engineSetup: Promise<void>
   store: Pick<ConfigStore, 'snapshot'>
@@ -38,7 +38,7 @@ export interface AutoLoadDeps {
 
 /** Resolves once the plan is carried out and any load has settled. Never rejects — a failure
  *  anywhere in this function, including while deciding what to do, is reported through
- *  `deps.warn` rather than left to reject the caller's `void runAutoLoad(...)` (cli.ts). */
+ *  `deps.warn` rather than left to reject the caller's `void runAutoLoad(...)` (boot.ts). */
 export async function runAutoLoad(deps: AutoLoadDeps): Promise<AutoLoadPlan> {
   let plan: AutoLoadPlan = { kind: 'disabled' }
   try {

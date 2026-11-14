@@ -86,7 +86,7 @@ test('no unaccounted-for run.repoRoot remains in code-routes.ts', () => {
 })
 
 test('the PTY cwd uses agentCwd too — both agents must see the same tree', () => {
-  const terminal = readFileSync(join(HERE, '..', 'terminal', 'terminal-routes.ts'), 'utf8')
+  const terminal = readFileSync(join(HERE, '..', 'terminal', 'terminal-service.ts'), 'utf8')
   const create = terminal.split('\n').find((l) => l.includes('m.create('))
   assert.ok(create, 'terminal creation call must still exist')
 

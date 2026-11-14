@@ -15,7 +15,7 @@ function scannerOver(t: TestContext): { library: string; scanner: Scanner } {
   mkdirSync(library)
   mkdirSync(data)
   const cfg: Config = { ...defaultConfig(), modelDirs: [library] }
-  const store = { dir: () => data, snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) }
+  const store = { dir: () => data, snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) }
   return { library, scanner: new Scanner(store as unknown as ConfigStore) }
 }
 

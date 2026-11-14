@@ -16,6 +16,8 @@ import { findTextClassificationRepos, type ListedModel } from './text-classifica
 
 const BASE = 'https://huggingface.co'
 const CACHE_TTL_MS = 5 * 60 * 1000
+/** Every Hugging Face call here is a JSON/README read; the daemon's global dispatcher has no timeout of its own. */
+const HF_REQUEST_TIMEOUT_MS = 30_000
 /** Upper bound on cached responses. The TTL only decides freshness — an expired entry is kept as
  *  the fallback for when HF is unreachable — so without a cap every distinct search, repo, tree
  *  and model card would be held for the daemon's lifetime. The oldest-written entry goes first. */
@@ -546,7 +548,7 @@ export class HfClient {
       const hit = this.cache.get(url)
       if (hit && now - hit.at < CACHE_TTL_MS) return hit.value as string
       try {
-        const res = await fetch(url, { headers: this.authHeaders(), redirect: 'follow' })
+        const res = await fetch(url, { headers: this.authHeaders(), redirect: 'follow', signal: AbortSignal.timeout(HF_REQUEST_TIMEOUT_MS) })
         if (!res.ok) continue
         const raw = await res.text()
         this.remember(url, { at: now, value: raw })
@@ -589,7 +591,7 @@ export class HfClient {
     const hit = this.cache.get(url)
     if (hit && now - hit.at < CACHE_TTL_MS) return (hit.value as string).slice(0, maxLen)
     try {
-      const res = await fetch(url, { headers: this.authHeaders(), redirect: 'follow' })
+      const res = await fetch(url, { headers: this.authHeaders(), redirect: 'follow', signal: AbortSignal.timeout(HF_REQUEST_TIMEOUT_MS) })
       if (!res.ok) return ''
       const raw = await res.text()
       // Strip a leading `---\n…\n---` YAML frontmatter block, then cap (cache the full window).
@@ -610,6 +612,7 @@ export class HfClient {
     try {
       res = await fetch(`${BASE}/api/whoami-v2`, {
         headers: { Authorization: `Bearer ${t}`, 'User-Agent': `TurboLLM/${this.version}` },
+        signal: AbortSignal.timeout(HF_REQUEST_TIMEOUT_MS),
       })
     } catch {
       throw new HfError('hf_unreachable', 'Hugging Face is unreachable — check your connection.')
@@ -643,7 +646,7 @@ export class HfClient {
 
     let res: Response
     try {
-      res = await fetch(url, { headers: this.authHeaders(), redirect: 'follow' })
+      res = await fetch(url, { headers: this.authHeaders(), redirect: 'follow', signal: AbortSignal.timeout(HF_REQUEST_TIMEOUT_MS) })
     } catch {
       // Graceful degradation: serve a stale cache entry if we have one.
       if (hit) return hit.value as T
@@ -673,7 +676,7 @@ export class HfClient {
       const all: unknown[] = value
       let next = nextPageUrl(res.headers.get('link'), url)
       for (let page = 1; next && page < maxPages; page++) {
-        const r = await fetch(next, { headers: this.authHeaders(), redirect: 'follow' }).catch(() => null)
+        const r = await fetch(next, { headers: this.authHeaders(), redirect: 'follow', signal: AbortSignal.timeout(HF_REQUEST_TIMEOUT_MS) }).catch(() => null)
         const more: unknown = r?.ok ? await r.json().catch(() => null) : null
         if (!r || !Array.isArray(more)) {
           // A half-read listing must never pass (or be cached) as the whole repo.

@@ -44,7 +44,7 @@ function fakeApp(o: Doubles = {}) {
     version: '1.12.7',
     store: {
       dir: () => '/tmp/turbollm-test',
-      snapshot: () => cfg,
+      snapshot: () => cfg, read: () => cfg,
       update: (fn: (c: typeof cfg) => void) => fn(cfg),
     },
     manager: { status: () => ({ state: o.managerState ?? 'stopped', model: null }) },

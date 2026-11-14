@@ -133,6 +133,37 @@ export function isBoundedNumber(path: BoundedConfigPath, v: unknown): boolean {
   return typeof v === 'number' && Number.isInteger(v) && v >= b.min && v <= b.max
 }
 
+/** How normalize loads a stored value against a {@link LoadedBound} (config.ts), faithful per setting to what it did
+ *  before the bound carried it:
+ *   - `integer` — a whole number in range is kept; anything else, a fraction included, loads as `default`.
+ *   - `floor`   — a number in range is floored; anything else loads as `default`.
+ *   - `clamp`   — a number of at least `min` is floored and capped at `max`; anything else loads as `default`. */
+export type LoadPolicy = 'integer' | 'floor' | 'clamp'
+
+/** A config-file number with a default: what normalize loads (`load`) and, for one the settings route writes, the exact
+ *  400 message it refuses a value outside it with. One declaration read by both, so they cannot drift. */
+export interface LoadedBound {
+  readonly min: number
+  readonly max: number
+  readonly default: number
+  readonly load: LoadPolicy
+  readonly message?: string
+}
+
+/** The value normalize stores for `raw` under `bound`'s load policy. */
+export function loadBounded(raw: unknown, bound: LoadedBound): number {
+  if (typeof raw !== 'number') return bound.default
+  if (bound.load === 'clamp') return raw >= bound.min ? Math.min(Math.floor(raw), bound.max) : bound.default
+  const inRange = Number.isFinite(raw) && raw >= bound.min && raw <= bound.max
+  if (bound.load === 'integer') return inRange && Number.isInteger(raw) ? raw : bound.default
+  return inRange ? Math.floor(raw) : bound.default
+}
+
+/** Whether `v` is a whole JSON number inside `bound`: what the settings route takes for a bounded setting. */
+export function isWholeInBounds(v: unknown, bound: Pick<LoadedBound, 'min' | 'max'>): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= bound.min && v <= bound.max
+}
+
 /** Settings → Tool permissions, "Wait for an answer": how long a chat reply waits for its tool
  *  calls' approvals, all its calls together, before the call still waiting and the reply's later
  *  ones are answered as not run (Config.tools.chatApprovalWaitMinutes, execute-with-approval.ts
@@ -144,10 +175,75 @@ export const CHAT_APPROVAL_WAIT_MINUTES = {
   min: 0,
   max: 1440,
   default: 30,
+  load: 'floor',
   message: 'chatApprovalWaitMinutes must be a whole number of minutes, 0–1440 (0 waits until answered).',
-} as const
+} as const satisfies LoadedBound
+
+/** Data retention (Config.retention, chat/retention.ts): how many days of raw gateway usage rows to keep before they
+ *  fold into daily totals, and how many runs to keep per routine. Local only, like chatApprovalWaitMinutes: the
+ *  settings route refuses a value outside them with `message`, and normalize loads one outside them as `default`.
+ *  31 days at least, so the dashboards' widest range (30d) never reaches folded rows; 10 runs at least, so a routine's
+ *  recent history is never pruned to nothing. */
+export const RETENTION_BOUNDS = {
+  apiUsageRawDays: {
+    min: 31,
+    max: 3650,
+    default: 90,
+    load: 'floor',
+    message: 'retention.apiUsageRawDays must be a whole number of days, 31–3650.',
+  },
+  routineRunsKept: {
+    min: 10,
+    max: 100_000,
+    default: 200,
+    load: 'floor',
+    message: 'retention.routineRunsKept must be a whole number, 10–100000.',
+  },
+} as const satisfies Record<string, LoadedBound>
+
+export type RetentionBoundedField = keyof typeof RETENTION_BOUNDS
+
+/** Whether `v` is a value the settings route takes for retention `field`: a whole JSON number in range. */
+export function isRetentionValue(field: RetentionBoundedField, v: unknown): v is number {
+  return isWholeInBounds(v, RETENTION_BOUNDS[field])
+}
 
 /** Whether `v` is a chatApprovalWaitMinutes the settings route takes: a whole JSON number in range. */
 export function isChatApprovalWaitMinutes(v: unknown): v is number {
-  return typeof v === 'number' && Number.isInteger(v) && v >= CHAT_APPROVAL_WAIT_MINUTES.min && v <= CHAT_APPROVAL_WAIT_MINUTES.max
+  return isWholeInBounds(v, CHAT_APPROVAL_WAIT_MINUTES)
 }
+
+/** How many files the download manager streams at once (Config.downloadConcurrency, downloads/downloads.ts). Host-only
+ *  in the settings route, with no Settings screen control. Normalize loads a value outside it as `default`; 2 is spec 10's
+ *  long-standing figure, and one connection per file stays, so more files at once is the only knob. */
+export const DOWNLOAD_CONCURRENCY = {
+  min: 1,
+  max: 8,
+  default: 2,
+  load: 'integer',
+  message: 'downloadConcurrency must be a whole number, 1–8.',
+} as const satisfies LoadedBound
+
+/** Seconds a native engine's load may show no progress before it is stopped and the global load lock freed (Config.engineLoadStallSeconds,
+ *  engines/manager.ts; scalability review 4.8). 0 turns the stall watch off, leaving only the 10-minute readiness cap. Host-only in
+ *  the settings route, with no Settings screen control, and outside CONFIG_BOUNDS, which a Turbo Link peer may write. Normalize
+ *  loads a value outside it as `default`. */
+export const ENGINE_LOAD_STALL_SECONDS = {
+  min: 0,
+  max: 600,
+  default: 120,
+  load: 'integer',
+  message: 'engineLoadStallSeconds must be a whole number of seconds, 0–600 (0 turns the stall watch off).',
+} as const satisfies LoadedBound
+
+/** The gateway's request-body cap in MB (Config.gateway.maxBodyMb, gateway/gateway.ts). Host-only in the settings route, with
+ *  no Settings screen control: it stays out of CONFIG_BOUNDS, whose leaves a Turbo Link peer may write (link/config-scope.ts),
+ *  because a peer must never be able to raise the body size this machine buffers. Normalize clamps a value above it to `max`
+ *  and loads one below it as `default`. */
+export const GATEWAY_MAX_BODY_MB = {
+  min: 1,
+  max: 4096,
+  default: 128,
+  load: 'clamp',
+  message: 'gateway.maxBodyMb must be a whole number of MB, 1–4096.',
+} as const satisfies LoadedBound

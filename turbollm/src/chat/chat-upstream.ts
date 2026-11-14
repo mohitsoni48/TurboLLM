@@ -46,6 +46,9 @@ export interface ChatUpstream {
   /** The LOCAL active engine's kind, which shapes the outbound body (applyEngineTokenLimit). Ignored
    *  for a remote turn: the host shapes the request for its own engine. */
   engineKind?: string
+  /** The library key of the local model this upstream serves, when it is not the primary's (a routine's pool slot):
+   *  what a LiteRT-LM round reads the model's tool support from. Unset: the primary's loaded model. */
+  libraryKey?: string
 }
 
 export type ChatUpstreamResult =

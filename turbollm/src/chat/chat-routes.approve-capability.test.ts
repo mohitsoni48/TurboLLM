@@ -30,7 +30,7 @@ function mkApp(): { app: Hono; store: ConversationStore; cfg: FakeConfig; cleanu
   const cfg: FakeConfig = { daemon: { lanBind: false }, tools: { toolPolicies: {}, autoAllowAll: false }, apiKeys: [] }
   const d = {
     db: store,
-    store: { snapshot: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg) },
   } as unknown as Deps
   const app = new Hono()
   registerChatRoutes(app, d)

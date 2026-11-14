@@ -13,7 +13,7 @@ function mkDeps(keys: ApiKey[]): Deps {
   }
   return {
     version: '1.11.2',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
   } as unknown as Deps
 }
 

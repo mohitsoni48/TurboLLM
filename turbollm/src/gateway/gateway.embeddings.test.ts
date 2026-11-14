@@ -27,7 +27,7 @@ function fakeDeps(routed: { model: string | null }): Deps {
         return { target: 'http://engine.local' }
       },
     },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     manager: {
       status: () => ({ state: 'stopped', model: null }),
       target: () => 'http://engine.local',
@@ -100,7 +100,7 @@ test('POST /v1/embeddings never proxies to a linked machine — Turbo Link is ch
   const d = {
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     modelRouter: { targetEntry: () => undefined, route: async () => ({ target: REMOTE.baseUrl, remote: REMOTE }) },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     manager: { status: () => ({ state: 'stopped', model: null }), target: () => null },
     registry: { active: () => ({ kind: 'llama.cpp' }) },
   } as unknown as Deps
@@ -155,7 +155,7 @@ function runningManager(modelKey: string, target: string): Manager {
 }
 
 function autoSwapOffDeps(models: ModelEntry[], slotKey: string): Deps {
-  const store = { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false, keepN: 1 } }) }
+  const store = { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false, keepN: 1 } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false, keepN: 1 } }) }
   const primary = runningManager(CHAT_KEY, PRIMARY_TARGET)
   const scanner = { list: () => ({ models, scanning: false, lastScanAt: '' }), get: (k: string) => models.find((m) => m.key === k) }
   const router = new ModelRouter(store as never, {} as never, primary, scanner as never, undefined)

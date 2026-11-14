@@ -48,7 +48,7 @@ function mkApp() {
   const app = new Hono()
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '.' },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '.' },
     manager: { status: () => ({ state: 'stopped', model: null }) },
   } as unknown as Deps
   registerApi(app, d)

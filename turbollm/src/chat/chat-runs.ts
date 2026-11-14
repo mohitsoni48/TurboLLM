@@ -138,6 +138,3 @@ export class ChatRuns {
     }
   }
 }
-
-/** The daemon's one registry. */
-export const chatRuns = new ChatRuns()

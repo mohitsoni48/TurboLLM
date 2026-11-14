@@ -31,6 +31,9 @@ export interface ModelSwapDeps {
   /** BenchRunner.isRunning(): an auto-tune run owns the engine, and a swap would stop its probe (see withPinnedModel).
    *  Absent: no tune is ever running. */
   isAutotuneRunning?: () => boolean
+  /** The caller holds the primary's GenerationGate for the swap and the restore (execute.ts): passed on as
+   *  LoadExplicitOpts.holdsGate, so the router's eviction does not read that hold as a request on the model. */
+  holdsGate?: boolean
 }
 
 /** Where the swap loaded the routine's model: its loadExplicit() result. With keep-N 2 or more that is a pool slot
@@ -84,8 +87,10 @@ export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, 
   }
 
   // 'swap-then-run'
-  const swapResult = await deps.modelRouter.loadExplicit(pinnedModel)
+  const swapResult = await deps.modelRouter.loadExplicit(pinnedModel, undefined, gateOpts(deps))
   if ('status' in swapResult) {
+    // Nothing was stopped, so the user's model runs on and there is nothing to restore.
+    if (refusedAsBusy(swapResult)) return { outcome: 'skip-busy' }
     // ComfyUI busy is a temporary yield, not a load failure. It still restores: a render whose acquire landed during
     // the swap met the user's model already stopped (Manager.load stops the slot before its pre-start hook), or the
     // routine's model starting, which it kills and keeps for its release() to reload. Its release then loaded the
@@ -145,13 +150,24 @@ export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, 
   return { outcome: 'ran' }
 }
 
+/** A swap the router refused because every engine it could unload is generating, or an auto-tune is running
+ *  (RouteResult's `reason`). It stopped nothing, and it clears by itself: a routine skips it as a busy engine
+ *  (model_busy), as decideModelAction's own skip-busy, rather than reporting a failed load (review L1). */
+export function refusedAsBusy(result: RouteResult): boolean {
+  return 'status' in result && (result.reason === 'busy' || result.reason === 'autotune')
+}
+
+function gateOpts(deps: ModelSwapDeps): { holdsGate?: true } {
+  return deps.holdsGate ? { holdsGate: true } : {}
+}
+
 /** Reload the model that was loaded before the routine's swap: the same loadExplicit() the swap made. Best effort.
  *  Handed the swap's result (`swap`), a restore that finds that model still running (keep-N 2 or more: the swap took a
  *  pool slot) puts back the model last loaded that the swap's record replaced (ModelRouter.undoSwapRecord).
  *  `runningOnly` (LoadExplicitOpts): only that, never a load. The result, or undefined when the load threw. */
 async function restore(deps: ModelSwapDeps, modelKey: string, pinnedModel: string, swap: RouteResult, opts: { runningOnly?: boolean } = {}): Promise<RouteResult | undefined> {
   try {
-    const result = await deps.modelRouter.loadExplicit(modelKey, undefined, { restoreAfter: swap, ...opts })
+    const result = await deps.modelRouter.loadExplicit(modelKey, undefined, { restoreAfter: swap, ...gateOpts(deps), ...opts })
     // A ComfyUI render that began while the routine ran (or during its swap) keeps the routine's model, or the
     // routine's paused load, for its release() to load, and the restore is refused until that render ends. Dropped,
     // the render's end brought the routine's model back and left the user's unloaded: the render's release reloads

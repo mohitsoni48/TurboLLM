@@ -23,6 +23,12 @@ function depsWith(keys: Array<{ key: string; tenant?: string; scopes?: string[];
           hash: createHash('sha256').update(key).digest('hex'),
           prefix: key.slice(0, 8),
         })),
+      }), read: () => ({
+        apiKeys: keys.map(({ key, ...rest }) => ({
+          ...rest,
+          hash: createHash('sha256').update(key).digest('hex'),
+          prefix: key.slice(0, 8),
+        })),
       }),
     },
   } as never

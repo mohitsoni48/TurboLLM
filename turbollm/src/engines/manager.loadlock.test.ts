@@ -55,3 +55,24 @@ test('two concurrent loads on different Managers run one-at-a-time (global lock)
   // With A enqueued first that means: a-start, a-end, then b-start — never interleaved.
   assert.deepEqual(events, ['a-start', 'a-end', 'b-start'])
 })
+
+// Review M1: keep-N eviction chose an idle victim, then load() waited on this lock and stopped it without looking again,
+// though a request could have started on it meanwhile. beforeStop runs under the lock, before anything is stopped; its
+// refusal rejects the load and leaves the engine exactly as it was (not 'error', which load() records for a failure).
+test('beforeStop runs under the lock, and its refusal changes nothing on the engine', async () => {
+  const dir = tmpDir('tllm-lock-')
+  const store = ConfigStore.load(join(dir, 'config.json'))
+  const a = new Manager(store)
+  const b = new Manager(store)
+  const events: string[] = []
+  const loadA = a.load(fakeOpts(), { beforeStart: async () => { events.push('a-start'); await sleep(50); events.push('a-end') } })
+  const loadB = b.load(fakeOpts(), {
+    beforeStop: () => { events.push('b-before-stop'); throw new Error('busy now') },
+    beforeStart: async () => { events.push('b-start') },
+  })
+  await loadA
+  await assert.rejects(loadB, /busy now/)
+  assert.deepEqual(events, ['a-start', 'a-end', 'b-before-stop'], 'checked only once it holds the lock; nothing started')
+  assert.equal(b.status().state, 'stopped')
+  assert.equal(b.status().err, null)
+})

@@ -29,7 +29,7 @@ function mkDeps(mutate: (cfg: Config) => void = () => {}, provider = 'cloudflare
   const conv = new ConversationStore(dir)
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
     db: conv,
     chatStore: new ChatStoreRouter(conv.chatStore, conv.chatStore),
     telemetry: { firstUse: () => {}, useFeature: () => {} },

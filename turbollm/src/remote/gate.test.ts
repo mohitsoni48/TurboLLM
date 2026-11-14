@@ -7,11 +7,11 @@ import { defaultConfig } from '../config/config'
 const depsWith = (remoteAccess: unknown): Deps => {
   const cfg = defaultConfig()
   ;(cfg.daemon.experimental as unknown as Record<string, unknown>).remoteAccess = remoteAccess
-  return { store: { snapshot: () => cfg } } as unknown as Deps
+  return { store: { snapshot: () => cfg, read: () => cfg } } as unknown as Deps
 }
 
 test('gate: off by default', () => {
-  assert.equal(isRemoteAccessEnabled({ store: { snapshot: () => defaultConfig() } } as unknown as Deps), false)
+  assert.equal(isRemoteAccessEnabled({ store: { snapshot: () => defaultConfig(), read: () => defaultConfig() } } as unknown as Deps), false)
 })
 
 test('gate: on only for a literal true', () => {
@@ -21,7 +21,7 @@ test('gate: on only for a literal true', () => {
 })
 
 test('gate: fails closed on a config with no experimental block at all', () => {
-  const d = { store: { snapshot: () => ({ daemon: {} }) } } as unknown as Deps
+  const d = { store: { snapshot: () => ({ daemon: {} }), read: () => ({ daemon: {} }) } } as unknown as Deps
   assert.equal(isRemoteAccessEnabled(d), false)
 })
 
@@ -33,7 +33,7 @@ test('gate: boot clears a leftover remoteAccess.enabled only while the flag is o
     const cfg = defaultConfig()
     cfg.daemon.experimental.remoteAccess = flag
     cfg.remoteAccess.enabled = enabled
-    return { cfg, d: { store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } } as unknown as Deps }
+    return { cfg, d: { store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } } as unknown as Deps }
   }
   const off = store(false, true)
   assert.equal(clearEnabledWhileFlagOff(off.d), true)

@@ -13,7 +13,7 @@ import { litertLmProfileToConfig } from './litert-lm'
 import { litertLmRequestSampling } from './litert-lm-request'
 import type { StartOpts } from './manager'
 import { mlxSamplingArgs } from './mlx'
-import { type LoadProfile, legacySeedProfile, LITERT_RUNTIME_DEFAULT_CTX, profileToArgs, resolveProfile, userSetProfile, vllmProfileToArgs } from '../models/profile'
+import { gpuUserSet, type LoadProfile, legacySeedProfile, LITERT_RUNTIME_DEFAULT_CTX, profileToArgs, resolveProfile, userSetProfile, vllmProfileToArgs } from '../models/profile'
 import type { ModelEntry } from '../models/scanner'
 import { autoThreadCount, type SysInfo, primaryVendor } from '../sysinfo/sysinfo'
 
@@ -28,6 +28,13 @@ export interface BuildStartOptsInput {
   sys: SysInfo
   overrides?: Partial<LoadProfile>
   trigger: NonNullable<StartOpts['trigger']>
+}
+
+/** The load's gpu block is the user's (a request's, or a saved profile that sets it): placement of a default
+ *  (ModelRouter.placeOnFreeVram, ADR-060) must leave it exactly as it is. */
+export function gpuBlockUserSet({ entry, engine, cfg, sys, overrides }: Omit<BuildStartOptsInput, 'trigger'>): boolean {
+  const saved = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
+  return gpuUserSet(entry, sys, saved, overrides, cfg.modelDefaults)
 }
 
 export function buildStartOpts(input: BuildStartOptsInput): StartOpts {

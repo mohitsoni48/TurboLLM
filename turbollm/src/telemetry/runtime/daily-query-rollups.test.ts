@@ -12,7 +12,7 @@ function tempDir(): string {
 
 function makeEmitter(dir: string) {
   const cfg = { telemetry: { level: 'full', machineId: '44444444-4444-4444-4444-444444444444' } }
-  const store = { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) }
+  const store = { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) }
   return new Emitter({ dataDir: dir, store: store as never, version: '1.11.0', os: 'win32/x64' })
 }
 

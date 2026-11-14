@@ -328,11 +328,13 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
       return extError(c, 'invalid_request', 'invalid_input', '`limit` must be an integer.', { param: 'limit' })
     }
     try {
-      const page = await d.chatStore.listMessages(scopeFor(c, c.req.query('owner')), c.req.param('id'), {
+      const scope = scopeFor(c, c.req.query('owner'))
+      const page = await d.chatStore.listMessages(scope, c.req.param('id'), {
         cursor: c.req.query('cursor'),
         limit,
       })
-      return c.json({ data: page.data.map((m) => toMessageDTO(m, include)), has_more: page.hasMore, next_cursor: page.nextCursor })
+      const data = await Promise.all(page.data.map((m) => toMessageDTO(m, include, d.db.attachments, scope.tenant)))
+      return c.json({ data, has_more: page.hasMore, next_cursor: page.nextCursor })
     } catch (e) {
       const m = mapStoreError(e)
       return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })
@@ -430,7 +432,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
         // The real created message id — this route's own `:id` param names the CHAT, not the
         // message just created, so without this the audit row would point at the parent.
         c.set('auditTargetId', msg.id)
-        return c.json(toMessageDTO(msg, parseInclude(c.req.query('include'))), 201)
+        return c.json(await toMessageDTO(msg, parseInclude(c.req.query('include')), d.db.attachments, scopeFor(c).tenant), 201)
       } catch (e) {
         const m = mapStoreError(e)
         return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })
@@ -484,7 +486,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     try {
       const msg = await d.chatStore.getMessage(scopeFor(c, c.req.query('owner')), c.req.param('id'))
       if (!msg) return extError(c, 'not_found', 'not_found', 'Not found.')
-      return c.json(toMessageDTO(msg, parseInclude(c.req.query('include'))))
+      return c.json(await toMessageDTO(msg, parseInclude(c.req.query('include')), d.db.attachments, scopeFor(c).tenant))
     } catch (e) {
       const m = mapStoreError(e)
       return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })
@@ -543,7 +545,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
         b.if_version,
       )
       if (!msg) return extError(c, 'not_found', 'not_found', 'Not found.')
-      return c.json(toMessageDTO(msg, parseInclude(c.req.query('include'))))
+      return c.json(await toMessageDTO(msg, parseInclude(c.req.query('include')), d.db.attachments, scopeFor(c).tenant))
     } catch (e) {
       const m = mapStoreError(e)
       return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })

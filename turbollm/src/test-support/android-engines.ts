@@ -82,7 +82,7 @@ export function appRegistry(t: AndroidTest, store: ConfigStore, onAdd: (registry
   return { store, registry, addOpts }
 }
 
-/** One Android start, as cli.ts runs it. */
+/** One Android start, as boot.ts runs it. */
 export interface AndroidLaunch {
   nativeLibDir: string
   /** Unset: the app did not start the SDK this launch. */

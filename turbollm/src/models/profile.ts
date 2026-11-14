@@ -1,7 +1,7 @@
 // LoadProfile: per-model launch parameters, default derivation, VRAM-fit
 // estimation, and the profile->llama-server arg mapping (spec 05). This
 // productizes the hand-tuned models.json knowledge.
-import { BUILTIN_MODEL_DEFAULT_CTX, getModelProfile, type Capabilities, type Config, type ModelDefaults } from '../config/config'
+import { BUILTIN_MODEL_DEFAULT_CTX, getModelProfile, type Capabilities, type Config, type DeepReadonly, type ModelDefaults } from '../config/config'
 import { backendIdFromBinPath } from '../engines/update'
 import { autoThreadCount, type SysInfo } from '../sysinfo/sysinfo'
 import { DECODER_EMBED_ARCHS, type ModelEntry } from './scanner'
@@ -472,6 +472,35 @@ export function estimateVram(p: LoadProfile, m: ModelEntry, sys: SysInfo): VramF
   return { estMb, totalVramMb, pct, verdict }
 }
 
+/** Where a DEFAULT profile loads given what the cards hold now ({@link placeOnFreeVram}). `default`: as it is (even
+ *  layer split); `place`: on this gpu block; `nofit`: on no card or combination of them. */
+export type FreeVramPlacement = { kind: 'default' } | { kind: 'place'; gpu: GpuProfile } | { kind: 'nofit' }
+
+/** Headroom kept on every card beyond a profile's estimate: the estimate is a model, and another process (the desktop,
+ *  ComfyUI) moves the card's use between the reading and the load. */
+const PLACEMENT_RESERVE_MB = 512
+
+/** Where an automatic profile loads when other engines already hold part of the cards (scalability review 4.7).
+ *  deriveDefault sizes against the cards' TOTAL VRAM, so with keep-N > 1 the second to fourth model assumed empty cards
+ *  and the third on 2x24 GB went ngl 99 onto full ones and ran out of memory, with room on the other card.
+ *
+ *  `usedMb`: each card's current use, index-aligned with `sys.gpus` (a reading of another length is not trusted). The
+ *  even split stays whenever every card can take its share; failing that the card with the most free memory takes the
+ *  model alone, then all cards share it in proportion to what each has free. Only the gpu block changes, so ADR-060's
+ *  "each model uses its own profile's gpu block" holds: this chooses an automatic profile's block, and a block the user
+ *  set is never passed here (gpuUserSet). */
+export function placeOnFreeVram(p: LoadProfile, m: ModelEntry, sys: SysInfo, usedMb: readonly number[]): FreeVramPlacement {
+  const n = sys.gpus.length
+  if (n === 0 || p.ngl === 0 || usedMb.length !== n) return { kind: 'default' }
+  const needMb = estimateVram(p, m, sys).estMb
+  const freeMb = sys.gpus.map((g, i) => Math.max(0, (g.vramMb || 0) - usedMb[i] - PLACEMENT_RESERVE_MB))
+  if (freeMb.every((f) => f >= needMb / n)) return { kind: 'default' }
+  const roomiest = freeMb.indexOf(Math.max(...freeMb))
+  if (freeMb[roomiest] >= needMb) return { kind: 'place', gpu: { ...p.gpu, splitMode: 'none', tensorSplit: [], mainGpu: roomiest } }
+  if (freeMb.reduce((a, b) => a + b, 0) >= needMb) return { kind: 'place', gpu: { ...p.gpu, splitMode: 'layer', tensorSplit: freeMb.map(Math.round), mainGpu: -1 } }
+  return { kind: 'nofit' }
+}
+
 /** What each GPU is projected to hold, index-aligned with `sys.gpus`. */
 export interface GpuSplitPlan {
   /** Layer count assigned to each GPU. */
@@ -880,6 +909,12 @@ export function userSetProfile(saved: Partial<LoadProfile> | undefined, auto: Lo
   return out as Partial<LoadProfile>
 }
 
+/** The gpu block of a load is the user's: a request's `overrides`, or a saved profile that sets it
+ *  ({@link userSetProfile}'s reading, so an earlier build's saved draft does not count for its untouched default). */
+export function gpuUserSet(m: ModelEntry, sys: SysInfo, saved: Partial<LoadProfile> | undefined, overrides: Partial<LoadProfile> | undefined, defaults?: ModelDefaults): boolean {
+  return !!overrides?.gpu || !!userSetProfile(saved, legacySeedProfile(m, sys, defaults))?.gpu
+}
+
 /** `b`'s user-set fields over `a`'s, the nested groups key by key (as {@link resolveProfile} merges them). */
 export function mergeUserSet(a: Partial<LoadProfile> | undefined, b: Partial<LoadProfile> | undefined): Partial<LoadProfile> {
   const out: Record<string, unknown> = { ...(a ?? {}) }
@@ -951,7 +986,7 @@ export function resolveProfile(
  *  dialog holds a context only when the user set one (userSetOnly), where an earlier build's held the
  *  automatic one too, so the stored field alone would advertise the ceiling for every model saved
  *  without touching Context. */
-export function configuredCtx(cfg: Config, m: ModelEntry, engineId: string, sys: SysInfo): number | undefined {
+export function configuredCtx(cfg: DeepReadonly<Config>, m: ModelEntry, engineId: string, sys: SysInfo): number | undefined {
   if (!engineId) return undefined
   const saved = getModelProfile(cfg, m.key, engineId) as Partial<LoadProfile> | undefined
   if (!saved || typeof saved !== 'object') return undefined
