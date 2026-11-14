@@ -174,3 +174,21 @@ test('Top K 0 on a GPU the user chose is no top-k limit too: the largest top_k, 
   assert.equal(body.top_k, 2147483647)
   assert.equal(body.min_p, 0.2)
 })
+
+const NATIVE_BIN = '/data/app/~~x/com.turbollm-y/lib/arm64/liblitertlm_server.so'
+const audioEntry = (): ModelEntry => ({ ...entry(), audio: true })
+
+test('an audio bundle on the app\'s native server is an audio model', () => {
+  const opts = buildStartOpts({ entry: audioEntry(), engine: { ...engine(), binPath: NATIVE_BIN }, cfg: defaultConfig(), sys: CPU_ONLY, trigger: 'manual' })
+  assert.equal(opts.model.audio, true)
+})
+
+test('an audio bundle on the Python serve is not offered recordings it may reject', () => {
+  const opts = buildStartOpts({ entry: audioEntry(), engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, trigger: 'manual' })
+  assert.ok(!('audio' in opts.model))
+})
+
+test('a bundle without an audio encoder is no audio model, even on the native server', () => {
+  const opts = buildStartOpts({ entry: entry(), engine: { ...engine(), binPath: NATIVE_BIN }, cfg: defaultConfig(), sys: CPU_ONLY, trigger: 'manual' })
+  assert.ok(!('audio' in opts.model))
+})

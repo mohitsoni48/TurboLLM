@@ -62,6 +62,8 @@ export interface TurnResult {
 export interface SentMessage {
   text: string
   images: string[]
+  /** Voice clips sent as audio (`data:audio/wav` URLs), for a model that hears. */
+  audio?: string[]
   docContext: string
   textAttachmentNames: string[]
 }
@@ -384,8 +386,8 @@ export class ChatSession {
     // not set yet: that Regenerate keeps the chat's abort entry, and the daemon refuses this
     // send (one turn per chat). Should this one start instead, its meta takes the entry.
     if (!this.abortRefs[convId]) this.abortRefs[convId] = ac
-    const { text, images, docContext, textAttachmentNames } = message
-    const started = await this.follow(convId, ac, followChatTurn(convId, (accepted) => sendMessage(convId, text, ac.signal, images, docContext, textAttachmentNames, settings.thinkingBudget, settings.reasoningEffort, settings.remoteModel, this.accepting(ac, accepted)), ac.signal))
+    const { text, images, audio, docContext, textAttachmentNames } = message
+    const started = await this.follow(convId, ac, followChatTurn(convId, (accepted) => sendMessage(convId, text, ac.signal, images, docContext, textAttachmentNames, settings.thinkingBudget, settings.reasoningEffort, settings.remoteModel, this.accepting(ac, accepted), audio), ac.signal))
     // follow toasts the error itself and never rethrows. An abort is the user (or Eject)
     // stopping it, not a refusal.
     return { started, aborted: ac.signal.aborted }

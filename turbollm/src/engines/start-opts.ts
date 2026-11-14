@@ -9,7 +9,7 @@
 import { BUILTIN_MODEL_DEFAULT_CTX, type Config, type Engine, getModelProfile } from '../config/config'
 import { engineAcceptsFormat, type ModelFormat } from './compat'
 import { koboldcppProfileToArgs } from './koboldcpp'
-import { litertLmProfileToConfig } from './litert-lm'
+import { isNativeLitertLm, litertLmProfileToConfig } from './litert-lm'
 import { litertLmRequestSampling } from './litert-lm-request'
 import type { StartOpts } from './manager'
 import { mlxSamplingArgs } from './mlx'
@@ -131,8 +131,10 @@ function buildLitertLmStartOpts({ entry, engine, cfg, sys, overrides, trigger }:
   const userSampling = { ...(userSetProfile(saved, legacySeedProfile(entry, sys, cfg.modelDefaults))?.sampling ?? {}), ...(overrides?.sampling ?? {}) }
   return {
     engine,
-    // The bundle's own modalities (its header): a vision bundle is a vision model, which it was not before.
-    model: { key: entry.key, name: entry.name, quant: entry.quant, ctx, vision: entry.vision },
+    // The bundle's own modalities (its header): a vision bundle is a vision model, which it was not before. Audio
+    // only on the app's native server, which is the one known to take a message's audio part (its main.cc); the
+    // Python `serve` is not offered a recording it may reject.
+    model: { key: entry.key, name: entry.name, quant: entry.quant, ctx, vision: entry.vision, ...(entry.audio && isNativeLitertLm(engine.binPath) ? { audio: true } : {}) },
     modelPath: entry.path,
     extraArgs: profile.extraArgs,
     // Auto threads are pinned only where the CPU is big.LITTLE (perfCores); elsewhere the runtime keeps choosing.

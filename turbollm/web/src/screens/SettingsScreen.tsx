@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Moon, Sun, Monitor, Save, ExternalLink, ShieldAlert, RefreshCw, Check, X, Loader2, AlertTriangle, SlidersHorizontal, Boxes, ShieldCheck, Wifi, Cpu, ChevronRight, FlaskConical } from 'lucide-react'
+import { Moon, Sun, Monitor, Save, ExternalLink, ShieldAlert, RefreshCw, Check, X, Loader2, AlertTriangle, SlidersHorizontal, Boxes, ShieldCheck, Wifi, Cpu, ChevronRight, FlaskConical, Mic } from 'lucide-react'
 import { getPersonalization, savePersonalization, type Personalization } from '../lib/personas'
 import { ScreenHeader } from '../components/common'
 import { AppUpdateSettingsBlock } from '../components/AppUpdateControl'
@@ -34,6 +34,7 @@ import { TurboLinkSection } from './settings/TurboLinkSection'
 import { RemoteAccessSection } from './settings/RemoteAccessSection'
 import { HardwareSection } from './settings/HardwareSection'
 import { RetentionSection } from './settings/RetentionSection'
+import { VoiceSection } from './settings/VoiceSection'
 
 import { ApiError, authHeaders, getAuthToken, track, type DaemonSettings, type DaemonSettingsPatch, type TelemetryLevel } from '../lib/api'
 import { TELEMETRY_UI_ENABLED } from '../lib/flags'
@@ -120,11 +121,12 @@ const clampN = (n: number, min: number, max: number) => Math.max(min, Math.min(m
 const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]'])
 
 /** Settings categories for the two-pane layout. Each maps to one pane of sections. */
-type CatId = 'general' | 'models' | 'tools' | 'network' | 'experimental' | 'system'
+type CatId = 'general' | 'models' | 'voice' | 'tools' | 'network' | 'experimental' | 'system'
 
 const SETTINGS_CATS: { id: CatId; label: string; icon: React.ElementType }[] = [
   { id: 'general', label: 'General', icon: SlidersHorizontal },
   { id: 'models', label: 'Models & loading', icon: Boxes },
+  { id: 'voice', label: 'Voice', icon: Mic },
   { id: 'tools', label: 'Tools & safety', icon: ShieldCheck },
   { id: 'network', label: 'Network & sharing', icon: Wifi },
   { id: 'experimental', label: 'Experimental', icon: FlaskConical },
@@ -218,8 +220,12 @@ export function SettingsScreen() {
   // Full-screen overlay while the daemon re-execs (spec 08 §2).
   const [restartOverlay, setRestartOverlay] = useState(false)
 
-  // Active category for the two-pane settings layout.
-  const [activeCat, setActiveCat] = useState<CatId>('general')
+  // Active category for the two-pane settings layout. `?section=<category>` opens on that one: the chat's
+  // microphone sends the user here for the Voice setup, and landing on General would leave them to find it.
+  const [activeCat, setActiveCat] = useState<CatId>(() => {
+    const wanted = new URLSearchParams(window.location.search).get('section')
+    return SETTINGS_CATS.find((c) => c.id === wanted)?.id ?? 'general'
+  })
 
   // Whether the Code-only sections under "Tools & safety" render at all — see the gate there.
   const codeEnabled = useCodeFeatureEnabled()
@@ -771,6 +777,8 @@ export function SettingsScreen() {
               </Collapsible>
             </>
           )}
+
+          {activeCat === 'voice' && <VoiceSection />}
 
           {activeCat === 'tools' && (
             <>

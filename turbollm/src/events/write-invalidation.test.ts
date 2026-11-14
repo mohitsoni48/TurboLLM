@@ -5,7 +5,7 @@ import { EventBus } from './bus'
 import { invalidateOnWrite, keysForWrite } from './write-invalidation'
 
 test('a config-backed write names the families it changes', () => {
-  assert.deepEqual(keysForWrite('/api/v1/settings'), ['settings', 'status'])
+  assert.deepEqual(keysForWrite('/api/v1/settings'), ['settings', 'status', 'voice'])
   assert.deepEqual(keysForWrite('/api/v1/engines/llama/update'), ['engines', 'status'])
   assert.deepEqual(keysForWrite('/api/v1/engine/start'), ['engines', 'status'])
   assert.deepEqual(keysForWrite('/api/v1/build/start'), ['engines', 'status'])
@@ -40,7 +40,7 @@ async function respond(method: string, path: string, status: number): Promise<st
 }
 
 test('a successful write is announced once it has been answered', async () => {
-  assert.deepEqual(await respond('PATCH', '/api/v1/settings', 200), [['settings', 'status']])
+  assert.deepEqual(await respond('PATCH', '/api/v1/settings', 200), [['settings', 'status', 'voice']])
 })
 
 test('a read, or a refused write, is not announced', async () => {

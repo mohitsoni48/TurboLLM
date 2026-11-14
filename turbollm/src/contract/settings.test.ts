@@ -10,7 +10,7 @@ import type { DaemonSettings, SettingsPatchResponse } from './settings'
 const DECLARED = {
   idleTtlMinutes: 1, port: 1, theme: 1, machineName: 1, autoGenerateTitles: 1, autoMemoryEnabled: 1, openBrowserOnStart: 1,
   autoLoadOnStart: 1, showAllEngineModels: 1, vramHeadroomMb: 1, lanBind: 1, requireApiKey: 1, telemetryLevel: 1,
-  modelDefaults: 1, comfyui: 1, gateway: 1, requestLog: 1, retention: 1, hfTokenSet: 1, ghTokenSet: 1, tavilyKeySet: 1,
+  modelDefaults: 1, comfyui: 1, speechToText: 1, gateway: 1, requestLog: 1, retention: 1, hfTokenSet: 1, ghTokenSet: 1, tavilyKeySet: 1,
   search: 1, mcp: 1, build: 1, code: 1, cloudDeploy: 1, experimental: 1, toolPolicies: 1, autoAllowAll: 1,
   pdfReading: 1, chatApprovalWaitMinutes: 1, remoteAccess: 1, downloadConcurrency: 1, engineLoadStallSeconds: 1,
 } satisfies Record<keyof DaemonSettings, 1>

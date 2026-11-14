@@ -29,7 +29,7 @@ export function toChatDTO(c: Chat): Record<string, unknown> {
 
 /** `attachments` reads back an image the chat store keeps as a file (chat/attachments.ts) to the data: URI this API
  *  documents, for `include=attachments` only: an API key cannot reach /api/v1/attachments. An image whose file is
- *  gone is left out, as it is from an engine prompt (AttachmentStore.resolveImages). Only the in-app (local) scope's
+ *  gone is left out, as it is from an engine prompt (AttachmentStore.resolveMedia). Only the in-app (local) scope's
  *  rows hold real references; another tenant's `attachment:` string is one it posted itself, so it goes back as
  *  stored and never reads a file, which would otherwise hand out a local image to anyone who knows its hash. */
 export async function toMessageDTO(

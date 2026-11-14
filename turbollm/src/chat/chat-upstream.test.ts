@@ -39,6 +39,7 @@ const REMOTE = { linkId: 'lnk1', baseUrl: 'https://rig.invalid', token: 'tllm-ho
 interface PrimaryState {
   state: 'running' | 'stopped'
   modelKey?: string
+  audio?: boolean
 }
 
 /** The members resolveChatUpstream reads, with the primary engine in the given state. */
@@ -46,7 +47,7 @@ function chatDeps(primary: PrimaryState): Deps {
   const loaded = LIBRARY.find((e) => e.key === primary.modelKey)
   return {
     manager: {
-      status: () => ({ state: primary.state, model: loaded ? { key: loaded.key, name: loaded.name, ctx: 8192 } : null }),
+      status: () => ({ state: primary.state, model: loaded ? { key: loaded.key, name: loaded.name, ctx: 8192, ...(primary.audio !== undefined ? { audio: primary.audio } : {}) } : null }),
       target: () => (primary.state === 'running' ? ENGINE : null),
       currentOpts: () => undefined,
     },
@@ -85,4 +86,18 @@ test('a Turbo Link turn is untouched by a local Jev primary', () => {
     ok: true,
     upstream: { modelField: GGUF_KEY, modelName: GGUF_KEY, ctxMax: 4096, remote: REMOTE, target: '' },
   })
+})
+
+test('hearsAudio is set only when the primary engine\'s loaded model reports audio', () => {
+  const hears = resolveChatUpstream(chatDeps({ state: 'running', modelKey: GGUF_KEY, audio: true }))
+  assert.ok(hears.ok && hears.upstream.hearsAudio === true)
+  for (const audio of [false, undefined]) {
+    const r = resolveChatUpstream(chatDeps({ state: 'running', modelKey: GGUF_KEY, audio }))
+    assert.ok(r.ok && !('hearsAudio' in r.upstream), `audio ${audio}`)
+  }
+})
+
+test('a Turbo Link upstream never hears audio, even when the local primary does', () => {
+  const r = resolveChatUpstream(chatDeps({ state: 'running', modelKey: GGUF_KEY, audio: true }), `Rig/${GGUF_KEY}`)
+  assert.ok(r.ok && !('hearsAudio' in r.upstream))
 })

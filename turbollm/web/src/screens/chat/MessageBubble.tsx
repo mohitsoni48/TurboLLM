@@ -12,7 +12,9 @@ import { CopyButton } from '../../components/ui/copy-button'
 import { ArtifactCard, isArtifactLang } from '../../components/ArtifactCard'
 import { isRoutineConfirmTool, isSupersededUpdatePreview, RoutineConfirmToolCard } from '../../components/routines/RoutineConfirmToolCard'
 import { friendlyName } from '../../lib/tool-explain'
+import { AttachmentAudio, isAudioAttachment } from './AttachmentAudio'
 import { AttachmentImage, isImageAttachment } from './AttachmentImage'
+import { SpeakButton } from './SpeakButton'
 import { ApiError, track } from '../../lib/api'
 import { toast } from '../../components/ui/sonner'
 import { saveThinkingBlockHeight, useThinkingBlockHeight } from '../../lib/thinking-block-size'
@@ -874,9 +876,15 @@ export function MessageBubble({
             </div>
           ) : (
             <div className="flex max-w-[min(88%,900px)] flex-col items-end">
-              <div ref={displayRef} className="whitespace-pre-wrap break-words rounded-[var(--radius-lg)] bg-accent px-4 py-2.5 text-[15px] leading-[1.6] text-on-accent">
-                {message.content}
-              </div>
+              {/* A voice message sent as audio has no words: its player below is the message, not an empty bubble. */}
+              {(message.content || !message.attachments?.some(isAudioAttachment)) && (
+                <div ref={displayRef} className="whitespace-pre-wrap break-words rounded-[var(--radius-lg)] bg-accent px-4 py-2.5 text-[15px] leading-[1.6] text-on-accent">
+                  {message.content}
+                </div>
+              )}
+              {message.attachments?.filter(isAudioAttachment).map((attachment, i) => (
+                <AttachmentAudio key={`clip-${i}`} attachment={attachment} />
+              ))}
               {message.attachments?.filter(isImageAttachment).map((attachment, i) => (
                 <AttachmentImage key={i} attachment={attachment} />
               ))}
@@ -1013,6 +1021,7 @@ export function MessageBubble({
             {/* `stillGenerating` (GitHub #177) joins hasError here for the same reason: there is
                 no text to copy or edit yet, and the row is about to be rewritten by the daemon. */}
             {!hasError && !stillGenerating && <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" screen="chat" />}
+            {!hasError && !stillGenerating && <SpeakButton id={message.id} text={message.content} />}
             {!hasError && !stillGenerating && onEdit && <ActionBtn icon={<Pencil size={12} />} label="Edit" onClick={() => { track('chat', 'open_edit_message'); beginEdit() }} />}
             {isLast && onRegenerate && <ActionBtn icon={<RefreshCw size={12} />} label="Regenerate" onClick={() => { track('chat', 'regenerate_message'); onRegenerate() }} />}
             {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => { track('chat', 'delete_message'); onDelete(message) }} destructive />}

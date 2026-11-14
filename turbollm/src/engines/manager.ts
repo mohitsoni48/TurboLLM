@@ -16,6 +16,7 @@ import { koboldcppServerCommand } from './koboldcpp'
 import { llamafileServerCommand } from './llamafile'
 import { slotCacheDir } from './slot-cache'
 import { emitInvalidation } from '../events/bus'
+import { probeAudioInput } from './modalities'
 import { rememberLitertLmModel, type LitertLmRequestInfo } from './litert-lm-request'
 import { litertlmHeaderFromFile } from '../models/litertlm'
 import { isTetheredGroupLeader, killTetheredTree, spawnTethered } from '../util/tether'
@@ -42,6 +43,10 @@ export interface ModelInfo {
   quant: string
   ctx: number
   vision: boolean
+  /** The model takes audio as input (a chat message's `input_audio` part). At load it is what the model file itself
+   *  declares, where the engine is known to honour it; status() replaces it with the running engine's own answer once
+   *  it has one (modalities.ts). Absent = no. */
+  audio?: boolean
 }
 export interface ErrInfo {
   code: string
@@ -254,6 +259,9 @@ export class Manager {
   private holds = 0
   private liveGen: LiveGen | null = null
   private session: SessionAccumulator = freshSession()
+  /** Whether the running engine says its model takes audio (modalities.ts); null until it has answered, and for an
+   *  engine that does not say. */
+  private audioInput: boolean | null = null
   /** The idle watchdog (watchdogTick), armed only while an engine process is alive. An interval armed for the
    *  Manager's whole life kept every pool-slot Manager the gateway dropped (and its per-minute config clone) alive
    *  forever; armed this way, a stopped Manager holds no timer and is collected once nothing references it. */
@@ -540,6 +548,7 @@ export class Manager {
 
     this.state = 'starting'
     this.session = freshSession() // each running session starts with fresh stats (B4)
+    this.audioInput = null
     this.port = port
     this.pid = child.pid ?? 0
     // Track the OS process on disk so a daemon that dies WITHOUT running its signal
@@ -715,10 +724,19 @@ export class Manager {
   status(): Status {
     const st: Status = { state: this.state, err: this.errInfo, port: this.port, pid: this.pid, model: null, loadElapsedMs: 0 }
     if ((this.state === 'running' || this.state === 'starting') && this.opts) {
-      st.model = this.opts.model
+      st.model = this.audioInput === null ? this.opts.model : { ...this.opts.model, audio: this.audioInput }
       if (this.state === 'starting') st.loadElapsedMs = Date.now() - this.startedAt
     }
     return st
+  }
+
+  /** Ask the engine that just became ready whether its model takes audio, once per load. The answer changes what
+   *  /status says about the model, so the pages showing it are told. */
+  private async learnAudioInput(child: ChildProcess, port: number): Promise<void> {
+    const audio = await loadTiming.audioInput(port)
+    if (audio === null || this.child !== child || this.state !== 'running') return
+    this.audioInput = audio
+    if (audio !== (this.opts?.model.audio === true)) announceEngineChange()
   }
 
   /** Clear a terminal error so a stale failure (e.g. a vLLM load that failed because the
@@ -901,6 +919,7 @@ export class Manager {
     if (this.watchdog) clearInterval(this.watchdog)
     this.watchdog = null
     this.session = freshSession() // session ended — clear stats (B4)
+    this.audioInput = null
     this.resolveExited?.()
   }
 
@@ -971,6 +990,7 @@ export class Manager {
         if (this.child === child && this.state === 'starting') {
           this.state = 'running'
           this.lastActivity = Date.now()
+          void this.learnAudioInput(child, port)
         }
         return
       }
@@ -1140,6 +1160,7 @@ export const loadTiming = {
   now: (): number => Date.now(),
   sleep: (ms: number): Promise<void> => sleep(ms),
   probe: (port: number): Promise<ProbeResult> => probeHealth(port),
+  audioInput: (port: number): Promise<boolean | null> => probeAudioInput(port),
   processActivity: (pid: number): number | null => readProcessActivity(pid),
   pollMs: 500,
 }

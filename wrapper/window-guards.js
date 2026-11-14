@@ -11,8 +11,20 @@
 // opens on: the one the window is on, else the daemon's.
 
 // Everything the web UI asks for: copy buttons (navigator.clipboard.writeText, web/src/lib/clipboard.ts)
-// and routine-finished notifications (web/src/lib/notify-routine.ts). Anything else is denied.
+// and routine-finished notifications (web/src/lib/notify-routine.ts). Anything else is denied, with one
+// exception that is narrower than a permission name: the microphone, for the chat's voice input
+// (web/src/lib/voice/recorder.ts). Electron files it under 'media' together with the camera, so it is not in
+// this list; allowPermission grants 'media' only when what is asked for is audio and nothing else.
 const ALLOWED_PERMISSIONS = new Set(['clipboard-sanitized-write', 'notifications'])
+
+/** Whether a 'media' ask is for the microphone alone. `kinds` is what Electron says is wanted: the request
+ *  handler's `details.mediaTypes` (a list), or the check handler's single `details.mediaType`. Anything that
+ *  is not exactly audio (video, a screen, 'unknown', nothing at all) is refused: the UI has no camera feature,
+ *  and an ask that does not say what it wants gets nothing. */
+function microphoneOnly (kinds) {
+  const list = Array.isArray(kinds) ? kinds : [kinds]
+  return list.length > 0 && list.every((kind) => kind === 'audio')
+}
 
 /** The origin the daemon serves the UI on: what main.js loads into the window. Normalized the way the
  *  page's own URL will be; a TURBOLLM_PORT that is not a port at all must not throw at startup. */
@@ -102,9 +114,12 @@ function isWebUrl (url) {
 }
 
 /** A permission is granted only to the app's own pages (see isAppUrl: any port, so it survives a
- *  port change), and only if the UI needs it. */
-function allowPermission (permission, requestingUrl, appOrigin) {
-  return ALLOWED_PERMISSIONS.has(permission) && isAppUrl(requestingUrl, appOrigin)
+ *  port change), and only if the UI needs it. `mediaKinds` is what a 'media' ask wants (see
+ *  microphoneOnly); it is ignored for every other permission. */
+function allowPermission (permission, requestingUrl, appOrigin, mediaKinds) {
+  if (!isAppUrl(requestingUrl, appOrigin)) return false
+  if (permission === 'media') return microphoneOnly(mediaKinds)
+  return ALLOWED_PERMISSIONS.has(permission)
 }
 
 module.exports = { ALLOWED_PERMISSIONS, allowPermission, appOriginFor, daemonPortFor, decodeConfigText, isAppUrl, isWebUrl, launchPortFor, recordedPortFor }

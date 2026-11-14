@@ -27,6 +27,7 @@ import { registerSettingsRoutes } from './settings-routes'
 import { registerStatusRoutes } from './status-routes'
 import { registerSystemOneJobRoutes } from './systemone-job'
 import { registerTelemetryRoutes } from './telemetry-routes'
+import { registerVoiceRoutes } from './voice-routes'
 
 export { engineWorkBusy } from './engine-work'
 export { MCP_ENV_MASK } from './mcp-routes'
@@ -64,6 +65,8 @@ export function registerApi(app: Hono, d: Deps): void {
   registerOnboardingRoutes(app, { store: d.store, telemetry: d.telemetry })
   // The text classification playground's run, as a job a page closing does not stop (systemone-job.ts).
   registerSystemOneJobRoutes(app, d)
+  // Speech-to-text for the chat's microphone (voice-routes.ts).
+  registerVoiceRoutes(app, d)
   // The Python sandbox's runtime download (GitHub #52).
   registerSandboxRuntimeRoutes(app, d)
 }

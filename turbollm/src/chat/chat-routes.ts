@@ -10,7 +10,8 @@ import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import type { EmitSink } from './emit-sink.js'
 import type { ChatRun, ChatRunMeta } from './chat-runs.js'
 import type { ChatTurns } from './chat-turns.js'
-import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent, type EngineMessage } from './chat-compaction.js'
+import { isAttachmentRef, isAudioAttachment, isCanonicalDataUrl } from './attachments.js'
+import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent, VOICE_MESSAGE_PLACEHOLDER, type EngineMessage } from './chat-compaction.js'
 
 import type { ConversationStore, Message, PageOpts, ToolCallRecord } from './db'
 import { InvalidCursorError } from './db'
@@ -136,7 +137,7 @@ function respondWithChatRun(c: Context, d: Deps, run: ChatRun | null, fromSeq: n
 // advertising the model, is a REMOTE availability failure, not a local 409.
 // 403 joined with ADR-422's N2 fix: a remote-access token is authenticated but
 // deliberately refused a specific action (persisting a global tool policy).
-type S = 200 | 201 | 202 | 400 | 403 | 404 | 409 | 500 | 503
+type S = 200 | 201 | 202 | 400 | 403 | 404 | 409 | 413 | 500 | 503
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
 
@@ -176,6 +177,53 @@ function forClient(messages: Message[]): Message[] {
     const { docContext: _docText, ...rest } = m
     return rest
   })
+}
+
+/** A message may carry this many voice clips: the page sends one per recording, and a handful is already minutes. */
+const MAX_VOICE_CLIPS = 8
+/** A clip's data URL may be this long: about 32 MB of audio, a quarter of an hour of the WAV the page records. Past
+ *  it the request is a file upload, not a voice message, and every later turn would resend it. */
+const MAX_VOICE_CLIP_CHARS = 44 * 1024 * 1024
+
+/** Why a message's `audio` is refused, or null. Each clip is a `data:audio/wav` or `data:audio/mpeg` URL (what the
+ *  engines that hear audio decode), or the reference of a clip already stored. */
+export function voiceClipsRefusal(audio: string[]): string | null {
+  if (audio.length > MAX_VOICE_CLIPS) return `A message can carry at most ${MAX_VOICE_CLIPS} voice clips.`
+  for (const clip of audio) {
+    if (!isAudioAttachment(clip)) return 'Each audio entry must be a WAV or MP3 clip as a data: URL.'
+    if (clip.length > MAX_VOICE_CLIP_CHARS) return 'A voice clip can be at most 32 MB.'
+    if (!isAttachmentRef(clip) && !isCanonicalDataUrl(clip)) return 'A voice clip must be valid base64, with no line breaks.'
+  }
+  return null
+}
+
+/** The largest POST /messages body: eight clips at their size cap, plus room for images, files and the text. Larger is
+ *  refused before the JSON is read, so a caller cannot make the daemon hold gigabytes. */
+const MAX_MESSAGE_BODY_BYTES = MAX_VOICE_CLIPS * MAX_VOICE_CLIP_CHARS + 64 * 1024 * 1024
+
+/** A JSON request body read within `max` bytes, or `{ ok: false }` once it runs past: a declared length over the cap
+ *  is refused unread, and a body with no length (chunked) is cut off as it streams. An unparsable or empty body is `{}`,
+ *  as `body()` treats it. Reads the original request rather than a limited copy (hono's bodyLimit replaces
+ *  `c.req.raw`): holdTurn finds the caller by that object, so a copy would leave a running turn that revoking the
+ *  caller's way in no longer stops. */
+export async function readCappedJson<T>(req: Request, max: number): Promise<{ ok: true; value: T } | { ok: false }> {
+  const declared = Number(req.headers.get('content-length'))
+  if (Number.isFinite(declared) && declared > max) return { ok: false }
+  if (!req.body) return { ok: true, value: {} as T }
+  const reader = req.body.getReader()
+  const chunks: Uint8Array[] = []
+  let seen = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    seen += value.byteLength
+    if (seen > max) {
+      await reader.cancel()
+      return { ok: false }
+    }
+    chunks.push(value)
+  }
+  try { return { ok: true, value: JSON.parse(Buffer.concat(chunks).toString('utf8')) as T } } catch { return { ok: true, value: {} as T } }
 }
 
 /** Edit-and-resend's branch (GitHub #52): the question `msg` and everything after it are frozen,
@@ -361,7 +409,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     return c.json({ ...shown, messages: forClient(shown.messages ?? []), ...d.chatTurns.slotState(conv.id) })
   })
 
-  // A chat image (attachments.ts), for the web UI to show. Under /api/v1 like the conversation that names it, so
+  // A chat image or voice clip (attachments.ts), for the web UI to show or play. Under /api/v1 like the conversation that names it, so
   // lanAuth admits the same callers, and a remote-access token needs models:use (auth.ts requiredCapability). The id
   // is checked against the one shape the store writes, so it can only name a file in the attachments folder. Its
   // name is the hash of its bytes, so it never changes: cacheable for good.
@@ -521,28 +569,35 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/messages', async (c) => {
     const convId = c.req.param('id')
-    const b = await body<{ content?: string; images?: string[]; docContext?: string; textAttachments?: string[]; thinkingBudget?: number; reasoningEffort?: string; model?: string }>(c)
+    const read = await readCappedJson<{ content?: string; images?: string[]; audio?: string[]; docContext?: string; textAttachments?: string[]; thinkingBudget?: number; reasoningEffort?: string; model?: string }>(c.req.raw, MAX_MESSAGE_BODY_BYTES)
+    if (!read.ok) return err(c, 413, 'payload_too_large', 'A message with its images and voice clips can be at most about 400 MB.')
+    const b = read.value
     // Trimmed here and in resolveChatUpstream (the model): anything but a string threw, a bare 500.
     const notString = nonStringField(b, ['content', 'model'])
     if (notString) return err(c, 400, 'invalid_input', `${notString} must be a string.`)
     const content = (b.content ?? '').trim()
     const images = b.images ?? []
+    // Voice clips, for a model that hears audio: sent to it as they are, where the page would otherwise have had
+    // whisper turn them into `content` first.
+    const audio = b.audio ?? []
     const textAttachments = b.textAttachments ?? []
     // Checked before anything is stored: a string passed the emptiness check below on its own
     // .length and was saved on the user row, which then broke the chat's view and every resend.
     const isStrings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string')
-    if (!isStrings(images) || !isStrings(textAttachments) || (b.docContext != null && typeof b.docContext !== 'string'))
-      return err(c, 400, 'invalid_input', 'images and textAttachments must be arrays of strings, and docContext a string.')
-    // A message is valid if it has typed text OR carries an image or file
-    // attachment — image-only / file-only sends are allowed.
-    if (!content && images.length === 0 && textAttachments.length === 0)
-      return err(c, 400, 'invalid_input', 'Type a message or attach an image or file.')
-    // Each image to its file before the row names it (attachments.ts); the engine is sent data URLs (below).
-    // Before the conversation is read and the busy check, so nothing they decide goes stale across this await.
-    const storedImages = await db.attachments.save(images)
-
-    const conv = db.getConversation(convId, true)
-    if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
+    if (!isStrings(images) || !isStrings(audio) || !isStrings(textAttachments) || (b.docContext != null && typeof b.docContext !== 'string'))
+      return err(c, 400, 'invalid_input', 'images, audio and textAttachments must be arrays of strings, and docContext a string.')
+    const audioRefusal = voiceClipsRefusal(audio)
+    if (audioRefusal) return err(c, 400, 'invalid_input', audioRefusal)
+    // A clip is told from an image by what it is, not by the field it came in (chat-compaction.ts mediaPart): sent
+    // as an image it would pass every check made on `audio` and still reach the engine as audio.
+    if (images.some(isAudioAttachment)) return err(c, 400, 'invalid_input', 'A voice clip goes in audio, not in images.')
+    // A message is valid if it has typed text OR carries an image, a voice clip or a file
+    // attachment — image-only / voice-only / file-only sends are allowed.
+    if (!content && images.length === 0 && audio.length === 0 && textAttachments.length === 0)
+      return err(c, 400, 'invalid_input', 'Type a message, record one, or attach an image or file.')
+    // Everything that can refuse the send is decided before a clip or image is written: a refused send must leave no
+    // file behind for the janitor to find later.
+    if (!db.getConversation(convId)) return err(c, 404, 'not_found', 'Conversation not found.')
 
     // Turbo Link (final-review C-1): `b.model` is the id the picker sent. A qualified
     // `<machine>/<model>` id that names a linked machine resolves to that HOST — the local
@@ -552,14 +607,27 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const resolved = resolveChatUpstream(d, b.model)
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
     const upstream = resolved.upstream
+    // Refused here rather than left to the engine, which answers audio it cannot take with an opaque 500 after the
+    // turn is already on the page. The composer only offers "send as audio" for a model that hears, so this is a
+    // model swapped between the recording and the send, or an API caller.
+    if (audio.length > 0 && !upstream.hearsAudio)
+      return err(c, 409, 'audio_unsupported', `${upstream.modelName} cannot take audio. Convert the recording to text and send that.`)
+
+    // Each image and clip to its file before the row names it (attachments.ts); the engine is sent the bytes (below).
+    // Before the conversation is read again and the busy check, so nothing they decide goes stale across this await.
+    const media = [...images, ...audio]
+    const storedMedia = await db.attachments.save(media)
+
+    const conv = db.getConversation(convId, true)
+    if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
 
     const busy = inflightRefusal(c, d, convId, 'A generation is already running for this conversation.')
     if (busy) return busy
 
-    // Persist user message — only the typed text is stored as content; images are
+    // Persist user message — only the typed text is stored as content; images and voice clips are
     // kept in attachments (the full doc context is folded into the engine prompt below,
     // and kept in docContext so /continue can send this turn again with it).
-    const userMsg = db.addMessage(convId, 'user', content, { attachments: storedImages, textAttachments, docContext: b.docContext })
+    const userMsg = db.addMessage(convId, 'user', content, { attachments: storedMedia, textAttachments, docContext: b.docContext })
 
     // Create a placeholder assistant message
     db.addMessage(convId, 'assistant', '', { stats: { aborted: false } })
@@ -591,12 +659,12 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // summary + cut when one is resolvable; a plain passthrough when not).
       // setAsideFrozenCut: a cut left behind on another branch is not this branch's summary.
       const allMsgs = (conv.messages ?? []).filter(m => m.id !== assistantMsg.id)
-      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, undefined, { reasoningField: reasoningAsField(d, upstream) })
-      // Fold any attached document text into the prompt; attach images as multimodal parts.
-      engineMessages.push({ role: 'user', content: userTurnContent(content, b.docContext, images) })
-      // Every stored reference as its data URL, as /continue does: the history's, and this turn's when a caller sent
+      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, undefined, { reasoningField: reasoningAsField(d, upstream), hearsAudio: upstream.hearsAudio })
+      // Fold any attached document text into the prompt; attach images and voice clips as multimodal parts.
+      engineMessages.push({ role: 'user', content: userTurnContent(content, b.docContext, media) })
+      // Every stored reference as its bytes, as /continue does: the history's, and this turn's when a caller sent
       // references it was shown (`attachment:<id>`) rather than the image itself. No engine understands a reference.
-      await db.attachments.resolveImages(engineMessages)
+      await db.attachments.resolveMedia(engineMessages)
 
       await runGeneration(d, sink, { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), userText: content, isCodeAuthorized })
     })
@@ -625,6 +693,13 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const busy = inflightRefusal(c, d, convId, 'A generation is already running for this conversation.')
     if (busy) return busy
 
+    // The turn being answered goes out with its voice clips, as POST /messages first sent it (buildEngineMessages),
+    // so that route's refusal applies here too: a model swapped since, or a Turbo Link machine's, would be handed
+    // audio it cannot take. Asked before the question is branched or the old reply set aside.
+    const unheard = (m: Message) => !upstream.hearsAudio && (m.attachments ?? []).some(isAudioAttachment)
+      ? err(c, 409, 'audio_unsupported', `${upstream.modelName} cannot take audio, and this message is a voice recording. Load a model that hears audio to answer it again.`)
+      : null
+
     // Save & Resend (`edit`): the question is branched only here, once nothing above refused the
     // turn, as Regenerate sets its reply aside below. Sent first as its own request (PUT), a
     // /continue the client then skipped (no model ready) or the daemon refused (a Turbo Link
@@ -642,12 +717,17 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       if (msg.role !== 'user') return err(c, 400, 'invalid_input', 'Only a question can be edited and resent.')
       // As in PUT: only a question on the shown branch.
       if (!msg.isActive) return err(c, 409, 'stale_message', STALE_MESSAGE)
+      // Its new version keeps its clips.
+      const refused = unheard(msg)
+      if (refused) return refused
       edited = { from: msg.id, to: branchEditedQuestion(db, convId, msg, content).id }
       conv.messages = db.getMessages(convId)
     }
 
     const lastUser = (conv.messages ?? []).filter((m) => m.role === 'user').at(-1)
     if (!lastUser) return err(c, 400, 'no_user_message', 'No user message to respond to.')
+    const refused = unheard(lastUser)
+    if (refused) return refused
 
     // Regenerate (`regenerate: true`, what the web UI sends): the reply it replaces is set aside
     // only here, once nothing above refused the turn. Sent first as its own request
@@ -711,9 +791,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // `lastUser` is the turn being answered: it goes out with its images and documents, as
       // POST /messages first sent it — the text alone is not what the user asked about.
       const allMsgs = (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id)
-      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id, { reasoningField: reasoningAsField(d, upstream) })
-      // Its stored images as the data URLs the first send carried (a local engine and a Turbo Link host alike).
-      await db.attachments.resolveImages(engineMessages)
+      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id, { reasoningField: reasoningAsField(d, upstream), hearsAudio: upstream.hearsAudio })
+      // Its stored images and clips as the bytes the first send carried (a local engine and a Turbo Link host alike).
+      await db.attachments.resolveMedia(engineMessages)
 
       await runGeneration(d, sink, { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), replacedId: replaced?.role === 'assistant' ? replaced.id : undefined, edited, isCodeAuthorized })
     })
@@ -1304,7 +1384,17 @@ export async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx)
  *  about you" block next to one short user turn often titled the chat off THAT instead of what
  *  was actually asked (GitHub: "gets title based on memory and not based on msg I send"). */
 export function recentTitleTurns(messages: { role: string; content: unknown }[], n = 2): { role: string; content: unknown }[] {
-  return messages.filter((m) => m.role !== 'system').slice(-n)
+  return messages.filter((m) => m.role !== 'system').slice(-n).map(withoutVoiceClips)
+}
+
+/** A turn as the title request carries it: without its voice clips. The title is written from the reply, which is in
+ *  the request too, so hearing the question again buys nothing and costs a second pass over its audio. A turn that
+ *  was only a clip is named as one rather than sent empty. */
+function withoutVoiceClips(m: { role: string; content: unknown }): { role: string; content: unknown } {
+  if (!Array.isArray(m.content)) return m
+  const parts = (m.content as Array<{ type?: unknown }>).filter((part) => part?.type !== 'input_audio')
+  if (parts.length === m.content.length) return m
+  return { ...m, content: parts.length > 0 ? parts : VOICE_MESSAGE_PLACEHOLDER }
 }
 
 async function autoTitle(

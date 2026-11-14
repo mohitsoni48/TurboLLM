@@ -9,6 +9,7 @@ import { chatKeys, memoryKeys } from './chat-queries'
 import { codeKeys } from './code-queries'
 import { queryKeys } from './queries'
 import { routineKeys } from './routine-queries'
+import { voiceKeys } from './voice/voice-queries'
 import {
   EVENT_FALLBACK_POLL_MS, invalidationTargets, liveEventsConnected, pollWhileLive, useLiveInvalidation,
 } from './live-events'
@@ -47,6 +48,7 @@ describe('invalidationTargets', () => {
     expect(invalidationTargets('engines')).toEqual([{ queryKey: queryKeys.engines }, { queryKey: queryKeys.engineUpdates }])
     expect(invalidationTargets('code-sessions')).toEqual([{ queryKey: ['code-sessions'] }, { queryKey: ['code-session'] }])
     expect(invalidationTargets('settings')).toEqual([{ queryKey: ['settings'] }])
+    expect(invalidationTargets('voice')).toEqual([{ queryKey: ['voice'] }])
     expect(invalidationTargets('sandboxRuntime')).toEqual([{ queryKey: queryKeys.sandboxRuntime }])
   })
 
@@ -79,6 +81,8 @@ describe('invalidationTargets', () => {
     expect(routineKeys.detail('x').slice(0, 1)).toEqual(['routine'])
     expect(codeKeys.list('all').slice(0, 1)).toEqual(['code-sessions'])
     expect(codeKeys.detail('x').slice(0, 1)).toEqual(['code-session'])
+    expect(voiceKeys.status.slice(0, 1)).toEqual(['voice'])
+    expect(invalidatedBy('voice', [voiceKeys.status, queryKeys.status])).toEqual([[...voiceKeys.status]])
   })
 })
 

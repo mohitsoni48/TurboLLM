@@ -260,6 +260,28 @@ test('GET /api/v1/activity gives a remote-access token the downloads and status 
     ['downloads', 'engineGenerating', 'items', 'status', 'waiting'])
 })
 
+test('GET /api/v1/activity appends the voice service\'s live speech-model download after the queue\'s rows, as downloading with no speed', async () => {
+  const d = apiDeps()
+  ;(d as unknown as { voice: unknown }).voice = { liveDownload: () => ({ name: 'Speech model Base', received: 1000, total: 4000 }) }
+  const { downloads } = await getJson(d, '/api/v1/activity') as { downloads: Array<Record<string, unknown>> }
+  assert.equal(downloads.length, 3)
+  assert.deepEqual(downloads.map((r) => r.name), ['qwen3-8b-q4.gguf', 'gemma-2b.gguf', 'Speech model Base'])
+  assert.deepEqual(downloads[2], { name: 'Speech model Base', status: 'downloading', received: 1000, total: 4000, bytesPerSec: 0 })
+})
+
+test('GET /api/v1/activity has no speech row when voice is absent or nothing downloads, and the speech row stands alone with an empty queue', async () => {
+  const d = apiDeps()
+  const before = (await getJson(d, '/api/v1/activity')).downloads
+  ;(d as unknown as { voice: unknown }).voice = { liveDownload: () => null }
+  assert.deepEqual((await getJson(d, '/api/v1/activity')).downloads, before)
+  assert.equal((before as unknown[]).length, 2)
+
+  ;(d as unknown as { downloads: unknown }).downloads = { list: () => [], activeCount: () => 0 }
+  ;(d as unknown as { voice: unknown }).voice = { liveDownload: () => ({ name: 'Speech model Tiny', received: 0, total: 10 }) }
+  assert.deepEqual((await getJson(d, '/api/v1/activity')).downloads,
+    [{ name: 'Speech model Tiny', status: 'downloading', received: 0, total: 10, bytesPerSec: 0 }])
+})
+
 test('a chat parked on a tool-call approval is listed in waiting, not in items', () => {
   const d = depsWith({ conversations: { 'chat-1': { title: 'Trip planning' }, 'chat-2': { title: 'Taxes' } } })
 

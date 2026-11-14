@@ -27,6 +27,7 @@ import { parseReasoningEffort } from '../chat/reasoning-effort'
 import { classifyHarness } from '../telemetry/classify'
 import { anthropicContentError, mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
 import { analyzeTurn, applyAgentGuidance } from './agent-guidance'
+import { audioEndpointFor, handleAudioRequest } from './audio-endpoints'
 import { handleJevRequest, jevEndpointFor } from './jev-endpoints'
 import { isJsonObject, NOT_A_JSON_OBJECT } from './jev-serving'
 import { appendNudges, appendSystemRules, declaresTools, openAiRequestView } from './openai-guidance'
@@ -991,6 +992,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // same handler, and a separately registered route is the registration-order bug class of ADR-421.
   const jevEndpoint = jevEndpointFor(c.req.method, pathname)
   if (jevEndpoint) return handleJevRequest(c, d, jevEndpoint, opts)
+
+  // POST /v1/audio/transcriptions and /v1/audio/translations: whisper.cpp answers them when speech-to-text is set up
+  // on this machine (audio-endpoints.ts). Otherwise, and for a Turbo Link peer (whose own daemon transcribes for it),
+  // they fall through to the engine as they always have.
+  const audioEndpoint = opts.origin === 'link' ? null : audioEndpointFor(c.req.method, pathname)
+  if (audioEndpoint && d.voice?.available()) return handleAudioRequest(c, d, audioEndpoint)
 
   // GET /v1/models: synthesise the list from the local library (not just the loaded model),
   // regardless of whether an engine is running — real key entries for OpenAI-style

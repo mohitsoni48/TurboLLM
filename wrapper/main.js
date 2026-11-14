@@ -420,11 +420,13 @@ app.whenReady().then(() => {
   if (!isPrimaryInstance) return
 
   // Deny by default (Electron's own default grants everything); see window-guards.js.
+  // A 'media' ask also says what it wants (the request names a list, the check one kind): only the
+  // microphone is granted, for voice input.
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
-    callback(allowPermission(permission, (details && details.requestingUrl) || webContents.getURL(), APP_ORIGIN))
+    callback(allowPermission(permission, (details && details.requestingUrl) || webContents.getURL(), APP_ORIGIN, details && details.mediaTypes))
   })
-  session.defaultSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin) =>
-    allowPermission(permission, requestingOrigin, APP_ORIGIN))
+  session.defaultSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin, details) =>
+    allowPermission(permission, requestingOrigin, APP_ORIGIN, details && details.mediaType))
 
   try {
     supervisor = createDaemonSupervisor({ spawnDaemon: () => spawnDaemonFrom(daemonLaunchSpec(daemonPort())), onDaemonLost })
