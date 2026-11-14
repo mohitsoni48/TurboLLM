@@ -369,6 +369,26 @@ function VoiceMessages() {
   )
 }
 
+/** The hands-free loop (screens/chat/useConversationMode.ts) is a beta: it opts in here, not by
+ *  stumbling onto a composer button that sends every spoken message sight unseen. */
+function ConversationCard() {
+  const conversation = useVoiceStore((s) => s.conversation)
+  const setConversation = useVoiceStore((s) => s.setConversation)
+  return (
+    <section className={CARD}>
+      <h2 className={H2}>
+        Voice conversation <Badge variant="accent">Beta</Badge>
+      </h2>
+      <CheckRow
+        title="Hands-free voice conversation"
+        description="Adds a conversation button next to the microphone. One tap, then just talk: what you say is sent, the reply is read aloud, and the microphone opens for your next turn. Tap the microphone while it speaks to interrupt. Uses the speech-to-text and read-aloud settings above."
+        checked={conversation}
+        onChange={setConversation}
+      />
+    </section>
+  )
+}
+
 const SAMPLE_ID = 'voice-sample'
 /** How many of the languages the device speaks are named before the rest are counted. */
 const LANGUAGES_SHOWN = 10
@@ -471,6 +491,7 @@ export function VoiceSection() {
     <div className="space-y-4">
       <SpeechToText />
       <VoiceMessages />
+      <ConversationCard />
       <ReadAloudCard />
     </div>
   )

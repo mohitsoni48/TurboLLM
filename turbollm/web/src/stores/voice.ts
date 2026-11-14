@@ -28,6 +28,7 @@ const KEYS = {
   audioMode: 'tllm.voice.audioMode',
   autoSend: 'tllm.voice.autoSend',
   autoStop: 'tllm.voice.autoStop',
+  conversation: 'tllm.voice.conversation',
   readAloud: 'tllm.voice.readAloud',
   ttsVoice: 'tllm.voice.ttsVoice',
   ttsRate: 'tllm.voice.ttsRate',
@@ -77,6 +78,10 @@ type VoiceState = {
   /** End a recording by itself when the speaker stops talking. */
   autoStop: boolean
   setAutoStop: (on: boolean) => void
+  /** Opt-in for the hands-free voice conversation (beta): the composer's conversation toggle only
+   *  exists while this is on. Off by default - it sends every spoken message without a look first. */
+  conversation: boolean
+  setConversation: (on: boolean) => void
   readAloud: ReadAloud
   setReadAloud: (mode: ReadAloud) => void
   /** The id of the voice replies are read in (lib/voice/tts.ts TtsVoice); '' picks one for each reply's language.
@@ -106,6 +111,11 @@ export const useVoiceStore = create<VoiceState>((set) => ({
   setAutoStop: (autoStop) => {
     write(KEYS.autoStop, String(autoStop))
     set({ autoStop })
+  },
+  conversation: read(KEYS.conversation) === 'true',
+  setConversation: (conversation) => {
+    write(KEYS.conversation, String(conversation))
+    set({ conversation })
   },
   readAloud: readReadAloud(),
   setReadAloud: (readAloud) => {

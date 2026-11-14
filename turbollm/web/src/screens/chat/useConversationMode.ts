@@ -24,6 +24,8 @@ export interface ConversationModeOptions {
   replyStreaming: boolean
   /** The composer cannot send right now (a reply in flight, no model ready). */
   composerLocked: boolean
+  /** The Settings -> Voice opt-in for the beta. Turning it off mid-conversation ends the mode. */
+  enabled: boolean
 }
 
 export interface ConversationMode {
@@ -70,6 +72,16 @@ export function useConversationMode(opts: ConversationModeOptions): Conversation
   }, [dispatch])
 
   const disable = useCallback(() => dispatch({ type: 'stop' }), [dispatch])
+
+  // The Settings opt-in is the master switch: revoking it mid-turn ends the mode (the stop event
+  // cancels whatever is mid-flight by design), so a composer the user no longer offers cannot
+  // keep a live loop running.
+  const enabledRef = useRef(opts.enabled)
+  useEffect(() => {
+    const was = enabledRef.current
+    enabledRef.current = opts.enabled
+    if (was && !opts.enabled) disable()
+  }, [opts.enabled, disable])
   const interrupt = useCallback(() => dispatch({ type: 'interrupt' }), [dispatch])
 
   // Clip routing: the recorder's own phase says how its clip ended. recording -> transcribing is
