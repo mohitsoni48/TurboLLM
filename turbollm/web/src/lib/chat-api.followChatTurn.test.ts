@@ -239,3 +239,36 @@ describe('followChatTurn', () => {
     expect(requests).toHaveLength(1)
   })
 })
+
+// What sendMessage puts in the POST body: a voice clip travels as `audio` (data:audio/wav URLs) beside the images, and
+// only when there is one.
+describe('sendMessage request body', () => {
+  async function bodyOf(audio: string[] | undefined): Promise<Record<string, unknown>> {
+    let body = ''
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      body = String(init?.body)
+      return new Response(sseBody([done(1)], 'close'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }))
+    for await (const frame of sendMessage('c1', 'hi', new AbortController().signal, undefined, undefined, undefined, undefined, undefined, undefined, undefined, audio)) void frame
+    return JSON.parse(body) as Record<string, unknown>
+  }
+
+  it('carries the audio clips when there are any', async () => {
+    const body = await bodyOf(['data:audio/wav;base64,AAAA', 'data:audio/wav;base64,BBBB'])
+    expect(body.audio).toEqual(['data:audio/wav;base64,AAAA', 'data:audio/wav;base64,BBBB'])
+    expect(body.content).toBe('hi')
+  })
+
+  it('leaves audio out when it is empty or not given', async () => {
+    expect(await bodyOf([])).not.toHaveProperty('audio')
+    expect(await bodyOf(undefined)).not.toHaveProperty('audio')
+  })
+
+  it('keeps images and audio apart', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      expect(JSON.parse(String(init?.body))).toMatchObject({ images: ['data:image/png;base64,II'], audio: ['data:audio/wav;base64,AA'] })
+      return new Response(sseBody([done(1)], 'close'), { status: 200 })
+    }))
+    for await (const frame of sendMessage('c1', 'hi', new AbortController().signal, ['data:image/png;base64,II'], undefined, undefined, undefined, undefined, undefined, undefined, ['data:audio/wav;base64,AA'])) void frame
+  })
+})

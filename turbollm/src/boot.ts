@@ -62,6 +62,7 @@ import { ToolRegistry } from './tools/tool-registry'
 import { EngineGates } from './agents/gate'
 import { AgentTaskState } from './agents/task-state'
 import { RequestLog } from './observability/request-log'
+import { VoiceService } from './voice/voice-service'
 import { syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
 import { writePidfile, readPidfile, claimDataDir, releaseDataDirClaim, daemonReachHost } from './daemon-pid'
 import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from './server'
@@ -389,6 +390,10 @@ export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
   // baked into this instance), so toggling either in Settings takes effect on the very next
   // request with no restart needed.
   deps.requestLog = new RequestLog(store.snapshot().requestLog.maxEntries)
+  // Speech-to-text (voice/voice-service.ts). Nothing starts here: whisper-server is spawned by the first
+  // transcription and stopped again once it has gone unused, and close() stops it with the engines.
+  const voice = new VoiceService({ store })
+  deps.voice = voice
 
   // App self-update apply state (spec 29 B.1). Two boot-time jobs:
   //  1. Record this daemon's launch identity (execPath/argv/cwd) so the detached update
@@ -1224,6 +1229,8 @@ export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
   //      stopped chat turns (up to 3 s: a turn running a tool call ends only when the call does) and a restart's
   //      paused downloads' writers are waited for together. remote.disableAll, not disable(): a remote-access Stop or
   //      a provider switch still running `tailscale … off` would otherwise be killed mid-call by the exit net.
+  //      voice.stop: whisper-server, when a transcription started one (it is tethered as an engine is, so its owner
+  //      stops it).
   //      stopTethered: everything else tethered (routine runs, Code commands, git, …) gets SIGTERM, then its group is
   //      killed after 3 s; engines and tunnels are their owners' to stop;
   //   6. only then the store closes, every connection is dropped (an SSE stream otherwise holds close() until the
@@ -1240,7 +1247,7 @@ export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
     clearInterval(cliInteractiveSweepTimer)
     comfy.stop()
     toolRegistry.disconnectAll()
-    const stopping: Promise<unknown>[] = [manager.shutdown(), modelRouter.shutdownPool(), remote.disableAll(), stopTethered(), chatTurns.turnsEnded()]
+    const stopping: Promise<unknown>[] = [manager.shutdown(), modelRouter.shutdownPool(), remote.disableAll(), voice.stop(), stopTethered(), chatTurns.turnsEnded()]
     if (forRestart) stopping.push(downloads.pauseAll())
     stopping.push(alsoWaitFor())
     return new Promise((closed) => {

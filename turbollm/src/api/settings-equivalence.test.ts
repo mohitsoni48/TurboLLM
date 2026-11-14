@@ -21,7 +21,10 @@ process.env.TURBOLLM_TELEMETRY = 'off' // a telemetryLevel change would otherwis
 const GOLDEN = join(import.meta.dirname, 'fixtures', 'settings-golden.json')
 const WRITE = process.env.TURBOLLM_SETTINGS_GOLDEN === 'write'
 /** Top-level payload keys added after the recording. */
-const NEW_KEYS = ['downloadConcurrency', 'engineLoadStallSeconds', 'pdfReading']
+const NEW_KEYS = ['downloadConcurrency', 'engineLoadStallSeconds', 'pdfReading', 'speechToText']
+/** Top-level config blocks added after the recording: the config a PATCH leaves is hashed without them, as the
+ *  payload is compared without NEW_KEYS. Their own rules are their own tests' (settings-speech-to-text.test.ts). */
+const NEW_CONFIG_KEYS = ['speechToText']
 /** `experimental` flags added after the recording, dropped from the payload and from the config hash alike. */
 const NEW_EXPERIMENTAL = ['sandbox']
 
@@ -268,7 +271,7 @@ async function runPatch(body: unknown, config: () => Config, remote: Remote, hos
     status: res.status,
     ...(res.status === 200 ? {} : { error: json.error }),
     body: hash(withoutNewKeys(json)),
-    config: hash(configAsRecorded(after())),
+    config: hash(Object.fromEntries(Object.entries(configAsRecorded(after()) as Record<string, unknown>).filter(([k]) => !NEW_CONFIG_KEYS.includes(k)))),
     calls,
   }
 }

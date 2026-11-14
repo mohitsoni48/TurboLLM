@@ -103,6 +103,17 @@ for (const backend of BACKENDS) {
     assert.equal((await janitor(store).run())?.deleted, 2)
     assert.deepEqual(files(dir), [attachmentRefId(shared)], 'still named by the other chat')
   }))
+
+  test(`collection keeps a voice clip a row names by its .wav reference (${backend})`, () => withFileStore(backend, async (store, dir) => {
+    const conv = store.createConversation()
+    const [clip] = await store.attachments.save([`data:audio/wav;base64,${Buffer.from('RIFF-clip-bytes').toString('base64')}`])
+    assert.match(clip, /\.wav$/)
+    store.addMessage(conv.id, 'user', '', { attachments: [clip] })
+    const old = new Date(Date.now() - 2 * 3600_000)
+    utimesSync(join(dir, 'attachments', attachmentRefId(clip)!), old, old)
+    assert.equal((await janitor(store).run())?.deleted, 0)
+    assert.deepEqual(files(dir), [attachmentRefId(clip)])
+  }))
 }
 
 test('an in-memory store has no files: the janitor does nothing', async () => {

@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
   withCurrentDate, shouldAutoCompact, lastCtxUsage, resolveCompactionCut,
-  buildEngineMessages, pickCompactionCut, AUTO_COMPACT_THRESHOLD,
+  buildEngineMessages, userTurnContent, VOICE_MESSAGE_PLACEHOLDER, pickCompactionCut, AUTO_COMPACT_THRESHOLD,
   compactConversation, maybeAutoCompact, setAsideFrozenCut,
 } from './chat-compaction.js'
 import type { Conversation, Message } from './db.js'
@@ -834,6 +834,38 @@ test('compactConversation: an aborted caller signal reaches the summarization ca
   }
 })
 
+// ── Compaction and voice clips ───────────────────────────────────────────────────────────
+
+test('pickCompactionCut: voice clips count toward the cut for a model that hears them, and not for one that does not', () => {
+  const messages = Array.from({ length: 8 }, (_, i) => (i % 2 === 0 ? makeMsg('user', '', { attachments: [CLIP_REF] }) : makeMsg('assistant', 'ok')))
+  // By their words alone, eight nearly empty messages fit any tail: sized that way, a conversation held by voice
+  // was never cut, though a hearing model is sent every one of its clips again on each turn.
+  assert.equal(pickCompactionCut(messages, 2000, undefined, false, false), null)
+  assert.equal(pickCompactionCut(messages, 2000), null)
+  const picked = pickCompactionCut(messages, 2000, undefined, false, true)
+  assert.ok(picked)
+  assert.equal(picked!.toSummarize.length, 6)
+  assert.ok(picked!.tokensBefore >= 900, `three clips' worth, got ${picked!.tokensBefore}`)
+})
+
+test('compactConversation: a voice-only turn is named in the summary\'s transcript, not left an empty line', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model' })
+    db.addMessage(conv.id, 'user', '', { attachments: [CLIP_REF] })
+    for (let i = 1; i < 8; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', `message ${i} with enough real content to count as real tokens`)
+    const prompts: string[] = []
+    await compactConversation(fakeDeps(db, 200), conv.id, { fetchImpl: recordingFetch(prompts) })
+    assert.equal(prompts.length, 1)
+    assert.ok(prompts[0].includes(`User: ${VOICE_MESSAGE_PLACEHOLDER}`), prompts[0].slice(0, 400))
+    assert.ok(!/User: (\\n|$)/.test(prompts[0]))
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 // ── Compaction fixes: the turn's snapshot, an already-applied compaction, a frozen cut ────
 
 /** A fake summarizer that records every summarization prompt it is sent. */
@@ -1020,5 +1052,68 @@ test('maybeAutoCompact: a branch whose own compaction another branch replaced is
   } finally {
     db.close()
     rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ── voice clips ─────────────────────────────────────────────────────────────────────
+
+const CLIP = 'data:audio/wav;base64,UklGRg=='
+const CLIP_REF = `attachment:${'ab'.repeat(32)}.wav`
+
+test('userTurnContent: a clip alone is a single input_audio part with no empty text part', () => {
+  assert.deepEqual(userTurnContent('', undefined, [CLIP_REF]), [
+    { type: 'input_audio', input_audio: { data: CLIP_REF, format: 'wav' } },
+  ])
+})
+
+test('userTurnContent: text first, then each attachment in order as its own part type', () => {
+  const image = 'data:image/png;base64,AAAA'
+  assert.deepEqual(userTurnContent('what is said here', undefined, [image, CLIP]), [
+    { type: 'text', text: 'what is said here' },
+    { type: 'image_url', image_url: { url: image } },
+    { type: 'input_audio', input_audio: { data: CLIP, format: 'wav' } },
+  ])
+})
+
+test('userTurnContent: an mp3 reference names the mp3 format', () => {
+  const ref = `attachment:${'cd'.repeat(32)}.mp3`
+  assert.deepEqual(userTurnContent('', undefined, [ref]), [{ type: 'input_audio', input_audio: { data: ref, format: 'mp3' } }])
+})
+
+test('buildEngineMessages: an earlier voice-only turn is resent with its clip when the model hears audio', () => {
+  const voice = makeMsg('user', '', { attachments: [CLIP_REF] })
+  const reply = makeMsg('assistant', 'You asked about the weather.')
+  const next = makeMsg('user', 'and tomorrow?')
+  const out = buildEngineMessages(makeConv(), [voice, reply, next], next.id, { hearsAudio: true })
+  assert.deepEqual(out[0].content, [{ type: 'input_audio', input_audio: { data: CLIP_REF, format: 'wav' } }])
+  assert.equal(out[2].content, 'and tomorrow?')
+})
+
+test('buildEngineMessages: without hearsAudio an earlier voice-only turn is the placeholder, never an empty message', () => {
+  const voice = makeMsg('user', '', { attachments: [CLIP_REF] })
+  const reply = makeMsg('assistant', 'ok')
+  const next = makeMsg('user', 'more')
+  assert.equal(buildEngineMessages(makeConv(), [voice, reply, next], next.id, { hearsAudio: false })[0].content, VOICE_MESSAGE_PLACEHOLDER)
+  assert.equal(buildEngineMessages(makeConv(), [voice, reply, next], next.id)[0].content, VOICE_MESSAGE_PLACEHOLDER)
+})
+
+test('buildEngineMessages: an earlier turn with typed text and a clip is just its text when the model does not hear', () => {
+  const voice = makeMsg('user', 'my question', { attachments: [CLIP_REF] })
+  const next = makeMsg('user', 'more')
+  assert.equal(buildEngineMessages(makeConv(), [voice, makeMsg('assistant', 'a'), next], next.id, { hearsAudio: false })[0].content, 'my question')
+})
+
+test('buildEngineMessages: an earlier image-only turn is still not resent with its image, whatever the model hears', () => {
+  const pic = makeMsg('user', 'look', { attachments: ['data:image/png;base64,AAAA'] })
+  for (const hearsAudio of [true, false]) {
+    assert.equal(buildEngineMessages(makeConv(), [pic, makeMsg('assistant', 'a'), makeMsg('user', 'q')], undefined, { hearsAudio })[0].content, 'look')
+  }
+})
+
+test('buildEngineMessages: the answered turn carries its clip whether or not the model hears', () => {
+  const voice = makeMsg('user', '', { attachments: [CLIP_REF] })
+  for (const hearsAudio of [true, false, undefined]) {
+    const out = buildEngineMessages(makeConv(), [voice], voice.id, { hearsAudio })
+    assert.deepEqual(out[0].content, [{ type: 'input_audio', input_audio: { data: CLIP_REF, format: 'wav' } }])
   }
 })

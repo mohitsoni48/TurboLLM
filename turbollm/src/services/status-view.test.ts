@@ -52,3 +52,18 @@ test('buildModelStatus names the in-app LiteRT-LM row by its own name, active an
   assert.equal(engine.servingName, 'LiteRT-LM')
   assert.equal(engine.kind, 'turbollm-sdk')
 })
+
+function depsLoaded(model: Record<string, unknown>) {
+  const deps = depsServing(LLAMA, LLAMA) as unknown as { manager: { status: () => unknown } }
+  deps.manager.status = () => ({ state: 'running', err: null, port: 8081, pid: 7, model, loadElapsedMs: 5 })
+  return deps as unknown as Deps
+}
+
+test('buildModelStatus marks a model that hears audio, and leaves the key out otherwise', () => {
+  const base = { key: 'k', name: 'n', quant: 'Q4', ctx: 4096, vision: false }
+  assert.equal(buildModelStatus(depsLoaded({ ...base, audio: true })).model?.audio, true)
+  // The key must be absent, not false: the page offers voice messages on `audio` being there.
+  for (const model of [base, { ...base, audio: false }]) {
+    assert.ok(!('audio' in buildModelStatus(depsLoaded(model)).model!))
+  }
+})

@@ -98,9 +98,13 @@ export function registerActivityRoutes(app: Hono, d: Deps): void {
 }
 
 function liveDownloads(d: Deps): LiveDownload[] {
-  return d.downloads.list()
+  const models: LiveDownload[] = d.downloads.list()
     .filter((r) => r.status === 'downloading' || r.status === 'queued')
     .map(({ name, status, received, total, bytesPerSec }) => ({ name, status, received, total, bytesPerSec }))
+  // A speech-to-text model is fetched by the voice service, not the downloads queue (voice/voice-service.ts), and is
+  // as much a reason to keep the app's process alive while its window is away.
+  const speech = d.voice?.liveDownload()
+  return speech ? [...models, { ...speech, status: 'downloading', bytesPerSec: 0 }] : models
 }
 
 function pollStatus(d: Deps): PollStatus {

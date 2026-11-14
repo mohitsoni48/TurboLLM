@@ -25,6 +25,7 @@ import type { Emitter } from './telemetry/emit'
 import type { CodeRunManager } from './code/code-run-manager'
 import type { LinkManager } from './link/link-manager'
 import type { RemoteCatalog } from './link/remote-catalog'
+import type { VoiceService } from './voice/voice-service'
 import type { SandboxRuntime } from './sandbox/runtime-install'
 
 /** What deleting a Code session came to (code-routes.ts deleteCodeSessionWithCleanup). */
@@ -152,4 +153,7 @@ export interface Deps {
    *  token counts, in-memory only. Optional — absent under tests that don't exercise it, same
    *  convention as gate/telemetry/agentTasks. */
   requestLog?: import('./observability/request-log').RequestLog
+  /** Speech-to-text through whisper.cpp (voice/voice-service.ts). Absent from a daemon built without it (a test's):
+   *  the voice routes then answer 503 and /v1/audio/* goes to the engine. */
+  voice?: VoiceService
 }

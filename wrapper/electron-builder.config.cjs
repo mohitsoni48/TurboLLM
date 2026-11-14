@@ -71,6 +71,16 @@ module.exports = {
     target: [{ target: 'dmg' }],
     icon: 'build/icon.png',
     category: 'public.app-category.developer-tools',
+    // macOS asks the user before an app may use the microphone, and shows this as the reason. Without the
+    // key it does not ask at all: the chat's voice input would be refused with no prompt.
+    extendInfo: {
+      NSMicrophoneUsageDescription: 'TurboLLM uses the microphone when you record a voice message in the chat. The recording stays on this Mac.',
+    },
+    // A signed build runs under the hardened runtime, which also wants the audio-input entitlement, for the app
+    // and for its helpers (Chromium records in one). An unsigned build, which is what a machine with no signing
+    // identity makes, uses neither.
+    entitlements: 'build/entitlements.mac.plist',
+    entitlementsInherit: 'build/entitlements.mac.plist',
   },
   dmg: {
     artifactName: 'TurboLLM-${arch}.${ext}',

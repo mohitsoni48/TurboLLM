@@ -18,6 +18,7 @@
 // noUnusedLocals: true, so importing them before anything in the file uses them would fail
 // Task 2's OWN typecheck step. Keep this file's imports exactly matched to what's actually
 // referenced at the end of whichever task last touched it.
+import { audioAttachmentFormat, isAudioAttachment } from './attachments.js'
 import type { Conversation, ConversationStore, Message } from './db.js'
 import { estimateTokens } from '../ext/context-limit.js'
 import { callChatUpstream, resolveChatUpstream, type ChatUpstream } from './chat-upstream.js'
@@ -154,17 +155,39 @@ function effectiveTailText(preserveThinking: boolean, m: Message): string {
 }
 
 /** A user turn as the engine receives it: the attached documents' text folded ahead of the
- *  typed text, images as multimodal parts. Shared by POST /messages (a new turn) and
+ *  typed text, then its attachments as multimodal parts, an image as `image_url` and a voice clip as
+ *  `input_audio` (attachments.ts tells them apart). Shared by POST /messages (a new turn) and
  *  buildEngineMessages (the turn /continue answers again — Regenerate, edit-and-resend), so a
- *  re-answered turn carries exactly what its first send did. */
-export function userTurnContent(text: string, docContext: string | undefined, images: string[]): unknown {
+ *  re-answered turn carries exactly what its first send did. A clip's `data` is the attachment string
+ *  here; AttachmentStore.resolveMedia makes it the base64 an engine reads. */
+export function userTurnContent(text: string, docContext: string | undefined, attachments: string[]): unknown {
   const fullContent = docContext ? (text ? `${docContext}\n\n${text}` : docContext) : text
-  return images.length
+  return attachments.length
     ? [
         ...(fullContent ? [{ type: 'text', text: fullContent }] : []),
-        ...images.map((url) => ({ type: 'image_url', image_url: { url } })),
+        ...attachments.map(mediaPart),
       ]
     : fullContent
+}
+
+function mediaPart(attachment: string): unknown {
+  const format = audioAttachmentFormat(attachment)
+  return format === null
+    ? { type: 'image_url', image_url: { url: attachment } }
+    : { type: 'input_audio', input_audio: { data: attachment, format } }
+}
+
+/** What stands in for a voice message in a prompt that cannot carry its audio. */
+export const VOICE_MESSAGE_PLACEHOLDER = '[Voice message]'
+
+/** An earlier user turn that was spoken, as it is resent. Images and documents of earlier turns are not resent (their
+ *  turn's text and the reply to them carry the conversation on), but a voice message may have no text at all: resent
+ *  as text alone, every spoken turn would reach the model empty and the conversation would be the assistant talking to
+ *  itself. So an engine that hears gets the clips again, and one that does not gets a placeholder where there is no
+ *  typed text, which keeps the turn from being an empty message (several chat templates refuse one). */
+function spokenTurnContent(text: string, clips: string[], hearsAudio: boolean): unknown {
+  if (hearsAudio) return userTurnContent(text, undefined, clips)
+  return text || VOICE_MESSAGE_PLACEHOLDER
 }
 
 /** A message as buildEngineMessages sends it: `reasoning_content` is a past turn's reasoning, for an engine whose
@@ -190,10 +213,13 @@ const IMAGE_OMITTED_PART = { type: 'text', text: '[image omitted: this engine ca
  *  template).
  *
  *  `withholdImages` (this machine's engine reads no images, G-2): the answered turn's images go as a text placeholder
- *  each, so a question asked with an image under another engine can still be answered. Older turns carry no images. */
+ *  each, so a question asked with an image under another engine can still be answered. Older turns carry no images.
+ *
+ *  `hearsAudio` (the turn's upstream takes audio input): earlier voice messages are resent with their clips; see
+ *  spokenTurnContent. */
 export function buildEngineMessages(
   conv: Conversation, activeMessages: Message[], answeringUserMessageId?: string,
-  opts: { reasoningField?: boolean; withholdImages?: boolean } = {},
+  opts: { reasoningField?: boolean; withholdImages?: boolean; hearsAudio?: boolean } = {},
 ): EngineMessage[] {
   const { summary, rest } = resolveCompactionCut(conv, activeMessages)
   const out: EngineMessage[] = []
@@ -211,11 +237,14 @@ export function buildEngineMessages(
       out.push({ role: m.role, content: m.content, reasoning_content: m.reasoning })
       continue
     }
+    if (m.id === answeringUserMessageId) {
+      out.push({ role: m.role, content: answeredTurnContent(m, opts) })
+      continue
+    }
+    const clips = m.role === 'user' ? (m.attachments ?? []).filter(isAudioAttachment) : []
     out.push({
       role: m.role,
-      content: m.id === answeringUserMessageId
-        ? answeredTurnContent(m, opts)
-        : effectiveTailText(!!conv.preserveThinking, m),
+      content: clips.length ? spokenTurnContent(m.content, clips, !!opts.hearsAudio) : effectiveTailText(!!conv.preserveThinking, m),
     })
   }
   return out
@@ -262,11 +291,25 @@ const MIN_MESSAGES_TO_COMPACT = 4
  *  (see effectiveTailText) — confirmed live: a real preserveThinking conversation's tail
  *  looked like a 9.8x under-estimate (content-only) until the reasoning fold was counted,
  *  which alone brought it to 2.98x — comfortably inside this clamp, not requiring a wider one. */
-function calibratedTokenScale(pool: Message[], realCtxUsed: number | undefined, preserveThinking: boolean): number {
+function calibratedTokenScale(pool: Message[], realCtxUsed: number | undefined, preserveThinking: boolean, hearsAudio: boolean): number {
   if (!realCtxUsed) return 1
-  const raw = estimateTokens(pool.map((m) => ({ role: m.role, content: effectiveTailText(preserveThinking, m) })))
+  const raw = estimateTokens(pool.map((m) => ({ role: m.role, content: effectiveTailText(preserveThinking, m) }))) + voiceClipTokens(pool, hearsAudio)
   if (raw < 200) return 1 // too little text for the ratio to mean anything
   return Math.min(4, Math.max(0.5, realCtxUsed / raw))
+}
+
+/** What one voice clip is taken to cost a model that hears it. The row names the clip's file, not its length, and
+ *  audio models spend from about six to twenty-five tokens on a second of sound, so a spoken message of ten or twenty
+ *  seconds is a few hundred. Rough, and enough: counted as nothing, every spoken turn fitted the kept tail for free. */
+const VOICE_CLIP_TOKENS = 300
+
+/** What the voice clips of `messages` add to a prompt for a model that hears, which is resent every earlier clip
+ *  (spokenTurnContent). Nothing for one that does not: it gets the turn's text, or a placeholder. */
+function voiceClipTokens(messages: Message[], hearsAudio: boolean): number {
+  if (!hearsAudio) return 0
+  let clips = 0
+  for (const m of messages) if (m.role === 'user') clips += (m.attachments ?? []).filter(isAudioAttachment).length
+  return clips * VOICE_CLIP_TOKENS
 }
 
 /** Chooses how much of `pool` (already past any earlier compaction cut — see
@@ -280,16 +323,17 @@ function calibratedTokenScale(pool: Message[], realCtxUsed: number | undefined, 
  *  budget. `realCtxUsed` — the engine's own last-reported prompt size for this exact pool,
  *  from `lastCtxUsage` — calibrates the estimate; see calibratedTokenScale. `preserveThinking`
  *  must be the conversation's own flag, so the sizing estimate matches what actually gets
- *  resent (see effectiveTailText). */
-export function pickCompactionCut(pool: Message[], ctxMax: number, realCtxUsed?: number, preserveThinking = false): { toSummarize: Message[]; cutMessageId: string; tokensBefore: number } | null {
+ *  resent (see effectiveTailText), and `hearsAudio` the upstream's, for the same reason (see
+ *  voiceClipTokens). */
+export function pickCompactionCut(pool: Message[], ctxMax: number, realCtxUsed?: number, preserveThinking = false, hearsAudio = false): { toSummarize: Message[]; cutMessageId: string; tokensBefore: number } | null {
   if (pool.length < MIN_MESSAGES_TO_COMPACT) return null
-  const scale = calibratedTokenScale(pool, realCtxUsed, preserveThinking)
+  const scale = calibratedTokenScale(pool, realCtxUsed, preserveThinking, hearsAudio)
   const keepBudget = Math.max(1, Math.round(ctxMax * KEEP_RECENT_FRACTION))
   let tailStart = pool.length
   let tailTokens = 0
   while (tailStart > 0) {
     const next = pool[tailStart - 1]
-    const nextTokens = estimateTokens([{ role: next.role, content: effectiveTailText(preserveThinking, next) }]) * scale
+    const nextTokens = (estimateTokens([{ role: next.role, content: effectiveTailText(preserveThinking, next) }]) + voiceClipTokens([next], hearsAudio)) * scale
     if (tailStart < pool.length && tailTokens + nextTokens > keepBudget) break
     tailTokens += nextTokens
     tailStart--
@@ -308,7 +352,7 @@ export function pickCompactionCut(pool: Message[], ctxMax: number, realCtxUsed?:
   tailStart = userStart
   if (tailStart <= 0) return null // the only user turn is the pool's first: nothing left to summarize
   const toSummarize = pool.slice(0, tailStart)
-  const tokensBefore = Math.round(estimateTokens(toSummarize.map((m) => ({ role: m.role, content: effectiveTailText(preserveThinking, m) }))) * scale)
+  const tokensBefore = Math.round((estimateTokens(toSummarize.map((m) => ({ role: m.role, content: effectiveTailText(preserveThinking, m) }))) + voiceClipTokens(toSummarize, hearsAudio)) * scale)
   return { toSummarize, cutMessageId: toSummarize[toSummarize.length - 1].id, tokensBefore }
 }
 
@@ -328,7 +372,9 @@ const COMPACTION_GATE_TIMEOUT_MS = 60_000
 const SUMMARIZATION_TIMEOUT_MS = 60_000
 
 function buildSummarizationPrompt(priorSummary: string | null, toSummarize: Message[]): { role: string; content: string }[] {
-  const transcript = toSummarize.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n\n')
+  // A turn that was only a voice clip has no words to write down: it is named as one, not left an empty line.
+  const said = (m: Message): string => m.content || (m.role === 'user' && (m.attachments ?? []).some(isAudioAttachment) ? VOICE_MESSAGE_PLACEHOLDER : '')
+  const transcript = toSummarize.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${said(m)}`).join('\n\n')
   const priorBlock = priorSummary ? `Summary of the conversation so far:\n${priorSummary}\n\n---\n\n` : ''
   return [
     {
@@ -392,7 +438,7 @@ export async function compactConversation(
   // auto-trigger check) calibrates pickCompactionCut's char-based estimate against reality —
   // see calibratedTokenScale's doc comment for why the raw estimate alone under-fires.
   const { ctxUsed: realCtxUsed } = lastCtxUsage(activeMessages)
-  const picked = pickCompactionCut(pool, upstream.ctxMax, realCtxUsed, !!conv.preserveThinking)
+  const picked = pickCompactionCut(pool, upstream.ctxMax, realCtxUsed, !!conv.preserveThinking, !!upstream.hearsAudio)
   if (!picked) throw new Error('nothing_to_compact')
 
   const promptMessages = buildSummarizationPrompt(priorSummary, picked.toSummarize)

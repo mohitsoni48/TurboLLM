@@ -7,10 +7,12 @@
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import { test } from 'node:test'
-import { readFileSync, rmSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
 import { Hono } from 'hono'
 import { stripThinkingBlocks, needsExtraPass } from './think-utils.js'
-import { recentTitleTurns, chatCodeAuthorization, registerChatRoutes } from './chat-routes.js'
+import { recentTitleTurns, chatCodeAuthorization, readCappedJson, registerChatRoutes, voiceClipsRefusal } from './chat-routes.js'
+import { VOICE_MESSAGE_PLACEHOLDER } from './chat-compaction.js'
 import { ChatTurns } from './chat-turns.js'
 import { ChatRuns } from './chat-runs.js'
 import { ConversationStore } from './db.js'
@@ -1601,4 +1603,268 @@ test('GET /api/v1/attachments/:id sits behind lanAuth: a LAN caller needs a key,
   } finally {
     h.cleanup()
   }
+})
+
+// ── voice messages for models that hear audio ─────────────────────────────────────────────────────
+
+// A 44-byte RIFF/WAVE header and four 16-bit samples.
+const WAV_BYTES = Buffer.concat([
+  Buffer.from('RIFF', 'ascii'), Buffer.from([0x2c, 0, 0, 0]), Buffer.from('WAVEfmt ', 'ascii'),
+  Buffer.from([16, 0, 0, 0, 1, 0, 1, 0, 0x80, 0x3e, 0, 0, 0, 0x7d, 0, 0, 2, 0, 16, 0]),
+  Buffer.from('data', 'ascii'), Buffer.from([8, 0, 0, 0]), Buffer.from([0, 0, 0x10, 0, 0, 0, 0xf0, 0xff]),
+])
+const WAV_B64 = WAV_BYTES.toString('base64')
+const WAV_URL = `data:audio/wav;base64,${WAV_B64}`
+
+/** Whether the loaded model hears audio, as the manager's status reports it; changeable between sends. */
+function setHearing(h: ReturnType<typeof inFlightHarness>, audio: boolean | undefined) {
+  const manager = h.d.manager as unknown as { status: () => unknown }
+  manager.status = () => ({
+    state: 'running', model: { key: 'gemma-27b', name: 'Gemma 27B', ctx: 8192, ...(audio === undefined ? {} : { audio }) },
+  })
+}
+
+type Part = { type: string; text?: string; image_url?: { url: string }; input_audio?: { data: string; format: string } }
+const lastParts = (engine: ReturnType<typeof fakeEngine>, n: number) => engine.bodies[n].messages.at(-1)!.content as Part[]
+const errorCode = async (res: Response) => ((await res.json()) as { error: { code: string } }).error.code
+
+test('a voice clip sent to a model that hears reaches the engine as input_audio with bare base64, and is stored as a .wav file', async () => {
+  const h = inFlightHarness()
+  setHearing(h, true)
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    const res = await h.app.request(`/api/v1/conversations/${conv.id}/messages`, json({ audio: [WAV_URL] }))
+    assert.equal(res.status, 200)
+    await res.text()
+    // Voice-only: no empty text part in front of the clip, and no data: prefix an engine would reject.
+    assert.deepEqual(lastParts(engine, 0), [{ type: 'input_audio', input_audio: { data: WAV_B64, format: 'wav' } }])
+
+    const [user] = h.store.getMessages(conv.id)
+    assert.match(user.attachments[0], /^attachment:[0-9a-f]{64}\.wav$/)
+    assert.equal(user.attachments.length, 1)
+    const served = await h.app.request(`/api/v1/attachments/${attachmentRefId(user.attachments[0])}`)
+    assert.equal(served.status, 200)
+    assert.equal(served.headers.get('content-type'), 'audio/wav')
+    assert.deepEqual(Buffer.from(await served.arrayBuffer()), WAV_BYTES)
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('typed text, an image and a clip in one send are stored in that order and sent as text, image, clip', async () => {
+  const h = inFlightHarness()
+  setHearing(h, true)
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    await (await h.app.request(`/api/v1/conversations/${conv.id}/messages`, json({ content: 'both', images: ['data:image/png;base64,AAAA'], audio: [WAV_URL] }))).text()
+    assert.deepEqual(h.store.getMessages(conv.id)[0].attachments.map((a) => a.slice(-4)), ['.png', '.wav'])
+    assert.deepEqual(lastParts(engine, 0).map((p) => p.type), ['text', 'image_url', 'input_audio'])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('a clip sent to a model that does not hear is refused with 409 audio_unsupported and no turn is stored', async () => {
+  for (const audio of [undefined, false]) {
+    const h = inFlightHarness()
+    setHearing(h, audio)
+    const engine = fakeEngine()
+    try {
+      const conv = h.store.createConversation()
+      const res = await h.app.request(`/api/v1/conversations/${conv.id}/messages`, json({ content: 'hi', audio: [WAV_URL] }))
+      assert.equal(res.status, 409, `audio ${audio}`)
+      assert.equal(await errorCode(res), 'audio_unsupported')
+      assert.deepEqual(h.store.getMessages(conv.id), [], 'a user row with a clip nobody can answer would be left behind')
+      assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
+      assert.equal(engine.bodies.length, 0)
+    } finally {
+      engine.restore()
+      h.cleanup()
+    }
+  }
+})
+
+test('POST /messages refuses a malformed, unsupported, non-audio or too many voice clips with 400 before storing anything', async () => {
+  const h = inFlightHarness()
+  setHearing(h, true)
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    const url = `/api/v1/conversations/${conv.id}/messages`
+    const bad = [
+      { audio: WAV_URL },
+      { audio: [1] },
+      { audio: [`data:audio/ogg;base64,${WAV_B64}`] },
+      { audio: ['data:image/png;base64,AAAA'] },
+      { audio: ['not a clip'] },
+      { audio: Array.from({ length: 9 }, () => WAV_URL) },
+      // A clip is one by what it is, whatever field it came in: as an image it would skip every check on `audio`.
+      { images: [WAV_URL] },
+      { images: [`attachment:${'ab'.repeat(32)}.wav`] },
+    ]
+    for (const extra of bad) {
+      const res = await h.app.request(url, json({ content: 'hi', ...extra }))
+      assert.equal(res.status, 400, JSON.stringify(extra).slice(0, 60))
+      assert.equal(await errorCode(res), 'invalid_input')
+    }
+    assert.deepEqual(h.store.getMessages(conv.id), [])
+    assert.equal(engine.bodies.length, 0)
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('Regenerate resends the answered turn\'s clip as input_audio', async () => {
+  const h = inFlightHarness()
+  setHearing(h, true)
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    await (await h.app.request(`${base}/messages`, json({ audio: [WAV_URL] }))).text()
+    await h.app.request(`${base}/regenerate`, { method: 'POST' })
+    await (await h.app.request(`${base}/continue`, json({ regenerate: true }))).text()
+    assert.equal(engine.bodies.length, 2)
+    assert.deepEqual(lastParts(engine, 1), [{ type: 'input_audio', input_audio: { data: WAV_B64, format: 'wav' } }])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('Regenerate and Save & Resend of a voice message are refused with 409 audio_unsupported once the model no longer hears', async () => {
+  const h = inFlightHarness()
+  setHearing(h, true)
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    await (await h.app.request(`${base}/messages`, json({ audio: [WAV_URL] }))).text()
+    const rows = () => h.store.getMessages(conv.id).map((m) => [m.id, m.isActive])
+    const before = rows()
+    setHearing(h, false)
+
+    for (const body of [{ regenerate: true }, { edit: { messageId: before[0][0], content: 'typed instead' } }]) {
+      const res = await h.app.request(`${base}/continue`, json(body))
+      assert.equal(res.status, 409, JSON.stringify(body))
+      assert.equal(await errorCode(res), 'audio_unsupported')
+    }
+    // The reply was not set aside, the question not branched, and the engine not handed audio it cannot take.
+    assert.deepEqual(rows(), before)
+    assert.equal(engine.bodies.length, 1)
+    assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('a later text turn resends the earlier voice turn\'s clip when the model hears, and the placeholder when it no longer does', async () => {
+  const h = inFlightHarness()
+  setHearing(h, true)
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    await (await h.app.request(`${base}/messages`, json({ audio: [WAV_URL] }))).text()
+
+    await (await h.app.request(`${base}/messages`, json({ content: 'and in French?' }))).text()
+    const heard = engine.bodies[1].messages.find((m) => m.role === 'user')!.content as Part[]
+    assert.deepEqual(heard, [{ type: 'input_audio', input_audio: { data: WAV_B64, format: 'wav' } }])
+
+    setHearing(h, false)
+    await (await h.app.request(`${base}/messages`, json({ content: 'once more' }))).text()
+    assert.equal(engine.bodies[2].messages.find((m) => m.role === 'user')!.content, VOICE_MESSAGE_PLACEHOLDER)
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('voiceClipsRefusal accepts up to 8 WAV or MP3 clips and names why it refuses the rest', () => {
+  assert.equal(voiceClipsRefusal([]), null)
+  assert.equal(voiceClipsRefusal(Array.from({ length: 8 }, () => WAV_URL)), null)
+  assert.equal(voiceClipsRefusal(['data:audio/mpeg;base64,AAAA', `attachment:${'a'.repeat(64)}.wav`]), null)
+  assert.match(voiceClipsRefusal(Array.from({ length: 9 }, () => WAV_URL))!, /at most 8/)
+  for (const clip of ['data:audio/ogg;base64,AAAA', 'data:image/png;base64,AAAA', '', 'https://example.com/a.wav']) {
+    assert.match(voiceClipsRefusal([clip])!, /WAV or MP3/, clip)
+  }
+  assert.match(voiceClipsRefusal([`data:audio/wav;base64,${'A'.repeat(44 * 1024 * 1024)}`])!, /32 MB/)
+})
+
+// A data URL the store cannot turn into a file (garbage, line breaks, odd padding) would stay inline in the message row,
+// up to 44 MB of it, and be resent on every later turn; the engine would answer it with an opaque 500.
+test('voiceClipsRefusal refuses a clip whose base64 is not canonical, so it cannot sit inline in the database', () => {
+  for (const clip of ['data:audio/wav;base64,!!!', 'data:audio/wav;base64,AAAA\nAAAA', 'data:audio/wav;base64,AAA', 'data:audio/wav;base64,AA=A', 'data:audio/wav;base64,AAAB=']) {
+    assert.match(voiceClipsRefusal([clip])!, /valid base64/, clip)
+  }
+})
+
+// Checked before the conversation is read and the model asked, so a refused send writes nothing to disk (the janitor
+// would only collect the clips later, and a model swap between recording and send makes this easy to hit).
+test('a refused voice send leaves no clip file on disk', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    const attachments = join(h.d.store.dir(), 'attachments')
+    const files = () => (existsSync(attachments) ? readdirSync(attachments).filter((f) => !f.endsWith('.tmp')) : [])
+    setHearing(h, false)
+    assert.equal((await h.app.request(`/api/v1/conversations/${conv.id}/messages`, json({ content: 'hi', audio: [WAV_URL] }))).status, 409)
+    assert.deepEqual(files(), [], 'a model that cannot hear refused the clip')
+    setHearing(h, true)
+    assert.equal((await h.app.request('/api/v1/conversations/no-such-chat/messages', json({ audio: [WAV_URL] }))).status, 404)
+    assert.deepEqual(files(), [], 'a conversation that does not exist refused the clip')
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+// The cap must not replace the request object: holdTurn finds the caller by it (auth.ts admissions), so a replaced
+// request would leave a running turn that revoking the caller's way in no longer stops.
+test('readCappedJson reads a JSON body within the cap, whatever its framing, and reports one past it without parsing it', async () => {
+  const chunked = (parts: string[]) => new Request('http://x/', {
+    method: 'POST', duplex: 'half',
+    body: new ReadableStream({ start(ctl) { for (const p of parts) ctl.enqueue(new TextEncoder().encode(p)); ctl.close() } }),
+  } as RequestInit)
+  assert.deepEqual(await readCappedJson(chunked(['{"a":', '1}']), 100), { ok: true, value: { a: 1 } })
+  assert.deepEqual(await readCappedJson(chunked(['{"a":', '"' + 'x'.repeat(50) + '"}']), 20), { ok: false })
+  assert.deepEqual(await readCappedJson(chunked(['not json']), 100), { ok: true, value: {} }, 'unparsable is an empty body, as body() treats it')
+  assert.deepEqual(await readCappedJson(new Request('http://x/', { method: 'POST' }), 100), { ok: true, value: {} })
+})
+
+test('POST /messages refuses a body larger than eight clips and a few images with 413 before reading it', async () => {
+  const h = inFlightHarness()
+  try {
+    const conv = h.store.createConversation()
+    const res = await h.app.request(`/api/v1/conversations/${conv.id}/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'content-length': String(600 * 1024 * 1024) }, body: '{}',
+    })
+    assert.equal(res.status, 413)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('recentTitleTurns drops input_audio parts, names a clip-only turn, and leaves images and plain text alone', () => {
+  const clip = { type: 'input_audio', input_audio: { data: WAV_B64, format: 'wav' } }
+  const image = { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }
+  const turns = recentTitleTurns([
+    { role: 'user', content: [clip] },
+    { role: 'assistant', content: 'You said hello.' },
+    { role: 'user', content: [{ type: 'text', text: 'this' }, image, clip] },
+  ], 3)
+  assert.deepEqual(turns.map((t) => t.content), [
+    VOICE_MESSAGE_PLACEHOLDER,
+    'You said hello.',
+    [{ type: 'text', text: 'this' }, image],
+  ])
+  const imageTurn = { role: 'user', content: [image] }
+  assert.equal(recentTitleTurns([imageTurn])[0], imageTurn, 'a turn without a clip is passed through untouched')
 })
