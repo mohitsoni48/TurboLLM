@@ -46,7 +46,16 @@ export const RUN_PYTHON_UNAVAILABLE = 'Error: run_python is only available in a 
 
 const DOCUMENT_TYPES = /\.(csv|tsv|txt|json|jsonl|md|py|xml|ya?ml|log|sql|html?)$/i
 const IMAGE_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg' }
-const TEXT_BACK_LIMIT = 8 * 1024
+// What the model reads of a run. Capped part by part, a run once came back as 230,000 characters; capped at fetch_url's
+// 20,000 (builtin.ts FETCH_URL_MAX_CHARS), it still did not fit an 8,192-token context: text like "x,y\n" is about two
+// characters a token. The engine refused the request both times and the reply came back empty.
+export const RESULT_MAX_CHARS = 20_000
+
+/** The characters a run's result may take for a model with `ctxTokens` of context: half of it, so at two characters a
+ *  token at most a quarter of the context, and never more than fetch_url's 20,000. */
+export function resultBudget(ctxTokens?: number | null): number {
+  return ctxTokens && ctxTokens > 0 ? Math.max(2_000, Math.min(RESULT_MAX_CHARS, Math.floor(ctxTokens / 2))) : RESULT_MAX_CHARS
+}
 const MAX_INPUT_TOTAL = 100 * 1024 * 1024
 const MAX_INPUT_FILES = 20
 
@@ -158,13 +167,19 @@ export function imageType(bytes: Buffer): 'image/png' | 'image/jpeg' | null {
 }
 
 /** The tool result the model reads, and the image references the reply row keeps. */
-export async function describeRun(r: SandboxRunResult, store: Pick<AttachmentStore, 'save'>): Promise<{ result: string; files: string[] }> {
+export async function describeRun(r: SandboxRunResult, store: Pick<AttachmentStore, 'save'>, budget = RESULT_MAX_CHARS): Promise<{ result: string; files: string[] }> {
+  // Shares of the budget: printed output, warnings, each text file, and the lists that come last.
+  const OUTPUT_BACK_LIMIT = Math.floor(budget * 0.4)
+  const WARNINGS_BACK_LIMIT = Math.floor(budget * 0.1)
+  const TEXT_BACK_LIMIT = Math.floor(budget * 0.2)
+  const RESULT_TAIL_RESERVE = Math.floor(budget * 0.15)
   const lines: string[] = []
   const refs: string[] = []
-  if (r.stdout.trim()) lines.push(`Output:\n${r.stdout.trimEnd()}`)
-  if (r.stderr.trim()) lines.push(`Warnings:\n${r.stderr.trimEnd()}`)
+  if (r.stdout.trim()) lines.push(`Output:\n${cutPrinted(r.stdout.trimEnd(), OUTPUT_BACK_LIMIT)}`)
+  if (r.stderr.trim()) lines.push(`Warnings:\n${cutPrinted(r.stderr.trimEnd(), WARNINGS_BACK_LIMIT)}`)
   if (!r.ok) lines.push(`Python error:\n${pythonError(r.error ?? 'unknown error')}`)
   const shown: string[] = []
+  const texts: Array<{ name: string; text: string }> = []
   for (const f of r.files) {
     const ext = f.name.slice(f.name.lastIndexOf('.') + 1).toLowerCase()
     if (IMAGE_MIME[ext]) {
@@ -184,13 +199,39 @@ export async function describeRun(r: SandboxRunResult, store: Pick<AttachmentSto
       }
       continue
     }
-    const text = f.bytes.toString('utf8')
-    lines.push(`${f.name}:\n${text.length > TEXT_BACK_LIMIT ? `${text.slice(0, TEXT_BACK_LIMIT)}\n[cut off: ${f.bytes.length} bytes in all]` : text}`)
+    texts.push({ name: f.name, text: f.bytes.toString('utf8') })
   }
+  // Text files come back while the result's budget lasts; the rest are named, so the model can read what it needs in
+  // another run.
+  const leftOut: string[] = []
+  let used = lines.reduce((n, l) => n + l.length + 2, 0)
+  for (const t of texts) {
+    const piece = `${t.name}:\n${cut(t.text, TEXT_BACK_LIMIT)}`
+    if (used + piece.length + 2 > budget - RESULT_TAIL_RESERVE) { leftOut.push(t.name); continue }
+    lines.push(piece)
+    used += piece.length + 2
+  }
+  if (leftOut.length) lines.push(`Not included, the result would be too long: ${leftOut.join(', ')}. Read what you need from them in another run and print it.`)
   if (shown.length) lines.push(`Shown to the user in the chat: ${shown.join(', ')}`)
-  if (r.skipped.length) lines.push(`Not returned (only png, jpg, csv, json, txt and py files are, up to 20 per run): ${r.skipped.slice(0, 20).join(', ')}`)
+  if (r.skipped.length) lines.push(`Not returned (only png, jpg, csv, json, txt and py files are, up to 20 per run and 25 MB each): ${r.skipped.slice(0, 20).join(', ')}${r.skipped.length > 20 ? `, and ${r.skipped.length - 20} more` : ''}`)
   if (!lines.length) lines.push('(no output; use print() to see values)')
-  return { result: lines.join('\n\n'), files: refs }
+  return { result: cut(lines.join('\n\n'), budget), files: refs }
+}
+
+/** `text` up to `max` characters, with a note of how long it was when it is cut. */
+function cut(text: string, max: number, total = `${text.length}`): string {
+  return text.length > max ? `${text.slice(0, max)}\n[cut off: ${total} characters in all]` : text
+}
+
+/** What sandbox-host.mjs ends printed text with when the run printed more than it keeps. */
+const HOST_CUT_NOTE = '\n[output cut off]'
+
+/** Printed text cut like `cut`. Text the host already cut is only the start of what was printed, so its length is
+ *  given as "more than", never as the whole. */
+function cutPrinted(text: string, max: number): string {
+  if (!text.endsWith(HOST_CUT_NOTE)) return cut(text, max)
+  const kept = text.slice(0, -HOST_CUT_NOTE.length)
+  return kept.length > max ? cut(kept, max, `more than ${kept.length}`) : text
 }
 
 /** The SandboxTurn for one live chat turn. `history` is read at the call: the chat's active rows before the turn's
@@ -200,6 +241,8 @@ export function sandboxTurn(o: {
   manager: SandboxManager
   store: Pick<AttachmentStore, 'inline' | 'save'>
   history: () => ChatRow[]
+  /** The characters a result may take (resultBudget of the loaded model's context), read at each run. */
+  resultChars?: () => number
 }): SandboxTurn {
   // Files go in with the turn's first run, and into any fresh sandbox (closed when idle, or after a timeout): a later
   // run of the same turn in a warm sandbox must not overwrite what the code changed in them.
@@ -218,7 +261,7 @@ export function sandboxTurn(o: {
         sent = true
         ranHere = true
         const r = await o.manager.run(o.convId, code, files, signal)
-        const done = await describeRun(r, o.store)
+        const done = await describeRun(r, o.store, o.resultChars?.() ?? RESULT_MAX_CHARS)
         if (!fresh || !ranBefore) return done
         const back = files.length ? ` The files attached in this chat are back in the folder: ${files.map((f) => f.name).join(', ')}.` : ''
         return { ...done, result: `This run started a new sandbox: variables from earlier runs are gone.${back}\n\n${done.result}` }

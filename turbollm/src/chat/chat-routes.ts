@@ -30,7 +30,7 @@ import { runGenerationCore } from './generation-core'
 import { nonStringField } from '../util/string-fields'
 import { conversationBodyError, CREATE_FIELDS, PATCH_FIELDS, patchFields } from './conversation-body.js'
 import { isSandboxEnabled } from '../sandbox/gate'
-import { sandboxTurn, type SandboxTurn } from '../sandbox/run-python'
+import { resultBudget, sandboxTurn, type SandboxTurn } from '../sandbox/run-python'
 import { ALWAYS_ASK_TOOLS } from '../tools/tool-policy'
 
 /** The per-request code-routine trust decision. Exported ONLY so it can be behaviourally
@@ -1308,6 +1308,8 @@ function chatSandbox(d: Deps, convId: string, assistantId: string, isCodeAuthori
       const at = msgs.findIndex((m) => m.id === assistantId)
       return msgs.slice(0, at < 0 ? msgs.length : at)
     },
+    // A run's result is sized to the loaded model's context, which a fixed cap did not fit.
+    resultChars: () => resultBudget(d.manager.status().model?.ctx),
   })
 }
 

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { describeRun, documentsFrom, filesFor, imageType, pythonError, RUN_PYTHON_TOOL, safeName, sandboxTurn, turnFiles } from './run-python'
+import { describeRun, documentsFrom, filesFor, imageType, pythonError, resultBudget, RUN_PYTHON_TOOL, safeName, sandboxTurn, turnFiles } from './run-python'
 import type { SandboxManager } from './sandbox-manager'
 import { SandboxError, type SandboxFile, type SandboxRunResult } from './sandbox-process'
 
@@ -88,9 +88,59 @@ test('describeRun: images to the store and the reply, text files back to the mod
   assert.deepEqual(r.files, [`attachment:${'0'.repeat(64)}.png`])
   assert.match(r.result, /^Output:\n12/)
   assert.match(r.result, /out\.csv:\na,b/)
-  assert.match(r.result, /\[cut off: 9000 bytes in all\]/)
+  assert.match(r.result, /\[cut off: 9000 characters in all\]/)
   assert.match(r.result, /Shown to the user in the chat: chart\.png/)
   assert.match(r.result, /Not returned .*evil\.exe/)
+})
+
+// Found attacking run_python by hand: 10 MB printed and 25 CSVs of 1 MB each came back as 230,000 characters, the engine
+// refused the request (171,235 tokens against an 8,192 context) and the reply was empty.
+test('describeRun: the whole result stays within 20,000 characters, and files that did not fit are named', async () => {
+  const csv = Buffer.from('x,y\n'.repeat(250_000))
+  const r = await describeRun(result({
+    stdout: `${'A'.repeat(64 * 1024)}\n[output cut off]\n`,
+    files: Array.from({ length: 20 }, (_, i) => ({ name: `part${i}.csv`, bytes: csv })),
+    skipped: ['part20.csv', 'huge.png'],
+  }), store)
+  assert.ok(r.result.length <= 20_000 + 60, `${r.result.length} characters`)
+  assert.match(r.result, /^Output:\nA{8000}\n\[cut off: more than 65536 characters in all\]/)
+  assert.match(r.result, /part0\.csv:\nx,y/)
+  assert.match(r.result, /Not included, the result would be too long: (part\d+\.csv, )*part19\.csv\. Read what you need from them in another run and print it\./)
+  assert.match(r.result, /Not returned \(.*25 MB each\): part20\.csv, huge\.png$/)
+})
+
+// The same run capped at 20,000 characters still did not fit Gemma's 8,192-token context: 16,620 characters of "A"s and
+// "x,y" came to 11,514 tokens with the chat. The budget follows the loaded model's context.
+test('resultBudget: half the context in characters, at most 20,000; and an 8K model gets a result that fits', async () => {
+  assert.equal(resultBudget(8192), 4096)
+  assert.equal(resultBudget(32_768), 16_384)
+  assert.equal(resultBudget(131_072), 20_000)
+  assert.equal(resultBudget(undefined), 20_000)
+  assert.equal(resultBudget(1024), 2000)
+  const csv = Buffer.from('x,y\n'.repeat(250_000))
+  const r = await describeRun(result({
+    stdout: `${'A'.repeat(64 * 1024)}\n[output cut off]\n`,
+    files: Array.from({ length: 20 }, (_, i) => ({ name: `part${i}.csv`, bytes: csv })),
+    skipped: ['part20.csv', 'huge.png'],
+  }), store, resultBudget(8192))
+  assert.ok(r.result.length <= 4096 + 60, `${r.result.length} characters`)
+  assert.match(r.result, /Not included, the result would be too long/)
+})
+
+// Found attacking run_python by hand: 10,000,001 characters printed reached the model as "[cut off: 65553 characters
+// in all]", the length of what the host kept plus its own note.
+test('describeRun: printed text the host already cut is said to be longer than what was kept, not that long', async () => {
+  const hostCut = (s: string) => result({ stdout: `${s}\n[output cut off]\n`, stderr: `${s}\n[output cut off]\n` })
+  const big = await describeRun(hostCut('A'.repeat(64 * 1024)), store)
+  assert.match(big.result, /^Output:\nA{8000}\n\[cut off: more than 65536 characters in all\]/)
+  assert.match(big.result, /Warnings:\nA{2000}\n\[cut off: more than 65536 characters in all\]/)
+  assert.doesNotMatch(big.result, /65553/)
+  // Kept whole when it fits: the host's own note then tells the model.
+  assert.match((await describeRun(hostCut('A'.repeat(100)), store)).result, /^Output:\nA{100}\n\[output cut off\]/)
+  // A file is never cut by the host, so a file ending with that note keeps its exact length.
+  const file = Buffer.from(`${'x'.repeat(9000)}\n[output cut off]`)
+  const f = await describeRun(result({ files: [{ name: 'log.txt', bytes: file }] }), store)
+  assert.match(f.result, new RegExp(`\\[cut off: ${file.length} characters in all\\]`))
 })
 
 test('describeRun: a Python error, and a run with nothing to say', async () => {
