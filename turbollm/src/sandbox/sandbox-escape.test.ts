@@ -136,6 +136,27 @@ for f in (lambda: os.system('whoami'), lambda: os.popen('whoami'), lambda: os.ex
   p.kill()
 })
 
+// Found the same way: a chart named rapport-été.png (or a 200-letter name) made the honest host send a name its
+// daemon refuses, and the daemon rightly killed the sandbox. Names now go out the way the daemon takes them.
+test('escape: odd output names and a flood of files still give a result the daemon accepts', { skip }, async () => {
+  const p = await start()
+  const r = await p.run(`png = bytes.fromhex("89504e470d0a1a0a")
+for n in ("rapport-été.png", "a" * 200 + ".png", "CON.png", "日本.png", "x;y|z.png", "rapport-ete.png"):
+    open(n, "wb").write(png)
+for i in range(250):
+    open(f"junk{i}.bin", "wb").write(b"x")
+x = 1`)
+  assert.equal(r.ok, true, r.error)
+  const names = r.files.map((f) => f.name)
+  assert.equal(names.length, 6, names.join(', '))
+  for (const n of names) assert.match(n, /^[A-Za-z0-9._ ()-]{1,128}$/, n)
+  assert.ok(names.includes('rapport-ete.png') && names.includes('rapport-ete-2.png'), names.join(', '))
+  assert.equal(r.skipped.length, 200)
+  assert.match(r.skipped.at(-1)!, /^…and 51 more$/)
+  assert.equal((await p.run('print(x)')).stdout.trim(), '1', 'same sandbox')
+  p.kill()
+})
+
 // Found the same way: a Worker asking for Deno permissions makes Deno exit (an unstable option it refuses by
 // exiting). The host uses no Workers, so the sandboxed code has none.
 test('escape: the sandboxed code has no Worker', { skip }, async () => {

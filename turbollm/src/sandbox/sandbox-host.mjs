@@ -84,6 +84,22 @@ async function* frames() {
   }
 }
 
+// The daemon refuses a whole result over one name it does not accept (sandbox-process.ts OUTPUT_NAME, MAX_SKIPPED),
+// so an honest result fits its rules: `Umsätze.png` goes as `Umsatze.png`, a 200-letter name is shortened.
+const OUTPUT_NAME_CHARS = /[^A-Za-z0-9._ ()-]/g
+const MAX_NAME = 128
+const MAX_SKIPPED = 200
+
+function sendableName(name, used) {
+  const dot = name.lastIndexOf('.')
+  const ext = name.slice(dot) // OUTPUT_TYPES matched it: a plain ASCII extension
+  const base = name.slice(0, dot).normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(OUTPUT_NAME_CHARS, '_').slice(0, MAX_NAME - ext.length - 4) || 'file'
+  let out = base + ext
+  for (let k = 2; used.has(out.toLowerCase()); k++) out = `${base}-${k}${ext}`
+  used.add(out.toLowerCase())
+  return out
+}
+
 function capped(text) {
   const bytes = enc.encode(text)
   if (bytes.length <= TEXT_LIMIT) return bytes
@@ -153,16 +169,20 @@ for await (const { header, payload } of frames()) {
   const files = []
   const parts = []
   const skipped = []
+  let unnamed = 0
+  const skip = (name) => { if (skipped.length < MAX_SKIPPED - 1) skipped.push(name.slice(0, 256)); else unnamed++ }
+  const used = new Set()
   let total = 0
   for (const [name, stamp] of listWork()) {
     if (before.get(name) === stamp) continue
-    if (!OUTPUT_TYPES.test(name)) { skipped.push(name); continue }
+    if (!OUTPUT_TYPES.test(name)) { skip(name); continue }
     const bytes = py.FS.readFile(`${WORK}/${name}`)
-    if (files.length >= MAX_OUTPUT_FILES || bytes.length > MAX_OUTPUT_FILE || total + bytes.length > MAX_OUTPUT_TOTAL) { skipped.push(name); continue }
-    files.push({ name, size: bytes.length })
+    if (files.length >= MAX_OUTPUT_FILES || bytes.length > MAX_OUTPUT_FILE || total + bytes.length > MAX_OUTPUT_TOTAL) { skip(name); continue }
+    files.push({ name: sendableName(name, used), size: bytes.length })
     parts.push(bytes)
     total += bytes.length
   }
+  if (unnamed) skipped.push(`…and ${unnamed} more`)
   const out = capped(stdout)
   const err = capped(stderr)
   await send({ t: 'result', size: out.length + err.length + total, ok, error, stdout: out.length, stderr: err.length, files, skipped }, [out, err, ...parts])
