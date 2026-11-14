@@ -285,7 +285,7 @@ export class ToolRegistry {
     }
 
     // Built-in: fetch_url
-    if (name === 'fetch_url') return execFetchUrl(args)
+    if (name === 'fetch_url') return execFetchUrl(args, { pdfReading: this.toolsCfg.pdfReading === true })
 
     // Built-in: run_code — approval gating happens upstream in execute-with-approval.ts
     // before executeTool is ever called, so run_code always executes here.
