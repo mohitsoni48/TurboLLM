@@ -18,14 +18,17 @@ import { SandboxError, RUN_TIMEOUT_MS, type SandboxFile, type SandboxRunResult }
 
 export const RUN_PYTHON = 'run_python'
 
+/** The packages the runtime ships (runtime-manifest.ts), as the model is told them. */
+const PACKAGES = 'numpy, pandas, matplotlib, Pillow and sympy'
+
 /** Fixed, never built per chat: a description that changed per chat would break the prompt cache. */
 export const RUN_PYTHON_TOOL: ToolDefinition = {
   type: 'function',
   function: {
     name: RUN_PYTHON,
     description:
-      'Run Python 3 code in a sandbox on this computer (Pyodide). numpy, pandas, matplotlib, Pillow and sympy are '
-      + 'available. There is no network and no access to the user\'s own files. Files the user attached to their '
+      `Run Python 3 code in a sandbox on this computer (Pyodide). ${PACKAGES} are available, and nothing else can be `
+      + 'installed. There is no network and no access to the user\'s own files. Files the user attached to their '
       + 'message are in the current folder. To give the user a file, save it to the current folder: png and jpg files '
       + 'are shown in the chat; csv, json, txt and py files come back to you as text. Use print() to see values. '
       + 'Variables and files stay between runs in this chat until it has been idle for 10 minutes. Each run may take '
@@ -106,13 +109,24 @@ export async function turnFiles(userMsg: Pick<Message, 'attachments' | 'textAtta
   return files
 }
 
+/** A missing module, said as what it is here. Pyodide's own message ends with how to install the package
+ *  (`micropip.install`, `loadPackage`), which needs the network the sandbox does not have: a model that follows it
+ *  tries again with the same import. Seen with a real model asking for scipy. */
+export function pythonError(error: string): string {
+  const missing = /ModuleNotFoundError: No module named '([^']+)'/.exec(error)
+  if (!missing) return error
+  const kept = error.slice(0, missing.index + missing[0].length)
+  return `${kept}\n'${missing[1].split('.')[0]}' cannot be installed: the sandbox has no network. Only the Python standard `
+    + `library and ${PACKAGES} are available; write the code with those.`
+}
+
 /** The tool result the model reads, and the image references the reply row keeps. */
 export async function describeRun(r: SandboxRunResult, store: Pick<AttachmentStore, 'save'>): Promise<{ result: string; files: string[] }> {
   const lines: string[] = []
   const refs: string[] = []
   if (r.stdout.trim()) lines.push(`Output:\n${r.stdout.trimEnd()}`)
   if (r.stderr.trim()) lines.push(`Warnings:\n${r.stderr.trimEnd()}`)
-  if (!r.ok) lines.push(`Python error:\n${r.error ?? 'unknown error'}`)
+  if (!r.ok) lines.push(`Python error:\n${pythonError(r.error ?? 'unknown error')}`)
   const shown: string[] = []
   for (const f of r.files) {
     const ext = f.name.slice(f.name.lastIndexOf('.') + 1).toLowerCase()

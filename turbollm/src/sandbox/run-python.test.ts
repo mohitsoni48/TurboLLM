@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { describeRun, documentsFrom, RUN_PYTHON_TOOL, safeName, sandboxTurn, turnFiles } from './run-python'
+import { describeRun, documentsFrom, pythonError, RUN_PYTHON_TOOL, safeName, sandboxTurn, turnFiles } from './run-python'
 import type { SandboxManager } from './sandbox-manager'
 import { SandboxError, type SandboxFile, type SandboxRunResult } from './sandbox-process'
 
@@ -65,6 +65,25 @@ test('describeRun: images to the store and the reply, text files back to the mod
 test('describeRun: a Python error, and a run with nothing to say', async () => {
   assert.match((await describeRun(result({ ok: false, error: 'ZeroDivisionError: division by zero' }), store)).result, /Python error:\nZeroDivisionError/)
   assert.match((await describeRun(result({}), store)).result, /no output; use print\(\)/)
+})
+
+// The exact text Pyodide 0.29.5 gave Gemma 4 E4B for `from scipy.stats import linregress` in a real chat.
+test('describeRun: a module the runtime does not ship is not sent to micropip', async () => {
+  const error = [
+    '    coroutine = eval(self.code, globals, locals)',
+    '  File "<exec>", line 4, in <module>',
+    "ModuleNotFoundError: No module named 'scipy'",
+    "The module 'scipy' is included in the Pyodide distribution, but it is not installed.",
+    'You can install it by calling:',
+    '  await micropip.install("scipy") in Python, or',
+    '  await pyodide.loadPackage("scipy") in JavaScript',
+  ].join('\n')
+  const r = (await describeRun(result({ ok: false, error }), store)).result
+  assert.match(r, /No module named 'scipy'\n'scipy' cannot be installed: the sandbox has no network/)
+  assert.match(r, /numpy, pandas, matplotlib, Pillow and sympy/)
+  assert.doesNotMatch(r, /micropip|loadPackage/)
+  assert.match(pythonError("ModuleNotFoundError: No module named 'sklearn.linear_model'"), /'sklearn' cannot be installed/)
+  assert.equal(pythonError('ZeroDivisionError: division by zero'), 'ZeroDivisionError: division by zero')
 })
 
 test('describeRun: an image the store could not keep is not claimed as shown', async () => {
