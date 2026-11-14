@@ -32,6 +32,7 @@ import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
 import { ToolApprovalBar } from './chat/ToolApprovalBar'
 import { VoiceBar } from './chat/VoiceBar'
 import { useVoiceInput, type ComposerClip } from './chat/useVoiceInput'
+import { useConversationMode, type ConversationMode } from './chat/useConversationMode'
 import { formatClock } from '../lib/voice/pcm'
 import { speaker, ttsAvailable, type SpeechStream } from '../lib/voice/tts'
 import { readAloudOptions } from '../lib/voice/use-tts'
@@ -1086,11 +1087,24 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // "Send automatically" only when a send can go out now. One that send() would refuse (a reply still streaming, no
   // model ready) leaves what was said in the chat box, where it used to be dropped.
   const autoSendNow = () => useVoiceStore.getState().autoSend && !composerLocked
+  // Full voice mode (useConversationMode, below useVoiceInput): when it is on, a spoken message
+  // always goes straight out - hands-free means no look at the chat box - and the loop is told so.
+  const conversationRef = useRef<ConversationMode | null>(null)
   const voice = useVoiceInput({
     modelHears,
     onText: (text) => {
       voiceUsed.current = true
       const combined = input.trim() ? `${input.trimEnd()} ${text}` : text
+      const conv = conversationRef.current
+      if (conv?.active) {
+        if (!composerLocked) {
+          void send(combined)
+          conv.emit({ type: 'message-sent' })
+        } else {
+          conv.emit({ type: 'send-failed' })
+        }
+        return
+      }
       if (autoSendNow()) {
         void send(combined)
         return
@@ -1100,6 +1114,16 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     },
     onClip: (clip: ComposerClip) => {
       voiceUsed.current = true
+      const conv = conversationRef.current
+      if (conv?.active) {
+        if (!composerLocked) {
+          void send(undefined, [...attachments, clip])
+          conv.emit({ type: 'message-sent' })
+        } else {
+          conv.emit({ type: 'send-failed' })
+        }
+        return
+      }
       if (autoSendNow()) {
         void send(undefined, [...attachments, clip])
         return
@@ -1109,7 +1133,16 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     },
     notify: (message, kind) => { if (kind === 'error') toast.error(message); else toast(message) },
   })
+  const conversation = useConversationMode({ voice, replyStreaming: !!live || daemonGenerating, composerLocked })
+  conversationRef.current = conversation
   const onMicClick = () => {
+    // Voice conversation on: a tap on the mic is barge-in (stop the reply, hear me now), except
+    // mid-recording, where it still finishes the clip like always.
+    if (conversation.active) {
+      if (voice.phase === 'recording') { void voice.stop(); return }
+      conversation.interrupt()
+      return
+    }
     if (voice.phase === 'recording') { void voice.stop(); return }
     if (voice.phase !== 'idle') return
     if (voice.block) {
@@ -1122,6 +1155,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     void voice.start()
   }
   const micLabel = voice.phase === 'recording' ? 'Finish recording' : 'Record a voice message'
+  const conversationLabel = conversation.active ? 'Stop voice conversation' : 'Start a voice conversation (hands-free)'
   const composerEmpty = !input.trim() && attachments.length === 0
 
   // Reading the reply aloud while it is written. A turn that asked for it (send) is spoken from its first complete
@@ -1632,6 +1666,17 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                     give, so it takes the Send button's place while there is nothing to send (below). */}
                 <button
                   type="button"
+                  onClick={() => (conversation.active ? conversation.disable() : conversation.enable())}
+                  disabled={(composerLocked && !conversation.active) || !!voice.block}
+                  className="hidden h-9 w-9 shrink-0 place-items-center rounded-md hover:bg-panel-2 disabled:opacity-40 sm:grid"
+                  title={conversationLabel}
+                  aria-label={conversationLabel}
+                  aria-pressed={conversation.active}
+                >
+                  <AudioLines size={15} className={conversation.active ? undefined : 'text-muted'} style={conversation.active ? { color: 'var(--accent)' } : undefined} />
+                </button>
+                <button
+                  type="button"
                   onClick={onMicClick}
                   disabled={composerLocked || voice.phase === 'starting' || voice.phase === 'transcribing' || voice.phase === 'choosing'}
                   className="hidden h-9 w-9 shrink-0 place-items-center rounded-md hover:bg-panel-2 disabled:opacity-40 sm:grid"
@@ -1699,6 +1744,19 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                   <>
                     {/* Phone widths: with nothing typed or attached there is nothing to send, so this place is
                         the microphone's. From sm up it has its own button beside the paperclip. */}
+                    {(composerEmpty || conversation.active) && (
+                      <Button
+                        size="icon"
+                        variant={conversation.active ? 'default' : 'outline'}
+                        className="sm:hidden"
+                        onClick={() => (conversation.active ? conversation.disable() : conversation.enable())}
+                        disabled={(composerLocked && !conversation.active) || !!voice.block}
+                        aria-label={conversationLabel}
+                        aria-pressed={conversation.active}
+                      >
+                        <AudioLines size={15} />
+                      </Button>
+                    )}
                     {composerEmpty && (
                       <Button
                         size="icon"

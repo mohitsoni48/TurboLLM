@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest'
 import {
   applyConversation,
   reduceConversation,
-  type ConversationEffect,
   type ConversationEvent,
   type ConversationPhase,
 } from './conversation-mode'
