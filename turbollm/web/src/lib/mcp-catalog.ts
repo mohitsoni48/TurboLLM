@@ -409,12 +409,12 @@ export const LOCAL_MCPS: LocalEntry[] = [
     id: 'mcp-web-engine',
     name: 'MCP Web Engine',
     cat: 'Search',
-    desc: 'Local MCP tools for search, public-page fetch and Markdown extraction. Requires uv and a running SearXNG instance; its upstream engines may receive queries. Optional DuckDuckGo fallback is off by default. Separate from the built-in search provider.',
+    desc: 'Local MCP tools for search, public-page fetch and Markdown extraction. Needs a running SearXNG instance with JSON output enabled; its upstream engines may receive queries. Optional DuckDuckGo fallback is off by default. Separate from the built-in search provider.',
     cmd: 'uvx mcp-web-engine==1.2.0',
     uvx: true,
     envs: [
-      { key: 'SEARXNG_URL', desc: 'Your running SearXNG JSON search endpoint, e.g. http://127.0.0.1:8080/search', required: true },
-      { key: 'ALLOW_DDG_FALLBACK', desc: 'Keep false unless direct DuckDuckGo queries are explicitly wanted when SearXNG fails.', required: false },
+      { key: 'SEARXNG_URL', desc: 'Your running SearXNG search endpoint (JSON format enabled in its settings.yml), e.g. http://127.0.0.1:8080/search', required: true },
+      { key: 'ALLOW_DDG_FALLBACK', desc: 'true or false (leave blank for false). Only set true if direct DuckDuckGo queries are wanted when SearXNG fails; any other value stops the server from starting.', required: false },
     ],
   },
 ]

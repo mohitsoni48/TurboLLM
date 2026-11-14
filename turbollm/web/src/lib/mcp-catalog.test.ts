@@ -28,6 +28,20 @@ describe('LOCAL_MCPS', () => {
     expect(fallback.desc).toContain('false')
   })
 
+  it('MCP Web Engine copy states what a working setup needs, without repeating the uv notice', () => {
+    const engine = LOCAL_MCPS.find((e) => e.id === 'mcp-web-engine')!
+    // A stock SearXNG serves HTML only; the server always asks for JSON, so every search
+    // would fail with SEARXNG_UNAVAILABLE unless JSON output is switched on.
+    expect(engine.desc).toMatch(/JSON output enabled/)
+    expect(engine.envs.find((e) => e.key === 'SEARXNG_URL')!.desc).toMatch(/JSON format enabled/)
+    // The Customize panel already shows "Requires uv" for every uvx entry.
+    expect(engine.desc).not.toMatch(/requires uv/i)
+    // A non-boolean value makes the server exit at start-up, so say which values are accepted.
+    const fallback = engine.envs.find((e) => e.key === 'ALLOW_DDG_FALLBACK')!
+    expect(fallback.desc).toMatch(/true or false/)
+    expect(fallback.desc).toMatch(/any other value stops the server/i)
+  })
+
   it('the PostgreSQL entry takes its password in PGPASSWORD, not in the connection-string argument', () => {
     const pg = LOCAL_MCPS.find((e) => e.id === 'postgres')!
     expect(pg.argNote).toContain('postgresql://user@host/db')
