@@ -96,7 +96,22 @@ try {
   py = await loadPyodide({ indexURL: pyodideDir.replace(/\\/g, '/') + '/', stdout: () => {}, stderr: () => {} })
   py.FS.mkdirTree(WORK)
   py.FS.chdir(WORK)
-  py.runPython("import os\nos.environ['MPLBACKEND'] = 'Agg'")
+  // os.system and friends would leave the run waiting on a process that can never start; with nothing else pending,
+  // Deno ends the whole sandbox ("Top-level await promise never resolved"). Fail them the way subprocess already does.
+  py.runPython([
+    'import os',
+    "os.environ['MPLBACKEND'] = 'Agg'",
+    'def _no_programs(*args, **kwargs):',
+    "    raise OSError(138, 'starting programs is not supported in this sandbox')",
+    "for _name in ('system', 'popen', 'fork', 'forkpty', 'posix_spawn', 'posix_spawnp', 'execv', 'execve', 'execvp', 'execvpe', 'execl', 'execle', 'execlp', 'execlpe', 'spawnv', 'spawnve', 'spawnvp', 'spawnvpe', 'spawnl', 'spawnle', 'spawnlp', 'spawnlpe'):",
+    '    if hasattr(os, _name):',
+    '        setattr(os, _name, _no_programs)',
+    'del _name, _no_programs',
+  ].join('\n'))
+  // Nothing here uses Workers, and a Worker asking for Deno permissions ends the process outright (an unstable option
+  // Deno refuses by exiting, not by throwing). Out of the sandboxed code's reach; the polite Stop (PR 4) will keep a
+  // private reference for its own worker before this runs.
+  delete globalThis.Worker
 } catch (e) {
   await send({ t: 'fatal', size: 0, error: String(e?.message ?? e).split('\n')[0].slice(0, 500) })
   Deno.exit(1)

@@ -208,7 +208,9 @@ export function sandboxTurn(o: {
         const back = files.length ? ` The files attached in this chat are back in the folder: ${files.map((f) => f.name).join(', ')}.` : ''
         return { ...done, result: `This run started a new sandbox: variables from earlier runs are gone.${back}\n\n${done.result}` }
       } catch (e) {
-        if (e instanceof SandboxError) return { result: `Error: ${e.message}${e.code === 'timeout' ? ' Variables from earlier runs are gone.' : ''}`, files: [] }
+        // Each of these ended the process: the next run starts a new sandbox.
+        const gone = e instanceof SandboxError && (e.code === 'timeout' || e.code === 'crashed' || e.code === 'violation')
+        if (e instanceof SandboxError) return { result: `Error: ${e.message}${gone ? ' Variables from earlier runs are gone.' : ''}`, files: [] }
         throw e
       }
     },

@@ -157,4 +157,7 @@ test('sandboxTurn: empty code, and a sandbox failure, come back as the tool\'s e
   const ac = new AbortController()
   assert.match((await turn.run({}, ac.signal)).result, /needs a non-empty `code`/)
   assert.match((await turn.run({ code: 'while True: pass' }, ac.signal)).result, /^Error: The code ran longer .* Variables from earlier runs are gone\.$/)
+  // A process that ended on its own (Deno.exit, a crash) says the same: the next run is a new sandbox.
+  const crashed = { has: () => false, run: async () => { throw new SandboxError('crashed', 'The sandbox stopped unexpectedly.') } } as unknown as SandboxManager
+  assert.match((await sandboxTurn({ convId: 'c1', manager: crashed, store, history: () => [] }).run({ code: 'x' }, ac.signal)).result, /^Error: The sandbox stopped unexpectedly\. Variables from earlier runs are gone\.$/)
 })

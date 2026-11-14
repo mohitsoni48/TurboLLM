@@ -119,6 +119,29 @@ test('escape: a Worker asking for more permissions than its parent gets nothing'
   p.kill()
 })
 
+// Found by hand through the app: os.system left the run waiting on a process that never starts, and Deno ended the
+// whole sandbox (every variable in the chat) instead of the call failing.
+test('escape: os.system and friends fail as an error, and the sandbox lives on', { skip }, async () => {
+  const p = await start()
+  const r = await p.run(`import os
+x = 41
+for f in (lambda: os.system('whoami'), lambda: os.popen('whoami'), lambda: os.execv('/bin/sh', ['sh'])):
+    try:
+        f()
+        print('RAN')
+    except OSError as e:
+        print('blocked', e.errno)`)
+  assert.equal(r.stdout.trim(), 'blocked 138\nblocked 138\nblocked 138', r.stdout + (r.error ?? ''))
+  assert.equal((await p.run('print(x + 1)')).stdout.trim(), '42', 'same sandbox, variables kept')
+  p.kill()
+})
+
+// Found the same way: a Worker asking for Deno permissions makes Deno exit (an unstable option it refuses by
+// exiting). The host uses no Workers, so the sandboxed code has none.
+test('escape: the sandboxed code has no Worker', { skip }, async () => {
+  assert.equal(await viaEscape(proc, `return typeof Worker`), 'undefined')
+})
+
 test('escape: a forged frame on stdout does not survive: the process is killed', { skip }, async () => {
   const p = await start()
   await viaEscape(p, `const h = new TextEncoder().encode(JSON.stringify({ t: 'result', size: 0, ok: true, stdout: 0, stderr: 0, files: [] }))
