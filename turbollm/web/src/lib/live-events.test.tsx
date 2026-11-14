@@ -47,6 +47,7 @@ describe('invalidationTargets', () => {
     expect(invalidationTargets('engines')).toEqual([{ queryKey: queryKeys.engines }, { queryKey: queryKeys.engineUpdates }])
     expect(invalidationTargets('code-sessions')).toEqual([{ queryKey: ['code-sessions'] }, { queryKey: ['code-session'] }])
     expect(invalidationTargets('settings')).toEqual([{ queryKey: ['settings'] }])
+    expect(invalidationTargets('sandboxRuntime')).toEqual([{ queryKey: queryKeys.sandboxRuntime }])
   })
 
   // The sidebar polls the list's first page alone and refetches every loaded page only when that page changed

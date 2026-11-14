@@ -158,7 +158,7 @@ export type DaemonSettings = {
    *  verified against a real second machine, so it is opt-in. While it is off the Turbo Link
    *  section does not render, `useLinks`/`useRemoteModels` do not fetch, and every merged
    *  fleet list falls back to local-only rows with no origin column and no machine filter. */
-  experimental: { memory: boolean; cloudDeploy: boolean; routines: boolean; turboLink: boolean; remoteAccess: boolean }
+  experimental: { memory: boolean; cloudDeploy: boolean; routines: boolean; turboLink: boolean; remoteAccess: boolean; sandbox: boolean }
   /** Tool-call approval gate (F-025): per-tool default policy. Missing tools default
    *  to 'ask'. Keyed by tool name (e.g. 'run_code', 'mcp__server__tool'). */
   toolPolicies: Record<string, ToolPolicy>

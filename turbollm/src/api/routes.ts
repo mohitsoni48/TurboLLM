@@ -22,6 +22,7 @@ import { registerLifecycleRoutes } from './lifecycle-routes'
 import { registerMcpRoutes } from './mcp-routes'
 import { registerModelRoutes } from './models-routes'
 import { registerOnboardingRoutes } from './onboarding-routes'
+import { registerSandboxRuntimeRoutes } from './sandbox-runtime-routes'
 import { registerSettingsRoutes } from './settings-routes'
 import { registerStatusRoutes } from './status-routes'
 import { registerSystemOneJobRoutes } from './systemone-job'
@@ -63,4 +64,6 @@ export function registerApi(app: Hono, d: Deps): void {
   registerOnboardingRoutes(app, { store: d.store, telemetry: d.telemetry })
   // The text classification playground's run, as a job a page closing does not stop (systemone-job.ts).
   registerSystemOneJobRoutes(app, d)
+  // The Python sandbox's runtime download (GitHub #52).
+  registerSandboxRuntimeRoutes(app, d)
 }
