@@ -29,6 +29,12 @@ name: npm publish
 # platform package already on the registry at this version is skipped, and so is
 # turbollm itself (inject and publish), while verify-published still runs.
 #
+# The native core is OFF until the repository variable PUBLISH_NATIVE_CORE is 'true'. With it unset the
+# `core` job is skipped, the platform packages are neither published nor listed, turbollm publishes on its
+# own, and the verify jobs skip the platform-package load. Set it only after the @turbollm npm org exists and
+# every @turbollm/core-<target> package has its Trusted Publisher (docs/TODO.md, F-C). Release 1.15.2 shipped
+# with it off because nothing at runtime loads the core yet.
+#
 # A tag from before the native core (no turbollm/core/Cargo.toml at the tag)
 # cannot be published by this workflow: the `core` job has nothing to build.
 # Such a tag can be republished only through the release script's local-token
@@ -48,7 +54,7 @@ permissions:
 
 jobs:
   core:
-    if: startsWith(github.event.release.tag_name || inputs.tag, 'v')
+    if: startsWith(github.event.release.tag_name || inputs.tag, 'v') && vars.PUBLISH_NATIVE_CORE == 'true'
     name: Core build (release)
     uses: ./.github/workflows/core-build.yml
     with:
@@ -57,6 +63,7 @@ jobs:
 
   publish:
     needs: core
+    if: ${{ !cancelled() && (needs.core.result == 'success' || needs.core.result == 'skipped') }}
     name: Publish to npm
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -111,6 +118,7 @@ jobs:
 
       # publish-platform-packages.mjs reads every turbollm-core.<target>.node from one flat folder.
       - name: Download the core binaries
+        if: vars.PUBLISH_NATIVE_CORE == 'true'
         uses: actions/download-artifact@v8
         with:
           pattern: core-node-*
@@ -120,16 +128,18 @@ jobs:
       # Checks all 9 binaries carry the release version before publishing any; skips a package
       # already on the registry at this version (re-run).
       - name: Publish the platform packages
+        if: vars.PUBLISH_NATIVE_CORE == 'true'
         run: node core/scripts/publish-platform-packages.mjs --version "${{ steps.version.outputs.version }}" --artifacts "${{ runner.temp }}/core-node"
         working-directory: turbollm
 
       - name: Wait until the registry answers for every platform package
+        if: vars.PUBLISH_NATIVE_CORE == 'true'
         run: node core/scripts/await-platform-packages.mjs --version "${{ steps.version.outputs.version }}"
         working-directory: turbollm
 
       # Working tree only: the committed package.json never lists the platform packages.
       - name: Add the platform packages to optionalDependencies
-        if: steps.published.outputs.published != 'true'
+        if: steps.published.outputs.published != 'true' && vars.PUBLISH_NATIVE_CORE == 'true'
         run: node core/scripts/inject-optional-deps.mjs "${{ steps.version.outputs.version }}"
         working-directory: turbollm
 
@@ -184,6 +194,7 @@ jobs:
           echo "$out" | grep -F "TurboLLM $VERSION"
 
       - name: Load the installed platform package
+        if: vars.PUBLISH_NATIVE_CORE == 'true'
         shell: bash
         env:
           VERSION: ${{ needs.publish.outputs.version }}
@@ -207,8 +218,9 @@ jobs:
       - name: Install, run and load turbollm in node:22-alpine
         env:
           VERSION: ${{ needs.publish.outputs.version }}
+          NATIVE_CORE: ${{ vars.PUBLISH_NATIVE_CORE }}
         run: |
-          docker run --rm -e VERSION -v "$GITHUB_WORKSPACE:/repo" -w /repo/turbollm node:22-alpine sh -euc '
+          docker run --rm -e VERSION -e NATIVE_CORE -v "$GITHUB_WORKSPACE:/repo" -w /repo/turbollm node:22-alpine sh -euc '
             for attempt in 1 2 3 4 5 6 7 8 9 10; do
               npm install -g "turbollm@$VERSION" && break
               if [ "$attempt" = 10 ]; then echo "turbollm@$VERSION did not install after 10 attempts"; exit 1; fi
@@ -216,5 +228,5 @@ jobs:
             done
             out="$(turbollm --help)"
             echo "$out" | grep -F "TurboLLM $VERSION"
-            node core/scripts/verify-installed-core.mjs --version "$VERSION"
+            if [ "$NATIVE_CORE" = true ]; then node core/scripts/verify-installed-core.mjs --version "$VERSION"; fi
           '

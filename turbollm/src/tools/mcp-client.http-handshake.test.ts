@@ -13,7 +13,7 @@ async function waitFor(cond: () => boolean, what: string): Promise<void> {
   }
 }
 
-async function fixture(failNotification = false) {
+async function fixture(failNotification: boolean | 405 = false) {
   let initializes = 0
   let notifications = 0
   let notificationsWithSession = 0
@@ -54,6 +54,7 @@ async function fixture(failNotification = false) {
       notificationsWithSession++
       lastNotificationAccept = accept
       await new Promise(r => setTimeout(r, 50))
+      if (failNotification === 405) { readySessions.add(currentSession); res.writeHead(405).end('notifications not accepted'); return }
       if (failNotification && notifications === 1) { res.writeHead(503).end('not ready'); return }
       readySessions.add(currentSession)
       res.writeHead(202).end()
@@ -96,6 +97,17 @@ test('HTTP initialized notification failure rejects connect and permits a clean 
   } finally { await f.close() }
 })
 
+
+// Some servers answer 405 to every notification POST although they accept requests. The spec does not make the
+// notification's acknowledgement a precondition, so that one status must not fail the connect (review of v1.15.2, F4).
+test('HTTP initialized notification answered 405 does not fail the connect', async () => {
+  const f = await fixture(405)
+  try {
+    await f.client.connect()
+    assert.equal(await f.client.callTool('echo', {}), 'pong')
+    assert.equal(f.counts().initializes, 1)
+  } finally { await f.close() }
+})
 
 test('disconnect during HTTP initialize cannot revive the old connection', async () => {
   const f = await fixture()

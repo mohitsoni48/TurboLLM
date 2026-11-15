@@ -413,6 +413,9 @@ export class SseMcpClient implements IMcpClient {
       method: 'POST', headers, body: JSON.stringify(msg),
       signal: AbortSignal.timeout(10_000),
     })
+    // 405: the server does not take notifications over POST. The spec does not make the acknowledgement a
+    // precondition for requests, so this one status is not a failed handshake.
+    if (resp.status === 405) { await resp.body?.cancel().catch(() => {}); return }
     if (!resp.ok) {
       // Include the body's first bytes (like sendRequest) so a rejected notification says
       // WHY — a bare status made SDK servers' 406s read as silent handshake failures.
