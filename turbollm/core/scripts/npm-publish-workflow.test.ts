@@ -12,6 +12,7 @@ import { parse } from 'yaml'
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 const NPM_PUBLISH = join(REPO_ROOT, '.github', 'workflows', 'npm-publish.yml')
 const RELEASE_TAG = 'github.event.release.tag_name || inputs.tag'
+const CORE_ON = "vars.PUBLISH_NATIVE_CORE == 'true'"
 
 interface Step {
   name?: string
@@ -73,7 +74,7 @@ test('the core is built by the reusable workflow, as a release, at the release t
   assert.equal(core.uses, './.github/workflows/core-build.yml')
   assert.equal(core.with?.release, true)
   assert.equal(core.with?.ref, `\${{ ${RELEASE_TAG} }}`)
-  assert.equal(core.if, `startsWith(${RELEASE_TAG}, 'v')`)
+  assert.equal(core.if, `startsWith(${RELEASE_TAG}, 'v') && ${CORE_ON}`)
 })
 
 test('jobs run in the order core, publish, verify-published', () => {
@@ -119,7 +120,7 @@ test('a re-run skips the inject and the turbollm publish when the registry alrea
   assert.match(steps[check]?.run ?? '', />> "\$GITHUB_OUTPUT"/)
   assert.equal(steps[check]?.env?.VERSION, '${{ steps.version.outputs.version }}')
   const notYetPublished = "steps.published.outputs.published != 'true'"
-  assert.equal(steps[inject]?.if, notYetPublished)
+  assert.equal(steps[inject]?.if, `${notYetPublished} && ${CORE_ON}`)
   assert.equal(steps[turbollm]?.if, notYetPublished)
 })
 
@@ -155,4 +156,33 @@ test('every job but the reusable core call sets timeout-minutes', () => {
     if (job.uses !== undefined) continue
     assert.ok(Number.isInteger(job['timeout-minutes']), `${name} has no timeout-minutes`)
   }
+})
+
+// Release 1.15.2: the @turbollm npm org and the 9 trusted publishers do not exist yet, so the native core is off until
+// PUBLISH_NATIVE_CORE is set. With it unset turbollm must still publish on its own and the verify jobs must not load a
+// platform package that was never published.
+test('with PUBLISH_NATIVE_CORE unset the core steps are skipped but turbollm still publishes', () => {
+  assert.match(publish.if ?? '', /needs.core.result == 'skipped'/)
+  assert.match(publish.if ?? '', /needs.core.result == 'success'/)
+  const gated = [
+    (s: Step) => s.uses?.startsWith('actions/download-artifact@') === true,
+    runs('node core/scripts/publish-platform-packages.mjs'),
+    runs('node core/scripts/await-platform-packages.mjs'),
+    runs('node core/scripts/inject-optional-deps.mjs'),
+  ]
+  for (const matches of gated) {
+    const step = publish.steps?.[stepIndex(publish, matches, 'is a core step')]
+    assert.ok(step?.if?.includes(CORE_ON), `${step?.name} is not gated on PUBLISH_NATIVE_CORE`)
+  }
+  const turbollm = publish.steps?.[stepIndex(publish, (s) => s.run?.trim() === 'npm publish --provenance', 'publishes turbollm')]
+  assert.ok(!turbollm?.if?.includes('PUBLISH_NATIVE_CORE'), 'the turbollm publish must not depend on the core')
+})
+
+test('the verify jobs load the platform package only when the core is on', () => {
+  const [matrixJob, alpineJob] = verifyJobs()
+  const load = matrixJob?.steps?.find(runs('verify-installed-core.mjs'))
+  assert.ok(load?.if?.includes(CORE_ON), 'the matrix verify load step is not gated')
+  const alpine = alpineJob?.steps?.find(runs('node:22-alpine'))
+  assert.equal(alpine?.env?.NATIVE_CORE, '${{ vars.PUBLISH_NATIVE_CORE }}')
+  assert.match(alpine?.run ?? '', /if \[ "\$NATIVE_CORE" = true \]; then node core\/scripts\/verify-installed-core\.mjs/)
 })

@@ -23,6 +23,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.15.2] - 2026-11-15
+
 Voice: talk to a model and have it read its answers back, all on your machine.
 
 ### Added
@@ -71,6 +75,11 @@ Voice: talk to a model and have it read its answers back, all on your machine.
   the install is all or nothing. Turning the switch off keeps the runtime; Remove deletes it. Nothing runs Python yet;
   that comes with the `run_python` tool.
 
+- **Read PDFs in fetch_url** (off by default: Settings → Tools). With it on, a PDF fetched by the tool is read as text for the model; changing the setting takes effect without a daemon restart.
+- **llama.cpp-tq3 engine**: a build-from-source Engines card for the TurboQuant weight formats.
+- **MCP Web Engine** stdio tools added to the MCP catalog.
+- **Built-in engines on Android**: the Android app's own engines (LiteRT-LM and llama.cpp CPU) appear as proper Engines rows, and Discover and onboarding pick models the active engine can read.
+
 ### Changed
 
 - **The desktop app may use the microphone**, and only the microphone: a page asking for the camera or the screen is
@@ -78,6 +87,18 @@ Voice: talk to a model and have it read its answers back, all on your machine.
 - **Voice input needs a secure page.** Browsers give a page the microphone only over https or on the machine itself,
   so over plain http on your LAN the microphone button explains this instead of recording. Remote access (https) and
   the desktop and Android apps are unaffected.
+- **Right-click menu in the desktop app.**
+
+### Fixed
+
+- **MCP over streamable HTTP** now completes its handshake correctly, so hosted MCP servers that rejected the old one connect.
+
+### Discord
+
+- Talk to your models: a microphone in the chat box transcribes with whisper.cpp, and models that can hear get your voice directly.
+- Replies can be read aloud in your device's own voice, in the reply's language.
+- New: read PDFs in the web-fetch tool, an experimental Python sandbox runtime, and a TurboQuant llama.cpp engine card.
+- The desktop app gets a right-click menu, and hosted MCP servers connect more reliably.
 
 ## [1.15.1] - 2026-11-07
 

@@ -7,7 +7,7 @@
 // into place. A crash, a failed hash or Cancel leaves the previous runtime (or nothing) and a stage folder the next
 // install sweeps. No pause and resume: 75 MB restarts quickly, and the engine downloader this reuses has no Range support.
 import { randomUUID } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statfsSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statfsSync, writeFileSync } from 'node:fs'
 import { readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { emitInvalidation } from '../events/bus'
@@ -197,7 +197,7 @@ export class SandboxRuntime {
       writeFileSync(join(pyDir, 'package.json'), '{"type":"commonjs"}\n')
       writeFileSync(join(out, RUNTIME_MARKER), JSON.stringify({ deno: DENO_VERSION, pyodide: PYODIDE_VERSION } satisfies Marker))
       // An older or half-removed runtime moves aside first, so the rename below never lands inside it.
-      if (existsSync(this.dir())) renameSync(this.dir(), join(runtimes, `${TRASH_PREFIX}${randomUUID().slice(0, 8)}`))
+      if (existsSync(this.dir())) await renameWithRetry(this.dir(), join(runtimes, `${TRASH_PREFIX}${randomUUID().slice(0, 8)}`))
       await renameWithRetry(out, this.dir())
     } finally {
       void rm(stage, { recursive: true, force: true, maxRetries: 3 }).catch(() => {})

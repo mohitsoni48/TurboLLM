@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "bindings/node", "bindings/uniffi", "xtask"]
 
 [workspace.package]
-version = "1.15.1"
+version = "1.15.2"
 edition = "2024"
 license = "FSL-1.1-ALv2"
 publish = false

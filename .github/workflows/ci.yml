@@ -114,9 +114,10 @@ jobs:
           files=$(npx tsx src/test-support/list-shard.ts "$SHARD") || exit 1
           [ -n "$files" ] || { echo "empty shard $SHARD"; exit 1; }
           # cli.keeper.test.ts boots real daemons in a pty and takes minutes as a whole: its file gets the long timeout
-          # (as in the process-tether job), every other file the short one.
-          slow=$(printf '%s\n' $files | grep -E '^src/cli\.keeper\.test\.ts$' || true)
-          fast=$(printf '%s\n' $files | grep -v -E '^src/cli\.keeper\.test\.ts$')
+          # (as in the process-tether job), every other file the short one. gguf.parity.test.ts compares 25,000 mutated
+          # headers and names against the native core: 41 s on a good runner against the 60 s limit, so it is slow too.
+          slow=$(printf '%s\n' $files | grep -E '^src/(cli\.keeper|native/gguf\.parity)\.test\.ts$' || true)
+          fast=$(printf '%s\n' $files | grep -v -E '^src/(cli\.keeper|native/gguf\.parity)\.test\.ts$')
           npx tsx --test --test-timeout=60000 $fast
           [ -z "$slow" ] || npx tsx --test --test-timeout=600000 $slow
         working-directory: turbollm

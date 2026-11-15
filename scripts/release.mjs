@@ -184,7 +184,13 @@ const tailOf = (s, lines = 40) => String(s || '').split(/\r?\n/).slice(-lines).j
 // the same words still blocks. b387a903 quotes `closes #12` while describing this very scan; #12 is a PR, so it closed
 // nothing.
 export const MAGIC_CLOSE = /\b(closes|fixes|resolves)\s+#\d+/i;
-export const MAGIC_CLOSE_ACKNOWLEDGED = new Set(['b387a90331e094858dcbaafd06faa0fdf15c0e7a']);
+// 1d6aabfe (#76) and 41800bc9 (#302) wrote a closing keyword in a PR body that merged to main; both issues were already
+// closed at merge, so there is nothing left to protect (acknowledged 2026-11-15).
+export const MAGIC_CLOSE_ACKNOWLEDGED = new Set([
+  'b387a90331e094858dcbaafd06faa0fdf15c0e7a',
+  '1d6aabfe03e7c7ba9e7f8ea425a560a7ec3bc03f',
+  '41800bc90296bffb53f81ce14248551b88e9a993',
+]);
 
 /** The short shas of commits in `log` (entries of `%H\x1f%B\x1e`) whose message has a closing keyword, minus the
  *  acknowledged ones. */
