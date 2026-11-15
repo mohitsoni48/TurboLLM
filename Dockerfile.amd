@@ -6,7 +6,9 @@
 # linux-x64-gnu build does not need. build-node.mjs needs @napi-rs/cli, hence Node and the daemon's dev dependencies.
 FROM rust:1.100.0-bookworm AS core
 ENV RUSTUP_TOOLCHAIN=1.100.0
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash -     && apt-get install -y --no-install-recommends nodejs     && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY turbollm/package*.json ./

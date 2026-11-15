@@ -31,9 +31,9 @@ RUN npm install -g turbollm
 # npm treats a failed fetch of an optional dependency as a warning, so an install that missed the native core
 # (@turbollm/core-linux-x64-gnu) still succeeds, and every pod would then stop with exit 69 at start. Load it here
 # instead and fail the build (rust-core plan T23d, QA PG-10). The global install is not on require's search path,
-# hence the require rooted at $(npm root -g)/turbollm.
-RUN turbollm --version \
-  && node -e "const r=require('module').createRequire(process.argv[1]);const p=r.resolve('@turbollm/core-linux-x64-gnu');const m={exports:{}};process.dlopen(m,p);console.log('core',m.exports.coreInfo().version)" "$(npm root -g)/turbollm/package.json"
+# hence the require rooted at $(npm root -g)/turbollm. No `turbollm --version` here: the published turbollm@1.15.1 has
+# no such flag, so it would boot the daemon in the foreground and hang the build.
+RUN node -e "const r=require('module').createRequire(process.argv[1]);const p=r.resolve('@turbollm/core-linux-x64-gnu');const m={exports:{}};process.dlopen(m,p);console.log('core',m.exports.coreInfo().version)" "$(npm root -g)/turbollm/package.json"
 
 # Pre-bake the Vulkan engine (TurboLLM's own first-run seed, ADR-024/025) into the
 # image so a per-hour-billed pod doesn't eat that download on its first request.

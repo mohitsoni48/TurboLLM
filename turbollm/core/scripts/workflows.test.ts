@@ -22,6 +22,7 @@ interface Step {
   if?: string
   shell?: string
   with?: Record<string, unknown>
+  'working-directory'?: string
 }
 
 interface Job {
@@ -33,6 +34,7 @@ interface Job {
 
 interface Workflow {
   on: Record<string, { inputs?: Record<string, { type: string }> }>
+  env?: Record<string, string>
   jobs: Record<string, Job>
 }
 
@@ -396,9 +398,60 @@ test('desktop-release installs the pinned Rust toolchain and caches the core wor
   assert.ok(stepIndex(desktopBuild, cache) < stepIndex(desktopBuild, buildCore))
 })
 
+// The AppImage ships the core too, so it must keep the glibc 2.28 floor of arch 2.3: on Linux, desktop-release builds
+// it exactly as core-build.yml's linux-x64-gnu row does (zig cross-build pinned to the floor) and checks it.
+const LINUX_BINARY = 'turbollm-core.linux-x64-gnu.node'
+const LINUX_ONLY = "${{ runner.os == 'Linux' }}"
+const desktopRelease = parse(readFileSync(DESKTOP_RELEASE, 'utf8')) as Workflow
+
+for (const action of ['mlugg/setup-zig@', 'taiki-e/install-action@']) {
+  test(`desktop-release sets up ${action} on Linux only, pinned as core-build does, before the core build`, () => {
+    const pinned = coreBuildStepUsing(action)
+    const setup = desktopBuild.steps.find((step) => step.uses?.startsWith(action))
+
+    assert.ok(setup, `no ${action} step`)
+    assert.equal(setup.uses, pinned.uses, 'same commit sha as core-build.yml')
+    assert.deepEqual(setup.with, pinned.with, 'same tool and version input as core-build.yml')
+    assert.equal(setup.if, LINUX_ONLY)
+    assert.ok(stepIndex(desktopBuild, setup) < stepIndex(desktopBuild, stepRunning(desktopBuild, 'npm run build:core')))
+  })
+}
+
+test('desktop-release pins the same zig and cargo-zigbuild versions as core-build', () => {
+  for (const name of ['ZIG_VERSION', 'CARGO_ZIGBUILD_VERSION']) {
+    assert.ok(workflow.env?.[name], `core-build.yml has no ${name}`)
+    assert.equal(desktopRelease.env?.[name], workflow.env?.[name], name)
+  }
+})
+
+test('desktop-release cross-builds the Linux core against the glibc floor', () => {
+  const buildCore = stepRunning(desktopBuild, 'npm run build:core')
+
+  assert.ok(
+    buildCore.run?.includes("${{ runner.os == 'Linux' && '-- --target linux-x64-gnu --cross-compile' || '' }}"),
+    'on Linux the core build must pass --target linux-x64-gnu --cross-compile',
+  )
+})
+
+test('desktop-release checks the Linux core needs no glibc newer than the floor before packaging', () => {
+  const checkGlibc = stepRunning(desktopBuild, 'cargo xtask check-glibc')
+  const packageInstaller = stepRunning(desktopBuild, 'npm run package')
+
+  assert.equal(checkGlibc.run, `cargo xtask check-glibc --max ${GLIBC_FLOOR} bindings/node/${LINUX_BINARY}`)
+  assert.equal(checkGlibc['working-directory'], 'turbollm/core')
+  assert.equal(checkGlibc.if, LINUX_ONLY)
+  assert.ok(stepIndex(desktopBuild, stepRunning(desktopBuild, 'npm run build:core')) < stepIndex(desktopBuild, checkGlibc))
+  assert.ok(stepIndex(desktopBuild, checkGlibc) < stepIndex(desktopBuild, packageInstaller))
+})
+
+function coreBuildStepUsing(action: string): Step {
+  const step = jobs['node-addon'].steps.find((candidate) => candidate.uses?.startsWith(action))
+  assert.ok(step, `core-build.yml node-addon has no ${action} step`)
+  return step
+}
+
 // T23: the release images build the Linux binary themselves, in a Rust stage pinned to rust-toolchain.toml, and the
 // Node build stage stages it into dist/native/ through `npm run build`. Docker cannot run here; this pins the order.
-const LINUX_BINARY = 'turbollm-core.linux-x64-gnu.node'
 
 for (const image of ['Dockerfile.nvidia', 'Dockerfile.amd']) {
   test(`${image} builds the linux-x64-gnu core in a pinned Rust stage and stages it before npm run build`, () => {
@@ -413,6 +466,10 @@ for (const image of ['Dockerfile.nvidia', 'Dockerfile.amd']) {
     const daemonBuild = lines.findIndex((line) => line === 'RUN npm run build')
 
     assert.ok(rustStage >= 0, `no FROM rust:${toolchainChannel()}-bookworm AS core stage`)
+    assert.ok(
+      lines.includes(`ENV RUSTUP_TOOLCHAIN=${toolchainChannel()}`),
+      'RUSTUP_TOOLCHAIN must name the rust-toolchain.toml channel, or rustup silently fetches another toolchain',
+    )
     assert.ok(rustStage < coreBuild && coreBuild < nodeStage, 'the Rust stage builds the core before the Node stage')
     assert.ok(sourceCopy < binaryCopy && binaryCopy < daemonBuild, 'the binary lands after the source, before build')
     assert.ok(!lines.some((line) => /win32|msvc/.test(line)), 'no Windows binary goes into a Linux image')
@@ -440,11 +497,20 @@ test('the RunPod image loads @turbollm/core-linux-x64-gnu and calls coreInfo() r
   const loadCheck = instructionAfter(lines, install)
 
   assert.ok(install >= 0, 'the RunPod image no longer installs turbollm from npm')
-  assert.match(loadCheck, /^RUN turbollm --version/)
+  // The published turbollm@1.15.1 has no --version flag: calling it boots the daemon and hangs the build.
+  assert.match(loadCheck, /^RUN node -e /)
+  assert.doesNotMatch(loadCheck, /turbollm --version/)
   assert.match(loadCheck, /process\.dlopen\([^)]*\)/)
   assert.match(loadCheck, /resolve\('@turbollm\/core-linux-x64-gnu'\)/)
   assert.match(loadCheck, /\.coreInfo\(\)\.version/)
   assert.match(loadCheck, /\$\(npm root -g\)\/turbollm\/package\.json/, 'resolved from the global turbollm install')
+})
+
+test('the RunPod image build job is bounded by timeout-minutes', () => {
+  const runpodImage = join(CORE_DIR, '..', '..', '.github', 'workflows', 'runpod-image.yml')
+  const buildAndPush = (parse(readFileSync(runpodImage, 'utf8')) as Workflow).jobs['build-and-push']
+
+  assert.ok(Number.isInteger(buildAndPush['timeout-minutes']), 'build-and-push has no timeout-minutes')
 })
 
 /** The Dockerfile instruction after line `index`, comments and blank lines skipped, continuation lines joined. */

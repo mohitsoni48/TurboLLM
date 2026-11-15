@@ -49,16 +49,16 @@ function makePtySpawnHelpersExecutable (nodeModules) {
 /** Builds whatever the installer needs from turbollm/. The native core is rebuilt on every run (QA PG-7): a dist
  *  built before the core existed has no dist/native/, and electron-builder would package it as it is. */
 function prepareDaemon (steps) {
-  if (steps.hostBinaryName === undefined) {
+  if (steps.host === undefined) {
     steps.fail(`no native core target for ${process.platform}-${process.arch}: this machine cannot build an installer.`)
     return
   }
-  const hostBinary = `dist/native/${steps.hostBinaryName}`
-  if (!steps.exists('node_modules')) {
+  const hostBinary = `dist/native/${steps.host.binaryName}`
+  if (!steps.exists('node_modules/@napi-rs/cli')) {
     steps.log('Installing turbollm daemon dependencies...')
     steps.run('npm', ['ci'])
   }
-  steps.run('npm', ['run', 'build:core'])
+  buildCore(steps)
   if (isDaemonBuilt(steps, hostBinary)) {
     steps.log('✓ turbollm/dist already built (delete it to force a rebuild); staging the fresh native core')
     steps.run('node', ['core/scripts/stage-native.mjs'])
@@ -68,6 +68,18 @@ function prepareDaemon (steps) {
     steps.run('npm', ['run', 'build'])
   }
   if (!steps.exists(hostBinary)) refuseInstallerWithoutCore(steps, hostBinary)
+}
+
+/** A Linux glibc build would link against this machine's glibc, so it is cross-built with zig against the floor of
+ *  rust-core arch 2.3 and checked, exactly as core-build.yml builds the npm binaries (zig and cargo-zigbuild on PATH). */
+function buildCore (steps) {
+  const { suffix, libc, binaryName, glibcFloor } = steps.host
+  if (libc !== 'glibc') {
+    steps.run('npm', ['run', 'build:core'])
+    return
+  }
+  steps.run('npm', ['run', 'build:core', '--', '--target', suffix, '--cross-compile'])
+  steps.run('cargo', ['xtask', 'check-glibc', '--max', glibcFloor, `bindings/node/${binaryName}`], 'core')
 }
 
 function isDaemonBuilt (steps, hostBinary) {
@@ -83,9 +95,9 @@ function refuseInstallerWithoutCore (steps, hostBinary) {
 
 async function main () {
   prepareDaemon({
-    hostBinaryName: await hostBinaryName(),
+    host: await hostTarget(),
     exists: (relativePath) => existsSync(join(TURBOLLM_ROOT, relativePath)),
-    run: (cmd, args) => run(cmd, args, TURBOLLM_ROOT),
+    run: (cmd, args, relativeCwd = '.') => run(cmd, args, join(TURBOLLM_ROOT, relativeCwd)),
     fail: (message) => {
       console.error(message)
       process.exit(1)
@@ -101,12 +113,23 @@ async function main () {
 }
 
 /** targets.mjs is the one table of native targets (rust-core plan P-9); it is ESM, so it is imported. */
-async function hostBinaryName () {
+async function hostTarget () {
   const targets = await import(pathToFileURL(join(TURBOLLM_ROOT, 'core', 'scripts', 'targets.mjs')).href)
   const host = targets.hostTarget()
-  return host === undefined ? undefined : targets.binaryFileName(host.suffix)
+  if (host === undefined) return undefined
+  return {
+    suffix: host.suffix,
+    libc: host.libc,
+    binaryName: targets.binaryFileName(host.suffix),
+    glibcFloor: targets.GLIBC_FLOOR,
+  }
 }
 
 module.exports = { makePtySpawnHelpersExecutable, prepareDaemon }
 
-if (require.main === module) main()
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err?.message ?? err)
+    process.exit(1)
+  })
+}
