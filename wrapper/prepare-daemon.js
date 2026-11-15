@@ -1,4 +1,4 @@
-// prepare-daemon.js — build the daemon + web UI if they aren't already built.
+// prepare-daemon.js — build the native core, and the daemon + web UI if they aren't already built.
 // electron-builder's extraResources (electron-builder.config.cjs) reads
 // turbollm/dist and turbollm/node_modules directly at package time — this
 // script only makes sure those exist before packaging runs, and that node-pty's
@@ -6,10 +6,9 @@
 const { chmodSync, existsSync, readdirSync, statSync } = require('node:fs')
 const { join } = require('node:path')
 const { spawnSync } = require('node:child_process')
+const { pathToFileURL } = require('node:url')
 
 const TURBOLLM_ROOT = join(__dirname, '..', 'turbollm')
-const DIST_DIR = join(TURBOLLM_ROOT, 'dist')
-const WEBDIST = join(DIST_DIR, 'webdist')
 
 function run(cmd, args, cwd) {
   console.log(`> ${cmd} ${args.join(' ')}  (in ${cwd})`)
@@ -47,19 +46,52 @@ function makePtySpawnHelpersExecutable (nodeModules) {
   return changed
 }
 
-function main () {
-  if (!existsSync(join(TURBOLLM_ROOT, 'node_modules'))) {
-    console.log('Installing turbollm daemon dependencies...')
-    run('npm', ['ci'], TURBOLLM_ROOT)
+/** Builds whatever the installer needs from turbollm/. The native core is rebuilt on every run (QA PG-7): a dist
+ *  built before the core existed has no dist/native/, and electron-builder would package it as it is. */
+function prepareDaemon (steps) {
+  if (steps.hostBinaryName === undefined) {
+    steps.fail(`no native core target for ${process.platform}-${process.arch}: this machine cannot build an installer.`)
+    return
   }
-
-  if (!existsSync(join(DIST_DIR, 'cli.js')) || !existsSync(WEBDIST)) {
-    console.log('Building TurboLLM daemon + web UI...')
-    run('npm', ['run', 'build:web'], TURBOLLM_ROOT)
-    run('npm', ['run', 'build'], TURBOLLM_ROOT)
+  const hostBinary = `dist/native/${steps.hostBinaryName}`
+  if (!steps.exists('node_modules')) {
+    steps.log('Installing turbollm daemon dependencies...')
+    steps.run('npm', ['ci'])
+  }
+  steps.run('npm', ['run', 'build:core'])
+  if (isDaemonBuilt(steps, hostBinary)) {
+    steps.log('✓ turbollm/dist already built (delete it to force a rebuild); staging the fresh native core')
+    steps.run('node', ['core/scripts/stage-native.mjs'])
   } else {
-    console.log('✓ turbollm/dist already built (delete it to force a rebuild)')
+    steps.log('Building TurboLLM daemon + web UI...')
+    steps.run('npm', ['run', 'build:web'])
+    steps.run('npm', ['run', 'build'])
   }
+  if (!steps.exists(hostBinary)) refuseInstallerWithoutCore(steps, hostBinary)
+}
+
+function isDaemonBuilt (steps, hostBinary) {
+  return ['dist/cli.js', 'dist/webdist', hostBinary].every((relativePath) => steps.exists(relativePath))
+}
+
+function refuseInstallerWithoutCore (steps, hostBinary) {
+  steps.fail([
+    `${hostBinary} is missing after the build: an installer without it would stop with exit 69 on launch.`,
+    'Run: npm run build:core && npm run build',
+  ].join('\n'))
+}
+
+async function main () {
+  prepareDaemon({
+    hostBinaryName: await hostBinaryName(),
+    exists: (relativePath) => existsSync(join(TURBOLLM_ROOT, relativePath)),
+    run: (cmd, args) => run(cmd, args, TURBOLLM_ROOT),
+    fail: (message) => {
+      console.error(message)
+      process.exit(1)
+    },
+    log: (message) => console.log(message),
+  })
 
   for (const helper of makePtySpawnHelpersExecutable(join(TURBOLLM_ROOT, 'node_modules'))) {
     console.log(`✓ made ${helper} executable`)
@@ -68,6 +100,13 @@ function main () {
   console.log('✓ Daemon ready for packaging')
 }
 
-module.exports = { makePtySpawnHelpersExecutable }
+/** targets.mjs is the one table of native targets (rust-core plan P-9); it is ESM, so it is imported. */
+async function hostBinaryName () {
+  const targets = await import(pathToFileURL(join(TURBOLLM_ROOT, 'core', 'scripts', 'targets.mjs')).href)
+  const host = targets.hostTarget()
+  return host === undefined ? undefined : targets.binaryFileName(host.suffix)
+}
+
+module.exports = { makePtySpawnHelpersExecutable, prepareDaemon }
 
 if (require.main === module) main()

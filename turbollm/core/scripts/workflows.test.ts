@@ -103,14 +103,15 @@ test('the musl targets are tested in node:22-alpine and Android is build only', 
   assert.equal(buildOnly.name, 'No tests (cross-built target)')
 })
 
-test('every runnable node-addon target runs the loader, golden and parity tests against its binary', () => {
+// The differential test against the TS parser was deleted with it (rust-core T22): the goldens are the spec.
+test('every runnable node-addon target runs the loader and golden tests against its binary, and no parity test', () => {
   for (const tests of ['host', 'alpine']) {
     const run = stepsRunning(jobs['node-addon'], 'src/native/gguf.golden.test.ts')
       .filter((step) => String(step.if).includes(`'${tests}'`))
       .map((step) => String(step.run))
       .join('\n')
     assert.match(run, /src\/native\/load\.test\.ts/, `${tests}: load.test.ts`)
-    assert.match(run, /src\/native\/gguf\.parity\.test\.ts/, `${tests}: gguf.parity.test.ts`)
+    assert.doesNotMatch(run, /gguf\.parity/, `${tests}: gguf.parity.test.ts is deleted`)
   }
 })
 
@@ -367,4 +368,88 @@ function matrixCombos(job: CiJob): Record<string, unknown>[] {
 
 function expand(text: string, combo: Record<string, unknown>): string {
   return text.replace(/\$\{\{\s*matrix\.([\w-]+)\s*\}\}/g, (_, key: string) => String(combo[key]))
+}
+
+// T23: the installers are built from a source checkout, so desktop-release builds the host's native core before the
+// daemon (`npm run build` stages it into dist/native/, which electron-builder.config.cjs copies into the app).
+const DESKTOP_RELEASE = join(CORE_DIR, '..', '..', '.github', 'workflows', 'desktop-release.yml')
+const desktopBuild = (parse(readFileSync(DESKTOP_RELEASE, 'utf8')) as Workflow).jobs.build
+
+test('desktop-release builds the native core before the daemon', () => {
+  const buildCore = stepRunning(desktopBuild, 'npm run build:core')
+  const buildDaemon = desktopBuild.steps.find((step) => /^npm run build$/m.test(step.run ?? ''))
+
+  assert.ok(buildDaemon, 'no step runs npm run build')
+  assert.equal(buildCore.if, undefined, 'build:core must run on every installer OS')
+  assert.ok(allRuns(desktopBuild).indexOf('npm run build:core') < allRuns(desktopBuild).search(/^npm run build$/m))
+})
+
+test('desktop-release installs the pinned Rust toolchain and caches the core workspace before building it', () => {
+  const toolchain = stepRunning(desktopBuild, 'rustup toolchain install')
+  const cache = desktopBuild.steps.find((step) => step.uses?.startsWith('Swatinem/rust-cache@'))
+  const buildCore = stepRunning(desktopBuild, 'npm run build:core')
+
+  assert.equal((toolchain as Step & { 'working-directory'?: string })['working-directory'], 'turbollm/core')
+  assert.ok(cache, 'no Swatinem/rust-cache step')
+  assert.equal(cache.with?.workspaces, 'turbollm/core', 'the cache is keyed on turbollm/core/Cargo.lock')
+  assert.ok(stepIndex(desktopBuild, toolchain) < stepIndex(desktopBuild, buildCore))
+  assert.ok(stepIndex(desktopBuild, cache) < stepIndex(desktopBuild, buildCore))
+})
+
+// T23: the release images build the Linux binary themselves, in a Rust stage pinned to rust-toolchain.toml, and the
+// Node build stage stages it into dist/native/ through `npm run build`. Docker cannot run here; this pins the order.
+const LINUX_BINARY = 'turbollm-core.linux-x64-gnu.node'
+
+for (const image of ['Dockerfile.nvidia', 'Dockerfile.amd']) {
+  test(`${image} builds the linux-x64-gnu core in a pinned Rust stage and stages it before npm run build`, () => {
+    const lines = dockerfileLines(image)
+    const rustStage = lines.findIndex((line) => line === `FROM rust:${toolchainChannel()}-bookworm AS core`)
+    const coreBuild = lines.findIndex((line) => line.includes('build-node.mjs --target linux-x64-gnu --release'))
+    const nodeStage = lines.findIndex((line) => /^FROM node:\S+ AS build$/.test(line))
+    const sourceCopy = lines.findIndex((line) => line === 'COPY turbollm/ ./')
+    const binaryCopy = lines.findIndex(
+      (line) => line === `COPY --from=core /src/core/bindings/node/${LINUX_BINARY} ./core/bindings/node/`,
+    )
+    const daemonBuild = lines.findIndex((line) => line === 'RUN npm run build')
+
+    assert.ok(rustStage >= 0, `no FROM rust:${toolchainChannel()}-bookworm AS core stage`)
+    assert.ok(rustStage < coreBuild && coreBuild < nodeStage, 'the Rust stage builds the core before the Node stage')
+    assert.ok(sourceCopy < binaryCopy && binaryCopy < daemonBuild, 'the binary lands after the source, before build')
+    assert.ok(!lines.some((line) => /win32|msvc/.test(line)), 'no Windows binary goes into a Linux image')
+  })
+}
+
+function dockerfileLines(name: string): string[] {
+  return readFileSync(join(CORE_DIR, '..', '..', name), 'utf8')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+}
+
+function toolchainChannel(): string {
+  const toolchain = readFileSync(join(CORE_DIR, 'rust-toolchain.toml'), 'utf8')
+  const channel = /^channel\s*=\s*"([^"]+)"/m.exec(toolchain)?.[1]
+  assert.ok(channel, 'rust-toolchain.toml has no channel')
+  return channel
+}
+
+// T23d (QA PG-10): npm treats a failed optional-dependency fetch as a warning, so the RunPod image must load the
+// platform package's binary at build time, or it would build green and exit 69 on every pod start.
+test('the RunPod image loads @turbollm/core-linux-x64-gnu and calls coreInfo() right after installing turbollm', () => {
+  const lines = dockerfileLines(join('deploy', 'runpod', 'Dockerfile'))
+  const install = lines.indexOf('RUN npm install -g turbollm')
+  const loadCheck = instructionAfter(lines, install)
+
+  assert.ok(install >= 0, 'the RunPod image no longer installs turbollm from npm')
+  assert.match(loadCheck, /^RUN turbollm --version/)
+  assert.match(loadCheck, /process\.dlopen\([^)]*\)/)
+  assert.match(loadCheck, /resolve\('@turbollm\/core-linux-x64-gnu'\)/)
+  assert.match(loadCheck, /\.coreInfo\(\)\.version/)
+  assert.match(loadCheck, /\$\(npm root -g\)\/turbollm\/package\.json/, 'resolved from the global turbollm install')
+})
+
+/** The Dockerfile instruction after line `index`, comments and blank lines skipped, continuation lines joined. */
+function instructionAfter(lines: string[], index: number): string {
+  const rest = lines.slice(index + 1).filter((line) => line !== '' && !line.startsWith('#'))
+  const end = rest.findIndex((line) => !line.endsWith('\\'))
+  return rest.slice(0, end + 1).join('\n')
 }

@@ -1,5 +1,6 @@
 //! Byte-for-byte parity with the TypeScript oracle (architecture 3.2): every golden in `fixtures/gguf/golden`
 //! holds the exact JSON text `parseGgufAsync` produced and the `ggufCutShort` verdicts; Rust must reproduce both.
+//! The oracle is deleted (rust-core T22): the goldens it wrote are now the spec.
 
 mod support;
 

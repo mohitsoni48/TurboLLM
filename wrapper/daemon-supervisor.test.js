@@ -151,9 +151,9 @@ test('the core-unavailable exit code is 69 (sysexits EX_UNAVAILABLE, plan P-5)',
   assert.equal(CORE_UNAVAILABLE_EXIT_CODE, 69)
 })
 
-test('the core-unavailable exit code matches turbollm/src/cli.ts once it declares it', (t) => {
+test('the core-unavailable exit code matches turbollm/src/cli.ts', () => {
   const declaration = readFileSync(CLI_SOURCE, 'utf8').match(CORE_UNAVAILABLE_DECLARATION)
-  if (!declaration) return t.skip('cli.ts declares CORE_UNAVAILABLE_EXIT_CODE when the daemon switches to the core')
+  assert.ok(declaration, 'turbollm/src/cli.ts must declare CORE_UNAVAILABLE_EXIT_CODE')
   assert.equal(Number(declaration[1]), CORE_UNAVAILABLE_EXIT_CODE)
 })
 

@@ -45,6 +45,20 @@ jobs:
         run: npm ci
         working-directory: turbollm
 
+      # The installer ships daemon/dist/native/turbollm-core.<host>.node (electron-builder.config.cjs), built here for
+      # this runner's own target; `npm run build` stages it into dist/native/ (rust-core plan T23, ADR-465).
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+        working-directory: turbollm/core
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: turbollm/core
+
+      - name: Build the native core
+        run: npm run build:core
+        working-directory: turbollm
+
       - name: Build daemon + web UI
         run: |
           npm run build:web
