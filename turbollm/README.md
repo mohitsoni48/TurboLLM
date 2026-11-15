@@ -627,8 +627,9 @@ the UI when something fails to load.
 Some models take speech in and give speech back directly, with no speech-to-text and text-to-speech
 steps in between. TurboLLM runs one of them today: **[LFM3-Audio-2B](https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF)**
 (the `LFM3-Audio-2B-Q4_K_M.gguf` model and its `mmproj-LFM3-Audio-2B-Q8_0.gguf` projector, kept in
-one folder so they pair) on the **llama.cpp** engine, **build b11960 or newer**. An older build loads the
-model but does not report that it can speak, so nothing below is offered. It is small enough for a CPU.
+one folder so they pair) on the **llama.cpp** engine, **build b11960 or newer**. TurboLLM's default llama.cpp
+(b9608) is older and cannot load this model (the engine exits with "unknown model architecture: 'lfm3'"): add a newer
+llama.cpp build on the Engines screen and make it active before you load the model. It is small enough for a CPU.
 
 **Use it.** Load the model. Press the microphone, speak, and choose **Send as audio**. The reply
 comes back as its text with a **player** under it (it never plays by itself), is saved with the chat
