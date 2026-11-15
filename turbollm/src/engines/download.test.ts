@@ -15,6 +15,7 @@ import {
   availableBackends,
   provisionBackend,
   provisionTurboquant,
+  latestBuildTagRelease,
   renameWithRetry,
   restoreInterruptedTurboquantUpdate,
   serverBinNameFor,
@@ -273,6 +274,67 @@ test('availableBackends: win32 rocm carries an assetPattern matching both the ol
   assert.ok(pattern!.test('llama-b9608-bin-win-hip-radeon-x64.zip'), 'matches the old hip-radeon name')
   assert.ok(pattern!.test('llama-b10991-bin-win-rocm-10.0-x64.zip'), 'matches the new rocm-<ver> name')
   assert.ok(!pattern!.test('llama-b10991-bin-win-cuda-13.3-x64.zip'), 'does not match an unrelated backend asset')
+})
+
+// llama.cpp creates the release for a tag before CI has uploaded its archives, so the newest build
+// number is briefly an empty release. Resolving it as "latest" made every backend's update 404.
+test('latestBuildTagRelease: skips a newer release whose archives have not been uploaded yet', async (t) => {
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async () => new Response(JSON.stringify([
+    { tag_name: 'b12396', assets: [] },
+    { tag_name: 'b12395', assets: [{ name: 'llama-b12395-bin-win-cpu-x64.zip' }] },
+    { tag_name: 'b12394', assets: [{ name: 'llama-b12394-bin-win-cpu-x64.zip' }] },
+  ]), { status: 200 })) as typeof fetch
+  assert.equal(await latestBuildTagRelease('o/r'), 'b12395')
+})
+
+// ─── CUDA toolkit-version drift (engine update 404) ────────────────────────────
+// Upstream bumps the Windows CUDA toolkit in the archive name (13.3 → 13.4 → 13.5) without notice, so a
+// hardcoded `cuda-13.3` URL 404s once the latest tag crosses a bump. Both the binary and its cudart
+// companion must resolve their real filename from the release's asset list.
+
+test('availableBackends: win32 cuda patterns match any 13.x toolkit for both archives but not 12.x or arm64', { skip: process.platform !== 'win32' && 'win32-only backend list' }, () => {
+  const cuda = availableBackends('b12395').find((b) => b.id === 'cuda')
+  assert.ok(cuda, 'cuda backend should exist on win32/x64')
+  const [main, cudart] = cuda!.assetPatterns ?? []
+  assert.ok(main && cudart, 'both cuda archives carry an assetPattern')
+  assert.ok(main.test('llama-b12395-bin-win-cuda-13.5-x64.zip'), 'binary: new 13.5')
+  assert.ok(main.test('llama-b9608-bin-win-cuda-13.3-x64.zip'), 'binary: old 13.3')
+  assert.ok(!main.test('llama-b12395-bin-win-cuda-12.4-x64.zip'), 'binary: 12.x lacks Blackwell support')
+  assert.ok(!main.test('llama-b12395-bin-win-cuda-13.5-arm64.zip'), 'binary: not arm64')
+  assert.ok(cudart.test('cudart-llama-bin-win-cuda-13.5-x64.zip'), 'cudart: new 13.5')
+  assert.ok(!cudart.test('cudart-llama-bin-win-cuda-12.4-x64.zip'), 'cudart: not 12.x')
+})
+
+test('provisionBackend: cuda downloads the toolkit version the release actually ships', { skip: process.platform !== 'win32' && 'Windows-only extraction path (PowerShell Expand-Archive)' }, async (t) => {
+  const root = tmpDir('tllm-dl-cuda-')
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  const calls: string[] = []
+  globalThis.fetch = (async (url: string | URL) => {
+    const u = String(url)
+    calls.push(u)
+    if (u.includes('/releases/tags/')) {
+      return new Response(
+        JSON.stringify({
+          tag_name: 'b12395',
+          assets: [
+            { name: 'llama-b12395-bin-win-cuda-12.4-x64.zip', browser_download_url: 'https://dl.example/cuda12.zip' },
+            { name: 'llama-b12395-bin-win-cuda-13.5-x64.zip', browser_download_url: 'https://dl.example/cuda13.zip' },
+            { name: 'cudart-llama-bin-win-cuda-13.5-x64.zip', browser_download_url: 'https://dl.example/cudart13.zip' },
+          ],
+        }),
+        { status: 200 },
+      )
+    }
+    return new Response(new Uint8Array(), { status: 200 })
+  }) as typeof fetch
+
+  const backend = availableBackends('b12395').find((b) => b.id === 'cuda')!
+  await assert.rejects(() => provisionBackend(root, backend, 'b12395'))
+  assert.ok(calls.includes('https://dl.example/cuda13.zip'), `expected the resolved 13.x binary URL, got: ${JSON.stringify(calls)}`)
+  assert.ok(!calls.some((c) => c.includes('cuda-13.3')), 'must not request the stale hardcoded 13.3 name')
 })
 
 test('provisionBackend: resolves the real asset name from the release when assetPatterns is set', { skip: process.platform !== 'win32' && 'Windows-only extraction path (PowerShell Expand-Archive)' }, async (t) => {
