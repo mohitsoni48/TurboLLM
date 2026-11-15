@@ -14,14 +14,8 @@ import type { LinkCapability } from '../link/types'
 import { LINK_PRESETS } from '../link/capabilities'
 import { emit } from '../telemetry/runtime/typed-emit'
 import { remoteAccessEnabled, remoteAccessDisabled, remoteAccessPreflightFailed } from '../telemetry/events/remote'
+import { body } from '../api/http'
 
-async function body<T>(c: Context): Promise<T> {
-  try {
-    return (await c.req.json()) as T
-  } catch {
-    return {} as T
-  }
-}
 
 const REMOTE_TOKEN_CAPABILITIES = new Set<string>(LINK_PRESETS.server)
 
