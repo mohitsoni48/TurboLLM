@@ -16,6 +16,7 @@ import {
   audioReplyRuntimeFor, AudioReplyError, DEFAULT_AUDIO_REPLY_MAX_TOKENS,
   type AudioReplyRequest, type AudioReplyRuntime,
 } from '../engines/audio-reply/index.js'
+import { withUserNote } from '../engines/audio-reply/instructions.js'
 import { concatPcm16, decodeWavToPcm16Mono, type DecodedWav } from '../engines/audio-reply/wav.js'
 import { noteLocalActivity } from '../link/host-idle.js'
 import { audioAttachmentFormat } from './attachments.js'
@@ -106,8 +107,7 @@ export interface AudioReplyOutcome {
 /** The instructions a runtime is given: the conversation as text (buildAudioReplyInstructions), and the typed note
  *  that came with a recording. */
 function instructionsFor(ctx: AudioReplyCtx): string {
-  const base = buildAudioReplyInstructions(ctx.conv, ctx.history, ctx.upstream.ctxMax)
-  return ctx.turn.note ? [base, `The user also wrote, with this message: ${ctx.turn.note}`].filter(Boolean).join('\n\n') : base
+  return withUserNote(buildAudioReplyInstructions(ctx.conv, ctx.history, ctx.upstream.ctxMax), ctx.turn.note)
 }
 
 /** Runs the turn and persists it. Every exit saves the placeholder: a finished reply, a stopped one (whatever arrived,

@@ -280,6 +280,8 @@ export class Manager {
   /** Whether the running engine says its model answers aloud; false until it has said so, and for an engine that does
    *  not say (unlike audioInput, nothing else could vouch for it). */
   private audioOutput = false
+  /** Settles once the probes behind audioInput and audioOutput have answered for the current load. */
+  private modalitiesLearned: Promise<void> = Promise.resolve()
   /** The idle watchdog (watchdogTick), armed only while an engine is live. An interval armed for the
    *  Manager's whole life kept every pool-slot Manager the gateway dropped (and its per-minute config clone) alive
    *  forever; armed this way, a stopped Manager holds no timer and is collected once nothing references it. */
@@ -838,6 +840,14 @@ export class Manager {
     return st
   }
 
+  /** Resolves when the engine's answers about what its model takes and gives (audio in, audio out) are in. They are
+   *  asked for just after the load turns `running`, without the load waiting, so a request that routed a model in
+   *  moments ago and needs the answer (an audio reply asked of the gateway) waits here rather than read "no". Already
+   *  resolved for a load that finished long ago, and never rejects. */
+  whenModalitiesKnown(): Promise<void> {
+    return this.modalitiesLearned
+  }
+
   /** Ask the engine that just became ready whether its model takes audio, once per load. The answer changes what
    *  /status says about the model, so the pages showing it are told. */
   private async learnAudioInput(child: ChildProcess, port: number): Promise<void> {
@@ -1109,8 +1119,7 @@ export class Manager {
         if (this.child === child && this.state === 'starting') {
           this.state = 'running'
           this.lastActivity = Date.now()
-          void this.learnAudioInput(child, port)
-          void this.learnAudioOutput(child, port)
+          this.modalitiesLearned = Promise.all([this.learnAudioInput(child, port), this.learnAudioOutput(child, port)]).then(() => undefined, () => undefined)
         }
         return
       }

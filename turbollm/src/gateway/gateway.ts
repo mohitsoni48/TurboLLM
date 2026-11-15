@@ -31,6 +31,7 @@ import { classifyHarness } from '../telemetry/classify'
 import { anthropicContentError, mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
 import { analyzeTurn, applyAgentGuidance } from './agent-guidance'
 import { audioEndpointFor, handleAudioRequest } from './audio-endpoints'
+import { asksForAudioOutput, audioRefusalResponse, handleAudioChatCompletion, readAudioChatRequest } from './audio-chat'
 import { handleJevRequest, jevEndpointFor } from './jev-endpoints'
 import { isJsonObject, NOT_A_JSON_OBJECT } from './jev-serving'
 import { appendNudges, appendSystemRules, declaresTools, openAiRequestView } from './openai-guidance'
@@ -1174,6 +1175,10 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       return c.json({ error: { type: 'invalid_request_error', code, message } }, 400)
     }
   }
+  // A request for audio that its own body already makes unanswerable (a stream, a bad format, an MP3, an empty clip) is
+  // refused here, before the router is asked for a model: it must not first unload one and load another.
+  const audioRead = isChat && parsedBody && asksForAudioOutput(parsedBody) ? readAudioChatRequest(parsedBody) : null
+  if (audioRead && 'error' in audioRead) return audioRefusalResponse(c, audioRead)
   if (isEmbeddings && embeddingsWithheldBeforeRouting(d, requestedModel)) return modelNotLoaded(c, EMBEDDINGS_REFUSAL)
   // An embeddings request reaches a running embedding model's pool slot even with auto-swap off (see the router).
   const routeResult = await d.modelRouter.route(requestedModel, { embeddings: isEmbeddings })
@@ -1234,6 +1239,23 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       },
       400,
     )
+  }
+
+  // A request that asks for speech back (`modalities` with "audio") is never proxied, to any engine kind: llama.cpp's
+  // /v1/chat/completions ignores `modalities` and answers 200 with text. It is answered by the spoken-reply runtime or
+  // refused (audio-chat.ts). A request that does not ask takes every line below unchanged.
+  if (audioRead && !('error' in audioRead) && parsedBody) {
+    const audioAc = clientAbort(c)
+    return handleAudioChatCompletion(c, d, {
+      body: parsedBody, read: audioRead, route: routeResult, requestedModel, harness: chatHarness, codeSessionId: chatCodeSessionId, signal: audioAc.signal,
+      accounting: {
+        manager: serving.manager,
+        gate: remote ? undefined : serving.gate,
+        recordUsage: (completionTokens, durationMs) => recordOpenAiUsage(
+          d, serving.manager, { usage: { prompt_tokens: 0, completion_tokens: completionTokens } }, 'openai', requestedModel || null, chatCodeSessionId, durationMs, chatHarness,
+        ),
+      },
+    })
   }
 
   // Local: the caller's header set, minus `host`, the hop-by-hop headers, TurboLLM's own

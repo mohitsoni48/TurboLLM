@@ -21,6 +21,7 @@
 import { audioAttachmentFormat, isAudioAttachment } from './attachments.js'
 import type { Conversation, ConversationStore, Message } from './db.js'
 import { estimateTokens } from '../ext/context-limit.js'
+import { flattenInstructions, SPOKEN_REPLY_PLACEHOLDER, VOICE_MESSAGE_PLACEHOLDER } from '../engines/audio-reply/instructions.js'
 import { callChatUpstream, resolveChatUpstream, type ChatUpstream } from './chat-upstream.js'
 import type { Deps } from '../deps.js'
 
@@ -178,7 +179,7 @@ function mediaPart(attachment: string): unknown {
 }
 
 /** What stands in for a voice message in a prompt that cannot carry its audio. */
-export const VOICE_MESSAGE_PLACEHOLDER = '[Voice message]'
+export { VOICE_MESSAGE_PLACEHOLDER }
 
 /** An earlier user turn that was spoken, as it is resent. Images and documents of earlier turns are not resent (their
  *  turn's text and the reply to them carry the conversation on), but a voice message may have no text at all: resent
@@ -193,7 +194,7 @@ function spokenTurnContent(text: string, clips: string[], hearsAudio: boolean): 
 /** What stands in for an assistant message that was spoken and has no words: a reply from an audio-to-audio model whose
  *  engine returned speech but no text. Its clip is never resent (only a user's is), and an empty assistant turn is the
  *  same trap an empty user turn is for a strict chat template. */
-export const SPOKEN_REPLY_PLACEHOLDER = '[Spoken reply]'
+export { SPOKEN_REPLY_PLACEHOLDER }
 
 /** A message as buildEngineMessages sends it: `reasoning_content` is a past turn's reasoning, for an engine whose
  *  templates read it there (see `reasoningField`). */
@@ -273,19 +274,9 @@ export function buildAudioReplyInstructions(conv: Conversation, activeMessages: 
   const messages = buildEngineMessages({ ...conv, preserveThinking: false }, activeMessages, undefined, { hearsAudio: false })
   const head = messages[0]?.role === 'system' ? String(messages[0].content) : ''
   const turns = messages
-    .filter((m) => m.role !== 'system' && typeof m.content === 'string' && m.content.trim())
-    .map((m) => ({ role: m.role, line: `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${(m.content as string).trim()}` }))
-  const budget = Math.max(0, Math.floor(ctxMax / 2) - estimateTokens([{ role: 'system', content: head }]))
-  let first = turns.length
-  let used = 0
-  while (first > 0) {
-    const cost = estimateTokens([{ role: turns[first - 1].role, content: turns[first - 1].line }])
-    if (used + cost > budget) break
-    used += cost
-    first--
-  }
-  const transcript = turns.slice(first).map((t) => t.line)
-  return [head, transcript.length ? `Earlier conversation (text transcript):\n${transcript.join('\n')}` : ''].filter(Boolean).join('\n\n')
+    .filter((m): m is EngineMessage & { role: 'user' | 'assistant'; content: string } => (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+    .map((m) => ({ role: m.role, text: m.content }))
+  return flattenInstructions(head, turns, ctxMax)
 }
 
 function answeredTurnContent(m: Message, { withholdImages }: { withholdImages?: boolean }): unknown {

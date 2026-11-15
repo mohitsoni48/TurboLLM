@@ -75,3 +75,18 @@ test('the answer is forgotten when the engine stops, and a second load learns it
   assert.equal(manager.status().state, 'running')
   assert.ok(!('audioOut' in manager.status().model!), 'the first load\'s answer does not carry over')
 })
+
+test('whenModalitiesKnown waits for a probe that is still in flight, so a request that just routed a model in reads its answer', { skip }, async (t) => {
+  const dir = tmpDir('tllm-audio-output-')
+  loadTiming.audioInput = async () => null
+  loadTiming.audioOutput = async () => {
+    await new Promise((r) => setTimeout(r, 150))
+    return true
+  }
+  const manager = new Manager(ConfigStore.load(join(dir, 'config.json')))
+  t.after(() => manager.stopAndWait({ force: true }))
+  await manager.load(await fakeEngine(dir))
+  assert.ok(!('audioOut' in manager.status().model!), 'the probe has not answered yet')
+  await manager.whenModalitiesKnown()
+  assert.equal(manager.status().model?.audioOut, true)
+})
