@@ -1,5 +1,11 @@
 [advisories]
 version = 2
+ignore = [
+    # 2026-11-15: basic-toml is unmaintained (archived upstream). It reaches us only through the pinned
+    # uniffi =0.32.2 -> askama_derive 0.16.1 -> basic-toml 0.1.10, a build-time dependency of the UniFFI code
+    # generator; it is not linked into the Node addon or the Android AAR. Revisit when uniffi is bumped.
+    { id = "RUSTSEC-2026-0374", reason = "build-time-only via uniffi's askama_derive; not shipped; revisit on uniffi bump" },
+]
 
 [licenses]
 version = 2
