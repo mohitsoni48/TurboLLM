@@ -342,7 +342,8 @@ function calibratedTokenScale(pool: Message[], realCtxUsed: number | undefined, 
 const VOICE_CLIP_TOKENS = 300
 
 /** What the voice clips of `messages` add to a prompt for a model that hears, which is resent every earlier clip
- *  (spokenTurnContent). Nothing for one that does not: it gets the turn's text, or a placeholder. */
+ *  (spokenTurnContent). Nothing for one that does not: it gets the turn's text, or a placeholder. Only a user's clip
+ *  counts: a clip on an assistant message (a spoken reply) is never resent, its text stands in. */
 function voiceClipTokens(messages: Message[], hearsAudio: boolean): number {
   if (!hearsAudio) return 0
   let clips = 0
@@ -411,7 +412,11 @@ const SUMMARIZATION_TIMEOUT_MS = 60_000
 
 function buildSummarizationPrompt(priorSummary: string | null, toSummarize: Message[]): { role: string; content: string }[] {
   // A turn that was only a voice clip has no words to write down: it is named as one, not left an empty line.
-  const said = (m: Message): string => m.content || (m.role === 'user' && (m.attachments ?? []).some(isAudioAttachment) ? VOICE_MESSAGE_PLACEHOLDER : '')
+  const said = (m: Message): string => {
+    if (m.content) return m.content
+    if (!(m.attachments ?? []).some(isAudioAttachment)) return ''
+    return m.role === 'user' ? VOICE_MESSAGE_PLACEHOLDER : SPOKEN_REPLY_PLACEHOLDER
+  }
   const transcript = toSummarize.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${said(m)}`).join('\n\n')
   const priorBlock = priorSummary ? `Summary of the conversation so far:\n${priorSummary}\n\n---\n\n` : ''
   return [

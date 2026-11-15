@@ -48,3 +48,8 @@ export interface AudioReplyRuntime {
    *  stop, and what had arrived resolves as a `cancelled` reply rather than rejecting. */
   reply(baseUrl: string, req: AudioReplyRequest, signal: AbortSignal): Promise<AudioReply>
 }
+
+/** The cap on a spoken reply when the caller names none. Audio tokens come to about a dozen a second of speech, so this
+ *  is a minute or so: long enough for any ordinary answer, short enough that a reply nobody asked to be endless cannot
+ *  hold the engine's only slot for minutes. */
+export const DEFAULT_AUDIO_REPLY_MAX_TOKENS = 1024

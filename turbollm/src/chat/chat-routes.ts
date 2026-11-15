@@ -27,6 +27,7 @@ import { callChatUpstream, resolveChatUpstream, type ChatUpstream } from './chat
 import { servingEngineKind } from '../engines/serving'
 import { engineTakesReasoningAsField, engineWithholdsVision, VISION_UNAVAILABLE } from '../engines/compat'
 import { runGenerationCore } from './generation-core'
+import { prepareAudioReplyTurn, runAudioReply, type SpokenTurn } from './audio-reply-turn'
 import { nonStringField } from '../util/string-fields'
 
 /** The per-request code-routine trust decision. Exported ONLY so it can be behaviourally
@@ -570,7 +571,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/messages', async (c) => {
     const convId = c.req.param('id')
-    const read = await readCappedJson<{ content?: string; images?: string[]; audio?: string[]; docContext?: string; textAttachments?: string[]; thinkingBudget?: number; reasoningEffort?: string; model?: string }>(c.req.raw, MAX_MESSAGE_BODY_BYTES)
+    const read = await readCappedJson<{ content?: string; images?: string[]; audio?: string[]; replyAudio?: boolean; docContext?: string; textAttachments?: string[]; thinkingBudget?: number; reasoningEffort?: string; model?: string }>(c.req.raw, MAX_MESSAGE_BODY_BYTES)
     if (!read.ok) return err(c, 413, 'payload_too_large', 'A message with its images and voice clips can be at most about 400 MB.')
     const b = read.value
     // Trimmed here and in resolveChatUpstream (the model): anything but a string threw, a bare 500.
@@ -587,6 +588,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const isStrings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string')
     if (!isStrings(images) || !isStrings(audio) || !isStrings(textAttachments) || (b.docContext != null && typeof b.docContext !== 'string'))
       return err(c, 400, 'invalid_input', 'images, audio and textAttachments must be arrays of strings, and docContext a string.')
+    // Ask for the reply as speech: absent or false, the turn is the ordinary text turn, untouched.
+    if (b.replyAudio != null && typeof b.replyAudio !== 'boolean') return err(c, 400, 'invalid_input', 'replyAudio must be a boolean.')
+    const replyAudio = b.replyAudio === true
     const audioRefusal = voiceClipsRefusal(audio)
     if (audioRefusal) return err(c, 400, 'invalid_input', audioRefusal)
     // A clip is told from an image by what it is, not by the field it came in (chat-compaction.ts mediaPart): sent
@@ -616,6 +620,14 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // An image is refused likewise, before any file is written: this machine's engine reads none (G-2), so no reply
     // could be generated.
     if (images.length && localEngineWithholdsVision(d, upstream)) return err(c, 400, 'vision_unavailable', VISION_UNAVAILABLE)
+    // A spoken reply, last of the checks that can refuse the send and still before a clip or row is written: a model
+    // that cannot answer aloud, a clip that is not a WAV, clips at different rates. Never a silent text reply.
+    let spoken: SpokenTurn | undefined
+    if (replyAudio) {
+      const prepared = await prepareAudioReplyTurn(d, upstream, { audio, images, text: b.docContext ? (content ? `${b.docContext}\n\n${content}` : b.docContext) : content })
+      if (!prepared.ok) return err(c, prepared.status, prepared.code, prepared.message)
+      spoken = prepared.turn
+    }
 
     // Each image and clip to its file before the row names it (attachments.ts); the engine is sent the bytes (below).
     // Before the conversation is read again and the busy check, so nothing they decide goes stale across this await.
@@ -658,6 +670,18 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // is its abort — both are handed down rather than re-derived, so a Turbo Link chat
       // summarizes on the host it is actually talking to and Stop can interrupt the wait.
       await maybeAutoCompact(d, convId, conv, upstream, ac.signal, d.chatTurns.autoCompactionPhase(ac, async (phase) => { await sink({ event: 'compaction', data: { phase } }) }))
+
+      // A turn asked to be answered aloud runs its own path (audio-reply-turn.ts); everything below is the text turn.
+      if (spoken) {
+        const outcome = await runAudioReply(d, sink, {
+          convId, conv: setAsideFrozenCut(db, conv), history: (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id), assistantMsg, upstream, ac, turn: spoken,
+          maxOutputTokens: d.store.snapshot().modelDefaults?.maxTokens,
+        })
+        if (!outcome.aborted && outcome.content && conv.title === 'New chat' && d.store.snapshot().daemon.autoGenerateTitles) {
+          d.chatTurns.afterReplyCall(convId, 1000, () => autoTitle(d, convId, [{ role: 'user', content: content || VOICE_MESSAGE_PLACEHOLDER }], outcome.content, upstream))
+        }
+        return
+      }
 
       // Build messages array for engine (chat-compaction.ts — folds in the compaction
       // summary + cut when one is resolvable; a plain passthrough when not).

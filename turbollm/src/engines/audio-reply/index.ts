@@ -5,7 +5,7 @@
 import { requestRealtimeAudioReply } from './llamacpp-realtime'
 import type { AudioReplyRuntime } from './types'
 
-export { AudioReplyError, type AudioReply, type AudioReplyRequest, type AudioReplyRuntime } from './types'
+export { AudioReplyError, DEFAULT_AUDIO_REPLY_MAX_TOKENS, type AudioReply, type AudioReplyRequest, type AudioReplyRuntime } from './types'
 
 const llamaCppRealtime: AudioReplyRuntime = {
   reply: (baseUrl, req, signal) => requestRealtimeAudioReply(baseUrl, req, signal),
