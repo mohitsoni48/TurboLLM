@@ -822,6 +822,17 @@ export async function latestReleaseTag(repo: string, signal?: AbortSignal): Prom
   return rel.tag_name ?? ''
 }
 
+const DESKTOP_ARCHIVE = /^(?!cudart-).+-bin-(?:win|windows|linux|ubuntu|macos)-/i
+
+/** True for a release whose build archives CI has not finished uploading, which is not downloadable yet. GitHub
+ *  lists the release first: it is empty at that point, and a release cut short (b12405) kept only the cudart
+ *  runtimes and an Android archive. Picking either as "latest" fails every backend's update with a missing asset.
+ *  A listing that carries no asset array at all is left alone: that is a listing we cannot judge, not an empty one. */
+function hasUnuploadedArchives(assets: { name?: string }[] | undefined): boolean {
+  if (!Array.isArray(assets)) return false
+  return !assets.some((asset) => DESKTOP_ARCHIVE.test(asset.name ?? ''))
+}
+
 /** Resolve the newest `b<number>`-style release tag (e.g. `b10818`) of `repo`, or '' when the
  *  repo publishes none.
  *
@@ -840,13 +851,11 @@ export async function latestBuildTagRelease(repo: string, signal?: AbortSignal):
   })
   if (isRateLimited(res)) throw new GithubRateLimitError(repo)
   if (!res.ok) throw new Error(`could not list ${repo} releases: HTTP ${res.status}`)
-  const data = (await res.json()) as { tag_name?: string; draft?: boolean; assets?: unknown[] }[]
+  const data = (await res.json()) as { tag_name?: string; draft?: boolean; assets?: { name?: string }[] }[]
   let best = ''
   let bestNum = -1
   for (const rel of data) {
-    // A release GitHub lists before CI has uploaded its archives (assets: []) is not downloadable yet:
-    // picking it as "latest" 404s every backend until the build finishes.
-    if (rel.draft || (Array.isArray(rel.assets) && rel.assets.length === 0)) continue
+    if (rel.draft || hasUnuploadedArchives(rel.assets)) continue
     const tag = (rel.tag_name ?? '').trim()
     const m = /^v?b(\d+)$/i.exec(tag)
     if (!m) continue
