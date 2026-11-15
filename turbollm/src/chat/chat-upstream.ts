@@ -50,6 +50,10 @@ export interface ChatUpstream {
    *  its transcript. Known only for the local primary engine (the manager's status); a Turbo Link host's model and a
    *  pool slot's are taken not to, and a recording for them is transcribed first. */
   hearsAudio?: boolean
+  /** The model answers with speech as well as text, so a turn may ask for an audio reply. Like hearsAudio, known only
+   *  for the local primary engine; a Turbo Link host's model and a pool slot's never carry it, and a request for
+   *  audio from them is refused rather than answered in text. */
+  speaksAudio?: true
   /** The library key of the local model this upstream serves, when it is not the primary's (a routine's pool slot):
    *  what a LiteRT-LM round reads the model's tool support from. Unset: the primary's loaded model. */
   libraryKey?: string
@@ -128,6 +132,7 @@ export function resolveChatUpstream(d: Deps, requestedModel?: string): ChatUpstr
       target,
       engineKind,
       ...(ms.model.audio === true ? { hearsAudio: true } : {}),
+      ...(ms.model.audioOut === true ? { speaksAudio: true as const } : {}),
     },
   }
 }

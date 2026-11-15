@@ -40,6 +40,7 @@ interface PrimaryState {
   state: 'running' | 'stopped'
   modelKey?: string
   audio?: boolean
+  audioOut?: boolean
 }
 
 /** The members resolveChatUpstream reads, with the primary engine in the given state. */
@@ -47,7 +48,7 @@ function chatDeps(primary: PrimaryState): Deps {
   const loaded = LIBRARY.find((e) => e.key === primary.modelKey)
   return {
     manager: {
-      status: () => ({ state: primary.state, model: loaded ? { key: loaded.key, name: loaded.name, ctx: 8192, ...(primary.audio !== undefined ? { audio: primary.audio } : {}) } : null }),
+      status: () => ({ state: primary.state, model: loaded ? { key: loaded.key, name: loaded.name, ctx: 8192, ...(primary.audio !== undefined ? { audio: primary.audio } : {}), ...(primary.audioOut ? { audioOut: true } : {}) } : null }),
       target: () => (primary.state === 'running' ? ENGINE : null),
       currentOpts: () => undefined,
     },
@@ -100,4 +101,16 @@ test('hearsAudio is set only when the primary engine\'s loaded model reports aud
 test('a Turbo Link upstream never hears audio, even when the local primary does', () => {
   const r = resolveChatUpstream(chatDeps({ state: 'running', modelKey: GGUF_KEY, audio: true }), `Rig/${GGUF_KEY}`)
   assert.ok(r.ok && !('hearsAudio' in r.upstream))
+})
+
+test('speaksAudio is set only when the primary engine\'s loaded model answers aloud', () => {
+  const speaks = resolveChatUpstream(chatDeps({ state: 'running', modelKey: GGUF_KEY, audioOut: true }))
+  assert.ok(speaks.ok && speaks.upstream.speaksAudio === true)
+  const silent = resolveChatUpstream(chatDeps({ state: 'running', modelKey: GGUF_KEY }))
+  assert.ok(silent.ok && !('speaksAudio' in silent.upstream))
+})
+
+test('a Turbo Link upstream never speaks audio, even when the local primary does', () => {
+  const r = resolveChatUpstream(chatDeps({ state: 'running', modelKey: GGUF_KEY, audioOut: true }), `Rig/${GGUF_KEY}`)
+  assert.ok(r.ok && !('speaksAudio' in r.upstream))
 })
