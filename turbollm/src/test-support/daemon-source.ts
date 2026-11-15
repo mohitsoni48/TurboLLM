@@ -26,7 +26,10 @@ export function bootBody(): string {
 export function daemonSourceInBootOrder(): string {
   const cli = source('cli.ts')
   const start = cli.indexOf('const daemon = await bootDaemon({')
-  const end = cli.indexOf('\n})\n', start)
-  if (start < 0 || end < start) throw new Error('cli.ts must boot the daemon with `const daemon = await bootDaemon({…})`')
-  return cli.slice(0, start) + bootBody() + cli.slice(end + '\n})\n'.length)
+  const close = cli.indexOf('\n})', start)
+  const end = cli.indexOf('\n', close + 1)
+  if (start < 0 || close < start || end < close) {
+    throw new Error('cli.ts must boot the daemon with `const daemon = await bootDaemon({…})`, closing at column 0')
+  }
+  return cli.slice(0, start) + bootBody() + cli.slice(end + 1)
 }

@@ -1,6 +1,7 @@
-//! Ports of the TypeScript builders behind the generated fixtures (`gguf-goldens.ts` RECIPES, plan P-1):
-//! `bigVocabGguf` from `gguf.test.ts`, and `ggufFile` / `ggufVocabOnly` from `src/test-support/gguf-file.ts`.
-//! Each must produce the golden's bytes exactly; the golden's `size` and `sha256` prove it.
+//! Ports of the TypeScript builders behind the generated fixtures (plan P-1): `bigVocabGguf` from the deleted
+//! `gguf.test.ts`, and `ggufFile` / `ggufVocabOnly` from `src/test-support/gguf-file.ts`. The TypeScript writer of
+//! these fixtures (`gguf-goldens.ts`) is deleted with the TS oracle (rust-core T22); the goldens are the spec. Each
+//! builder must produce the golden's bytes exactly; the golden's `size` and `sha256` prove it.
 
 const GGUF_MAGIC: u32 = 0x4655_4747;
 const T_UINT32: u32 = 4;
