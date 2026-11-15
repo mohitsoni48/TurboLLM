@@ -894,6 +894,7 @@ function ModelRow({
   /** Hide the model by hand, or unhide it (Config.hiddenModels on the daemon). */
   onToggleHidden: (m: ModelEntry) => void
 }) {
+  const { data: status } = useStatus()
   const variants = group.variants
   const multi = variants.length > 1
   // Default the selected quant to the loaded variant, else the first. Falls back to the
@@ -956,6 +957,11 @@ function ModelRow({
         ))}
         <TextClassificationRuntimeLabel model={m} />
         {m.hasProfile && <CapChip>tuned</CapChip>}
+        {/* Only the model that is loaded now, and only when its engine says it answers with speech (status audioOut):
+            a library row cannot know that before a load, so nothing is shown for any other row. */}
+        {loaded && status?.model?.key === m.key && status.model.audioOut === true && (
+          <CapChip label="This model answers aloud: replies come back as speech with a player">Answers aloud</CapChip>
+        )}
         {/* Listed by "Show hidden models", or because it is loaded: marked, with its Unhide right here in both layouts
             (the desktop actions column has no room for another button). */}
         {m.hidden && (
@@ -1312,9 +1318,9 @@ function FilterChip({ active, onClick, children }: { active: boolean; onClick: (
 
 /** Quiet capability chip (vision / MoE / embed / NextN / tuned) — muted, never loud;
  *  only problems get a warning color. */
-function CapChip({ children }: { children: ReactNode }) {
+function CapChip({ children, label }: { children: ReactNode; label?: string }) {
   return (
-    <span className="shrink-0 whitespace-nowrap rounded bg-panel-2 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted">
+    <span title={label} aria-label={label} className="shrink-0 whitespace-nowrap rounded bg-panel-2 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted">
       {children}
     </span>
   )
