@@ -190,6 +190,11 @@ function spokenTurnContent(text: string, clips: string[], hearsAudio: boolean): 
   return text || VOICE_MESSAGE_PLACEHOLDER
 }
 
+/** What stands in for an assistant message that was spoken and has no words: a reply from an audio-to-audio model whose
+ *  engine returned speech but no text. Its clip is never resent (only a user's is), and an empty assistant turn is the
+ *  same trap an empty user turn is for a strict chat template. */
+export const SPOKEN_REPLY_PLACEHOLDER = '[Spoken reply]'
+
 /** A message as buildEngineMessages sends it: `reasoning_content` is a past turn's reasoning, for an engine whose
  *  templates read it there (see `reasoningField`). */
 export type EngineMessage = { role: string; content: unknown; reasoning_content?: string }
@@ -233,6 +238,10 @@ export function buildEngineMessages(
   ].filter(Boolean).join('\n\n')
   if (system) out.push({ role: 'system', content: system })
   for (const m of rest) {
+    if (m.role === 'assistant' && !m.content.trim() && (m.attachments ?? []).some(isAudioAttachment)) {
+      out.push({ role: m.role, content: SPOKEN_REPLY_PLACEHOLDER })
+      continue
+    }
     if (opts.reasoningField && conv.preserveThinking && m.role === 'assistant' && m.reasoning?.trim()) {
       out.push({ role: m.role, content: m.content, reasoning_content: m.reasoning })
       continue
@@ -248,6 +257,35 @@ export function buildEngineMessages(
     })
   }
   return out
+}
+
+/** Where the earlier conversation goes for an audio reply. The realtime engines take only user items, and never an
+ *  assistant's, so the context is one block of text: the system prompt (dated, as every turn's is), the compaction
+ *  summary if there is one, and the earlier turns as a transcript. Earlier turns are never sent as audio, so the
+ *  context cannot grow with every clip. Built from buildEngineMessages with `hearsAudio` off, so an earlier voice
+ *  message is `[Voice message]` and an earlier spoken reply with no words is `[Spoken reply]`, and an earlier reply's
+ *  reasoning is left out whatever the conversation's preserve-thinking setting.
+ *
+ *  `activeMessages` are the turns BEFORE the one being answered: that one is the request's input. The transcript is
+ *  bounded to about half of `ctxMax` (counted as compaction counts), dropping the oldest turns first, so a long chat
+ *  leaves the model room for the new clip and its answer; the system prompt and summary are always kept. */
+export function buildAudioReplyInstructions(conv: Conversation, activeMessages: Message[], ctxMax: number): string {
+  const messages = buildEngineMessages({ ...conv, preserveThinking: false }, activeMessages, undefined, { hearsAudio: false })
+  const head = messages[0]?.role === 'system' ? String(messages[0].content) : ''
+  const turns = messages
+    .filter((m) => m.role !== 'system' && typeof m.content === 'string' && m.content.trim())
+    .map((m) => ({ role: m.role, line: `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${(m.content as string).trim()}` }))
+  const budget = Math.max(0, Math.floor(ctxMax / 2) - estimateTokens([{ role: 'system', content: head }]))
+  let first = turns.length
+  let used = 0
+  while (first > 0) {
+    const cost = estimateTokens([{ role: turns[first - 1].role, content: turns[first - 1].line }])
+    if (used + cost > budget) break
+    used += cost
+    first--
+  }
+  const transcript = turns.slice(first).map((t) => t.line)
+  return [head, transcript.length ? `Earlier conversation (text transcript):\n${transcript.join('\n')}` : ''].filter(Boolean).join('\n\n')
 }
 
 function answeredTurnContent(m: Message, { withholdImages }: { withholdImages?: boolean }): unknown {
