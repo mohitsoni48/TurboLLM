@@ -1,0 +1,13 @@
+{
+  "parse": "{\"arch\":\"llama\",\"name\":\"Llama 3.2 1B Instruct\",\"quant\":\"Q4_K_M\",\"sizeLabel\":\"1B\",\"nativeCtx\":131072,\"blockCount\":16,\"embedLen\":2048,\"headCountKv\":8,\"headDim\":64,\"expertCount\":0,\"nextnLayers\":0,\"hasChatTemplate\":true,\"reasoningEffort\":false,\"slidingWindow\":0,\"slidingWindowPattern\":[],\"headDimSwa\":0,\"headCountKvPerLayer\":[],\"fullAttentionInterval\":0,\"ssmInnerSize\":0,\"ssmStateSize\":0,\"ssmConvKernel\":0,\"dataEnd\":807694464}",
+  "cutShort": [
+    [
+      807694464,
+      false
+    ],
+    [
+      7864320,
+      true
+    ]
+  ]
+}

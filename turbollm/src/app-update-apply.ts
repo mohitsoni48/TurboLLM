@@ -27,6 +27,7 @@ import { fileURLToPath } from 'node:url'
 import { packagedAndroidApp } from './engines/zip-install'
 import { openOwnerOnlyLog } from './util/owner-only-log'
 import { bootEnvironment } from './util/boot-env'
+import { nativeTarget, type NativeTarget, SUPPORTED_SYSTEMS } from './native/load'
 
 /** How this daemon was installed. `unknown` is a real, expected answer (an embedding we
  *  don't recognise) and is treated exactly like the refuse-to-self-update methods. */
@@ -49,6 +50,11 @@ export const INSTALL_METHODS: readonly InstallMethod[] = [
 export interface InstallSignals {
   /** `process.platform`. */
   platform: string
+  /** `process.arch`. */
+  arch: string
+  /** The native core build for this system ({@link nativeTarget}), or null when the core has none:
+   *  every release from the first core release on cannot start there. */
+  nativeTarget: NativeTarget | null
   /** The packaged Android app (nodejs-mobile, {@link packagedAndroidApp}): its own install
    *  method, updated through the Play Store. Not `platform === 'android'` alone: Termux's Node
    *  reports 'android' too, and there TurboLLM is an ordinary npm install that can update
@@ -135,13 +141,18 @@ export function classifyInstall(s: InstallSignals): InstallInfo {
     }
   }
 
+  const selfUpdating = selfUpdatingInstall(s, entry)
+  if (selfUpdating && s.nativeTarget === null) {
+    return { method: selfUpdating, canSelfUpdate: false, command: '', note: unsupportedCoreNote(s) }
+  }
+
   // `npx turbollm` unpacks into npm's `_npx` cache. There is nothing persistent to
   // upgrade: the fix is to re-run with `@latest`, which fetches a fresh copy.
-  if (entry.includes('/_npx/')) {
+  if (selfUpdating === 'npx') {
     return { method: 'npx', canSelfUpdate: true, command: 'npx turbollm@latest', note: '' }
   }
 
-  if (s.npmGlobalRoot && isUnder(s.entry, s.npmGlobalRoot, s.platform === 'win32')) {
+  if (selfUpdating === 'npm_global') {
     // Offered on a prefix this user cannot write, "Update & restart" stopped the daemon, the
     // helper's `npm install -g` failed with EACCES, and the old version came back detached from
     // the terminal, the dialog reading only "npm exited with code 243" (npm's own EACCES text
@@ -175,6 +186,18 @@ export function classifyInstall(s: InstallSignals): InstallInfo {
     command: 'npm i -g turbollm@latest',
     note: "TurboLLM couldn't tell how it was installed, so it won't update itself. Run the command above in the same place you installed it.",
   }
+}
+
+/** The install methods whose update fetches the newest release from npm, or null for any other. */
+function selfUpdatingInstall(s: InstallSignals, entry: string): 'npx' | 'npm_global' | null {
+  if (entry.includes('/_npx/')) return 'npx'
+  if (s.npmGlobalRoot && isUnder(s.entry, s.npmGlobalRoot, s.platform === 'win32')) return 'npm_global'
+  return null
+}
+
+/** Why an install on a system with no native core build is not updated: the new version would not start. */
+function unsupportedCoreNote(s: InstallSignals): string {
+  return `This system (${s.platform}-${s.arch}) is not supported by TurboLLM's native core, which new versions need, so it can't update itself. Supported: ${SUPPORTED_SYSTEMS}.`
 }
 
 /** Path containment, case-insensitively when asked (Windows). Compares whole segments (a
@@ -292,13 +315,22 @@ function writable(dir: string): boolean {
 /** Classify the running daemon. Async only because `npm root -g` is a subprocess; every
  *  other signal is a cheap local read. Never throws. */
 export async function detectInstall(): Promise<InstallInfo> {
+  return classifyInstall(await readInstallSignals())
+}
+
+/** The running daemon's install signals. `systemTarget` looks up the native core build for this system. */
+export async function readInstallSignals(
+  systemTarget: () => NativeTarget | null = () => nativeTarget(),
+): Promise<InstallSignals> {
   const link = resolve(process.argv[1] ?? '')
   const entry = realPathOr(link)
   // Resolved too, so a prefix that itself sits behind a symlink still contains the entry.
   const raw = await npmGlobalRoot()
   const root = raw && realPathOr(raw)
-  return classifyInstall({
+  return {
     platform: process.platform,
+    arch: process.arch,
+    nativeTarget: systemTarget(),
     androidApp: packagedAndroidApp(),
     entry,
     // Captured at boot and removed from the environment (util/boot-env.ts), so a TurboLLM run from a desktop Code
@@ -311,7 +343,7 @@ export async function detectInstall(): Promise<InstallInfo> {
     // folder is under the user's AppData), and its folder ACLs are not what access() reads.
     globalInstallWritable: process.platform === 'win32' || !root || (writable(root) && writable(dirname(link))),
     sourceCheckout: detectSourceCheckout(entry),
-  })
+  }
 }
 
 // ─── Blocking an unsafe apply ─────────────────────────────────────────────────

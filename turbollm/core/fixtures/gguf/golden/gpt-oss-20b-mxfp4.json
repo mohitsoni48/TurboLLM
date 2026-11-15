@@ -1,0 +1,13 @@
+{
+  "parse": "{\"arch\":\"gpt-oss\",\"name\":\"gpt-oss-20b\",\"quant\":\"\",\"sizeLabel\":\"32x2.4B\",\"nativeCtx\":131072,\"blockCount\":24,\"embedLen\":2880,\"headCountKv\":8,\"headDim\":64,\"expertCount\":32,\"nextnLayers\":0,\"hasChatTemplate\":true,\"reasoningEffort\":true,\"slidingWindow\":128,\"slidingWindowPattern\":[],\"headDimSwa\":0,\"headCountKvPerLayer\":[],\"fullAttentionInterval\":0,\"ssmInnerSize\":0,\"ssmStateSize\":0,\"ssmConvKernel\":0,\"dataEnd\":12109566624}",
+  "cutShort": [
+    [
+      12109566624,
+      false
+    ],
+    [
+      13041664,
+      true
+    ]
+  ]
+}

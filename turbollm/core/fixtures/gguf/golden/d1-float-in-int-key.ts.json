@@ -1,0 +1,9 @@
+{
+  "parse": "{\"arch\":\"llama\",\"name\":\"\",\"quant\":\"\",\"sizeLabel\":\"\",\"nativeCtx\":4096.5,\"blockCount\":0,\"embedLen\":0,\"headCountKv\":8.5,\"headDim\":128.75,\"expertCount\":0,\"nextnLayers\":0,\"hasChatTemplate\":false,\"reasoningEffort\":false,\"slidingWindow\":0,\"slidingWindowPattern\":[],\"headDimSwa\":0,\"headCountKvPerLayer\":[8.5,2.25],\"fullAttentionInterval\":0,\"ssmInnerSize\":0,\"ssmStateSize\":0,\"ssmConvKernel\":0,\"dataEnd\":212}",
+  "cutShort": [
+    [
+      212,
+      false
+    ]
+  ]
+}

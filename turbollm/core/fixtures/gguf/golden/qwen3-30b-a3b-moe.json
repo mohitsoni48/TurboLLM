@@ -1,0 +1,13 @@
+{
+  "parse": "{\"arch\":\"qwen3moe\",\"name\":\"Qwen3-30B-A3B\",\"quant\":\"Q4_K_M\",\"sizeLabel\":\"30B-A3B\",\"nativeCtx\":40960,\"blockCount\":48,\"embedLen\":2048,\"headCountKv\":4,\"headDim\":128,\"expertCount\":128,\"nextnLayers\":0,\"hasChatTemplate\":true,\"reasoningEffort\":false,\"slidingWindow\":0,\"slidingWindowPattern\":[],\"headDimSwa\":0,\"headCountKvPerLayer\":[],\"fullAttentionInterval\":0,\"ssmInnerSize\":0,\"ssmStateSize\":0,\"ssmConvKernel\":0,\"dataEnd\":18556686912}",
+  "cutShort": [
+    [
+      18556686912,
+      false
+    ],
+    [
+      6029312,
+      true
+    ]
+  ]
+}

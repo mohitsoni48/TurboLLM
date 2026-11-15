@@ -1,0 +1,28 @@
+{
+  "name": "@turbollm/core-linux-x64-gnu",
+  "version": "0.0.0",
+  "description": "TurboLLM native core for linux-x64-gnu",
+  "license": "FSL-1.1-ALv2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mohitsoni48/TurboLLM.git",
+    "directory": "turbollm/core/bindings/node/npm/linux-x64-gnu"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "main": "turbollm-core.linux-x64-gnu.node",
+  "files": [
+    "turbollm-core.linux-x64-gnu.node",
+    "LICENSE.md"
+  ],
+  "engines": {
+    "node": ">=18.20"
+  }
+}

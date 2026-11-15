@@ -1,0 +1,17 @@
+[package]
+name = "turbollm-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "turbollm_core_ffi"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+turbollm-core = { path = "../../crates/turbollm-core" }
+# Same exact version as xtask's uniffi (bindgen): generated Kotlin must match the scaffolding.
+uniffi = { version = "=0.32.2", default-features = false }
+thiserror = "=2.0.21"

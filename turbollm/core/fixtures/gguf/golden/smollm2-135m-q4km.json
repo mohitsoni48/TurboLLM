@@ -1,0 +1,13 @@
+{
+  "parse": "{\"arch\":\"llama\",\"name\":\"Smollm2 135M 8k Lc100K Mix1 Ep2\",\"quant\":\"Q4_K_M\",\"sizeLabel\":\"135M\",\"nativeCtx\":8192,\"blockCount\":30,\"embedLen\":576,\"headCountKv\":3,\"headDim\":0,\"expertCount\":0,\"nextnLayers\":0,\"hasChatTemplate\":true,\"reasoningEffort\":false,\"slidingWindow\":0,\"slidingWindowPattern\":[],\"headDimSwa\":0,\"headCountKvPerLayer\":[],\"fullAttentionInterval\":0,\"ssmInnerSize\":0,\"ssmStateSize\":0,\"ssmConvKernel\":0,\"dataEnd\":105454432}",
+  "cutShort": [
+    [
+      105454432,
+      false
+    ],
+    [
+      1835008,
+      true
+    ]
+  ]
+}

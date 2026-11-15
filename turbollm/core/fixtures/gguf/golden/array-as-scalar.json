@@ -1,0 +1,9 @@
+{
+  "parse": "{\"error\":{\"code\":\"bad_type\",\"message\":\"Unknown GGUF value type 9.\"}}",
+  "cutShort": [
+    [
+      81,
+      false
+    ]
+  ]
+}

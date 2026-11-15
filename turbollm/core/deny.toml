@@ -1,0 +1,40 @@
+[advisories]
+version = 2
+ignore = [
+    # 2026-11-15: basic-toml is unmaintained (archived upstream). It reaches us only through the pinned
+    # uniffi =0.32.2 -> askama_derive 0.16.1 -> basic-toml 0.1.10, a build-time dependency of the UniFFI code
+    # generator; it is not linked into the Node addon or the Android AAR. Revisit when uniffi is bumped.
+    { id = "RUSTSEC-2026-0374", reason = "build-time-only via uniffi's askama_derive; not shipped; revisit on uniffi bump" },
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "uniffi" },
+    { allow = ["MPL-2.0"], crate = "uniffi_bindgen" },
+    { allow = ["MPL-2.0"], crate = "uniffi_build" },
+    { allow = ["MPL-2.0"], crate = "uniffi_core" },
+    { allow = ["MPL-2.0"], crate = "uniffi_internal_macros" },
+    { allow = ["MPL-2.0"], crate = "uniffi_macros" },
+    { allow = ["MPL-2.0"], crate = "uniffi_meta" },
+    { allow = ["MPL-2.0"], crate = "uniffi_pipeline" },
+    { allow = ["MPL-2.0"], crate = "uniffi_udl" },
+]
+
+# The workspace's own crates are FSL-1.1-ALv2 and never published (publish = false): only third-party licenses are checked.
+[licenses.private]
+ignore = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []

@@ -1,0 +1,9 @@
+{
+  "parse": "{\"arch\":\"qwen3next\",\"name\":\"Qwen3-Coder-Next\",\"quant\":\"Q4_1\",\"sizeLabel\":\"512x2.5B\",\"nativeCtx\":262144,\"blockCount\":48,\"embedLen\":2048,\"headCountKv\":2,\"headDim\":256,\"expertCount\":512,\"nextnLayers\":0,\"hasChatTemplate\":true,\"reasoningEffort\":false,\"slidingWindow\":0,\"slidingWindowPattern\":[],\"headDimSwa\":0,\"headCountKvPerLayer\":[],\"fullAttentionInterval\":4,\"ssmInnerSize\":4096,\"ssmStateSize\":128,\"ssmConvKernel\":4,\"dataEnd\":5936310}",
+  "cutShort": [
+    [
+      5936320,
+      false
+    ]
+  ]
+}
