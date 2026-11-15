@@ -354,6 +354,17 @@ describe('ChatSession.send', () => {
     expect(args[10]).toEqual(['data:audio/wav;base64,AA'])
   })
 
+  it('forwards a spoken-reply request after the clips', async () => {
+    const asked = await sentArgs({ text: '', images: [], audio: ['data:audio/wav;base64,AA'], replyAudio: true, docContext: '', textAttachmentNames: [] })
+    expect(asked[10]).toEqual(['data:audio/wav;base64,AA'])
+    expect(asked[11]).toBe(true)
+  })
+
+  it('passes no spoken-reply request when the message does not ask', async () => {
+    const plain = await sentArgs({ text: 'hi', images: [], docContext: '', textAttachmentNames: [] })
+    expect(plain[11]).toBeUndefined()
+  })
+
   it('passes no audio when the message has none', async () => {
     const args = await sentArgs({ text: 'hi', images: [], docContext: '', textAttachmentNames: [] })
     expect(args[10]).toBeUndefined()
