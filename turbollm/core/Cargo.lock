@@ -1042,14 +1042,14 @@ checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
 
 [[package]]
 name = "turbollm-core"
-version = "1.15.1"
+version = "1.15.2"
 dependencies = [
  "turbollm-gguf",
 ]
 
 [[package]]
 name = "turbollm-ffi"
-version = "1.15.1"
+version = "1.15.2"
 dependencies = [
  "thiserror",
  "turbollm-core",
@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "turbollm-gguf"
-version = "1.15.1"
+version = "1.15.2"
 dependencies = [
  "fancy-regex",
  "proptest",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "turbollm-node"
-version = "1.15.1"
+version = "1.15.2"
 dependencies = [
  "napi",
  "napi-build",
@@ -1271,7 +1271,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "1.15.1"
+version = "1.15.2"
 dependencies = [
  "object",
  "serde_json",
