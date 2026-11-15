@@ -60,7 +60,7 @@ describe('ChatSession.follow', () => {
     const ac = new AbortController()
     const seen: string[] = []
     session.subscribe(() => seen.push(session.getSnapshot().liveByConv.c1?.content ?? '<none>'))
-    // One frame per task, as a live reply arrives (one network read per token): each change is told as it lands.
+    // One frame per task, as a live reply arrives (one network read per token): each change is notified as it lands.
     async function* live(...list: ChatFrame[]): AsyncGenerator<ChatFrame> {
       for (const f of list) { await new Promise((r) => setTimeout(r, 0)); yield f }
     }
@@ -78,19 +78,22 @@ describe('ChatSession.follow', () => {
   })
 
   // A refreshed page attaching to a reply that waits for approval: the daemon replays every frame so far in one burst.
-  // Telling React per frame made it throw "Maximum update depth exceeded", and the approval bar never showed.
-  it('tells a replayed burst of frames once at its start and once at its end, with the final state', async () => {
+  // Notifying React per frame made it throw "Maximum update depth exceeded", and the approval bar never showed.
+  it('notifies a replayed burst of frames once at its start and once at its end, with the final state', async () => {
     const { session } = makeSession()
     let calls = 0
     const states: string[] = []
     session.subscribe(() => { calls++; const l = session.getSnapshot().liveByConv.c1; states.push(l ? `${l.reasoning.length}:${l.timeline.map((b) => b.kind).join(',')}` : '<none>') })
     const burst: ChatFrame[] = [META, ...Array.from({ length: 400 }, () => ({ event: 'reasoning', data: { delta: 'x' } }) as ChatFrame),
       { event: 'tool_call', data: { id: 't1', name: 'run_code', args: { code: '2 + 2' }, status: 'awaiting_approval' } }]
-    void session.follow('c1', new AbortController(), (async function* () { yield* burst; await new Promise(() => {}) })())
+    const ac = new AbortController()
+    const following = session.follow('c1', ac, (async function* () { yield* burst; await new Promise((r) => ac.signal.addEventListener('abort', r)) })())
     await new Promise((r) => setTimeout(r, 5))
     expect(calls).toBeLessThanOrEqual(3)
     expect(states.at(-1)).toBe('400:tool')
     expect(session.getSnapshot().liveByConv.c1?.timeline.find((b) => b.kind === 'tool')).toMatchObject({ call: { status: 'awaiting_approval' } })
+    ac.abort()
+    await following
   })
 
   it('keeps the text so far across a repeated meta, and clears it on reset', async () => {
