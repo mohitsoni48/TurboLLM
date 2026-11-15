@@ -84,7 +84,9 @@ test('after the strip step `npm pack --dry-run` lists dist files but no .node', 
   const pack = spawnSync('npm pack --dry-run --json --ignore-scripts', { cwd: root, shell: true, encoding: 'utf8' })
   assert.equal(pack.status, 0, pack.stderr)
 
-  const packed = (JSON.parse(pack.stdout) as Array<{ files: Array<{ path: string }> }>)[0].files.map((f) => f.path)
+  // npm may print lifecycle output (the `prepare` script's patch-package) before the JSON on a clean checkout.
+  const json = pack.stdout.slice(pack.stdout.search(/^\[/m))
+  const packed = (JSON.parse(json) as Array<{ files: Array<{ path: string }> }>)[0].files.map((f) => f.path)
   assert.ok(packed.includes('dist/cli.js'), packed.join(', '))
   assert.deepEqual(packed.filter((path) => path.endsWith('.node')), [])
 })
