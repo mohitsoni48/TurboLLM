@@ -180,6 +180,7 @@ test('validateEvent: ui_action accepts the Phase 6g ChatScreen batch actions', (
     'open_model_settings', 'copy_chat_link', 'copy_chat_debug_info', 'export_chat',
     'dismiss_import_banner', 'use_suggested_prompt', 'scroll_to_latest', 'dismiss_clipboard_modal',
     'select_skill_from_picker', 'remove_attachment', 'attach_file', 'stop_generation', 'send_message',
+    'switch_agent',
   ]
   for (const action of actions) {
     const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'chat', action } }))

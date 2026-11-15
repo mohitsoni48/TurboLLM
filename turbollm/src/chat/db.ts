@@ -54,6 +54,10 @@ export interface Conversation {
   /** Tool-name allow-list baked in from a custom chat Agent at creation (Customize →
    *  Agents). Undefined/empty = unrestricted (every built-in persona). */
   allowedTools?: string[]
+  /** GitHub #52: the chat agent this conversation runs under: a built-in persona id or a custom agent's id. Kept here, not
+   *  only in the browser, so switching agents mid-chat and any device that opens the chat name the same agent. Distinct
+   *  from `agentId`, which belongs to background agent runs. Undefined on chats from before it existed. */
+  chatAgentId?: string
   /** GitHub #52: when true, past turns' reasoning is folded back into what's resent to
    *  the engine (wrapped in <think> tags, with chat_template_kwargs.preserve_thinking
    *  set so the template doesn't strip it back out) instead of only their final content.
@@ -494,7 +498,7 @@ export interface Message {
   edited: boolean
 }
 
-interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; compaction_applied_at: string | null; created_at: string; updated_at: string }
+interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; chat_agent_id: string | null; preserve_thinking: number; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; compaction_applied_at: string | null; created_at: string; updated_at: string }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface ExtRunRow { id: string; chat_id: string; message_id: string; tenant: string; owner: string; status: string; event_seq: number; error: string | null; created_at: string; ended_at: string | null }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number; doc_context: string | null }
@@ -562,7 +566,7 @@ function likeSubstring(text: string): string {
 
 /** Conversation list rows: every column but compaction_summary, which can run to thousands of
  *  words and only the opened conversation (getConversation) shows. */
-const CONV_LIST_COLUMNS = `id, title, system_prompt, model_key, sampling, expert_mode, tool_policy, kind, folder_id, tool_overrides, agent_id, completed_at, read_scope, agent_mode, skill_ids, allowed_tools, preserve_thinking, NULL AS compaction_summary, compaction_upto_message_id, compaction_tokens_before, compaction_applied_at, created_at, updated_at`
+const CONV_LIST_COLUMNS = `id, title, system_prompt, model_key, sampling, expert_mode, tool_policy, kind, folder_id, tool_overrides, agent_id, completed_at, read_scope, agent_mode, skill_ids, allowed_tools, chat_agent_id, preserve_thinking, NULL AS compaction_summary, compaction_upto_message_id, compaction_tokens_before, compaction_applied_at, created_at, updated_at`
 
 /** Message rows for display: every column but doc_context (getMessagesForDisplay). */
 const MSG_DISPLAY_COLUMNS = `id, conv_id, seq, role, content, reasoning, attachments, text_attachments, tool_calls, timeline, stats, model_key, research_meta, created_at, variant_group, is_active, branch_of, edited, NULL AS doc_context`
@@ -579,7 +583,7 @@ function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
 }
 
 function rowToConv(r: ConvRow): Conversation {
-  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : r.kind === 'code' ? 'code' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, readScope: r.read_scope ? (safeJson(r.read_scope) as string[]) : undefined, agentMode: r.agent_mode ?? undefined, skillIds: r.skill_ids ? (safeJson(r.skill_ids) as string[]) : undefined, allowedTools: r.allowed_tools ? (safeJson(r.allowed_tools) as string[]) : undefined, preserveThinking: r.preserve_thinking === 1, compactionSummary: r.compaction_summary ?? undefined, compactionUpToMessageId: r.compaction_upto_message_id ?? undefined, compactionTokensBefore: r.compaction_tokens_before ?? undefined, compactionAppliedAt: r.compaction_applied_at ?? undefined, createdAt: r.created_at, updatedAt: r.updated_at }
+  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : r.kind === 'code' ? 'code' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, readScope: r.read_scope ? (safeJson(r.read_scope) as string[]) : undefined, agentMode: r.agent_mode ?? undefined, skillIds: r.skill_ids ? (safeJson(r.skill_ids) as string[]) : undefined, allowedTools: r.allowed_tools ? (safeJson(r.allowed_tools) as string[]) : undefined, chatAgentId: r.chat_agent_id ?? undefined, preserveThinking: r.preserve_thinking === 1, compactionSummary: r.compaction_summary ?? undefined, compactionUpToMessageId: r.compaction_upto_message_id ?? undefined, compactionTokensBefore: r.compaction_tokens_before ?? undefined, compactionAppliedAt: r.compaction_applied_at ?? undefined, createdAt: r.created_at, updatedAt: r.updated_at }
 }
 
 interface MemoryFactRow { id: string; fact_text: string; source_conv_id: string | null; created_at: string }
@@ -764,14 +768,14 @@ export class ConversationStore {
     return { conversations: rows.map(rowToConv), nextCursor }
   }
 
-  createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'sampling' | 'expertMode' | 'toolPolicy' | 'kind' | 'folderId' | 'agentId' | 'skillIds' | 'allowedTools' | 'preserveThinking'>>): Conversation {
+  createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'sampling' | 'expertMode' | 'toolPolicy' | 'kind' | 'folderId' | 'agentId' | 'skillIds' | 'allowedTools' | 'chatAgentId' | 'preserveThinking'>>): Conversation {
     const now = new Date().toISOString()
     const id = randomUUID()
     // preserve_thinking's column default is baked in at ALTER TABLE time (v25) and can't
     // be changed retroactively for already-migrated DBs — so "on by default for new chats"
     // is enforced here instead, by always writing an explicit value.
-    this.db.prepare(`INSERT INTO conversations (id,title,system_prompt,model_key,sampling,expert_mode,tool_policy,kind,folder_id,agent_id,skill_ids,allowed_tools,preserve_thinking,created_at,updated_at) VALUES ($id,$title,$sp,$mk,$samp,$expert,$tp,$kind,$fid,$aid,$sk,$at,$pt,$now,$now)`)
-      .run({ $id: id, $title: partial?.title ?? 'New chat', $sp: partial?.systemPrompt ?? '', $mk: partial?.modelKey ?? '', $samp: JSON.stringify(partial?.sampling ?? {}), $expert: partial?.expertMode ? 1 : 0, $tp: partial?.toolPolicy ?? null, $kind: partial?.kind ?? 'chat', $fid: partial?.folderId ?? null, $aid: partial?.agentId ?? null, $sk: partial?.skillIds ? JSON.stringify(partial.skillIds) : null, $at: partial?.allowedTools ? JSON.stringify(partial.allowedTools) : null, $pt: (partial?.preserveThinking ?? true) ? 1 : 0, $now: now } as P)
+    this.db.prepare(`INSERT INTO conversations (id,title,system_prompt,model_key,sampling,expert_mode,tool_policy,kind,folder_id,agent_id,skill_ids,allowed_tools,chat_agent_id,preserve_thinking,created_at,updated_at) VALUES ($id,$title,$sp,$mk,$samp,$expert,$tp,$kind,$fid,$aid,$sk,$at,$cai,$pt,$now,$now)`)
+      .run({ $id: id, $title: partial?.title ?? 'New chat', $sp: partial?.systemPrompt ?? '', $mk: partial?.modelKey ?? '', $samp: JSON.stringify(partial?.sampling ?? {}), $expert: partial?.expertMode ? 1 : 0, $tp: partial?.toolPolicy ?? null, $kind: partial?.kind ?? 'chat', $fid: partial?.folderId ?? null, $aid: partial?.agentId ?? null, $sk: partial?.skillIds ? JSON.stringify(partial.skillIds) : null, $at: partial?.allowedTools ? JSON.stringify(partial.allowedTools) : null, $cai: partial?.chatAgentId ?? null, $pt: (partial?.preserveThinking ?? true) ? 1 : 0, $now: now } as P)
     return this.getConversation(id)!
   }
 
@@ -783,7 +787,9 @@ export class ConversationStore {
     return conv
   }
 
-  updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'modelKey' | 'skillIds' | 'preserveThinking'>>): boolean {
+  /** `allowedTools` and `toolPolicy` take `null` to clear them (every tool allowed again / no policy): the Pick-patch's
+   *  `!== undefined` guard alone could only ever write a value. An agent switch needs both directions. */
+  updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'modelKey' | 'skillIds' | 'preserveThinking'>> & { allowedTools?: string[] | null; toolPolicy?: string | null; chatAgentId?: string | null }): boolean {
     const now = new Date().toISOString()
     const sets: string[] = ['updated_at = $now']
     const params: Record<string, SqlValue> = { $id: id, $now: now }
@@ -793,6 +799,9 @@ export class ConversationStore {
     if (patch.modelKey !== undefined)     { sets.push('model_key = $mk');     params.$mk    = patch.modelKey }
     if (patch.skillIds !== undefined)     { sets.push('skill_ids = $sk');     params.$sk    = JSON.stringify(patch.skillIds) }
     if (patch.preserveThinking !== undefined) { sets.push('preserve_thinking = $pt'); params.$pt = patch.preserveThinking ? 1 : 0 }
+    if (patch.allowedTools !== undefined) { sets.push('allowed_tools = $at'); params.$at = patch.allowedTools === null ? null : JSON.stringify(patch.allowedTools) }
+    if (patch.toolPolicy !== undefined)   { sets.push('tool_policy = $tp');   params.$tp = patch.toolPolicy }
+    if (patch.chatAgentId !== undefined)  { sets.push('chat_agent_id = $cai'); params.$cai = patch.chatAgentId }
     return ((this.db.prepare(`UPDATE conversations SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
   }
 
