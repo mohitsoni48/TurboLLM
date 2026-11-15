@@ -62,6 +62,7 @@ class GoldenSuite(private val fixtures: File, private val corpusDir: File) {
 
     private fun headerMismatches(id: String, golden: JsonObject, file: File): List<String> {
         val expected = Json.parseToJsonElement(golden.getValue("parse").jsonPrimitive.content).jsonObject
+            .withSaturatedDataEnd()
         val maxRead = golden["maxRead"]?.jsonPrimitive?.long?.toULong()
         val actual = headerAsGolden(file, maxRead)
         return (expected.keys + actual.keys).filter { expected[it] != actual[it] }.map { field ->
@@ -111,6 +112,18 @@ private fun goldenId(fileName: String): String? {
 }
 
 private fun readJson(file: File): JsonElement = Json.parseToJsonElement(file.readText())
+
+/**
+ * Declared binding behaviour, not a tolerance: `GgufMeta.dataEnd` is a signed `Long`, so the UniFFI layer saturates
+ * a u64 tensor end past `Long.MAX_VALUE` (only a crafted file reaches one) to `Long.MAX_VALUE`
+ * (`saturated_long` in bindings/uniffi/src/lib.rs). The golden holds the core's u64, so only that one case is
+ * clamped the same way; every other value of every field is still compared exactly.
+ */
+private fun JsonObject.withSaturatedDataEnd(): JsonObject {
+    val dataEnd = this["dataEnd"]?.jsonPrimitive?.content?.toULongOrNull() ?: return this
+    if (dataEnd <= Long.MAX_VALUE.toULong()) return this
+    return JsonObject(this + ("dataEnd" to JsonPrimitive(Long.MAX_VALUE)))
+}
 
 private fun GgufMeta.asGolden(): JsonObject = buildJsonObject {
     put("arch", arch)

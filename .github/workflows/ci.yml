@@ -29,6 +29,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Keep Node 22 here: its bundled npm 10 is the strictest reader of package-lock.json, so this `npm ci` is the
+      # guard that a lock written by a newer local npm (11.x accepts entries 10.x reports as "Missing") still installs.
+      # Check a regenerated lock locally with `npx -y npm@10.9.9 ci --dry-run --ignore-scripts` in turbollm/.
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
