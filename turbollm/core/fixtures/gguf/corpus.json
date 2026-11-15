@@ -1,0 +1,137 @@
+[
+  {
+    "id": "llama32-1b-q4km",
+    "repo": "bartowski/Llama-3.2-1B-Instruct-GGUF",
+    "revision": "067b946cf014b7c697f3654f621d577a3e3afd1c",
+    "file": "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+    "bytes": 7864320,
+    "sha256": "1e1d784699c7c567571103fed985fad41cdeef03f26c5c2bf52f73a8fbfe5a87",
+    "fileSize": 807694464
+  },
+  {
+    "id": "qwen25-05b-q4km",
+    "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+    "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    "bytes": 5963776,
+    "sha256": "dfa8bbb81c5149b0e2565943a14ed3f5ca536547e84842458605b66d358d4af6",
+    "fileSize": 491400032
+  },
+  {
+    "id": "qwen3-30b-a3b-moe",
+    "repo": "unsloth/Qwen3-30B-A3B-GGUF",
+    "revision": "d5b1d57bd0b504ac62ae6c725904e96ef228dc74",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "bytes": 6029312,
+    "sha256": "fcfce5d26842bf142d86bab75ea5aca24c515ffaa76ffacb1836d691139d4881",
+    "fileSize": 18556686912
+  },
+  {
+    "id": "qwen36-27b-hybrid",
+    "repo": "unsloth/Qwen3.6-27B-GGUF",
+    "revision": "82d411acf4a06cfb8d9b073a5211bf410bfc29bf",
+    "file": "Qwen3.6-27B-Q4_K_M.gguf",
+    "bytes": 11010048,
+    "sha256": "9151ff0d5c6326944bc793353ca205f3c537e27c499adc837f03f381ec73c375",
+    "fileSize": 16817244384
+  },
+  {
+    "id": "qwen3-coder-next-shard1",
+    "repo": "unsloth/Qwen3-Coder-Next-GGUF",
+    "revision": "ce09c67b53bc8739eef83fe67b2f5d293c270632",
+    "file": "Q4_1/Qwen3-Coder-Next-Q4_1-00001-of-00003.gguf",
+    "bytes": 5936320,
+    "sha256": "6997125c01586ef1778b90ce5f78fe51a5fa965dc719f31c7efd114e74081d36",
+    "fileSize": 5936320
+  },
+  {
+    "id": "gemma3-1b",
+    "repo": "ggml-org/gemma-3-1b-it-GGUF",
+    "revision": "f9c28bcd85737ffc5aef028638d3341d49869c27",
+    "file": "gemma-3-1b-it-Q4_K_M.gguf",
+    "bytes": 6553600,
+    "sha256": "b434739f64210efd9d1f6e53d44e2367c32f7491d56924759e64996921cfdf73",
+    "fileSize": 806058240
+  },
+  {
+    "id": "gemma4-26b-a4b",
+    "repo": "ggml-org/gemma-4-26B-A4B-it-GGUF",
+    "revision": "1ca99aae748b4b01f609fa51eb23682ee5f00b85",
+    "file": "gemma-4-26B-A4B-it-Q4_0.gguf",
+    "bytes": 15859712,
+    "sha256": "fef4e4c9c84d22440e7ff91f6a0d32ba100b8080cb8cb548398a8e8b8e6ac108",
+    "fileSize": 14618145824
+  },
+  {
+    "id": "glm45-air-nextn",
+    "repo": "unsloth/GLM-4.5-Air-GGUF",
+    "revision": "506d64aa8c5cfe9dbbf00bc7a15739438f83204d",
+    "file": "GLM-4.5-Air-Q2_K.gguf",
+    "bytes": 9371648,
+    "sha256": "8086cc51ca87c69d2c237640ceb2476f4fff3c99cb30cacb79643608e340225c",
+    "fileSize": 45322103872
+  },
+  {
+    "id": "gpt-oss-20b-mxfp4",
+    "repo": "ggml-org/gpt-oss-20b-GGUF",
+    "revision": "41e8a94d15d62070b36cf4553a0250717ecf46b8",
+    "file": "gpt-oss-20b-MXFP4.gguf",
+    "bytes": 13041664,
+    "sha256": "c3870df511b03cbee609c34208b2bfc625b4af48dc5e78dcf0552e382aee46b4",
+    "fileSize": 12109566624
+  },
+  {
+    "id": "qwen36-apex-safetensors",
+    "repo": "mudler/Qwen3.6-35B-A3B-APEX-MTP-GGUF",
+    "revision": "28ea82d91803164a535589a6ec686ba9cc6bd593",
+    "file": "Qwen3.6-35B-A3B-APEX-MTP-I-Mini.gguf",
+    "bytes": 11010048,
+    "sha256": "63a58dfd735e242cd48ce5d8545421ab6d4e5f682aa2a5ce3891cccbd8fa0758",
+    "fileSize": 14272220768
+  },
+  {
+    "id": "qwen38-27b-reasoning-effort",
+    "repo": "unsloth/Qwen3.8-27B-GGUF",
+    "revision": "4af51b3542f775b0a8e4b310bfb3f17e01c306c9",
+    "file": "Qwen3.8-27B-Q4_0.gguf",
+    "bytes": 11010048,
+    "sha256": "38d938d3da2aa13eb5fe6fbd8cd9031875f105333a86f8536117f9b938a1cdd2",
+    "fileSize": 16056478688
+  },
+  {
+    "id": "nomic-embed-v15",
+    "repo": "nomic-ai/nomic-embed-text-v1.5-GGUF",
+    "revision": "0188c9bf409793f810680a5a431e7b899c46104c",
+    "file": "nomic-embed-text-v1.5.Q4_K_M.gguf",
+    "bytes": 786432,
+    "sha256": "3d82426e1dcf315fe183543383f2a992d70e497142aa5963e4f99fd8183f5ad3",
+    "fileSize": 84106624
+  },
+  {
+    "id": "qwen3-06b-bf16",
+    "repo": "unsloth/Qwen3-0.6B-GGUF",
+    "revision": "50968a4468ef4233ed78cd7c3de230dd1d61a56b",
+    "file": "Qwen3-0.6B-BF16.gguf",
+    "bytes": 5963776,
+    "sha256": "5ef5b44a84d71e8b1379011c2a2cc85a2e59cec888389e3795306220a4b82e7b",
+    "fileSize": 1198182848
+  },
+  {
+    "id": "llamacpp-vocab-llama-bpe",
+    "repo": "github:ggml-org/llama.cpp",
+    "revision": "a956a852c9c8bc1fb07206364838ddef299178c0",
+    "file": "models/ggml-vocab-llama-bpe.gguf",
+    "bytes": 7818140,
+    "sha256": "97272e430d53bc7688f52d5e0ad8ea8f163ede9f1bbd1694feaa504797d5d96e",
+    "fileSize": 7818140
+  },
+  {
+    "id": "smollm2-135m-q4km",
+    "repo": "bartowski/SmolLM2-135M-Instruct-GGUF",
+    "revision": "09816acd5d99df7be770d85ea30822623dab342c",
+    "file": "SmolLM2-135M-Instruct-Q4_K_M.gguf",
+    "bytes": 1835008,
+    "sha256": "c777ea52480b98f0678164ec29b47282008d830d24b5c720504ce3dc84c2c175",
+    "fileSize": 105454432
+  }
+]

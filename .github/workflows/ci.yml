@@ -13,6 +13,13 @@ on:
 # A pid namespace left by pid1.test.ts under sudo held the unit job, and a hung file each tether job, for 2.5 hours
 # until the run was cancelled, with no name in the log.
 jobs:
+  # The Rust core (turbollm/core): lint, tests and every binary (rust-core arch 2.7). The jobs that run daemon code from
+  # source (unit, unit-windows, tether, android-bundle) need it and download their own runner's core-node-<target>
+  # artifact into turbollm/core/bindings/node/, where src/native/load.ts looks for a source build. They install no Rust.
+  core:
+    name: Core
+    uses: ./.github/workflows/core-build.yml
+
   # Fast gate: the checks that need no test run.
   test:
     name: Typecheck & Lint
@@ -45,6 +52,7 @@ jobs:
   # named shards do not, so a new directory is never dropped.
   unit:
     name: Unit tests (${{ matrix.shard }})
+    needs: core
     runs-on: ubuntu-latest
     # Each shard takes a few minutes.
     timeout-minutes: 20
@@ -64,6 +72,27 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+        working-directory: turbollm
+
+      - name: Download the core binary
+        uses: actions/download-artifact@v8
+        with:
+          name: core-node-linux-x64-gnu
+          path: turbollm/core/bindings/node
+
+      # CI sets CI=true, so the native golden tests in the rest shard fail on a missing corpus slice. Same cache key as
+      # core-build.yml's rust-checks; the fetcher verifies every slice's sha256, so a cache hit is not trusted blindly.
+      - name: Restore the GGUF corpus
+        if: matrix.shard == 'rest'
+        uses: actions/cache@v6
+        with:
+          path: turbollm/core/fixtures/gguf/.corpus-cache
+          key: gguf-corpus-${{ hashFiles('turbollm/core/fixtures/gguf/corpus.json') }}
+          enableCrossOsArchive: true
+
+      - name: Fetch the GGUF corpus
+        if: matrix.shard == 'rest'
+        run: node core/scripts/fetch-gguf-corpus.mjs
         working-directory: turbollm
 
       # code/search-tools.test.ts runs TurboLLM's grep and find against pi's own on real rg and fd (Debian names
@@ -96,6 +125,7 @@ jobs:
   # list on purpose until those are fixed.
   unit-windows:
     name: Unit tests (Windows smoke)
+    needs: core
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -110,6 +140,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
         working-directory: turbollm
+
+      - name: Download the core binary
+        uses: actions/download-artifact@v8
+        with:
+          name: core-node-win32-x64-msvc
+          path: turbollm/core/bindings/node
 
       - name: Unit tests (Windows smoke)
         run: npx tsx --test --test-timeout=60000 "src/tools/*.test.ts" src/auth.lanauth-composed.test.ts src/test-support/test-shards.test.ts
@@ -167,6 +203,7 @@ jobs:
   # can't be reproduced here.
   android-bundle:
     name: Android bundle build
+    needs: core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -180,6 +217,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
         working-directory: turbollm
+
+      # Bundle content only: the CI host's binary, not the phone's (that is core-build.yml's nodejs-mobile-addon).
+      - name: Download the core binary
+        uses: actions/download-artifact@v8
+        with:
+          name: core-node-linux-x64-gnu
+          path: turbollm/core/bindings/node
 
       - name: Build the Android bundle
         run: npx tsup --config tsup.android.config.ts
@@ -252,6 +296,7 @@ jobs:
   # kernel32 jobs), the Git Bash gate and ConPTY, which only a Windows runner has.
   tether:
     name: Process tether (${{ matrix.os }})
+    needs: core
     runs-on: ${{ matrix.os }}
     # A few minutes of tests on each OS.
     timeout-minutes: 30
@@ -259,6 +304,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
+        # The core binary each runner loads (macos-latest is Apple silicon). Adds a key, not a combination, so the
+        # check names stay "Process tether (<os>)".
+        include:
+          - os: macos-latest
+            core-target: darwin-arm64
+          - os: windows-latest
+            core-target: win32-x64-msvc
     steps:
       - uses: actions/checkout@v7
 
@@ -271,6 +323,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
         working-directory: turbollm
+
+      - name: Download the core binary
+        uses: actions/download-artifact@v8
+        with:
+          name: core-node-${{ matrix.core-target }}
+          path: turbollm/core/bindings/node
 
       - name: Install ripgrep and fd
         if: runner.os == 'macOS'

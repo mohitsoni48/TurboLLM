@@ -1,0 +1,9 @@
+{
+  "parse": "{\"arch\":\"qwen3next\",\"name\":\"\",\"quant\":\"\",\"sizeLabel\":\"\",\"nativeCtx\":0,\"blockCount\":48,\"embedLen\":0,\"headCountKv\":2,\"headDim\":256,\"expertCount\":0,\"nextnLayers\":0,\"hasChatTemplate\":false,\"reasoningEffort\":false,\"slidingWindow\":0,\"slidingWindowPattern\":[],\"headDimSwa\":0,\"headCountKvPerLayer\":[],\"fullAttentionInterval\":0,\"ssmInnerSize\":4096,\"ssmStateSize\":128,\"ssmConvKernel\":4,\"dataEnd\":326}",
+  "cutShort": [
+    [
+      326,
+      false
+    ]
+  ]
+}

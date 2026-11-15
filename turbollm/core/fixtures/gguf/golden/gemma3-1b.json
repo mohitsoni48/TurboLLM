@@ -1,0 +1,13 @@
+{
+  "parse": "{\"arch\":\"gemma3\",\"name\":\"Gemma 3 1b It\",\"quant\":\"Q4_K_M\",\"sizeLabel\":\"1B\",\"nativeCtx\":32768,\"blockCount\":26,\"embedLen\":1152,\"headCountKv\":1,\"headDim\":256,\"expertCount\":0,\"nextnLayers\":0,\"hasChatTemplate\":true,\"reasoningEffort\":false,\"slidingWindow\":512,\"slidingWindowPattern\":[],\"headDimSwa\":0,\"headCountKvPerLayer\":[],\"fullAttentionInterval\":0,\"ssmInnerSize\":0,\"ssmStateSize\":0,\"ssmConvKernel\":0,\"dataEnd\":806058240}",
+  "cutShort": [
+    [
+      806058240,
+      false
+    ],
+    [
+      6553600,
+      true
+    ]
+  ]
+}

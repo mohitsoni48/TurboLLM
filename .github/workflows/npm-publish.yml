@@ -12,9 +12,27 @@ name: npm publish
 # granular-automation-token approach after npm's 2026-07-08 changelog announced
 # 2FA-bypass tokens lose direct-publish ability around January 2027.
 #
+# The native core (turbollm/core, rust-core arch 2.8) ships as 9 platform packages,
+# @turbollm/core-<target>, that turbollm lists as optional dependencies at its own
+# version. npm skips an optional dependency it cannot find without failing the
+# install, so the order is strict: `core` builds every binary at the tag;
+# `publish` publishes the 9 platform packages, waits until the registry answers
+# for all 9, adds them to package.json in this job's working tree only, and only
+# then publishes turbollm; `verify-published` installs the release on Windows,
+# macOS, Linux (glibc) and Alpine (musl) and loads the platform package it got.
+# Each @turbollm/core-<target> package needs its own Trusted Publisher entry
+# naming this workflow, like turbollm's.
+#
 # `workflow_dispatch` exists so a release whose GitHub Release already existed
 # before this workflow was added (or a publish that needs a manual re-run) can
-# still be published without recreating the release.
+# still be published without recreating the release. A re-run is safe: a
+# platform package already on the registry at this version is skipped, and so is
+# turbollm itself (inject and publish), while verify-published still runs.
+#
+# A tag from before the native core (no turbollm/core/Cargo.toml at the tag)
+# cannot be published by this workflow: the `core` job has nothing to build.
+# Such a tag can be republished only through the release script's local-token
+# fallback (scripts/release.mjs, ADR-418), from a clean checkout of the tag.
 on:
   release:
     types: [published]
@@ -29,10 +47,21 @@ permissions:
   id-token: write # required for npm OIDC trusted publishing
 
 jobs:
-  publish:
+  core:
     if: startsWith(github.event.release.tag_name || inputs.tag, 'v')
+    name: Core build (release)
+    uses: ./.github/workflows/core-build.yml
+    with:
+      release: true
+      ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+  publish:
+    needs: core
     name: Publish to npm
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -62,8 +91,130 @@ jobs:
         run: npm ci
         working-directory: turbollm
 
-      # prepublishOnly (build:web + build) runs automatically as part of `npm
-      # publish` — see turbollm/package.json.
+      - name: Read the release version
+        id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+        working-directory: turbollm
+
+      # npm refuses a second publish of the same version, so a re-run after a complete release
+      # skips the inject and the turbollm publish instead of failing (qa-tasks E-45).
+      - name: Check whether turbollm is already on the registry
+        id: published
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ "$(npm view "turbollm@$VERSION" version 2>/dev/null || true)" = "$VERSION" ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # publish-platform-packages.mjs reads every turbollm-core.<target>.node from one flat folder.
+      - name: Download the core binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: core-node-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/core-node
+
+      # Checks all 9 binaries carry the release version before publishing any; skips a package
+      # already on the registry at this version (re-run).
+      - name: Publish the platform packages
+        run: node core/scripts/publish-platform-packages.mjs --version "${{ steps.version.outputs.version }}" --artifacts "${{ runner.temp }}/core-node"
+        working-directory: turbollm
+
+      - name: Wait until the registry answers for every platform package
+        run: node core/scripts/await-platform-packages.mjs --version "${{ steps.version.outputs.version }}"
+        working-directory: turbollm
+
+      # Working tree only: the committed package.json never lists the platform packages.
+      - name: Add the platform packages to optionalDependencies
+        if: steps.published.outputs.published != 'true'
+        run: node core/scripts/inject-optional-deps.mjs "${{ steps.version.outputs.version }}"
+        working-directory: turbollm
+
+      # prepublishOnly (build:web + build + strip-native) runs automatically as
+      # part of `npm publish` — see turbollm/package.json.
       - name: Publish
+        if: steps.published.outputs.published != 'true'
         run: npm publish --provenance
         working-directory: turbollm
+
+  # `turbollm --help` prints the version and exits; the daemon has no --version flag, and a bare
+  # `turbollm` would start the daemon.
+  verify-published:
+    needs: publish
+    name: Verify the published package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          sparse-checkout: |
+            turbollm/core/scripts
+            turbollm/core/fixtures/gguf/crafted
+            turbollm/core/fixtures/gguf/golden
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install turbollm from the registry
+        shell: bash
+        env:
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            npm install -g "turbollm@$VERSION" && break
+            if [ "$attempt" = 10 ]; then echo "turbollm@$VERSION did not install after 10 attempts"; exit 1; fi
+            sleep 30
+          done
+
+      - name: Run the installed turbollm
+        shell: bash
+        env:
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          out="$(turbollm --help)"
+          echo "$out" | grep -F "TurboLLM $VERSION"
+
+      - name: Load the installed platform package
+        shell: bash
+        env:
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: node core/scripts/verify-installed-core.mjs --version "$VERSION"
+        working-directory: turbollm
+
+  verify-published-alpine:
+    needs: publish
+    name: Verify the published package (node:22-alpine)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          sparse-checkout: |
+            turbollm/core/scripts
+            turbollm/core/fixtures/gguf/crafted
+            turbollm/core/fixtures/gguf/golden
+
+      - name: Install, run and load turbollm in node:22-alpine
+        env:
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          docker run --rm -e VERSION -v "$GITHUB_WORKSPACE:/repo" -w /repo/turbollm node:22-alpine sh -euc '
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              npm install -g "turbollm@$VERSION" && break
+              if [ "$attempt" = 10 ]; then echo "turbollm@$VERSION did not install after 10 attempts"; exit 1; fi
+              sleep 30
+            done
+            out="$(turbollm --help)"
+            echo "$out" | grep -F "TurboLLM $VERSION"
+            node core/scripts/verify-installed-core.mjs --version "$VERSION"
+          '

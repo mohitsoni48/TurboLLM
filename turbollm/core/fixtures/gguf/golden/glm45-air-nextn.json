@@ -1,0 +1,13 @@
+{
+  "parse": "{\"arch\":\"glm4moe\",\"name\":\"Glm-4.5-Air\",\"quant\":\"Q2_K\",\"sizeLabel\":\"128x9.4B\",\"nativeCtx\":131072,\"blockCount\":47,\"embedLen\":4096,\"headCountKv\":8,\"headDim\":128,\"expertCount\":128,\"nextnLayers\":1,\"hasChatTemplate\":true,\"reasoningEffort\":false,\"slidingWindow\":0,\"slidingWindowPattern\":[],\"headDimSwa\":0,\"headCountKvPerLayer\":[],\"fullAttentionInterval\":0,\"ssmInnerSize\":0,\"ssmStateSize\":0,\"ssmConvKernel\":0,\"dataEnd\":45322103872}",
+  "cutShort": [
+    [
+      45322103872,
+      false
+    ],
+    [
+      9371648,
+      true
+    ]
+  ]
+}

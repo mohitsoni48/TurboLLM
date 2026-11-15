@@ -16,12 +16,16 @@
 // git-URL installs (both of which DO install devDependencies), but never for a registry
 // tarball install. This test fails if `postinstall` is ever reintroduced.
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { test } from 'node:test'
+import { fileURLToPath } from 'node:url'
+import { tmpDir } from './test-support/tmp'
 
 const manifest = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
-) as { scripts?: Record<string, string> }
+) as { scripts?: Record<string, string>; files?: string[] }
 
 test('#226: package.json declares no postinstall script (it runs without devDependencies)', () => {
   assert.equal(
@@ -44,4 +48,43 @@ test('#226: patch-package is wired through `prepare`, so the dev repo still gets
 // `--import tsx` reaches the replacement (cli.ts becomeKeeper).
 test('`npm start` runs the daemon as node itself, with tsx as a loader: no relaying process to SIGKILL it at Ctrl+C', () => {
   assert.equal(manifest.scripts?.start, 'node --import tsx src/cli.ts')
+})
+
+// Rust core (rust-core plan T13, arch 2.4): `build` stages the host binary into dist/native for a local daemon, and
+// the published tarball never carries a `.node`: the platform packages (@turbollm/core-<target>) ship the binaries.
+const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url))
+const STRIP_SCRIPT = join(PACKAGE_ROOT, 'core', 'scripts', 'strip-native.mjs')
+
+test('`build` ends by staging the host native core into dist/native', () => {
+  assert.ok(manifest.scripts?.build?.endsWith(' && node core/scripts/stage-native.mjs'), manifest.scripts?.build)
+})
+
+test('`prepublishOnly` builds and then strips dist/native, so the tarball carries no .node', () => {
+  assert.equal(
+    manifest.scripts?.prepublishOnly,
+    'npm run build:web && npm run build && node core/scripts/strip-native.mjs',
+  )
+})
+
+test('the published files are still only bin and dist (core/ is never published)', () => {
+  assert.deepEqual(manifest.files, ['bin', 'dist'])
+})
+
+test('after the strip step `npm pack --dry-run` lists dist files but no .node', () => {
+  const root = tmpDir('pack-no-native-')
+  copyFileSync(join(PACKAGE_ROOT, 'package.json'), join(root, 'package.json'))
+  mkdirSync(join(root, 'bin'))
+  writeFileSync(join(root, 'bin', 'turbollm.js'), '// bin\n')
+  mkdirSync(join(root, 'dist', 'native'), { recursive: true })
+  writeFileSync(join(root, 'dist', 'cli.js'), '// bundle\n')
+  writeFileSync(join(root, 'dist', 'native', 'x.node'), 'native bytes')
+
+  const strip = spawnSync(process.execPath, [STRIP_SCRIPT, root], { encoding: 'utf8' })
+  assert.equal(strip.status, 0, strip.stderr)
+  const pack = spawnSync('npm pack --dry-run --json --ignore-scripts', { cwd: root, shell: true, encoding: 'utf8' })
+  assert.equal(pack.status, 0, pack.stderr)
+
+  const packed = (JSON.parse(pack.stdout) as Array<{ files: Array<{ path: string }> }>)[0].files.map((f) => f.path)
+  assert.ok(packed.includes('dist/cli.js'), packed.join(', '))
+  assert.deepEqual(packed.filter((path) => path.endsWith('.node')), [])
 })

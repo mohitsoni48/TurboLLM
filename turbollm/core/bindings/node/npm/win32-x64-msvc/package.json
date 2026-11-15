@@ -1,0 +1,25 @@
+{
+  "name": "@turbollm/core-win32-x64-msvc",
+  "version": "0.0.0",
+  "description": "TurboLLM native core for win32-x64-msvc",
+  "license": "FSL-1.1-ALv2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mohitsoni48/TurboLLM.git",
+    "directory": "turbollm/core/bindings/node/npm/win32-x64-msvc"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "turbollm-core.win32-x64-msvc.node",
+  "files": [
+    "turbollm-core.win32-x64-msvc.node",
+    "LICENSE.md"
+  ],
+  "engines": {
+    "node": ">=18.20"
+  }
+}

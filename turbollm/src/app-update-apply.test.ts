@@ -29,6 +29,7 @@ import {
   detectInstall,
   npmGlobalRoot,
   progressFromResult,
+  readInstallSignals,
   realPathOr,
   resetNpmRootCache,
   helperPath,
@@ -38,12 +39,15 @@ import {
   type InstallSignals,
 } from './app-update-apply'
 import { APP_INSTALL_METHODS } from './telemetry/events/app-update'
+import { SUPPORTED_SYSTEMS } from './native/load'
 
 /** A plausible-but-unclassifiable baseline, so each test states ONLY the signal it is
  *  about. Defaults are the "none of the special cases apply" answer. */
 function signals(over: Partial<InstallSignals> = {}): InstallSignals {
   return {
     platform: 'linux',
+    arch: 'x64',
+    nativeTarget: 'linux-x64-gnu',
     androidApp: false,
     entry: '/opt/somewhere/turbollm/bin/turbollm.mjs',
     desktopEnv: false,
@@ -113,6 +117,61 @@ test('classifyInstall: an npx cache run relaunches at @latest rather than instal
   assert.equal(info.method, 'npx')
   assert.equal(info.canSelfUpdate, true)
   assert.equal(info.command, 'npx turbollm@latest')
+})
+
+// PG-3: an update into the first native-core release on a system the core has no binary for
+// (32-bit ARM, FreeBSD) installs a TurboLLM that cannot start, and the daemon stays stopped.
+const UNSUPPORTED_CORE_NOTE = `This system (freebsd-x64) is not supported by TurboLLM's native core, which new versions need, so it can't update itself. Supported: ${SUPPORTED_SYSTEMS}.`
+
+test('classifyInstall: a global npm install on a system the native core does not support refuses to update itself', () => {
+  const info = classifyInstall(
+    signals({
+      platform: 'freebsd',
+      nativeTarget: null,
+      entry: '/usr/local/lib/node_modules/turbollm/bin/turbollm.mjs',
+      npmGlobalRoot: '/usr/local/lib/node_modules',
+    }),
+  )
+  assert.equal(info.method, 'npm_global')
+  assert.equal(info.canSelfUpdate, false)
+  assert.equal(info.command, '')
+  assert.equal(info.note, UNSUPPORTED_CORE_NOTE)
+})
+
+test('classifyInstall: an npx run on a system the native core does not support refuses to update itself', () => {
+  const info = classifyInstall(
+    signals({ platform: 'freebsd', nativeTarget: null, entry: '/home/u/.npm/_npx/8a3f/node_modules/turbollm/bin/turbollm.mjs' }),
+  )
+  assert.equal(info.method, 'npx')
+  assert.equal(info.canSelfUpdate, false)
+  assert.equal(info.command, '')
+  assert.equal(info.note, UNSUPPORTED_CORE_NOTE)
+})
+
+test('classifyInstall: the note names the arch of a 32-bit ARM system', () => {
+  const info = classifyInstall(
+    signals({
+      arch: 'arm',
+      nativeTarget: null,
+      entry: '/usr/lib/node_modules/turbollm/bin/turbollm.mjs',
+      npmGlobalRoot: '/usr/lib/node_modules',
+    }),
+  )
+  assert.equal(info.canSelfUpdate, false)
+  assert.match(info.note, /^This system \(linux-arm\) is not supported/)
+})
+
+test('readInstallSignals: takes the native target from the system lookup it is given', async () => {
+  const signals = await readInstallSignals(() => null)
+  assert.equal(signals.nativeTarget, null)
+})
+
+test('readInstallSignals: reads the native target of the system it runs on', async () => {
+  const { hostTarget } = (await import(new URL('../core/scripts/targets.mjs', import.meta.url).href)) as {
+    hostTarget(): { suffix: string } | undefined
+  }
+  const signals = await readInstallSignals()
+  assert.equal(signals.nativeTarget, hostTarget()?.suffix ?? null)
 })
 
 test('classifyInstall: the packaged desktop daemon is never treated as an npm install', () => {

@@ -1,0 +1,9 @@
+{
+  "parse": "{\"error\":{\"code\":\"not_gguf\",\"message\":\"Not a GGUF file.\"}}",
+  "cutShort": [
+    [
+      22,
+      false
+    ]
+  ]
+}

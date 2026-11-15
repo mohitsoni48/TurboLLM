@@ -1,0 +1,17 @@
+{
+  "parse": "{\"arch\":\"llama\",\"name\":\"\",\"quant\":\"\",\"sizeLabel\":\"\",\"nativeCtx\":0,\"blockCount\":7,\"embedLen\":0,\"headCountKv\":0,\"headDim\":0,\"expertCount\":0,\"nextnLayers\":0,\"hasChatTemplate\":false,\"reasoningEffort\":false,\"slidingWindow\":0,\"slidingWindowPattern\":[],\"headDimSwa\":0,\"headCountKvPerLayer\":[],\"fullAttentionInterval\":0,\"ssmInnerSize\":0,\"ssmStateSize\":0,\"ssmConvKernel\":0,\"dataEnd\":41943272}",
+  "cutShort": [
+    [
+      41943296,
+      false
+    ]
+  ],
+  "generated": {
+    "recipe": "huge-description",
+    "args": [
+      41943040
+    ],
+    "size": 41943296,
+    "sha256": "7d67db70e4608c5024d9db7a323c7093597727bfa0671e304aadcc60d658c373"
+  }
+}

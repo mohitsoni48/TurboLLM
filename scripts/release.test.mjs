@@ -10,6 +10,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  CORE_VERSION_PATHS,
   INDEPENDENT_PATHS,
   PREPARE_PATHS,
   alreadyRecordedOk,
@@ -19,9 +20,11 @@ import {
   isCliEntry,
   magicCloseCommits,
   localPublishProblem,
+  publishWithLocalToken,
   splitDirtyPaths,
   splitPreflightDirty,
   stageReleasePaths,
+  syncCoreVersion,
   syncMainFastForward,
   waitForCommitRun,
   waitForWorkflowRun,
@@ -487,7 +490,7 @@ function cliSandbox({ version, phases, notes = {}, rules = [] }) {
   mkdirSync(bin, { recursive: true });
   writeFileSync(join(stubDir, 'rules.json'), JSON.stringify(rules));
   writeFileSync(join(stubDir, 'stub.cjs'), `(${stubMain.toString()})();\n`);
-  for (const tool of ['gh', 'npm']) {
+  for (const tool of ['gh', 'npm', 'cargo']) {
     const p = join(bin, tool);
     writeFileSync(p, `#!/bin/sh\nexec "${process.execPath}" "${join(stubDir, 'stub.cjs')}" "${stubDir}" ${tool} "$@"\n`);
     chmodSync(p, 0o755);
@@ -747,4 +750,334 @@ test('magicCloseCommits: a commit acknowledged by its full SHA is skipped, anoth
   const log = entry(known, 'quotes `closes #12` while describing the check') + entry('d'.repeat(40), 'closes #12');
   assert.deepEqual(magicCloseCommits(log, new Set([known])), ['dddddddd']);
   assert.deepEqual(magicCloseCommits('', new Set()), []);
+});
+
+// ── the Rust core's version moves with the release (rust-core plan T20, ADR-374: one version) ────────────────
+// turbollm/core/Cargo.toml's [workspace.package] version is what every core binary embeds and what
+// `cargo xtask check-version` (CI) compares against turbollm/package.json, so `prepare` bumps both together.
+function coreCheckout(cargoVersion) {
+  const root = mkdtempSync(join(tmpdir(), 'turbollm-release-core-test-'));
+  if (cargoVersion !== undefined) {
+    put(root, 'turbollm/core/Cargo.toml', `[workspace]\nmembers = ["xtask"]\n\n[workspace.package]\nversion = "${cargoVersion}"\nedition = "2024"\n`);
+    put(root, 'turbollm/core/Cargo.lock', 'version = 4\n');
+  }
+  return root;
+}
+
+function recordingCargo(code = 0, out = '') {
+  const calls = [];
+  const run = (args, cwd) => { calls.push({ args: args.join(' '), cwd }); return { code, out }; };
+  return { run, calls };
+}
+
+test('PREPARE_PATHS commits the core workspace manifest and lock with the release', () => {
+  assert.deepEqual(CORE_VERSION_PATHS, ['turbollm/core/Cargo.toml', 'turbollm/core/Cargo.lock']);
+  for (const p of CORE_VERSION_PATHS) assert.ok(PREPARE_PATHS.includes(p), `${p} missing from PREPARE_PATHS`);
+});
+
+test('the version sync runs cargo xtask sync-version, then refreshes the lock offline, inside turbollm/core', () => {
+  const root = coreCheckout('1.0.0');
+  try {
+    const cargo = recordingCargo();
+
+    const changed = syncCoreVersion('1.0.1', { repo: root, cargoRun: cargo.run });
+
+    assert.deepEqual(changed, CORE_VERSION_PATHS);
+    const coreDir = join(root, 'turbollm', 'core');
+    assert.deepEqual(cargo.calls, [
+      { args: 'xtask sync-version', cwd: coreDir },
+      { args: 'update --workspace --offline', cwd: coreDir },
+    ]);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('a dry-run version sync lists the two Cargo files without running cargo', () => {
+  const root = coreCheckout('1.0.0');
+  try {
+    const cargo = recordingCargo();
+
+    assert.deepEqual(syncCoreVersion('1.0.1', { repo: root, dryRun: true, cargoRun: cargo.run }), CORE_VERSION_PATHS);
+    assert.deepEqual(cargo.calls, []);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('the version sync changes nothing when the core already has the version, or the checkout has no core', () => {
+  const synced = coreCheckout('1.0.1');
+  const coreless = coreCheckout();
+  try {
+    const cargo = recordingCargo();
+
+    assert.deepEqual(syncCoreVersion('1.0.1', { repo: synced, cargoRun: cargo.run }), []);
+    assert.deepEqual(syncCoreVersion('1.0.1', { repo: coreless, cargoRun: cargo.run }), []);
+    assert.deepEqual(cargo.calls, []);
+  } finally {
+    cleanup(synced);
+    cleanup(coreless);
+  }
+});
+
+test('a failed cargo stops the release with cargo\'s own output', () => {
+  const root = coreCheckout('1.0.0');
+  try {
+    const cargo = recordingCargo(101, 'error: no such command: `xtask`');
+
+    assert.throws(
+      () => syncCoreVersion('1.0.1', { repo: root, cargoRun: cargo.run }),
+      /`cargo xtask sync-version` failed in turbollm\/core \(exit 101\)[^]*no such command/,
+    );
+    assert.equal(cargo.calls.length, 1, 'the lock refresh must not run after a failed sync');
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('prepare --dry-run lists the core Cargo files and never runs cargo', POSIX_ONLY, () => {
+  const s = cliSandbox({ version: '1.0.1', phases: ['preflight', 'review'], notes: { baseVersion: '1.0.0' } });
+  try {
+    put(s.work, 'turbollm/core/Cargo.toml', '[workspace.package]\nversion = "1.0.0"\n');
+    put(s.work, 'turbollm/core/Cargo.lock', 'version = 4\n');
+    must(s.g, 'add', '-A');
+    must(s.g, 'commit', '-m', 'core');
+    must(s.g, 'push');
+
+    const r = s.release(['prepare', '--dry-run']);
+
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /\[dry-run\] would run `cargo xtask sync-version` in turbollm\/core/);
+    assert.match(r.out, /would commit \+ push:\nturbollm\/core\/Cargo\.lock\nturbollm\/core\/Cargo\.toml\nturbollm\/package\.json\n/);
+    assert.deepEqual(s.calls().filter((c) => c.startsWith('cargo')), []);
+  } finally {
+    cleanup(s.root);
+  }
+});
+
+test('prepare runs the core version sync after setting turbollm/package.json', POSIX_ONLY, () => {
+  const s = cliSandbox({ version: '1.0.1', phases: ['preflight', 'review'], notes: { baseVersion: '1.0.0' } });
+  try {
+    put(s.work, 'turbollm/core/Cargo.toml', '[workspace.package]\nversion = "1.0.0"\n');
+    must(s.g, 'add', '-A');
+    must(s.g, 'commit', '-m', 'core');
+    must(s.g, 'push');
+
+    const r = s.release(['prepare']);
+
+    assert.equal(r.code, 0, r.out);
+    assert.deepEqual(s.calls().filter((c) => c.startsWith('cargo')), ['cargo xtask sync-version', 'cargo update --workspace --offline']);
+  } finally {
+    cleanup(s.root);
+  }
+});
+
+// ── the local-token fallback and the core's platform packages (rust-core plan T20b, PG-1, arch 2.8) ─────────────
+// That fallback is a plain `npm publish` of turbollm/. Once the core ships, a turbollm published without its 9
+// @turbollm/core-<target> packages of the same version on the registry stops at boot (exit 69) on every install.
+const TARGETS_SOURCE = fileURLToPath(new URL('../turbollm/core/scripts/targets.mjs', import.meta.url));
+const INJECT_SOURCE = fileURLToPath(new URL('../turbollm/core/scripts/inject-optional-deps.mjs', import.meta.url));
+// Deliberately not JSON.stringify's own layout (CRLF, 4-space indent), so a restore by re-serialising shows up.
+const TURBOLLM_MANIFEST = '{\r\n    "name": "turbollm",\r\n    "version": "1.0.1",\r\n    "optionalDependencies": {\r\n        "node-pty": "^1.1.0"\r\n    }\r\n}\r\n';
+const ALL_CORE_SUFFIXES = [
+  'win32-x64-msvc', 'win32-arm64-msvc', 'darwin-x64', 'darwin-arm64', 'linux-x64-gnu',
+  'linux-arm64-gnu', 'linux-x64-musl', 'linux-arm64-musl', 'android-arm64',
+];
+
+function coreReleaseCheckout() {
+  const root = coreCheckout('1.0.1');
+  put(root, 'turbollm/core/scripts/targets.mjs', readFileSync(TARGETS_SOURCE));
+  put(root, 'turbollm/core/scripts/inject-optional-deps.mjs', readFileSync(INJECT_SOURCE));
+  put(root, 'turbollm/package.json', TURBOLLM_MANIFEST);
+  return root;
+}
+
+const manifestOf = (root) => readFileSync(join(root, 'turbollm', 'package.json'), 'utf8');
+
+// HEAD is the tag and turbollm/ is clean, so only the core rule can stop the fallback.
+const taggedCleanGit = (...args) => ({ code: 0, stdout: args[0] === 'rev-parse' ? 'a'.repeat(40) : '', out: '' });
+
+// Answers `npm view @turbollm/core-<suffix>@<v> version` with <v> for the suffixes in `published`. Records the
+// turbollm/package.json each `npm publish` saw, and answers it with `publishCode`.
+function registryWith(published, { publishCode = 0 } = {}) {
+  const calls = [];
+  const manifestsAtPublish = [];
+  const run = (args, opts = {}) => {
+    calls.push(args.join(' '));
+    if (args[0] === 'publish') {
+      manifestsAtPublish.push(JSON.parse(readFileSync(join(opts.cwd, 'package.json'), 'utf8')));
+      return { code: publishCode, stdout: '', out: publishCode ? 'npm ERR! 403 Forbidden' : '' };
+    }
+    const view = /^view @turbollm\/core-(.+)@(\S+) version$/.exec(args.join(' '));
+    if (view) return { code: 0, stdout: published.includes(view[1]) ? view[2] : '', out: '' };
+    if (args[0] === 'whoami') return { code: 0, stdout: 'release-bot', out: 'release-bot' };
+    return { code: 0, stdout: '', out: '' };
+  };
+  return { run, calls, manifestsAtPublish, publishes: () => calls.filter((c) => c.startsWith('publish')) };
+}
+
+const LEGACY = { token: 'npm_test_token', source: 'test' };
+
+test('the token fallback refuses a core release when none of its platform packages is on the registry', async () => {
+  const root = coreReleaseCheckout();
+  try {
+    const npm = registryWith([]);
+
+    await assert.rejects(
+      publishWithLocalToken('v1.0.1', LEGACY, { repo: root, gitRun: taggedCleanGit, npmRun: npm.run }),
+      (error) => {
+        assert.match(error.message, /Nothing was published to npm/);
+        assert.match(error.message, /gh workflow run npm-publish\.yml -f tag=v1\.0\.1/);
+        for (const suffix of ALL_CORE_SUFFIXES) assert.ok(error.message.includes(`@turbollm/core-${suffix}@1.0.1`), suffix);
+        return true;
+      },
+    );
+    assert.deepEqual(npm.publishes(), []);
+    assert.equal(npm.calls.filter((c) => c.startsWith('view @turbollm/core-')).length, 9);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('the token fallback names the one platform package that is missing and publishes nothing', async () => {
+  const root = coreReleaseCheckout();
+  try {
+    const npm = registryWith(ALL_CORE_SUFFIXES.filter((s) => s !== 'linux-arm64-musl'));
+
+    await assert.rejects(
+      publishWithLocalToken('v1.0.1', LEGACY, { repo: root, gitRun: taggedCleanGit, npmRun: npm.run }),
+      (error) => {
+        assert.match(error.message, /@turbollm\/core-linux-arm64-musl@1\.0\.1/);
+        assert.doesNotMatch(error.message, /@turbollm\/core-linux-x64-musl@/);
+        return true;
+      },
+    );
+    assert.deepEqual(npm.publishes(), []);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('the token fallback publishes a core release once all 9 platform packages answer its version', async () => {
+  const root = coreReleaseCheckout();
+  try {
+    const npm = registryWith(ALL_CORE_SUFFIXES);
+
+    const result = await publishWithLocalToken('v1.0.1', LEGACY, { repo: root, gitRun: taggedCleanGit, npmRun: npm.run });
+
+    assert.equal(result.whoami, 'release-bot');
+    assert.equal(npm.publishes().length, 1);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('the token fallback publishes turbollm with all 9 platform packages as optional dependencies at its version', async () => {
+  const root = coreReleaseCheckout();
+  try {
+    const npm = registryWith(ALL_CORE_SUFFIXES);
+
+    await publishWithLocalToken('v1.0.1', LEGACY, { repo: root, gitRun: taggedCleanGit, npmRun: npm.run });
+
+    const expected = { 'node-pty': '^1.1.0' };
+    for (const suffix of ALL_CORE_SUFFIXES) expected[`@turbollm/core-${suffix}`] = '1.0.1';
+    assert.deepEqual(npm.manifestsAtPublish.map((m) => m.optionalDependencies), [expected]);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('the token fallback leaves turbollm/package.json byte-identical after it publishes', async () => {
+  const root = coreReleaseCheckout();
+  try {
+    await publishWithLocalToken('v1.0.1', LEGACY, { repo: root, gitRun: taggedCleanGit, npmRun: registryWith(ALL_CORE_SUFFIXES).run });
+
+    assert.equal(manifestOf(root), TURBOLLM_MANIFEST);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('the token fallback leaves turbollm/package.json byte-identical when npm publish fails', async () => {
+  const root = coreReleaseCheckout();
+  try {
+    const npm = registryWith(ALL_CORE_SUFFIXES, { publishCode: 1 });
+
+    await assert.rejects(
+      publishWithLocalToken('v1.0.1', LEGACY, { repo: root, gitRun: taggedCleanGit, npmRun: npm.run }),
+      /npm publish failed/,
+    );
+    assert.equal(npm.publishes().length, 1);
+    assert.equal(manifestOf(root), TURBOLLM_MANIFEST);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('the token fallback publishes a checkout without the core as before, asking npm about no platform package', async () => {
+  const root = coreCheckout();
+  try {
+    put(root, 'turbollm/package.json', TURBOLLM_MANIFEST);
+    const npm = registryWith([]);
+
+    await publishWithLocalToken('v1.0.1', LEGACY, { repo: root, gitRun: taggedCleanGit, npmRun: npm.run });
+
+    assert.equal(npm.publishes().length, 1);
+    assert.deepEqual(npm.calls.filter((c) => c.startsWith('view')), []);
+    assert.deepEqual(npm.manifestsAtPublish.map((m) => m.optionalDependencies), [{ 'node-pty': '^1.1.0' }]);
+    assert.equal(manifestOf(root), TURBOLLM_MANIFEST);
+  } finally {
+    cleanup(root);
+  }
+});
+
+// npm-publish.yml builds the core at the tag, so it cannot publish a tag from before the core; dispatching it is
+// the wrong advice there (review S3).
+test('the token fallback tells a pre-core tag that only this fallback can republish it', async () => {
+  const root = coreCheckout();
+  try {
+    const dirtyGit = (...args) => (args[0] === 'status'
+      ? { code: 0, stdout: ' M turbollm/package.json', out: '' }
+      : taggedCleanGit(...args));
+
+    await assert.rejects(
+      publishWithLocalToken('v1.0.1', LEGACY, { repo: root, gitRun: dirtyGit, npmRun: registryWith([]).run }),
+      /v1\.0\.1 predates the native core[^]*can be republished only through this local-token fallback/,
+    );
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('the token fallback does not call a core release a pre-core tag', async () => {
+  const root = coreReleaseCheckout();
+  try {
+    await assert.rejects(
+      publishWithLocalToken('v1.0.1', LEGACY, { repo: root, gitRun: taggedCleanGit, npmRun: registryWith([]).run }),
+      (error) => {
+        assert.doesNotMatch(error.message, /predates the native core/);
+        return true;
+      },
+    );
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('the token fallback still refuses a checkout that is not the tag, before asking npm anything', async () => {
+  const root = coreReleaseCheckout();
+  try {
+    const npm = registryWith(ALL_CORE_SUFFIXES);
+    const dirtyGit = (...args) => (args[0] === 'status'
+      ? { code: 0, stdout: ' M turbollm/package.json', out: '' }
+      : taggedCleanGit(...args));
+
+    await assert.rejects(
+      publishWithLocalToken('v1.0.1', LEGACY, { repo: root, gitRun: dirtyGit, npmRun: npm.run }),
+      /turbollm\/ holds changes that v1\.0\.1 does not[^]*Nothing was published to npm/,
+    );
+    assert.deepEqual(npm.calls, []);
+  } finally {
+    cleanup(root);
+  }
 });

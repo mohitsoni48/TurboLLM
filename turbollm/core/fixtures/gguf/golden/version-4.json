@@ -1,0 +1,9 @@
+{
+  "parse": "{\"error\":{\"code\":\"bad_version\",\"message\":\"Unsupported GGUF version 4.\"}}",
+  "cutShort": [
+    [
+      69,
+      false
+    ]
+  ]
+}

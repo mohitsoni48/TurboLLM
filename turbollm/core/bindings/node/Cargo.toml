@@ -1,0 +1,26 @@
+[package]
+name = "turbollm-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["dyn-symbols"]
+# Resolve napi_* from the host process at load time (how an addon for a node executable finds them).
+dyn-symbols = ["napi/dyn-symbols"]
+# The Android app's embedded Node: link libnode.so instead (build.rs). Build with --no-default-features.
+nodejs-mobile = []
+
+[dependencies]
+turbollm-core = { path = "../../crates/turbollm-core" }
+# N-API 8 at most (B-7). dyn-symbols comes from this crate's default feature of the same name.
+napi = { version = "=3.16.2", default-features = false, features = ["napi8"] }
+napi-derive = "=3.7.1"
+
+[build-dependencies]
+napi-build = "=2.6.0"
