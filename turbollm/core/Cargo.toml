@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "bindings/node", "bindings/uniffi", "xtask"]
+
+[workspace.package]
+version = "1.15.2"
+edition = "2024"
+license = "FSL-1.1-ALv2"
+publish = false
+rust-version = "1.100.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"

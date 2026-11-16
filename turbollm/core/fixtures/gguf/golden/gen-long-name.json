@@ -1,0 +1,18 @@
+{
+  "parse": "{\"error\":{\"code\":\"too_large\",\"message\":\"GGUF header is too large to read.\"}}",
+  "cutShort": [
+    [
+      3145829,
+      false
+    ]
+  ],
+  "generated": {
+    "recipe": "long-name",
+    "args": [
+      3145728
+    ],
+    "size": 3145829,
+    "sha256": "2965e995c738693d26f992da3ffeaf9554af7bc7122370e8197fda5bd6378fb8"
+  },
+  "maxRead": 1048576
+}

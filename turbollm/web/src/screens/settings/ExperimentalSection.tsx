@@ -95,7 +95,7 @@ function SandboxRow({ checked, onChange, disabled }: { checked: boolean; onChang
       <FeatureRow
         icon={Terminal}
         title="Python sandbox"
-        description="Lets chat run Python it writes, with no network and no access to your files, and hand back charts and files. You approve every run. Desktop only."
+        description="Downloads the runtime for an upcoming tool that will let chat run Python it writes, with no network and no access to your files. It runs nothing yet. Desktop only."
         checked={checked}
         onChange={onChange}
         disabled={disabled}

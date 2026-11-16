@@ -1,0 +1,13 @@
+{
+  "parse": "{\"arch\":\"nomic-bert\",\"name\":\"nomic-embed-text-v1.5\",\"quant\":\"Q4_K_M\",\"sizeLabel\":\"\",\"nativeCtx\":2048,\"blockCount\":12,\"embedLen\":768,\"headCountKv\":0,\"headDim\":0,\"expertCount\":0,\"nextnLayers\":0,\"hasChatTemplate\":false,\"reasoningEffort\":false,\"slidingWindow\":0,\"slidingWindowPattern\":[],\"headDimSwa\":0,\"headCountKvPerLayer\":[],\"fullAttentionInterval\":0,\"ssmInnerSize\":0,\"ssmStateSize\":0,\"ssmConvKernel\":0,\"dataEnd\":84106624}",
+  "cutShort": [
+    [
+      84106624,
+      false
+    ],
+    [
+      786432,
+      true
+    ]
+  ]
+}

@@ -4,9 +4,10 @@
 // A daemon exits RESTART_REQUESTED_EXIT_CODE to ask for a fresh one; any other exit means the daemon is gone.
 // It exits DATA_DIR_IN_USE_EXIT_CODE when its start guard refused it because another TurboLLM holds its data
 // dir (a CLI daemon on ~/.turbollm), and CONFIG_ACCESS_EXIT_CODE when it may not read or write its config.json
-// (another user's, as `sudo turbollm` leaves it): gone too, but the app tells the user why (main.js onDaemonLost).
-// The constants mirror turbollm/src/daemon-restart.ts and turbollm/src/daemon-pid.ts, and
-// daemon-supervisor.test.js pins that.
+// (another user's, as `sudo turbollm` leaves it), and CORE_UNAVAILABLE_EXIT_CODE when its native core could not load
+// (missing from the install, or built for another system): gone too, but the app tells the user why (main.js
+// onDaemonLost). The constants mirror turbollm/src/daemon-restart.ts, turbollm/src/daemon-pid.ts and
+// turbollm/src/cli.ts; daemon-supervisor.test.js pins all four.
 
 const { spawnSync } = require('node:child_process')
 const { accessSync, constants, realpathSync, statSync } = require('node:fs')
@@ -15,6 +16,7 @@ const { basename } = require('node:path')
 const RESTART_REQUESTED_EXIT_CODE = 75 // mirrors turbollm/src/daemon-restart.ts
 const DATA_DIR_IN_USE_EXIT_CODE = 73 // mirrors turbollm/src/daemon-pid.ts
 const CONFIG_ACCESS_EXIT_CODE = 77 // mirrors turbollm/src/daemon-pid.ts
+const CORE_UNAVAILABLE_EXIT_CODE = 69 // mirrors turbollm/src/cli.ts (P-5)
 
 /** How long Quit (stop()) waits for the daemon's own graceful shutdown before it ends the daemon, and how long the
  *  POSIX watcher (DAEMON_WRAP) gives a daemon whose app died before it SIGKILLs it. The daemon's teardown is bounded
@@ -160,7 +162,8 @@ function daemonSpawnSpec ({ platform, node, args, cwd, env, appPid, graceS, bash
  * Tracks exactly one live daemon: respawns it on a requested restart, starts it again when it was refused for a data
  * dir still in use shortly after the app's start (RETRY_WINDOW_MS), reports any other exit as lost (once), and on
  * stop() ends whichever daemon is live now. A loss says whether the daemon was refused because another TurboLLM
- * holds its data dir (dataDirInUse) or because it may not read or write its config.json (configAccess).
+ * holds its data dir (dataDirInUse), because it may not read or write its config.json (configAccess), or because its
+ * native core could not load (coreUnavailable).
  *
  * stop() is graceful: it ends the daemon's stdin (its lifeline, daemonSpawnSpec), which runs the daemon's own
  * shutdown (chats saved as stopped, the store closed, engines and every tethered child stopped, on Windows each tree
@@ -169,7 +172,7 @@ function daemonSpawnSpec ({ platform, node, args, cwd, env, appPid, graceS, bash
  * it), then TerminateProcess; on POSIX a SIGKILL of its pid, not its group (see daemonWrap). Before, stop() sent
  * SIGTERM, which on Windows is a TerminateProcess: no teardown ran there at all.
  * @param {{ spawnDaemon: () => import('node:child_process').ChildProcess,
- *           onDaemonLost: (reason: string, details: { dataDirInUse: boolean, configAccess: boolean }) => void,
+ *           onDaemonLost: (reason: string, details: LossDetails) => void,
  *           log?: Pick<Console,'log'|'error'>,
  *           quitGraceMs?: number,
  *           platform?: NodeJS.Platform,
@@ -208,7 +211,7 @@ function createDaemonSupervisor ({
     const decision = decideOnDaemonExit({ code, signal, stopping: state !== 'running', sinceStartMs: now() - startedAt, retryWindowMs })
     if (decision.action === 'respawn') respawn()
     else if (decision.action === 'retry') retry(decision.reason)
-    else if (decision.action === 'lost') lose(decision.reason, decision.dataDirInUse === true, decision.configAccess === true)
+    else if (decision.action === 'lost') lose(decision.reason, lossDetails(decision))
   }
 
   // Node may emit 'error' without 'exit' (a spawn that never started), or both.
@@ -239,10 +242,10 @@ function createDaemonSupervisor ({
     }, retryEveryMs)
   }
 
-  function lose (reason, dataDirInUse = false, configAccess = false) {
+  function lose (reason, details = lossDetails({})) {
     if (state !== 'running') return
     state = 'lost'
-    onDaemonLost(reason, { dataDirInUse, configAccess })
+    onDaemonLost(reason, details)
   }
 
   function stop () {
@@ -301,7 +304,8 @@ function taskkillTreeSync (pid) {
 /**
  * Pure. `sinceStartMs`: how long ago the app started (by default long enough that nothing is retried).
  * @param {{ code: number | null, signal: string | null, stopping: boolean, sinceStartMs?: number, retryWindowMs?: number }} exit
- * @returns {{ action: 'respawn'|'retry'|'lost'|'none', reason: string, dataDirInUse?: true, configAccess?: true }}
+ * @returns {{ action: 'respawn'|'retry'|'lost'|'none', reason: string, dataDirInUse?: true, configAccess?: true,
+ *             coreUnavailable?: true }}
  */
 function decideOnDaemonExit ({ code, signal, stopping, sinceStartMs = Infinity, retryWindowMs = RETRY_WINDOW_MS }) {
   if (stopping) return { action: 'none', reason: 'stopping' }
@@ -327,7 +331,25 @@ function decideOnDaemonExit ({ code, signal, stopping, sinceStartMs = Infinity, 
       configAccess: true
     }
   }
+  // Never retried: a binary missing from the install, or built for another system, does not appear by itself.
+  if (code === CORE_UNAVAILABLE_EXIT_CODE) {
+    return {
+      action: 'lost',
+      reason: `refused: its native core could not load (exit ${CORE_UNAVAILABLE_EXIT_CODE})`,
+      coreUnavailable: true
+    }
+  }
   return { action: 'lost', reason: `exited (code=${code}, signal=${signal ?? 'none'})` }
+}
+
+/**
+ * Pure. Why a lost daemon was refused, each flag false for a plain crash.
+ * @typedef {{ dataDirInUse: boolean, configAccess: boolean, coreUnavailable: boolean }} LossDetails
+ * @param {{ dataDirInUse?: true, configAccess?: true, coreUnavailable?: true }} decision
+ * @returns {LossDetails}
+ */
+function lossDetails ({ dataDirInUse, configAccess, coreUnavailable }) {
+  return { dataDirInUse: dataDirInUse === true, configAccess: configAccess === true, coreUnavailable: coreUnavailable === true }
 }
 
 /**
@@ -378,6 +400,24 @@ function configAccessNotice (daemonStderr, platform = process.platform) {
   }
 }
 
+/**
+ * Pure. The dialog the app shows before it quits when its daemon's native core could not load. The daemon's own
+ * error (its stderr) names this system, the systems the core ships for and every place it looked, so it is the
+ * detail. Its advice is for an npm install; the message says what it means for the app.
+ * @param {string} daemonStderr
+ * @returns {{ title: string, message: string, detail: string }}
+ */
+function coreUnavailableNotice (daemonStderr) {
+  const error = String(daemonStderr || '').trim()
+  return {
+    title: 'TurboLLM could not start',
+    message: 'TurboLLM\'s native core could not be loaded: it is missing from this install, or this system is not ' +
+      'one TurboLLM supports. Reinstall the TurboLLM app with the installer for this system, then open it again.',
+    detail: error || 'If it still does not start, please open an issue at ' +
+      'https://github.com/mohitsoni48/TurboLLM/issues.'
+  }
+}
+
 /** Pure. Still running iff it has neither an exit code nor a terminating signal.
  *  (Replaces main.js's `!exitCode`, which is true for a process that exited with 0.) */
 function isRunning (child) {
@@ -388,6 +428,7 @@ module.exports = {
   RESTART_REQUESTED_EXIT_CODE,
   DATA_DIR_IN_USE_EXIT_CODE,
   CONFIG_ACCESS_EXIT_CODE,
+  CORE_UNAVAILABLE_EXIT_CODE,
   QUIT_GRACE_MS,
   RETRY_WINDOW_MS,
   DAEMON_WRAP,
@@ -395,6 +436,7 @@ module.exports = {
   daemonSpawnSpec,
   dataDirInUseNotice,
   configAccessNotice,
+  coreUnavailableNotice,
   decideOnDaemonExit,
   isRunning,
   createDaemonSupervisor

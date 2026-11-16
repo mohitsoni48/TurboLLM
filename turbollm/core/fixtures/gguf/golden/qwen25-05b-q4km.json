@@ -1,0 +1,13 @@
+{
+  "parse": "{\"arch\":\"qwen2\",\"name\":\"qwen2.5-0.5b-instruct\",\"quant\":\"Q4_K_M\",\"sizeLabel\":\"630M\",\"nativeCtx\":32768,\"blockCount\":24,\"embedLen\":896,\"headCountKv\":2,\"headDim\":0,\"expertCount\":0,\"nextnLayers\":0,\"hasChatTemplate\":true,\"reasoningEffort\":false,\"slidingWindow\":0,\"slidingWindowPattern\":[],\"headDimSwa\":0,\"headCountKvPerLayer\":[],\"fullAttentionInterval\":0,\"ssmInnerSize\":0,\"ssmStateSize\":0,\"ssmConvKernel\":0,\"dataEnd\":491400032}",
+  "cutShort": [
+    [
+      491400032,
+      false
+    ],
+    [
+      5963776,
+      true
+    ]
+  ]
+}

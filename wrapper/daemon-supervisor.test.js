@@ -13,11 +13,13 @@ const {
   RESTART_REQUESTED_EXIT_CODE,
   DATA_DIR_IN_USE_EXIT_CODE,
   CONFIG_ACCESS_EXIT_CODE,
+  CORE_UNAVAILABLE_EXIT_CODE,
   DAEMON_WRAP,
   daemonWrap,
   daemonSpawnSpec,
   dataDirInUseNotice,
   configAccessNotice,
+  coreUnavailableNotice,
   decideOnDaemonExit,
   isRunning,
   createDaemonSupervisor
@@ -28,6 +30,8 @@ const DAEMON_EXIT_CODE_DECLARATION = /export const RESTART_REQUESTED_EXIT_CODE =
 const DAEMON_PID_SOURCE = join(__dirname, '..', 'turbollm', 'src', 'daemon-pid.ts')
 const DATA_DIR_IN_USE_DECLARATION = /export const DATA_DIR_IN_USE_EXIT_CODE = (\d+)/
 const CONFIG_ACCESS_DECLARATION = /export const CONFIG_ACCESS_EXIT_CODE = (\d+)/
+const CLI_SOURCE = join(__dirname, '..', 'turbollm', 'src', 'cli.ts')
+const CORE_UNAVAILABLE_DECLARATION = /const CORE_UNAVAILABLE_EXIT_CODE = (\d+)/
 
 const FAKE_DAEMON = join(__dirname, 'test-fixtures', 'fake-daemon.js')
 const LIFELINE_DAEMON = join(__dirname, 'test-fixtures', 'lifeline-daemon.js')
@@ -119,7 +123,7 @@ test('a daemon refused for its data dir right after the app\'s start is started 
   const last = launches.spawned.at(-1)
   last.exitCode = 73
   last.emit('exit', 73, null)
-  assert.deepEqual(lost, [{ reason: 'refused: another TurboLLM holds its data dir (exit 73)', details: { dataDirInUse: true, configAccess: false } }])
+  assert.deepEqual(lost, [{ reason: 'refused: another TurboLLM holds its data dir (exit 73)', details: { dataDirInUse: true, configAccess: false, coreUnavailable: false } }])
   await sleep(30)
   assert.equal(launches.spawned.length, 16, 'and not started again')
 })
@@ -141,6 +145,41 @@ test('decideOnDaemonExit: exit 77 is a daemon that may not read or write its con
     { action: 'lost', reason: 'refused: it may not read or write its config file (exit 77)', configAccess: true }
   )
   assert.deepEqual(decideOnDaemonExit({ code: 77, signal: null, stopping: true }), { action: 'none', reason: 'stopping' })
+})
+
+test('the core-unavailable exit code is 69 (sysexits EX_UNAVAILABLE, plan P-5)', () => {
+  assert.equal(CORE_UNAVAILABLE_EXIT_CODE, 69)
+})
+
+test('the core-unavailable exit code matches turbollm/src/cli.ts', () => {
+  const declaration = readFileSync(CLI_SOURCE, 'utf8').match(CORE_UNAVAILABLE_DECLARATION)
+  assert.ok(declaration, 'turbollm/src/cli.ts must declare CORE_UNAVAILABLE_EXIT_CODE')
+  assert.equal(Number(declaration[1]), CORE_UNAVAILABLE_EXIT_CODE)
+})
+
+// A desktop install whose native core is missing or built for another system: the daemon prints the
+// CoreLoadError and exits 69. As a plain crash the app opened and vanished with that text unseen. The
+// binary will not appear by itself, so it is never retried, even right after the app's start.
+test('decideOnDaemonExit: exit 69 is a daemon whose native core could not load', () => {
+  const lost = { action: 'lost', reason: 'refused: its native core could not load (exit 69)', coreUnavailable: true }
+  assert.deepEqual(decideOnDaemonExit({ code: 69, signal: null, stopping: false }), lost)
+  assert.deepEqual(decideOnDaemonExit({ code: 69, signal: null, stopping: false, sinceStartMs: 0 }), lost)
+  assert.deepEqual(decideOnDaemonExit({ code: 69, signal: null, stopping: true }), { action: 'none', reason: 'stopping' })
+})
+
+test('coreUnavailableNotice: the dialog shows the daemon\'s error, which names the system and what was tried', () => {
+  const error = "TurboLLM's native core is not available for this system (win32-ia32, Node v22.12.0).\n" +
+    'Tried:\n  dist/native/turbollm-core.win32-ia32-msvc.node: no such file'
+  const notice = coreUnavailableNotice(`${error}\n`)
+  assert.equal(notice.title, 'TurboLLM could not start')
+  assert.match(notice.message, /native core/)
+  assert.match(notice.message, /Reinstall the TurboLLM app/)
+  assert.equal(notice.detail, error)
+
+  // Nothing read from its stderr: the dialog still says where to report it.
+  for (const nothing of ['', '  \n', undefined]) {
+    assert.match(coreUnavailableNotice(nothing).detail, /github\.com\/mohitsoni48\/TurboLLM\/issues/)
+  }
 })
 
 test('configAccessNotice: the dialog shows the daemon\'s message, which says whose the file is and how to give it back', () => {
@@ -285,7 +324,7 @@ test('a daemon refused for its data dir is not respawned: the app is told why, o
   await exited
   assert.equal(launches.count, 1, 'a refused daemon is never respawned')
   assert.deepEqual(lost, [
-    { reason: 'refused: another TurboLLM holds its data dir (exit 73)', details: { dataDirInUse: true, configAccess: false } }
+    { reason: 'refused: another TurboLLM holds its data dir (exit 73)', details: { dataDirInUse: true, configAccess: false, coreUnavailable: false } }
   ])
   settled(dir)
 })
@@ -304,7 +343,26 @@ test('a daemon that may not read or write its config file is not respawned: the 
   await exited
   assert.equal(launches.count, 1, 'a refused daemon is never respawned')
   assert.deepEqual(lost, [
-    { reason: 'refused: it may not read or write its config file (exit 77)', details: { dataDirInUse: false, configAccess: true } }
+    { reason: 'refused: it may not read or write its config file (exit 77)', details: { dataDirInUse: false, configAccess: true, coreUnavailable: false } }
+  ])
+  settled(dir)
+})
+
+test('a daemon whose native core could not load is not respawned: the app is told why, once', async () => {
+  const dir = newDir()
+  const lost = []
+  const launches = countingSpawner(fakeDaemon(dir, '69'))
+  const child = supervise({
+    spawnDaemon: launches.spawnDaemon,
+    onDaemonLost: (reason, details) => lost.push({ reason, details })
+  }).start()
+  const exited = once(child, 'exit')
+
+  await waitUntil(() => lost.length === 1, DEADLINE_MS, 'the daemon to be reported lost')
+  await exited
+  assert.equal(launches.count, 1, 'a daemon with no core is never respawned')
+  assert.deepEqual(lost, [
+    { reason: 'refused: its native core could not load (exit 69)', details: { dataDirInUse: false, configAccess: false, coreUnavailable: true } }
   ])
   settled(dir)
 })

@@ -1,0 +1,10 @@
+[package]
+name = "turbollm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+turbollm-gguf = { path = "../turbollm-gguf" }

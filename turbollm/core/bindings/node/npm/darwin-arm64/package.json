@@ -1,0 +1,25 @@
+{
+  "name": "@turbollm/core-darwin-arm64",
+  "version": "0.0.0",
+  "description": "TurboLLM native core for darwin-arm64",
+  "license": "FSL-1.1-ALv2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mohitsoni48/TurboLLM.git",
+    "directory": "turbollm/core/bindings/node/npm/darwin-arm64"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "turbollm-core.darwin-arm64.node",
+  "files": [
+    "turbollm-core.darwin-arm64.node",
+    "LICENSE.md"
+  ],
+  "engines": {
+    "node": ">=18.20"
+  }
+}

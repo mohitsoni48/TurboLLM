@@ -1,0 +1,19 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# ELF headers for check-android-elf and check-glibc (plan T16).
+object = { version = "=0.41.0", default-features = false, features = ["std", "read_core", "elf"] }
+serde_json = "=1.0.154"
+toml_edit = "=0.25.19"
+# Same exact version as bindings/uniffi's uniffi.
+uniffi = { version = "=0.32.2", features = ["bindgen"] }
+
+[dev-dependencies]
+# Builds the shared libraries elf.rs tests read.
+object = { version = "=0.41.0", default-features = false, features = ["std", "read_core", "elf", "write_std"] }

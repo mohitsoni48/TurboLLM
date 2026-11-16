@@ -12,6 +12,11 @@ on:
 permissions:
   contents: write
 
+env:
+  # The same zig and cargo-zigbuild core-build.yml cross-builds the linux-*-gnu core with (workflows.test.ts checks).
+  ZIG_VERSION: 0.17.0
+  CARGO_ZIGBUILD_VERSION: 0.24.1
+
 jobs:
   build:
     # Guard against this ever firing for a release that isn't this repo's own
@@ -44,6 +49,37 @@ jobs:
       - name: Install daemon dependencies
         run: npm ci
         working-directory: turbollm
+
+      # The installer ships daemon/dist/native/turbollm-core.<host>.node (electron-builder.config.cjs), built here for
+      # this runner's own target; `npm run build` stages it into dist/native/ (rust-core plan T23, ADR-465).
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+        working-directory: turbollm/core
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: turbollm/core
+
+      # The AppImage keeps the glibc 2.28 floor (rust-core arch 2.3, ADR-465): a native build on ubuntu-latest would
+      # link against the runner's newer glibc, so Linux cross-builds with zig pinned to the floor, as core-build.yml.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: ${{ runner.os == 'Linux' }}
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        if: ${{ runner.os == 'Linux' }}
+        with:
+          tool: cargo-zigbuild@${{ env.CARGO_ZIGBUILD_VERSION }}
+
+      - name: Build the native core
+        run: npm run build:core ${{ runner.os == 'Linux' && '-- --target linux-x64-gnu --cross-compile' || '' }}
+        working-directory: turbollm
+
+      - name: Needs no glibc newer than 2.28
+        if: ${{ runner.os == 'Linux' }}
+        run: cargo xtask check-glibc --max 2.28 bindings/node/turbollm-core.linux-x64-gnu.node
+        working-directory: turbollm/core
 
       - name: Build daemon + web UI
         run: |
