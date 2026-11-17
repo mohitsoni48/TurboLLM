@@ -244,6 +244,15 @@ test('an empty clip and an absurd sample rate are refused with audio_format_unsu
   await refused(h, proxied, ask(wavB64(1, 100)), 400, 'audio_format_unsupported', /sample rate/)
 })
 
+test('audio longer than the recorder allows is refused before the router is asked for a model', async (t) => {
+  const h = await harness(t)
+  const proxied = proxyStub(t)
+  const ask = (...data: string[]) => spokenAsk({ messages: [{ role: 'user', content: data.map((d) => ({ type: 'input_audio', input_audio: { data: d, format: 'wav' } })) }] })
+  await refused(h, proxied, ask(wavB64(16000, 301 * 16000)), 400, 'audio_format_unsupported', /at most 5 minutes/)
+  await refused(h, proxied, ask(wavB64(16000, 120 * 16000), wavB64(16000, 120 * 16000), wavB64(16000, 120 * 16000)), 400, 'audio_format_unsupported', /at most 5 minutes/)
+  assert.deepEqual(h.routed, [])
+})
+
 test('a request with no audio object, or malformed messages, is a 400 invalid_request_error', async (t) => {
   const h = await harness(t)
   const proxied = proxyStub(t)

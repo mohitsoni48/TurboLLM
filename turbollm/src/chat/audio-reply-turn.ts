@@ -17,7 +17,7 @@ import {
   type AudioReplyRequest, type AudioReplyRuntime,
 } from '../engines/audio-reply/index.js'
 import { withUserNote } from '../engines/audio-reply/instructions.js'
-import { concatPcm16, decodeWavToPcm16Mono, type DecodedWav } from '../engines/audio-reply/wav.js'
+import { decodeWavClips } from '../engines/audio-reply/wav.js'
 import { noteLocalActivity } from '../link/host-idle.js'
 import { audioAttachmentFormat } from './attachments.js'
 import { buildAudioReplyInstructions } from './chat-compaction.js'
@@ -37,12 +37,6 @@ export interface SpokenTurn {
 export type SpokenTurnCheck =
   | { ok: true; turn: SpokenTurn }
   | { ok: false; status: 400 | 409; code: string; message: string }
-
-/** The clips of a turn as PCM: each must be a WAV the decoder reads (an MP3 would need a decoder this build does not
- *  carry), and they must share a sample rate to be played back to back. The first refusal's message names what to send. */
-function pcmOf(wavs: Buffer[]): DecodedWav {
-  return concatPcm16(wavs.map((w) => decodeWavToPcm16Mono(w)))
-}
 
 /** Whether the turn about to be stored can be answered aloud, decided before anything is written so a refusal leaves
  *  no row and no file behind. `audio` are the turn's clips as the route received them (data URLs or stored
@@ -78,7 +72,7 @@ export async function prepareAudioReplyTurn(
     wavs.push(Buffer.from(url.slice(url.indexOf(',') + 1), 'base64'))
   }
   try {
-    const { pcm16, sampleRate } = pcmOf(wavs)
+    const { pcm16, sampleRate } = decodeWavClips(wavs)
     return { ok: true, turn: { runtime, input: { kind: 'audio', pcm16, sampleRate }, note: turn.text } }
   } catch (e) {
     return { ok: false, status: 400, code: 'audio_format_unsupported', message: (e as Error).message }

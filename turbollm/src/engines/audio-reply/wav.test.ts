@@ -2,7 +2,7 @@
 // PCM16 as a file a player opens.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { concatPcm16, decodeWavToPcm16Mono, pcm16ToWav } from './wav'
+import { concatPcm16, decodeWavClips, decodeWavToPcm16Mono, MAX_SPOKEN_INPUT_MS, pcm16ToWav } from './wav'
 
 /** A WAV file with the given format tag, channel count, rate, bit depth and raw sample bytes. */
 function wav(opts: { format: number; channels: number; rate: number; bits: number; data: Buffer; extra?: Buffer; dataSize?: number }): Buffer {
@@ -102,4 +102,18 @@ test('clips of one turn are joined back to back when they share a rate, and refu
   assert.deepEqual(concatPcm16([a, b]), { pcm16: int16(1, 2, 3), sampleRate: 16000 })
   assert.deepEqual(concatPcm16([a]), a)
   assert.throws(() => concatPcm16([a, { pcm16: int16(3), sampleRate: 44100 }]), /different sample rates \(16000, 44100 Hz\)/)
+})
+
+test('the clips of a turn are capped by their total duration, read from the headers before anything is decoded', () => {
+  const silence = (ms: number, rate: number, channels: number, bytes: number) => Buffer.alloc(Math.round((ms / 1000) * rate) * channels * bytes)
+  const clip = (ms: number) => wav({ format: 1, channels: 1, rate: 16000, bits: 16, data: silence(ms, 16000, 1, 2) })
+  assert.throws(() => decodeWavClips([clip(MAX_SPOKEN_INPUT_MS + 1000)]), /301 s of audio, and at most 5 minutes/)
+  // Stereo float counts its channels and sample size.
+  const stereoFloat = wav({ format: 3, channels: 2, rate: 8000, bits: 32, data: silence(301_000, 8000, 2, 4) })
+  assert.throws(() => decodeWavClips([stereoFloat]), /at most 5 minutes/)
+  // The limit is on the total: three clips of two minutes are refused, though each alone is fine.
+  assert.throws(() => decodeWavClips([clip(120_000), clip(120_000), clip(120_000)]), /at most 5 minutes/)
+  // Within it, the clips decode and join.
+  assert.deepEqual(decodeWavClips([wav({ format: 1, channels: 1, rate: 16000, bits: 16, data: int16(1) }), wav({ format: 1, channels: 1, rate: 16000, bits: 16, data: int16(2) })]), { pcm16: int16(1, 2), sampleRate: 16000 })
+  assert.ok(decodeWavClips([clip(MAX_SPOKEN_INPUT_MS)]).pcm16.length > 0, 'exactly the limit is accepted')
 })

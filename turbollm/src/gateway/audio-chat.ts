@@ -19,7 +19,7 @@ import {
   type AudioReplyRequest, type AudioReplyRuntime,
 } from '../engines/audio-reply'
 import { flattenInstructions, SPOKEN_REPLY_PLACEHOLDER, VOICE_MESSAGE_PLACEHOLDER, withUserNote, type TranscriptTurn } from '../engines/audio-reply/instructions'
-import { concatPcm16, decodeWavToPcm16Mono } from '../engines/audio-reply/wav'
+import { decodeWavClips } from '../engines/audio-reply/wav'
 import { servingEngineKind } from '../engines/serving'
 import { extractParams, requestLogConfig, summarizeRequest } from '../observability/request-log'
 import type { RouteResult } from './model-router'
@@ -126,7 +126,7 @@ export function readAudioChatRequest(body: Record<string, unknown>): ReadAudioRe
       wavs.push(Buffer.from(data, 'base64'))
     }
     try {
-      const { pcm16, sampleRate } = concatPcm16(wavs.map((w) => decodeWavToPcm16Mono(w)))
+      const { pcm16, sampleRate } = decodeWavClips(wavs)
       input = { kind: 'audio', pcm16, sampleRate }
     } catch (e) {
       return bad((e as Error).message, 'audio_format_unsupported', 'messages')

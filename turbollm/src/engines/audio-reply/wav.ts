@@ -19,10 +19,16 @@ function fail(why: string): never {
   throw new Error(`Unsupported WAV file: ${why}. Send a PCM16 or float32 WAV.`)
 }
 
-/** Reads a RIFF/WAVE file of 16-bit PCM or 32-bit float samples at any channel count, and returns it as mono PCM16:
- *  channels are averaged, floats are scaled and clipped. Anything else (8, 24 or 32-bit integers, A-law, a compressed
- *  codec, a file that is not WAV at all) throws with a message that says what to send instead. */
-export function decodeWavToPcm16Mono(buf: Buffer): DecodedWav {
+interface WavHeader {
+  isFloat: boolean
+  channels: number
+  sampleRate: number
+  bytesPerSample: number
+  data: Buffer
+}
+
+/** The header of a RIFF/WAVE file, validated, and its data chunk as a view of `buf` (nothing is copied or decoded). */
+function readWavHeader(buf: Buffer): WavHeader {
   if (buf.length < 12 || buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') fail('not a RIFF/WAVE file')
   let format = 0
   let channels = 0
@@ -57,8 +63,14 @@ export function decodeWavToPcm16Mono(buf: Buffer): DecodedWav {
   const isFloat = format === FORMAT_FLOAT && bits === 32
   const isPcm16 = format === FORMAT_PCM && bits === 16
   if (!isFloat && !isPcm16) fail(`format ${format} at ${bits} bits`)
+  return { isFloat, channels, sampleRate, bytesPerSample: bits / 8, data }
+}
 
-  const bytesPerSample = bits / 8
+/** Reads a RIFF/WAVE file of 16-bit PCM or 32-bit float samples at any channel count, and returns it as mono PCM16:
+ *  channels are averaged, floats are scaled and clipped. Anything else (8, 24 or 32-bit integers, A-law, a compressed
+ *  codec, a file that is not WAV at all) throws with a message that says what to send instead. */
+export function decodeWavToPcm16Mono(buf: Buffer): DecodedWav {
+  const { isFloat, channels, sampleRate, bytesPerSample, data } = readWavHeader(buf)
   const frames = Math.floor(data.length / (bytesPerSample * channels))
   if (frames === 0) fail('it holds no audio')
   const out = Buffer.alloc(frames * 2)
@@ -71,6 +83,25 @@ export function decodeWavToPcm16Mono(buf: Buffer): DecodedWav {
     out.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(sum / channels))), i * 2)
   }
   return { pcm16: out, sampleRate }
+}
+
+/** The most speech one turn may carry, in all its clips: the recorder's own limit (web/src/lib/voice/recorder.ts,
+ *  MAX_RECORDING_MS). Decoding is a loop in JS on the daemon's one thread, so a clip longer than anyone can record is
+ *  refused before it is decoded rather than stalling every stream and the status API while it is. */
+export const MAX_SPOKEN_INPUT_MS = 5 * 60_000
+
+/** Decodes the clips of one turn and joins them (concatPcm16). Their total length is read from their headers alone
+ *  and checked against MAX_SPOKEN_INPUT_MS before any sample is decoded. Throws as decodeWavToPcm16Mono does. */
+export function decodeWavClips(wavs: Buffer[]): DecodedWav {
+  let ms = 0
+  for (const wav of wavs) {
+    const { channels, sampleRate, bytesPerSample, data } = readWavHeader(wav)
+    ms += (data.length / (sampleRate * channels * bytesPerSample)) * 1000
+  }
+  if (ms > MAX_SPOKEN_INPUT_MS) {
+    fail(`it is ${Math.round(ms / 1000)} s of audio, and at most ${MAX_SPOKEN_INPUT_MS / 60_000} minutes is read in one message`)
+  }
+  return concatPcm16(wavs.map((w) => decodeWavToPcm16Mono(w)))
 }
 
 /** Wraps mono PCM16 in the 44-byte header of a canonical WAV file. */
