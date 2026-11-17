@@ -51,7 +51,9 @@ describe('useChatSession', () => {
       await Promise.resolve()
     })
     expect(result.current.liveByConv.c9?.assistantId).toBe('a9')
-    await act(async () => { release(); await running })
+    // The end of the stream may land while the meta's change is still held (notify()), so its notification can come a
+    // task later: wait that task, as the attach test above does.
+    await act(async () => { release(); await running; await new Promise((r) => setTimeout(r, 0)) })
     expect(result.current.liveByConv.c9).toBeUndefined()
   })
 
