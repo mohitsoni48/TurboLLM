@@ -93,6 +93,46 @@ test('a fork keeps the compaction summary only when its cut is among the copied 
   })
 })
 
+// The fork's files are not the files a copied edit was made against, so revert-with-files in the fork must never
+// reverse-apply a copied patch. The diff stays for display.
+test('copied tool calls lose their edit patch and keep their diff', () => {
+  withStore((db) => {
+    const src = db.createConversation({ kind: 'code' })
+    db.addMessage(src.id, 'user', 'edit it')
+    const a = db.addMessage(src.id, 'assistant', 'edited', {
+      toolCalls: [
+        { id: 'e1', name: 'edit', args: { path: 'a.ts' }, result: 'ok', diff: '-a\n+b', patch: '--- a.ts\n+++ a.ts\n@@ -1 +1 @@\n-a\n+b\n' },
+        { id: 'r1', name: 'read', args: { path: 'a.ts' }, result: 'b' },
+      ],
+    })
+    const r = db.forkConversation(src.id, a.id)
+    assert.equal(r.ok, true)
+    if (!r.ok) return
+    const [edit, read] = db.getMessages(r.conversation.id)[1].toolCalls!
+    assert.equal(edit.patch, undefined)
+    assert.equal(edit.diff, '-a\n+b')
+    assert.equal(edit.result, 'ok')
+    assert.deepEqual(read, { id: 'r1', name: 'read', args: { path: 'a.ts' }, result: 'b' })
+    assert.ok(db.getMessages(src.id)[1].toolCalls![0].patch, 'the source keeps its patch')
+  })
+})
+
+test('a fork of a fork is "<title> (fork)", and the copied ids are handed back', () => {
+  withStore((db) => {
+    const src = db.createConversation({ title: 'Ideas' })
+    const u = db.addMessage(src.id, 'user', 'q')
+    const first = db.forkConversation(src.id, u.id)
+    assert.equal(first.ok, true)
+    if (!first.ok) return
+    const copy = db.getMessages(first.conversation.id)[0]
+    assert.deepEqual([...first.copiedIds], [[u.id, copy.id]])
+    const second = db.forkConversation(first.conversation.id, copy.id)
+    assert.equal(second.ok, true)
+    if (!second.ok) return
+    assert.equal(second.conversation.title, 'Ideas (fork)')
+  })
+})
+
 test('deleting the source leaves the fork whole', () => {
   withStore((db) => {
     const src = db.createConversation()

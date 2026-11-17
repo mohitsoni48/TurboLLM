@@ -578,6 +578,11 @@ function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
   return out
 }
 
+/** A fork's title (GitHub #323): "<title> (fork)", and a fork of a fork stays "<title> (fork)". */
+export function forkTitle(title: string): string {
+  return `${title.replace(/( \(fork\))+$/, '')} (fork)`
+}
+
 function rowToConv(r: ConvRow): Conversation {
   return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : r.kind === 'code' ? 'code' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, readScope: r.read_scope ? (safeJson(r.read_scope) as string[]) : undefined, agentMode: r.agent_mode ?? undefined, skillIds: r.skill_ids ? (safeJson(r.skill_ids) as string[]) : undefined, allowedTools: r.allowed_tools ? (safeJson(r.allowed_tools) as string[]) : undefined, preserveThinking: r.preserve_thinking === 1, compactionSummary: r.compaction_summary ?? undefined, compactionUpToMessageId: r.compaction_upto_message_id ?? undefined, compactionTokensBefore: r.compaction_tokens_before ?? undefined, compactionAppliedAt: r.compaction_applied_at ?? undefined, createdAt: r.created_at, updatedAt: r.updated_at }
 }
@@ -1215,8 +1220,15 @@ export class ConversationStore {
    *  from seq 1. The source is never changed. Attachments are `attachment:<id>` references to files stored once by hash,
    *  so the copies share them (the attachment janitor keeps a file any message still references). The compaction
    *  summary comes along only when its cut is among the copied messages; otherwise the fork has none. Not the
-   *  completion marker, and not the per-session usage. One transaction: a fork is whole or absent. */
-  forkConversation(sourceId: string, uptoMessageId: string): { ok: true; conversation: Conversation } | { ok: false; reason: 'conversation_not_found' | 'message_not_found' } {
+   *  completion marker, and not the per-session usage. One transaction: a fork is whole or absent.
+   *  Copied tool calls lose their `patch` (Code's edit patches, which revert-to-message reverse-applies with
+   *  revertFiles): the fork's files are not the files those patches were made against (a new worktree starts at the
+   *  original branch's tip, and a session without one shares the original's folder), so a revert in the fork must
+   *  never reverse-apply them. The `diff` stays for display. Revert in a fork still walks back the edits the fork
+   *  itself made. A fork of a fork is titled "<title> (fork)", not "(fork) (fork)".
+   *  `copiedIds` maps each copied source message id to its copy's, for state kept outside the conversation (a Code
+   *  session's compaction cut). */
+  forkConversation(sourceId: string, uptoMessageId: string): { ok: true; conversation: Conversation; copiedIds: Map<string, string> } | { ok: false; reason: 'conversation_not_found' | 'message_not_found' } {
     return this.transaction(() => {
       const src = this.db.prepare(`SELECT title, compaction_summary, compaction_upto_message_id, compaction_tokens_before, compaction_applied_at FROM conversations WHERE id = $id`)
         .get({ $id: sourceId } as P) as unknown as { title: string; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; compaction_applied_at: string | null } | undefined
@@ -1228,17 +1240,24 @@ export class ConversationStore {
       const now = new Date().toISOString()
       this.db.prepare(`INSERT INTO conversations (id,title,system_prompt,model_key,sampling,expert_mode,tool_policy,kind,folder_id,tool_overrides,agent_id,read_scope,agent_mode,skill_ids,allowed_tools,preserve_thinking,tenant,owner,metadata,created_at,updated_at)
         SELECT $id,$title,system_prompt,model_key,sampling,expert_mode,tool_policy,kind,folder_id,tool_overrides,agent_id,read_scope,agent_mode,skill_ids,allowed_tools,preserve_thinking,tenant,owner,metadata,$now,$now FROM conversations WHERE id = $src`)
-        .run({ $id: id, $title: `${src.title} (fork)`, $now: now, $src: sourceId } as P)
+        .run({ $id: id, $title: forkTitle(src.title), $now: now, $src: sourceId } as P)
 
       const sourceIds = (this.db.prepare(`SELECT id FROM messages WHERE conv_id = $cid AND is_active = 1 AND seq <= $seq ORDER BY seq ASC`)
         .all({ $cid: sourceId, $seq: upto.seq } as P) as unknown as { id: string }[]).map((r) => r.id)
       const copyMessage = this.db.prepare(`INSERT INTO messages (id,conv_id,seq,role,content,reasoning,attachments,stats,created_at,model_key,text_attachments,tool_calls,research_meta,is_active,edited,timeline,tenant,owner,status,metadata,doc_context)
         SELECT $nid,$cid,$seq,role,content,reasoning,attachments,stats,created_at,model_key,text_attachments,tool_calls,research_meta,1,edited,timeline,tenant,owner,status,metadata,doc_context FROM messages WHERE id = $old`)
       const copiedIds = new Map<string, string>()
+      const readToolCalls = this.db.prepare(`SELECT tool_calls FROM messages WHERE id = $id`)
+      const writeToolCalls = this.db.prepare(`UPDATE messages SET tool_calls = $tc WHERE id = $id`)
       sourceIds.forEach((old, i) => {
         const nid = randomUUID()
         copyMessage.run({ $nid: nid, $cid: id, $seq: i + 1, $old: old } as P)
         copiedIds.set(old, nid)
+        const raw = (readToolCalls.get({ $id: nid } as P) as unknown as { tool_calls: string | null } | undefined)?.tool_calls
+        if (raw?.includes('"patch"')) {
+          const calls = JSON.parse(raw) as ToolCallRecord[]
+          writeToolCalls.run({ $id: nid, $tc: JSON.stringify(calls.map(({ patch: _patch, ...call }) => call)) } as P)
+        }
       })
 
       const cut = src.compaction_upto_message_id ? copiedIds.get(src.compaction_upto_message_id) : undefined
@@ -1246,7 +1265,7 @@ export class ConversationStore {
         this.db.prepare(`UPDATE conversations SET compaction_summary = $s, compaction_upto_message_id = $cut, compaction_tokens_before = $t, compaction_applied_at = $at WHERE id = $id`)
           .run({ $id: id, $s: src.compaction_summary, $cut: cut, $t: src.compaction_tokens_before, $at: src.compaction_applied_at } as P)
       }
-      return { ok: true as const, conversation: this.getConversation(id)! }
+      return { ok: true as const, conversation: this.getConversation(id)!, copiedIds }
     })
   }
 

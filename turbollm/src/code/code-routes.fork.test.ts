@@ -2,6 +2,7 @@
 // A worktree session forks onto a worktree of its own, branched from the original's branch.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { Hono } from 'hono'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
@@ -88,5 +89,111 @@ test('a worktree session forks onto a new worktree of its own, branched from the
   assert.notEqual(fork.worktreeBranch, original.worktreeBranch)
   assert.match(fork.worktreeBranch ?? '', /^feature-fork/)
   assert.equal(fork.worktreeBase, original.worktreeBranch)
+  db.close()
+})
+
+// A Code session's compaction lives on its run, not its conversation: without it the fork replayed the full history.
+test('a compacted session\'s fork keeps the compaction when its cut is copied, pointed at the copy', async () => {
+  const { app, db } = makeApp()
+  const conv = db.createConversation({ kind: 'code' })
+  const run = db.createAgentRun({ convId: conv.id, title: 'T', allowedTools: [], repoRoot: '/work/repo' })
+  const u1 = db.addMessage(conv.id, 'user', 'step one')
+  const a1 = db.addMessage(conv.id, 'assistant', 'did one')
+  const u2 = db.addMessage(conv.id, 'user', 'step two')
+  db.updateAgentRun(run.id, { compactionSummary: 'Step one is done.', compactionUpToMessageId: a1.id, compactionTokensBefore: 1234 })
+
+  const after = await post(app, `/api/v1/code/sessions/${run.id}/fork`, { messageId: u2.id })
+  assert.equal(after.status, 201)
+  const kept = db.getAgentRun(((await after.json()) as { sessionId: string }).sessionId)!
+  const copies = db.getMessages(kept.convId)
+  assert.equal(kept.compactionSummary, 'Step one is done.')
+  assert.equal(kept.compactionTokensBefore, 1234)
+  assert.equal(kept.compactionUpToMessageId, copies[1].id, 'the copy of the cut, not the original message')
+
+  const before = await post(app, `/api/v1/code/sessions/${run.id}/fork`, { messageId: u1.id })
+  assert.equal(before.status, 201)
+  assert.equal(db.getAgentRun(((await before.json()) as { sessionId: string }).sessionId)!.compactionSummary, undefined, 'the cut is past the fork')
+  db.close()
+})
+
+test('a reverted or cleared session forks only what it shows, and the fork carries no revert, clear or compaction marker', async () => {
+  const { app, db } = makeApp()
+  const conv = db.createConversation({ kind: 'code' })
+  const run = db.createAgentRun({ convId: conv.id, title: 'T', allowedTools: [], repoRoot: '/work/repo' })
+  const u1 = db.addMessage(conv.id, 'user', 'one')
+  const a1 = db.addMessage(conv.id, 'assistant', 'did one')
+  const u2 = db.addMessage(conv.id, 'user', 'two')
+  db.addMessage(conv.id, 'assistant', 'did two')
+  db.updateAgentRun(run.id, { compactionSummary: 'One.', compactionUpToMessageId: a1.id, compactionTokensBefore: 10 })
+
+  db.deactivateMessagesFrom(conv.id, u2.id)
+  db.setRevertedFromMessageId(run.id, u2.id)
+  assert.equal((await post(app, `/api/v1/code/sessions/${run.id}/fork`, { messageId: u2.id })).status, 404, 'a reverted message is not forkable')
+  const reverted = await post(app, `/api/v1/code/sessions/${run.id}/fork`, { messageId: a1.id })
+  assert.equal(reverted.status, 201)
+  const r = db.getAgentRun(((await reverted.json()) as { sessionId: string }).sessionId)!
+  assert.deepEqual(db.getMessages(r.convId).map((m) => m.content), ['one', 'did one'])
+  assert.equal(r.revertedFromMessageId, undefined)
+
+  db.reactivateMessagesFrom(conv.id, u2.id)
+  db.setRevertedFromMessageId(run.id, null)
+  db.deactivateMessagesUpTo(conv.id, a1.id)
+  db.setClearedUpToMessageId(run.id, a1.id)
+  const last = db.getMessages(conv.id).at(-1)!
+  const cleared = await post(app, `/api/v1/code/sessions/${run.id}/fork`, { messageId: last.id })
+  assert.equal(cleared.status, 201)
+  const cl = db.getAgentRun(((await cleared.json()) as { sessionId: string }).sessionId)!
+  assert.deepEqual(db.getMessages(cl.convId).map((m) => m.content), ['two', 'did two'])
+  assert.equal(cl.clearedUpToMessageId, undefined)
+  assert.equal(cl.compactionSummary, undefined, 'a clear replays nothing before it, so no compaction comes along')
+  assert.ok(u1)
+  db.close()
+})
+
+test('a terminal agent\'s session is not forked: it would never see the copied transcript', async () => {
+  const { app, db } = makeApp()
+  const conv = db.createConversation({ kind: 'code' })
+  const run = db.createAgentRun({ convId: conv.id, title: 'T', allowedTools: [], repoRoot: '/work/repo', codeAgent: 'claude' })
+  const u = db.addMessage(conv.id, 'user', 'task')
+  const before = db.listAgentRuns().length
+  assert.equal((await post(app, `/api/v1/code/sessions/${run.id}/fork`, { messageId: u.id })).status, 400)
+  assert.equal(db.listAgentRuns().length, before)
+  db.close()
+})
+
+const branches = (repoRoot: string, pattern: string) =>
+  execFileSync('git', ['-C', repoRoot, 'branch', '--list', pattern], { encoding: 'utf8' }).split('\n').map((l) => l.trim()).filter(Boolean)
+
+test('a worktree session with a bad message id makes no worktree or branch', async () => {
+  const { app, db } = makeApp()
+  const repoRoot = tmpGitRepo('tllm-code-fork-bad-')
+  const created = await post(app, '/api/v1/code/sessions', { repoRoot, task: 'feature work', useWorktree: true, worktreeBranch: 'feature' })
+  const { sessionId } = (await created.json()) as { sessionId: string }
+  const res = await post(app, `/api/v1/code/sessions/${sessionId}/fork`, { messageId: 'nope' })
+  assert.equal(res.status, 404)
+  assert.deepEqual(branches(repoRoot, 'feature-fork*'), [])
+  assert.equal(db.listAgentRuns().length, 1)
+  db.close()
+})
+
+test('a fork that fails after its worktree is made takes the worktree, branch and copied conversation with it', async () => {
+  const { app, db } = makeApp()
+  const repoRoot = tmpGitRepo('tllm-code-fork-fail-')
+  const created = await post(app, '/api/v1/code/sessions', { repoRoot, task: 'feature work', useWorktree: true, worktreeBranch: 'feature' })
+  const { sessionId } = (await created.json()) as { sessionId: string }
+  const task = db.getMessages(db.getAgentRun(sessionId)!.convId)[0]
+  const conversations = db.listConversations().length
+  const real = db.createAgentRun.bind(db)
+  let madePath: string | undefined
+  db.createAgentRun = (params) => { madePath = params.worktreePath; throw new Error('disk full') }
+
+  const res = await post(app, `/api/v1/code/sessions/${sessionId}/fork`, { messageId: task.id })
+  db.createAgentRun = real
+  assert.equal(res.status, 500)
+  assert.ok(madePath, 'the worktree was made before the failure')
+  assert.ok(!existsSync(madePath!), 'and removed after it')
+  assert.deepEqual(branches(repoRoot, 'feature-fork*'), [], 'its branch too')
+  assert.equal(db.listConversations().length, conversations, 'no copied conversation left behind')
+  assert.equal(db.listAgentRuns().length, 1)
   db.close()
 })

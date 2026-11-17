@@ -21,12 +21,12 @@ import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { CodeSessionDeletion, Deps } from '../deps'
 import { holdOpen } from '../auth'
-import type { AgentRun, ConversationStore, Message } from '../chat/db'
+import { forkTitle, type AgentRun, type ConversationStore, type Message } from '../chat/db'
 import { CodeRunManager, type SteerKind } from './code-run-manager'
 import { parseReasoningEffort } from '../chat/reasoning-effort'
 import { compactCodeSession, disposeLspClientsForConv } from './code-session'
 import { revertFileEdits } from './revert'
-import { agentCwd, createSessionWorktree, removeSessionWorktree } from './worktree'
+import { agentCwd, createSessionWorktree, removeSessionWorktree, runGit } from './worktree'
 import { codeSessionExportFilename, serializeCodeSessionMarkdown } from './session-export'
 import { commitGitChanges, getGithubCompareUrl, getGitStatus, pushGitBranch } from './git-actions'
 import { runShellCommand, shellContextText } from './code-shell'
@@ -723,8 +723,14 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
 
     const run = db.getAgentRun(id)
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    // A terminal agent (Claude Code, opencode, the pi CLI) keeps its own history: it would never see the copied
+    // transcript, so its fork would look like the original and act like a new session.
+    if ((run.codeAgent ?? 'turbollm') !== 'turbollm') return err(c, 400, 'invalid_input', 'Only a session the built-in agent runs can be forked.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before forking.')
     if (compacting.has(id)) return compactionInProgress(c)
+    // Before any worktree is made: a bad id must not create (and remove) a real worktree and branch.
+    const from = db.getMessage(messageId)
+    if (!from || from.convId !== run.convId || !from.isActive) return err(c, 404, 'not_found', 'That message is not in this session.')
 
     let worktreePath: string | undefined
     let worktreeBranch: string | undefined
@@ -735,25 +741,45 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
       worktreeBranch = created.branch
     }
 
-    const forked = db.forkConversation(run.convId, messageId)
-    if (!forked.ok) {
-      if (worktreePath && run.repoRoot) await removeWorktree(run.repoRoot, worktreePath)
-      return err(c, 404, 'not_found', forked.reason === 'conversation_not_found' ? 'Session conversation not found.' : 'That message is not in this session.')
+    // Whatever fails from here takes the new worktree and the copied conversation with it: nothing half-made stays.
+    let forkedConvId: string | undefined
+    let done = false
+    try {
+      const forked = db.forkConversation(run.convId, messageId)
+      if (!forked.ok) return err(c, 404, 'not_found', forked.reason === 'conversation_not_found' ? 'Session conversation not found.' : 'That message is not in this session.')
+      forkedConvId = forked.conversation.id
+      const fork = db.createAgentRun({
+        convId: forked.conversation.id,
+        title: forkTitle(run.title),
+        allowedTools: run.allowedTools,
+        agentId: run.agentId,
+        repoRoot: run.repoRoot,
+        repoBranch: run.repoBranch,
+        useWorktree: worktreePath ? true : run.useWorktree,
+        worktreeBranch: worktreeBranch ?? run.worktreeBranch,
+        worktreeBase: worktreePath ? run.worktreeBranch : run.worktreeBase,
+        worktreePath,
+        codeAgent: run.codeAgent,
+      })
+      // A Code session's compaction lives on its run (resolveEffectiveHistory reads it there), not the conversation:
+      // carry it over when its cut is among the copied messages, pointed at the copy. Not past a /clear, which
+      // replays nothing before it and so leaves the cut nothing to stand for.
+      const cut = run.compactionUpToMessageId ? forked.copiedIds.get(run.compactionUpToMessageId) : undefined
+      if (cut && run.compactionSummary && !run.clearedUpToMessageId) {
+        db.updateAgentRun(fork.id, { compactionSummary: run.compactionSummary, compactionUpToMessageId: cut, compactionTokensBefore: run.compactionTokensBefore })
+      }
+      done = true
+      return c.json({ sessionId: fork.id, convId: forked.conversation.id }, 201)
+    } finally {
+      if (!done) {
+        if (forkedConvId) db.deleteConversation(forkedConvId)
+        // The branch too: unlike a deleted session's, a fork that never came to be has no work on it.
+        if (worktreePath && run.repoRoot) {
+          const removed = await removeWorktree(run.repoRoot, worktreePath)
+          if (removed.ok && worktreeBranch) await runGit(run.repoRoot, ['branch', '-D', worktreeBranch])
+        }
+      }
     }
-    const fork = db.createAgentRun({
-      convId: forked.conversation.id,
-      title: `${run.title} (fork)`,
-      allowedTools: run.allowedTools,
-      agentId: run.agentId,
-      repoRoot: run.repoRoot,
-      repoBranch: run.repoBranch,
-      useWorktree: worktreePath ? true : run.useWorktree,
-      worktreeBranch: worktreeBranch ?? run.worktreeBranch,
-      worktreeBase: worktreePath ? run.worktreeBranch : run.worktreeBase,
-      worktreePath,
-      codeAgent: run.codeAgent,
-    })
-    return c.json({ sessionId: fork.id, convId: forked.conversation.id }, 201)
   })
 
   app.post('/api/v1/code/sessions/:id/revert', async (c) => {

@@ -636,8 +636,11 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
   }
   // Fork from before an instruction (GitHub #323): a new session keeps everything up to `uptoMessageId` and opens;
   // this one is left as it is.
+  // One fork at a time: a double-click made two sessions (and two worktrees).
+  const forking = useRef(false)
   const runFork = async (uptoMessageId: string) => {
-    if (!effectiveSessionId) return
+    if (!effectiveSessionId || forking.current) return
+    forking.current = true
     try {
       const { sessionId } = await forkCodeSession(effectiveSessionId, uptoMessageId)
       void qc.invalidateQueries({ queryKey: ['code-sessions'] })
@@ -645,6 +648,8 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
       toast('Forked into a new session.')
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : 'Could not fork this session.')
+    } finally {
+      forking.current = false
     }
   }
   const runRevert = async (messageId: string, revertFiles: boolean) => {
@@ -1092,7 +1097,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
                     liveAssistantId={live?.assistantId}
                     live={live ? { timeline: live.timeline, reasoning: live.reasoning, compacting: live.compacting, retry: live.retry, prefill: live.prefill } : null}
                     onRevert={live || queued.length > 0 || compacting ? undefined : openRevertConfirm}
-                    onFork={live || queued.length > 0 || compacting ? undefined : (id) => void runFork(id)}
+                    onFork={isTerminalSession || live || queued.length > 0 || compacting ? undefined : (id) => void runFork(id)}
                     queued={queued}
                     onSendNowQueued={(id) => void handleSendNow(id)}
                     shellRuns={shellRuns}

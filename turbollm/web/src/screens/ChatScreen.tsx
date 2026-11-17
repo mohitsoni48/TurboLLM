@@ -980,8 +980,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   }
 
   // Fork from here (GitHub #323): the new chat opens; this one is left as it was.
+  // One fork at a time: a double-click made two chats.
+  const forking = useRef(false)
   const handleFork = async (m: Message) => {
-    if (!activeId) return
+    if (!activeId || forking.current) return
+    forking.current = true
     try {
       const forked = await forkConversation(activeId, m.id)
       qc.setQueryData(chatKeys.detail(forked.id), forked)
@@ -990,6 +993,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       toast('Forked into a new chat.')
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : 'Could not fork this chat.')
+    } finally {
+      forking.current = false
     }
   }
 
