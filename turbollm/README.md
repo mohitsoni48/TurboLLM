@@ -661,8 +661,10 @@ A request that does not ask for audio is untouched.
 
 - **A finished clip, not a stream.** The reply is played once it is complete; `stream: true` with audio
   is refused (`audio_stream_unsupported`).
-- **At most 5 minutes of audio in one spoken turn** (all its recordings together, with a few seconds of slack for the
-  recorder's own overrun). A message with more is sent as an ordinary text turn by the page, and refused
+- **At most about 5 minutes of mono audio in one spoken turn** (all its recordings together, with a few seconds of
+  slack for the recorder's own overrun). The page records 16 kHz mono, so a full recording always fits. A WAV with more
+  channels or a higher rate is bounded by its total samples as well: 44.1 or 48 kHz stereo fits only about 3 minutes, so
+  send mono for longer clips. A message over the limit is sent as an ordinary text turn by the page, and refused
   (`audio_format_unsupported`) by the API.
 - **WAV only.** An MP3 recording is refused (`audio_format_unsupported`); the page records WAV.
 - **A local model only.** A model on a linked machine, or in an extra pool slot, cannot answer aloud
