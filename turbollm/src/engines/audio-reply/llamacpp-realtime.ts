@@ -118,7 +118,7 @@ export function createRealtimeCollector(now: () => number = Date.now): RealtimeC
         status: cancelled ?? status,
         ...(outputTokens === undefined ? {} : { outputTokens }),
         // From the first piece of output to the end of the reply; absent for a reply that was stopped before it ended.
-        ...(firstOutputAt !== null && doneAt !== null && !cancelled ? { generationMs: Math.max(0, doneAt - firstOutputAt) } : {}),
+        ...(firstOutputAt !== null && doneAt !== null && (cancelled ?? status) !== 'cancelled' ? { generationMs: Math.max(0, doneAt - firstOutputAt) } : {}),
       }
     },
   }
@@ -147,6 +147,9 @@ export interface RealtimeDeps {
   /** The ceiling on how long a stop waits for the engine's `response.done` before settling with what it has and closing
    *  anyway. A stop normally ends in a fraction of a second, or a couple of seconds when it lands during prefill. */
   cancelWaitMs?: number
+  /** How long an engine error waits for a reply that never started (no `response.created`, no output) to end before the
+   *  error is reported: there is no `response.done` to wait for when the engine refused the request outright. */
+  errorGraceMs?: number
   /** How often an unacknowledged `response.cancel` is sent again while a stop waits. */
   cancelResendMs?: number
   /** How long the connection and `session.update` may take before the engine is taken to be not answering. */
@@ -158,6 +161,7 @@ export interface RealtimeDeps {
 export const REALTIME_TIMEOUT_MS = 10 * 60_000
 export const REALTIME_CANCEL_WAIT_MS = 30_000
 export const REALTIME_CANCEL_RESEND_MS = 300
+export const REALTIME_ERROR_GRACE_MS = 2500
 export const REALTIME_HANDSHAKE_MS = 15_000
 export const REALTIME_CLOSE_WAIT_MS = 1000
 
@@ -184,6 +188,7 @@ export function requestRealtimeAudioReply(
   const cancelTimer = deps.clearTimeout ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>))
   const timeoutMs = deps.timeoutMs ?? REALTIME_TIMEOUT_MS
   const cancelWaitMs = deps.cancelWaitMs ?? REALTIME_CANCEL_WAIT_MS
+  const errorGraceMs = deps.errorGraceMs ?? REALTIME_ERROR_GRACE_MS
   const cancelResendMs = deps.cancelResendMs ?? REALTIME_CANCEL_RESEND_MS
   const handshakeMs = deps.handshakeMs ?? REALTIME_HANDSHAKE_MS
   const closeWaitMs = deps.closeWaitMs ?? REALTIME_CLOSE_WAIT_MS
@@ -202,6 +207,8 @@ export function requestRealtimeAudioReply(
     let settled = false
     let sessionSeen = false
     let requested = false
+    /** The engine has begun the reply (`response.created` or any output arrived), so a cancel will end in `response.done`. */
+    let replyStarted = false
     let stopping: 'abort' | 'timeout' | 'error' | null = null
     /** The engine's own error, for a reply that failed after it had been asked for: told to the caller once it has stopped. */
     let engineError: AudioReplyError | null = null
@@ -249,7 +256,7 @@ export function requestRealtimeAudioReply(
     // every `cancelResendMs` until the engine says `response.done`, and the session stays open until it has: closing
     // early would leave the reply generating on the engine's only slot. Only the ceiling, or a socket that is gone,
     // ends the wait without it. A socket that has not got as far as asking for a reply has nothing to cancel.
-    const stop = (why: 'abort' | 'timeout' | 'error') => {
+    const stop = (why: 'abort' | 'timeout' | 'error', ceilingMs = cancelWaitMs) => {
       if (settled || stopping) return
       stopping = why
       if (!requested) {
@@ -266,7 +273,7 @@ export function requestRealtimeAudioReply(
         resendHandle = later(cancel, cancelResendMs)
       }
       cancel()
-      cancelTimerHandle = later(() => settleStopped(), cancelWaitMs)
+      cancelTimerHandle = later(() => settleStopped(), ceilingMs)
     }
     const settleStopped = () => {
       if (stopping === 'timeout') finish(() => reject(timedOut()))
@@ -292,6 +299,14 @@ export function requestRealtimeAudioReply(
       // An error that lands while a stop is in flight is not the end of the wait: the cancel is sent again and the
       // reply's own `response.done` (or the ceiling) ends it. It is not kept, so what arrived is not lost to it.
       if (stopping && ev.type === 'error') return
+      if (requested && !replyStarted && typeof ev.type === 'string' && ev.type.startsWith('response.') && ev.type !== 'response.done') {
+        replyStarted = true
+        // The reply did begin after all: an error that was waiting out the grace now waits for its end.
+        if (stopping === 'error' && cancelTimerHandle !== null) {
+          cancelTimer(cancelTimerHandle)
+          cancelTimerHandle = later(() => settleStopped(), cancelWaitMs)
+        }
+      }
       collector.push(ev)
       if (collector.error) {
         // After the reply was asked for it may still be generating on the engine's only slot, and closing does not stop
@@ -299,7 +314,9 @@ export function requestRealtimeAudioReply(
         // answers `session.update` with one) there is nothing to cancel.
         if (requested && !collector.done) {
           engineError = collector.error
-          stop('error')
+          // A reply the engine never began has no `response.done` to wait for (it refused the request): only a short
+          // grace, in case the reply is about to start, before the error is reported.
+          stop('error', replyStarted ? cancelWaitMs : errorGraceMs)
         } else finish(() => reject(collector.error))
         return
       }

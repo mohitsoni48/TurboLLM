@@ -97,6 +97,14 @@ test('generation time runs from the first output, text or audio, to response.don
   assert.equal(c.result().generationMs, 2500)
 })
 
+test('a reply the engine ended as cancelled reports no generation time: it would include the cancel wait', () => {
+  const c = createRealtimeCollector()
+  for (const e of loadRealtimeFixture('realtime-cancelled')) c.push(e)
+  const reply = c.result()
+  assert.equal(reply.status, 'cancelled')
+  assert.equal(reply.generationMs, undefined)
+})
+
 test('a reply stopped before its end, or one with no output, reports no generation time', () => {
   const c = createRealtimeCollector(() => 1)
   c.push({ type: 'response.output_text.delta', delta: 'hi' })
@@ -228,6 +236,33 @@ test('an engine error mid-reply cancels the reply as a stop does, resending unti
   assert.equal(engine.received.filter((m) => m.type === 'response.cancel').length, 2, 'sent again until the engine ended the reply')
   assert.ok(engine.sent.includes('response.done'), 'the session was still open when the reply ended')
   await until(() => engine.closed() === 1, 'the close')
+})
+
+test('an engine error that starts no reply is reported after the short grace, not the full cancel ceiling', async () => {
+  const events = loadRealtimeFixture('realtime-text-audio')
+  const pending = requestRealtimeAudioReply('http://127.0.0.1:1', spoken(), noAbort(), { WebSocket: FakeSocket, errorGraceMs: 60, cancelWaitMs: 60_000, cancelResendMs: 20 })
+  const ws = FakeSocket.last
+  ws.emit('message', JSON.stringify(events[0]))
+  ws.emit('message', JSON.stringify(events[1]))
+  const t0 = Date.now()
+  ws.emit('message', JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'response.create: refused' } }))
+  await assert.rejects(pending, (e: unknown) => e instanceof AudioReplyError && /refused/.test(e.message))
+  assert.ok(Date.now() - t0 < 5000, 'ended at the grace, not the ceiling')
+  assert.ok(ws.sent.some((m: any) => m.type === 'response.cancel'), 'the cancel was still sent')
+})
+
+test('an error that waits out the grace keeps waiting once the reply turns out to have begun', async () => {
+  const events = loadRealtimeFixture('realtime-text-audio')
+  const pending = requestRealtimeAudioReply('http://127.0.0.1:1', spoken(), noAbort(), { WebSocket: FakeSocket, errorGraceMs: 80, cancelWaitMs: 60_000, cancelResendMs: 1000 })
+  const ws = FakeSocket.last
+  ws.emit('message', JSON.stringify(events[0]))
+  ws.emit('message', JSON.stringify(events[1]))
+  ws.emit('message', JSON.stringify({ type: 'error', error: { type: 'server_error', message: 'late failure' } }))
+  ws.emit('message', JSON.stringify(events.find((e) => e.type === 'response.created')))
+  await new Promise((r) => setTimeout(r, 200))
+  assert.deepEqual(ws.calls, [], 'past the grace, the reply is known to be running, so the session is not closed')
+  ws.emit('message', JSON.stringify(events.at(-1)))
+  await assert.rejects(pending, /late failure/)
 })
 
 test('an error before the reply was asked for rejects at once, with nothing to cancel', async (t) => {
