@@ -10,15 +10,12 @@ import type { Hono } from 'hono'
 import type { Deps } from '../deps'
 import { SkillStore, isBuiltinSkill, isValidSkillId, toSkillId, importSkillsFromFolder, fromSkillMd, type Skill } from './skills'
 import { isLocalOrAuthenticated } from '../auth'
+import { body } from '../api/http'
+import { nonStringField } from '../util/string-fields'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function err(c: any, status: number, code: string, message: string) {
   return c.json({ error: { code, message } }, status)
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function body<T>(c: any): Promise<T> {
-  try { return (await c.req.json()) as T } catch { return {} as T }
 }
 
 export function registerAgentRoutes(app: Hono, d: Deps): void {
@@ -30,6 +27,8 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   app.post('/api/v1/skills', async (c) => {
     if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Authoring a skill requires a valid API key from a non-host device.')
     const b = await body<Partial<Skill>>(c)
+    const notText = nonStringField(b, ['id', 'name', 'description', 'instructions'])
+    if (notText) return err(c, 400, 'invalid_config_value', `${notText} must be a string.`)
     if (!b.id?.trim() || !/^[a-z0-9-]+$/.test(b.id)) return err(c, 400, 'invalid_config_value', 'id must be kebab-case (a-z0-9-).')
     if (!b.name?.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
     if (isBuiltinSkill(b.id)) return err(c, 400, 'builtin_skill', 'Cannot overwrite a built-in skill.')
@@ -63,6 +62,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   app.post('/api/v1/skills/import', async (c) => {
     if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Authoring a skill requires a valid API key from a non-host device.')
     const b = await body<{ text?: string }>(c)
+    if (nonStringField(b, ['text'])) return err(c, 400, 'invalid_input', 'text must be a string.')
     const text = b.text?.trim()
     if (!text) return err(c, 400, 'invalid_input', 'text is required.')
     const draft = fromSkillMd('draft', text)
@@ -82,6 +82,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   app.post('/api/v1/skills/learn-folder', async (c) => {
     if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Learning skills from a folder requires a valid API key from a non-host device.')
     const b = await body<{ folder?: string }>(c)
+    if (nonStringField(b, ['folder'])) return err(c, 400, 'invalid_input', 'folder must be a string.')
     const folder = b.folder?.trim()
     if (!folder) return err(c, 400, 'invalid_input', 'folder is required.')
     const store = skills()

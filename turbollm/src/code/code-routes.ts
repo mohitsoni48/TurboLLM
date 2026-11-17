@@ -36,13 +36,13 @@ import type { CodeMode } from './persona'
 import { sessionAuth } from './session-auth'
 import { nonStringField } from '../util/string-fields'
 import { releaseTetherScope } from '../util/tether'
+import { body } from '../api/http'
 
 // 503 is Turbo Link's (ADR-376): a linked machine that went offline between the picker
 // listing it and this turn being submitted. Deliberately not 409 — nothing about THIS
 // machine's state is wrong, and the fix is on the other box.
 type S = 200 | 201 | 202 | 400 | 404 | 409 | 500 | 503
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
-async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
 /** `contextFiles` is stored as the user row's textAttachments, which the chat and Code views
  *  render as an array of strings (a string or object there crashed them): anything else is
  *  refused before it is stored. Absent or null is fine. */
