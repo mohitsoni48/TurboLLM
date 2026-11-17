@@ -1,0 +1,13 @@
+{
+  "parse": "{\"arch\":\"gemma4\",\"name\":\"gemma-4-26B-A4B-it\",\"quant\":\"Q4_0\",\"sizeLabel\":\"128x2.6B\",\"nativeCtx\":262144,\"blockCount\":30,\"embedLen\":2816,\"headCountKv\":8,\"headDim\":512,\"expertCount\":128,\"nextnLayers\":0,\"hasChatTemplate\":true,\"reasoningEffort\":false,\"slidingWindow\":1024,\"slidingWindowPattern\":[true,true,true,true,true,false,true,true,true,true,true,false,true,true,true,true,true,false,true,true,true,true,true,false,true,true,true,true,true,false],\"headDimSwa\":256,\"headCountKvPerLayer\":[8,8,8,8,8,2,8,8,8,8,8,2,8,8,8,8,8,2,8,8,8,8,8,2,8,8,8,8,8,2],\"fullAttentionInterval\":0,\"ssmInnerSize\":0,\"ssmStateSize\":0,\"ssmConvKernel\":0,\"dataEnd\":14618145824}",
+  "cutShort": [
+    [
+      14618145824,
+      false
+    ],
+    [
+      15859712,
+      true
+    ]
+  ]
+}

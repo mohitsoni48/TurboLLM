@@ -1,0 +1,25 @@
+{
+  "name": "@turbollm/core-android-arm64",
+  "version": "0.0.0",
+  "description": "TurboLLM native core for android-arm64",
+  "license": "FSL-1.1-ALv2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mohitsoni48/TurboLLM.git",
+    "directory": "turbollm/core/bindings/node/npm/android-arm64"
+  },
+  "os": [
+    "android"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "turbollm-core.android-arm64.node",
+  "files": [
+    "turbollm-core.android-arm64.node",
+    "LICENSE.md"
+  ],
+  "engines": {
+    "node": ">=18.20"
+  }
+}

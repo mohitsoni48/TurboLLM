@@ -1,0 +1,3 @@
+[bindings.kotlin]
+package_name = "dev.turbollm.core"
+cdylib_name = "turbollm_core_ffi"

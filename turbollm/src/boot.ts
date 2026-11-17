@@ -94,6 +94,7 @@ import { checkDailyQueryRollups } from './telemetry/runtime/daily-query-rollups'
 import { markEverLoadedModel } from './api/onboarding-routes'
 import { SandboxRuntime } from './sandbox/runtime-install'
 import { sandboxSupported } from './sandbox/gate'
+import { loadCore } from './native/load'
 
 export interface BootOptions {
   /** The loaded config; its directory is the data dir. */
@@ -139,8 +140,10 @@ export interface BootedDaemon {
 
 /** Builds and starts the daemon. The listener's bind is started, not awaited: deps.bindPort is set once it binds.
  *  Everything it starts runs in the order the daemon has always started it; the comments say where that order
- *  matters. */
+ *  matters. The native core loads first, before any side effect: when it cannot, this throws its CoreLoadError and
+ *  cli.ts exits 69 (P-5). */
 export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
+  loadCore()
   const { store, version } = opts
   // Make the user's configured GitHub token available to EVERY GitHub call in the process
   // (update checks, engine downloads), not just the ones that thread a token explicitly.

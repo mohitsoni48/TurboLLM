@@ -1,0 +1,9 @@
+{
+  "parse": "{\"error\":{\"code\":\"truncated\",\"message\":\"Unexpected EOF in GGUF header.\"}}",
+  "cutShort": [
+    [
+      6,
+      true
+    ]
+  ]
+}

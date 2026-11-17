@@ -32,7 +32,7 @@ import {
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -117,6 +117,7 @@ const runNpm = (args, opts = {}) => run(NPM, args, { ...opts, shell: WIN });
 
 const git = (...args) => run('git', args);
 const mustGit = (...args) => mustRun('git', args);
+const cargo = (args, cwd) => run('cargo', args, { cwd });
 const gh = (...args) => run('gh', args);
 const mustGh = (...args) => mustRun('gh', args);
 
@@ -183,7 +184,13 @@ const tailOf = (s, lines = 40) => String(s || '').split(/\r?\n/).slice(-lines).j
 // the same words still blocks. b387a903 quotes `closes #12` while describing this very scan; #12 is a PR, so it closed
 // nothing.
 export const MAGIC_CLOSE = /\b(closes|fixes|resolves)\s+#\d+/i;
-export const MAGIC_CLOSE_ACKNOWLEDGED = new Set(['b387a90331e094858dcbaafd06faa0fdf15c0e7a']);
+// 1d6aabfe (#76) and 41800bc9 (#302) wrote a closing keyword in a PR body that merged to main; both issues were already
+// closed at merge, so there is nothing left to protect (acknowledged 2026-11-15).
+export const MAGIC_CLOSE_ACKNOWLEDGED = new Set([
+  'b387a90331e094858dcbaafd06faa0fdf15c0e7a',
+  '1d6aabfe03e7c7ba9e7f8ea425a560a7ec3bc03f',
+  '41800bc90296bffb53f81ce14248551b88e9a993',
+]);
 
 /** The short shas of commits in `log` (entries of `%H\x1f%B\x1e`) whose message has a closing keyword, minus the
  *  acknowledged ones. */
@@ -430,6 +437,8 @@ export const PREPARE_PATHS = [
   'telemetry-worker/deployed.schema.sha256',
   'turbollm/CHANGELOG.md',
   'turbollm/README.md',
+  'turbollm/core/Cargo.lock',
+  'turbollm/core/Cargo.toml',
   'turbollm/package-lock.json',
   'turbollm/package.json',
   'turbollm/web/src/lib/personas.ts',
@@ -466,6 +475,30 @@ export function stageReleasePaths(paths, gitRun = git) {
   if (r.code !== 0) fail(`\`git add\` failed while staging the release files:\n${r.out}`);
 }
 
+// The Rust core (turbollm/core) carries the release version too (ADR-374): every core binary embeds its
+// workspace version, and CI's `cargo xtask check-version` fails when it differs from turbollm/package.json.
+export const CORE_VERSION_PATHS = ['turbollm/core/Cargo.toml', 'turbollm/core/Cargo.lock'];
+
+// Returns the files the sync changes (a dry run: would change). sync-version reads turbollm/package.json,
+// so it runs after that file has the new version; a dry run never wrote it and so never runs cargo.
+// `cargo update --workspace --offline` moves only the workspace's own entries in Cargo.lock.
+export function syncCoreVersion(version, { dryRun = false, repo = REPO, cargoRun = cargo } = {}) {
+  const coreDir = join(repo, 'turbollm', 'core');
+  const manifest = join(coreDir, 'Cargo.toml');
+  if (!existsSync(manifest) || coreWorkspaceVersion(readFileSync(manifest, 'utf8')) === version) return [];
+  if (dryRun) return CORE_VERSION_PATHS;
+  for (const args of [['xtask', 'sync-version'], ['update', '--workspace', '--offline']]) {
+    const r = cargoRun(args, coreDir);
+    if (r.code !== 0) fail(`\`cargo ${args.join(' ')}\` failed in turbollm/core (exit ${r.code})\n${r.out}`);
+  }
+  return CORE_VERSION_PATHS;
+}
+
+function coreWorkspaceVersion(manifestText) {
+  const section = manifestText.split(/^\[workspace\.package\]\s*$/m)[1]?.split(/^\[/m)[0] ?? '';
+  return section.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+}
+
 async function phasePrepare(state, flags) {
   const version = state.version;
   const out = [];
@@ -497,6 +530,12 @@ async function phasePrepare(state, flags) {
     if (next !== raw) writeFileSync(p, next);
     note(`${p.replace(REPO, '.')} → ${version}`);
   }
+
+  const coreChanges = syncCoreVersion(version, { dryRun });
+  if (coreChanges.length && dryRun) {
+    wouldChange.push(...coreChanges);
+    note('[dry-run] would run `cargo xtask sync-version` in turbollm/core');
+  } else if (coreChanges.length) note(`turbollm/core Cargo workspace → ${version}`);
 
   // changelog gate — the AI writes it, the script refuses to continue without it
   const section = changelogSection(version);
@@ -822,21 +861,78 @@ export function localPublishProblem(tag, gitRun = git) {
   return null;
 }
 
+// The local-token fallback (ADR-418): publishes this checkout's turbollm/ with `legacy.token`, only when that
+// checkout is exactly `tag` and, once the core ships, every platform package of its version is on the registry.
+export async function publishWithLocalToken(tag, legacy, { repo = REPO, gitRun = git, npmRun = runNpm } = {}) {
+  const refusal = localPublishProblem(tag, gitRun) ?? await missingPlatformPackagesProblem(tag, { repo, npmRun });
+  if (refusal) {
+    fail(
+      `no npm-publish.yml run found for ${tag}, and the local-token fallback would not publish ${tag}: ${refusal}\n`
+      + `  It publishes this checkout's turbollm/ as it is on disk. Nothing was published to npm.\n`
+      + `  ${recoveryRoute(tag, repo)}\n`
+      + `  ${shipsCore(repo) ? 'or ' : ''}check out ${tag} with a clean turbollm/ (\`git checkout ${tag}\`, \`git status -- turbollm\`) and re-run publish.`,
+    );
+  }
+  warnLine(`falling back to the local token (${legacy.source}) — npm-publish.yml did not pick up this release, or you're re-running after it was added later`);
+  return withPlatformPackagesInjected(tag, repo, () => npmPublishWithToken(legacy.token, { dryRun: false, repo, npmRun }));
+}
+
+// npm-publish.yml builds the core at the tag, so a tag from before the core cannot go through it (review S3).
+function recoveryRoute(tag, repo) {
+  if (shipsCore(repo)) return `Dispatch the workflow instead (\`gh workflow run npm-publish.yml -f tag=${tag}\`), which builds the tag itself,`;
+  return `${tag} predates the native core, so npm-publish.yml cannot build it: it can be republished only through this local-token fallback. To do that,`;
+}
+
+const coreDirOf = (repo) => join(repo, 'turbollm', 'core');
+const shipsCore = (repo) => existsSync(join(coreDirOf(repo), 'Cargo.toml'));
+
+// npm-publish.yml injects the 9 platform packages into turbollm's optionalDependencies in its own throwaway checkout
+// (arch 2.8, B-12); this fallback publishes the founder's working copy, so it injects for the publish and then puts
+// the committed package.json back byte for byte, whether or not the publish succeeded.
+async function withPlatformPackagesInjected(tag, repo, publish) {
+  if (!shipsCore(repo)) return publish();
+  const manifestPath = join(repo, 'turbollm', 'package.json');
+  const committedManifest = readFileSync(manifestPath);
+  const injectScript = join(coreDirOf(repo), 'scripts', 'inject-optional-deps.mjs');
+  const { injectOptionalDeps } = await import(pathToFileURL(injectScript).href);
+  try {
+    injectOptionalDeps(manifestPath, tag.replace(/^v/, ''));
+    return publish();
+  } finally {
+    writeFileSync(manifestPath, committedManifest);
+  }
+}
+
+// turbollm lists the core's platform packages as optional dependencies, and npm skips one it cannot find, so a
+// turbollm published before all of them are on the registry installs with no core and stops at boot (arch 2.8).
+// The table of targets is read from the checkout being published; a checkout without the core (older tags) has none.
+async function missingPlatformPackagesProblem(tag, { repo, npmRun }) {
+  if (!shipsCore(repo)) return null;
+  const version = tag.replace(/^v/, '');
+  const targetsScript = join(coreDirOf(repo), 'scripts', 'targets.mjs');
+  const { NPM_TARGETS, platformPackageName } = await import(pathToFileURL(targetsScript).href);
+  const missing = NPM_TARGETS
+    .map(({ suffix }) => `${platformPackageName(suffix)}@${version}`)
+    .filter((packageSpec) => npmRun(['view', packageSpec, 'version']).stdout.trim() !== version);
+  if (!missing.length) return null;
+  return `these platform packages of the core are not on the registry, and turbollm would install without its core:\n  ${missing.join('\n  ')}`;
+}
+
 // Publish with a throwaway userconfig so the token never lands in a persistent
 // .npmrc. Always removed in the finally.
-function npmPublishWithToken(token, { dryRun }) {
+function npmPublishWithToken(token, { dryRun, repo = REPO, npmRun = runNpm }) {
   const dir = mkdtempSync(join(tmpdir(), 'turbollm-npmrc-'));
   const rc = join(dir, '.npmrc');
   try {
     writeFileSync(rc, `//registry.npmjs.org/:_authToken=${token}\nregistry=https://registry.npmjs.org/\n`, { mode: 0o600 });
 
-    const who = runNpm(['whoami', '--userconfig', rc]);
+    const who = npmRun(['whoami', '--userconfig', rc]);
     if (who.code !== 0) fail(`\`npm whoami\` failed with the supplied token — it may be expired or wrong-scoped.\n${who.out}`);
     okLine(`publishing as npm user: ${bold(who.stdout)}`);
 
     const args = ['publish', '--userconfig', rc];
     if (dryRun) args.push('--dry-run');
-    const p = runNpm(args, { cwd: join(REPO, 'turbollm') });
+    const p = npmRun(args, { cwd: join(repo, 'turbollm') });
     if (p.code !== 0) fail(`npm publish failed:\n${tailOf(p.out, 60)}`);
     return { whoami: who.stdout, out: tailOf(p.out, 30) };
   } finally {
@@ -941,17 +1037,7 @@ async function phasePublish(state, flags) {
           + `  You can also dispatch it manually: \`gh workflow run npm-publish.yml -f tag=${tag}\`.`,
         );
       }
-      const notTheTag = localPublishProblem(tag);
-      if (notTheTag) {
-        fail(
-          `no npm-publish.yml run found for ${tag}, and the local-token fallback would not publish ${tag}: ${notTheTag}\n`
-          + `  It publishes this checkout's turbollm/ as it is on disk. Nothing was published to npm.\n`
-          + `  Dispatch the workflow instead (\`gh workflow run npm-publish.yml -f tag=${tag}\`), which builds the tag itself,\n`
-          + `  or check out ${tag} with a clean turbollm/ (\`git checkout ${tag}\`, \`git status -- turbollm\`) and re-run publish.`,
-        );
-      }
-      warnLine(`falling back to the local token (${legacy.source}) — npm-publish.yml did not pick up this release, or you're re-running after it was added later`);
-      const res = npmPublishWithToken(legacy.token, { dryRun: false });
+      const res = await publishWithLocalToken(tag, legacy);
       note(`npm publish (legacy token path) as ${res.whoami}`);
     } else {
       const conclusion = await waitForRun(runId, 10 * 60_000);

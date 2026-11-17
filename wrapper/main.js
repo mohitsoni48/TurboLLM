@@ -10,7 +10,9 @@ const { execFile, spawn } = require('child_process')
 const http = require('http')
 const { existsSync, readFileSync } = require('fs')
 const { contextMenuTemplate } = require('./context-menu')
-const { createDaemonSupervisor, daemonSpawnSpec, dataDirInUseNotice, configAccessNotice } = require('./daemon-supervisor')
+const {
+  createDaemonSupervisor, daemonSpawnSpec, dataDirInUseNotice, configAccessNotice, coreUnavailableNotice
+} = require('./daemon-supervisor')
 const { allowPermission, appOriginFor, daemonPortFor, decodeConfigText, isAppUrl, isWebUrl, launchPortFor, recordedPortFor } = require('./window-guards')
 const {
   MINIMIZED_NOTICE, TRAY_ICON, TRAY_NOTICE, TRAY_NOTICE_FILE, closeAction, createTrayNotice, openAction,
@@ -239,9 +241,9 @@ function daemonPort () {
 // write its config.json: from then on the dialog below decides when the app quits, and no window opens.
 let daemonRefused = false
 
-function onDaemonLost (reason, { dataDirInUse = false, configAccess = false } = {}) {
+function onDaemonLost (reason, { dataDirInUse = false, configAccess = false, coreUnavailable = false } = {}) {
   console.error(`TurboLLM daemon ${reason}`)
-  if (!dataDirInUse && !configAccess) {
+  if (!dataDirInUse && !configAccess && !coreUnavailable) {
     setImmediate(() => app.quit())
     return
   }
@@ -249,9 +251,11 @@ function onDaemonLost (reason, { dataDirInUse = false, configAccess = false } = 
   // start there is still under way. The app quit here at once, as after a crash, so to the user it opened and
   // vanished, and the refusal, which names that daemon and how to stop it, went to a stderr no one sees.
   // The same for a config.json the daemon may not read or write (another user's, as `sudo turbollm` leaves it):
-  // its message says whose the file is and the `sudo chown` that gives it back.
+  // its message says whose the file is and the `sudo chown` that gives it back. And for a native core that could not
+  // load (its binary missing from the install, or built for another system): its error names the system and every
+  // place it looked.
   daemonRefused = true
-  const notice = configAccess ? configAccessNotice : dataDirInUseNotice
+  const notice = coreUnavailable ? coreUnavailableNotice : configAccess ? configAccessNotice : dataDirInUseNotice
   stderrOf(supervisor && supervisor.current())
     .then((stderr) => dialog.showMessageBox({ type: 'error', buttons: ['Quit'], ...notice(stderr) }))
     .catch((err) => console.error('Could not show why the daemon was refused:', err.message))

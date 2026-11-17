@@ -89,7 +89,8 @@ const REPO = 'ggml-org/llama.cpp'
 // removed after it never passed) and hosts the archive as a plain file on this Hugging Face
 // model repo, not a GitHub release — there's no "tag" to track, just whatever's at `main`.
 const ANDROID_ENGINE_HF_URL = 'https://huggingface.co/mohitsoni48/turbollm-android-engine/resolve/main'
-// CUDA toolkit line for Windows prebuilts (13.x is required for Blackwell / RTX 50xx).
+// CUDA toolkit line for Windows prebuilts (13.x is required for Blackwell / RTX 50xx). Only the fallback
+// label for the pinned build: the real archive names are resolved from the release (see availableBackends).
 const CUDA_VER = '13.3'
 
 /** The server binary name for a platform: upstream names its Windows build `llama-server.exe`
@@ -153,7 +154,15 @@ export function availableBackends(tag = LLAMA_BUILD): BackendDef[] {
   if (plat() === 'win32') {
     if (a === 'arm64') return [def('cpu', 'CPU', `llama-${tag}-bin-win-cpu-arm64.zip`)]
     return [
-      def('cuda', 'CUDA (NVIDIA)', `llama-${tag}-bin-win-cuda-${CUDA_VER}-x64.zip`, `cudart-llama-bin-win-cuda-${CUDA_VER}-x64.zip`),
+      // Upstream bumps the toolkit in the archive name (13.3 → 13.4 → 13.5) without notice, so, as with
+      // ROCm below, the literals are only fallback labels and assetPatterns resolves the real filenames
+      // from the release's asset list. 13.x only (Blackwell needs it; the 12.4 build is not offered).
+      {
+        id: 'cuda',
+        label: 'CUDA (NVIDIA)',
+        assets: [`llama-${tag}-bin-win-cuda-${CUDA_VER}-x64.zip`, `cudart-llama-bin-win-cuda-${CUDA_VER}-x64.zip`],
+        assetPatterns: [/^llama-.+-bin-win-cuda-13\.\d+-x64\.zip$/i, /^cudart-llama-bin-win-cuda-13\.\d+-x64\.zip$/i],
+      },
       // Upstream has renamed this archive at least once (`*-bin-win-hip-radeon-x64.zip` →
       // `*-bin-win-rocm-<toolkit-ver>-x64.zip`, GitHub #220) without any deprecation window,
       // so the literal name below is only a fallback label — assetPatterns resolves the
@@ -813,6 +822,17 @@ export async function latestReleaseTag(repo: string, signal?: AbortSignal): Prom
   return rel.tag_name ?? ''
 }
 
+const DESKTOP_ARCHIVE = /^(?!cudart-).+-bin-(?:win|windows|linux|ubuntu|macos)-/i
+
+/** True for a release whose build archives CI has not finished uploading, which is not downloadable yet. GitHub
+ *  lists the release first: it is empty at that point, and a release cut short (b12405) kept only the cudart
+ *  runtimes and an Android archive. Picking either as "latest" fails every backend's update with a missing asset.
+ *  A listing that carries no asset array at all is left alone: that is a listing we cannot judge, not an empty one. */
+function hasUnuploadedArchives(assets: { name?: string }[] | undefined): boolean {
+  if (!Array.isArray(assets)) return false
+  return !assets.some((asset) => DESKTOP_ARCHIVE.test(asset.name ?? ''))
+}
+
 /** Resolve the newest `b<number>`-style release tag (e.g. `b10818`) of `repo`, or '' when the
  *  repo publishes none.
  *
@@ -831,10 +851,11 @@ export async function latestBuildTagRelease(repo: string, signal?: AbortSignal):
   })
   if (isRateLimited(res)) throw new GithubRateLimitError(repo)
   if (!res.ok) throw new Error(`could not list ${repo} releases: HTTP ${res.status}`)
-  const data = (await res.json()) as { tag_name?: string }[]
+  const data = (await res.json()) as { tag_name?: string; draft?: boolean; assets?: { name?: string }[] }[]
   let best = ''
   let bestNum = -1
   for (const rel of data) {
+    if (rel.draft || hasUnuploadedArchives(rel.assets)) continue
     const tag = (rel.tag_name ?? '').trim()
     const m = /^v?b(\d+)$/i.exec(tag)
     if (!m) continue

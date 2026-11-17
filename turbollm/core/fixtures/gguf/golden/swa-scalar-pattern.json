@@ -1,0 +1,9 @@
+{
+  "parse": "{\"arch\":\"gemma3\",\"name\":\"\",\"quant\":\"\",\"sizeLabel\":\"\",\"nativeCtx\":0,\"blockCount\":26,\"embedLen\":0,\"headCountKv\":4,\"headDim\":256,\"expertCount\":0,\"nextnLayers\":0,\"hasChatTemplate\":false,\"reasoningEffort\":false,\"slidingWindow\":1024,\"slidingWindowPattern\":[],\"headDimSwa\":0,\"headCountKvPerLayer\":[],\"fullAttentionInterval\":0,\"ssmInnerSize\":0,\"ssmStateSize\":0,\"ssmConvKernel\":0,\"dataEnd\":295}",
+  "cutShort": [
+    [
+      295,
+      false
+    ]
+  ]
+}

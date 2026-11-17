@@ -26,7 +26,7 @@
 // failed install leaves the old version installed and simply relaunches it.
 
 import { spawn, spawnSync } from 'node:child_process'
-import { fchmodSync, openSync, readFileSync, writeFileSync } from 'node:fs'
+import { closeSync, fchmodSync, fstatSync, openSync, readFileSync, readSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** How long to wait for the old daemon to actually exit before giving up. Must comfortably
@@ -36,6 +36,15 @@ import { join } from 'node:path'
  *  avoid, so we abort instead. */
 const WAIT_FOR_EXIT_MS = 60_000
 const POLL_MS = 250
+
+/** How long the relaunched daemon is watched before the result is written (PG-3). A daemon whose
+ *  native core cannot load stops at boot with CORE_UNAVAILABLE_EXIT_CODE (native/load.ts), which
+ *  must not be left behind a "success" with TurboLLM stopped. */
+const RELAUNCH_WATCH_MS = 10_000
+const CORE_UNAVAILABLE_EXIT_CODE = 69
+const BOOT_ERROR_HEAD_BYTES = 4096
+const CORE_UNAVAILABLE_FALLBACK = "TurboLLM's native core is not available for this system."
+const REINSTALL_INSTRUCTION = 'Reinstall with: npm install -g turbollm (without --omit=optional)'
 
 const opts = JSON.parse(process.argv[2] ?? '{}')
 
@@ -132,8 +141,53 @@ function run(cmd, args) {
  *  own log file: this helper is about to exit, so inheriting its streams would break the
  *  new daemon's stdio the moment it does. Owner-only, as util/owner-only-log.ts opens it for
  *  the helper (this file is copied to dist on its own, so it can't import that): a daemon
- *  started with --print-token or --tunnel prints its fresh API key into this log. */
+ *  started with --print-token or --tunnel prints its fresh API key into this log.
+ *
+ *  Resolves after RELAUNCH_WATCH_MS with '' when the daemon is still up (or stopped for another
+ *  reason), or earlier with its boot error when it stopped with CORE_UNAVAILABLE_EXIT_CODE. The
+ *  boot error is read back from update.log rather than a stderr pipe: this helper exits after the
+ *  watch, and a pipe with no reader would fail every later stderr write of the daemon (EPIPE). */
 function relaunch() {
+  const out = openRelaunchLog()
+  const logStart = out === 'ignore' ? 0 : fstatSync(out).size
+  const exe = opts.method === 'npx' ? (process.platform === 'win32' ? 'npx.cmd' : 'npx') : opts.execPath
+  const args = opts.method === 'npx' ? ['-y', 'turbollm@latest', ...(opts.argv ?? []).slice(1)] : opts.argv ?? []
+  log(`relaunching: ${exe} ${args.join(' ')}`)
+  const options = { cwd: opts.cwd, detached: true, stdio: ['ignore', out, out], windowsHide: true }
+  // npx is a .cmd shim on Windows (see spawnNpm); execPath is node itself and spawns directly.
+  const child = opts.method === 'npx' ? spawnNpm(exe, args, options) : spawn(exe, args, options)
+  child.unref()
+  return watchBoot(child, logStart)
+}
+
+function watchBoot(child, logStart) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(''), RELAUNCH_WATCH_MS)
+    child.once('exit', (code) => {
+      if (code !== CORE_UNAVAILABLE_EXIT_CODE) return
+      clearTimeout(timer)
+      resolve(readBootError(logStart) || CORE_UNAVAILABLE_FALLBACK)
+    })
+  })
+}
+
+/** The first BOOT_ERROR_HEAD_BYTES the relaunched daemon wrote to update.log; '' when unreadable. */
+function readBootError(logStart) {
+  try {
+    const fd = openSync(join(opts.dataDir, 'update.log'), 'r')
+    try {
+      const head = Buffer.alloc(BOOT_ERROR_HEAD_BYTES)
+      const read = readSync(fd, head, 0, head.length, logStart)
+      return head.subarray(0, read).toString('utf8').trim()
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return ''
+  }
+}
+
+function openRelaunchLog() {
   let out = 'ignore'
   try {
     out = openSync(join(opts.dataDir, 'update.log'), 'a', 0o600)
@@ -145,13 +199,14 @@ function relaunch() {
   } catch {
     out = 'ignore'
   }
-  const exe = opts.method === 'npx' ? (process.platform === 'win32' ? 'npx.cmd' : 'npx') : opts.execPath
-  const args = opts.method === 'npx' ? ['-y', 'turbollm@latest', ...(opts.argv ?? []).slice(1)] : opts.argv ?? []
-  log(`relaunching: ${exe} ${args.join(' ')}`)
-  const options = { cwd: opts.cwd, detached: true, stdio: ['ignore', out, out], windowsHide: true }
-  // npx is a .cmd shim on Windows (see spawnNpm); execPath is node itself and spawns directly.
-  const child = opts.method === 'npx' ? spawnNpm(exe, args, options) : spawn(exe, args, options)
-  child.unref()
+  return out
+}
+
+/** Relaunch, then write the result only once the watch shows whether the daemon came back. */
+async function relaunchAndReport(installError) {
+  const bootError = await relaunch()
+  if (bootError) writeResult(false, `${bootError}\n${REINSTALL_INSTRUCTION}`)
+  else writeResult(!installError, installError)
 }
 
 async function main() {
@@ -174,15 +229,13 @@ async function main() {
       // The install failed, so the OLD version is still what's on disk, intact. Relaunch it
       // — leaving the user daemonless because an update failed would be far worse than the
       // update simply not happening.
-      writeResult(false, r.error)
       log(`install failed: ${r.error} — relaunching the previous version`)
-      relaunch()
+      await relaunchAndReport(r.error)
       return
     }
   }
 
-  writeResult(true)
-  relaunch()
+  await relaunchAndReport()
   log('done')
 }
 
@@ -191,7 +244,7 @@ main().catch((e) => {
   log(`unexpected failure: ${e}`)
   // Still try to bring the daemon back — see the install-failure branch above.
   try {
-    relaunch()
+    void relaunch()
   } catch {
     /* nothing more we can do */
   }

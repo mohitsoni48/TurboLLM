@@ -1,0 +1,509 @@
+name: Core build
+
+# Builds, lints and tests the Rust core (turbollm/core) and uploads every binary the daemon, the Android library and
+# the npm platform packages are made from (rust-core arch 2.7, artifacts 5.7). Reusable only: ci.yml calls it on every
+# PR, npm-publish.yml calls it with `release: true` at the release tag. Its structure is pinned by
+# turbollm/core/scripts/workflows.test.ts; the target matrix must equal turbollm/core/scripts/targets.mjs.
+#
+# CI sets CI=true, so a missing GGUF corpus slice FAILS the golden tests (Rust, napi, JVM and on-device): every job that
+# runs them restores the corpus cache and runs the fetcher first. The fetcher verifies each slice's sha256, so a cache
+# hit is never trusted blindly.
+#
+# rust-toolchain.toml lists only three targets (plan P-10), so every job that builds another one runs
+# `rustup target add` first. Third-party actions are pinned to full commit shas (the tag is in the comment).
+on:
+  workflow_call:
+    inputs:
+      release:
+        description: >-
+          Build the binaries a release publishes. A release build never restores a Rust build cache that a PR branch
+          could have written, so the published binaries are compiled from the checked-out sources only.
+        type: boolean
+        default: false
+      ref:
+        description: The commit, branch or tag to build. Empty means the caller's own ref.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The NDK every Android build uses: the Gradle module's default turbollm.ndkVersion (arch 2.6, NDK r27).
+  NDK_VERSION: 27.0.12077973
+  # cargo-zigbuild 0.24.1's own CI tests zig 0.17.0.
+  ZIG_VERSION: 0.17.0
+  CARGO_ZIGBUILD_VERSION: 0.24.1
+  CARGO_DENY_VERSION: 0.20.2
+  CARGO_NDK_VERSION: 4.1.2
+  # nodejs-mobile's public Android release (arch 4): bin/<abi>/libnode.so, the library the app's addon links against.
+  NODEJS_MOBILE_VERSION: v18.20.4
+  NODEJS_MOBILE_SHA256: bd7321eaa1a7602fbe0bb87302df2d79d87835cf4363fbdd17c350dbb485c2af
+
+jobs:
+  rust-checks:
+    name: Core (Rust checks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # GITHUB_SHA is the caller's commit, not inputs.ref; build.rs prefers this one.
+      - name: Record the commit being built
+        shell: bash
+        run: echo "TURBOLLM_GIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+        working-directory: turbollm/core
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !inputs.release }}
+        with:
+          workspaces: turbollm/core
+
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: cargo-deny@${{ env.CARGO_DENY_VERSION }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: turbollm/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: turbollm
+
+      - name: Restore the GGUF corpus
+        uses: actions/cache@v6
+        with:
+          path: turbollm/core/fixtures/gguf/.corpus-cache
+          key: gguf-corpus-${{ hashFiles('turbollm/core/fixtures/gguf/corpus.json') }}
+          enableCrossOsArchive: true
+
+      - name: Fetch the GGUF corpus
+        run: node core/scripts/fetch-gguf-corpus.mjs
+        working-directory: turbollm
+
+      - name: Format
+        run: cargo fmt --all --check
+        working-directory: turbollm/core
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: turbollm/core
+
+      - name: Licenses, sources and advisories
+        run: cargo deny check
+        working-directory: turbollm/core
+
+      - name: Cargo version matches package.json
+        run: cargo xtask check-version
+        working-directory: turbollm/core
+
+      - name: Every crafted fixture has a golden
+        run: cargo xtask goldens-check
+        working-directory: turbollm/core
+
+      - name: Rust tests
+        run: cargo test --workspace
+        working-directory: turbollm/core
+
+      # The core's scripts (corpus fetch, staging, publish, this workflow's structure) sit outside npm test's src/** glob.
+      - name: Core script tests
+        run: npx tsx --test --test-timeout=60000 "core/scripts/*.test.ts"
+        working-directory: turbollm
+
+      - name: binding.generated.d.ts matches the napi exports
+        run: |
+          npm run build:core
+          git diff --exit-code -- src/native/binding.generated.d.ts
+        working-directory: turbollm
+
+  node-addon:
+    name: Core (Node addon ${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        # zig: cross-built with cargo-zigbuild (glibc targets against GLIBC_FLOOR, musl with -crt-static).
+        # tests: host = on the runner itself; alpine = in a node:22-alpine container on the same-arch runner;
+        # none = build only (the runner cannot execute the binary).
+        include:
+          - target: win32-x64-msvc
+            triple: x86_64-pc-windows-msvc
+            runner: windows-latest
+            tests: host
+          # Native Windows on Arm runner. Fallback if it is ever unavailable: build only, cross from windows-latest.
+          - target: win32-arm64-msvc
+            triple: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            tests: host
+          # Cross-built on Apple silicon; the tests run under Rosetta with an x64 Node. Fallback if a runner image ever
+          # lacks Rosetta: tests none (build only).
+          - target: darwin-x64
+            triple: x86_64-apple-darwin
+            runner: macos-latest
+            node-arch: x64
+            tests: host
+          - target: darwin-arm64
+            triple: aarch64-apple-darwin
+            runner: macos-latest
+            tests: host
+          - target: linux-x64-gnu
+            triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            zig: true
+            tests: host
+          - target: linux-arm64-gnu
+            triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            zig: true
+            tests: host
+          - target: linux-x64-musl
+            triple: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            zig: true
+            tests: alpine
+          - target: linux-arm64-musl
+            triple: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            zig: true
+            tests: alpine
+          # Termux (npm path): links no libnode.so; on a phone only (Z-7).
+          - target: android-arm64
+            triple: aarch64-linux-android
+            runner: ubuntu-latest
+            ndk: true
+            tests: none
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # GITHUB_SHA is the caller's commit, not inputs.ref; build.rs prefers this one.
+      - name: Record the commit being built
+        shell: bash
+        run: echo "TURBOLLM_GIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      # The Windows on Arm image is not guaranteed to ship rustup; the toolchain itself comes from rust-toolchain.toml.
+      - name: Install rustup if the image has none
+        if: ${{ runner.os == 'Windows' && runner.arch == 'ARM64' }}
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl -sSf -o "$RUNNER_TEMP/rustup-init.exe" https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe
+            "$RUNNER_TEMP/rustup-init.exe" -y --profile minimal --default-toolchain none
+            echo "$USERPROFILE\.cargo\bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install the pinned Rust toolchain and the target
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.triple }}
+        working-directory: turbollm/core
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !inputs.release }}
+        with:
+          workspaces: turbollm/core
+          key: ${{ matrix.target }}
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: ${{ matrix.zig }}
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        if: ${{ matrix.zig }}
+        with:
+          tool: cargo-zigbuild@${{ env.CARGO_ZIGBUILD_VERSION }}
+
+      # napi-rs's Android build reads the NDK from ANDROID_NDK_LATEST_HOME; point it at the pinned NDK, not the image's.
+      - name: Install the Android NDK
+        if: ${{ matrix.ndk }}
+        run: |
+          echo y | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+          echo "ANDROID_NDK_LATEST_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          architecture: ${{ matrix.node-arch }}
+          cache: 'npm'
+          cache-dependency-path: turbollm/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: turbollm
+
+      - name: Restore the GGUF corpus
+        if: ${{ matrix.tests != 'none' }}
+        uses: actions/cache@v6
+        with:
+          path: turbollm/core/fixtures/gguf/.corpus-cache
+          key: gguf-corpus-${{ hashFiles('turbollm/core/fixtures/gguf/corpus.json') }}
+          enableCrossOsArchive: true
+
+      - name: Fetch the GGUF corpus
+        if: ${{ matrix.tests != 'none' }}
+        run: node core/scripts/fetch-gguf-corpus.mjs
+        working-directory: turbollm
+
+      - name: Build the addon
+        run: node core/scripts/build-node.mjs --target ${{ matrix.target }} --release ${{ matrix.zig && '--cross-compile' || '' }}
+        working-directory: turbollm
+
+      - name: Needs no glibc newer than 2.28
+        if: ${{ endsWith(matrix.target, '-gnu') }}
+        run: cargo xtask check-glibc --max 2.28 bindings/node/turbollm-core.${{ matrix.target }}.node
+        working-directory: turbollm/core
+
+      - name: Android ELF is 16 KB aligned
+        if: ${{ matrix.ndk }}
+        run: cargo xtask check-android-elf bindings/node/turbollm-core.${{ matrix.target }}.node
+        working-directory: turbollm/core
+
+      # load.test.ts also asserts that the loaded core reports this target (E-11).
+      - name: Loader and golden tests
+        if: ${{ matrix.tests == 'host' }}
+        run: npx tsx --test --test-timeout=60000 src/native/load.test.ts src/native/gguf.golden.test.ts
+        working-directory: turbollm
+
+      # A fresh install inside Alpine, so tsx/esbuild get their musl binaries. --ignore-scripts: the tests need no
+      # install script, and Alpine has no toolchain for node-pty's optional native build.
+      - name: Loader and golden tests (node:22-alpine)
+        if: ${{ matrix.tests == 'alpine' }}
+        run: >-
+          docker run --rm -e CI -v "$GITHUB_WORKSPACE:/work" -w /work/turbollm node:22-alpine sh -ec
+          'npm ci --ignore-scripts;
+          npx tsx --test --test-timeout=60000 src/native/load.test.ts src/native/gguf.golden.test.ts'
+
+      - name: No tests (cross-built target)
+        if: ${{ matrix.tests == 'none' }}
+        run: |
+          echo "build only: ${{ matrix.runner }} cannot run ${{ matrix.target }} binaries"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: core-node-${{ matrix.target }}
+          path: turbollm/core/bindings/node/turbollm-core.${{ matrix.target }}.node
+          if-no-files-found: error
+
+  nodejs-mobile-addon:
+    name: Core (nodejs-mobile addon)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # GITHUB_SHA is the caller's commit, not inputs.ref; build.rs prefers this one.
+      - name: Record the commit being built
+        shell: bash
+        run: echo "TURBOLLM_GIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+        working-directory: turbollm/core
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !inputs.release }}
+        with:
+          workspaces: turbollm/core
+          key: nodejs-mobile
+
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: cargo-ndk@${{ env.CARGO_NDK_VERSION }}
+
+      - name: Install the Android NDK
+        run: |
+          echo y | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Fetch nodejs-mobile's libnode.so
+        run: |
+          zip="$RUNNER_TEMP/nodejs-mobile.zip"
+          curl -fsSL -o "$zip" "https://github.com/nodejs-mobile/nodejs-mobile/releases/download/$NODEJS_MOBILE_VERSION/nodejs-mobile-$NODEJS_MOBILE_VERSION-android.zip"
+          echo "$NODEJS_MOBILE_SHA256  $zip" | sha256sum -c -
+          unzip -q "$zip" 'bin/*' -d "$RUNNER_TEMP/nodejs-mobile"
+
+      # Builds both ABIs and runs `cargo xtask check-android-elf --needs libnode.so` on each.
+      - name: Build the addon for both ABIs
+        run: >-
+          node core/scripts/build-node.mjs --flavour nodejs-mobile --release
+          --libnode-dir "$RUNNER_TEMP/nodejs-mobile/bin" --out "$RUNNER_TEMP/nodejs-mobile-addon"
+        working-directory: turbollm
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: core-nodejs-mobile-arm64-v8a
+          path: ${{ runner.temp }}/nodejs-mobile-addon/arm64-v8a/libturbollm_core_node.so
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: core-nodejs-mobile-x86_64
+          path: ${{ runner.temp }}/nodejs-mobile-addon/x86_64/libturbollm_core_node.so
+          if-no-files-found: error
+
+  android-library:
+    name: Core (Android library)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # GITHUB_SHA is the caller's commit, not inputs.ref; build.rs prefers this one.
+      - name: Record the commit being built
+        shell: bash
+        run: echo "TURBOLLM_GIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+        working-directory: turbollm/core
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !inputs.release }}
+        with:
+          workspaces: turbollm/core
+          key: android-library
+
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: cargo-ndk@${{ env.CARGO_NDK_VERSION }}
+
+      - name: Install the Android NDK
+        run: echo y | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: |
+            turbollm/core/bindings/android/**/*.gradle.kts
+            turbollm/core/bindings/android/gradle/wrapper/gradle-wrapper.properties
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Restore the GGUF corpus
+        uses: actions/cache@v6
+        with:
+          path: turbollm/core/fixtures/gguf/.corpus-cache
+          key: gguf-corpus-${{ hashFiles('turbollm/core/fixtures/gguf/corpus.json') }}
+          enableCrossOsArchive: true
+
+      - name: Fetch the GGUF corpus
+        run: node core/scripts/fetch-gguf-corpus.mjs
+        working-directory: turbollm
+
+      # gradlew is stored without the executable bit. The JVM goldens run against a host-built library (plan P-7);
+      # r8-consumer proves the AAR's consumer rules survive minification (PG-8).
+      - name: AAR, JVM goldens and the minified consumer
+        run: |
+          chmod +x gradlew
+          ./gradlew -Pturbollm.ndkVersion="$NDK_VERSION" :turbollm-core:assembleRelease :turbollm-core:testDebugUnitTest :r8-consumer:assembleRelease
+        working-directory: turbollm/core/bindings/android
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: core-android-aar
+          path: turbollm/core/bindings/android/turbollm-core/build/outputs/aar/turbollm-core-release.aar
+          if-no-files-found: error
+
+  android-emulator:
+    name: Core (Android emulator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # GITHUB_SHA is the caller's commit, not inputs.ref; build.rs prefers this one.
+      - name: Record the commit being built
+        shell: bash
+        run: echo "TURBOLLM_GIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+        working-directory: turbollm/core
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !inputs.release }}
+        with:
+          workspaces: turbollm/core
+          key: android-emulator
+
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: cargo-ndk@${{ env.CARGO_NDK_VERSION }}
+
+      - name: Install the Android NDK
+        run: echo y | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: |
+            turbollm/core/bindings/android/**/*.gradle.kts
+            turbollm/core/bindings/android/gradle/wrapper/gradle-wrapper.properties
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Restore the GGUF corpus
+        uses: actions/cache@v6
+        with:
+          path: turbollm/core/fixtures/gguf/.corpus-cache
+          key: gguf-corpus-${{ hashFiles('turbollm/core/fixtures/gguf/corpus.json') }}
+          enableCrossOsArchive: true
+
+      - name: Fetch the GGUF corpus
+        run: node core/scripts/fetch-gguf-corpus.mjs
+        working-directory: turbollm
+
+      # Built before the emulator boots, so its timeout covers only the device runs. The build's CI=true reaches the
+      # device as the instrumentation argument turbollmCi, so a missing corpus slice fails there too.
+      - name: Build the instrumented test APKs
+        run: |
+          chmod +x gradlew
+          ./gradlew -Pturbollm.ndkVersion="$NDK_VERSION" :turbollm-core:assembleDebugAndroidTest :r8-consumer:assembleReleaseAndroidTest
+        working-directory: turbollm/core/bindings/android
+
+      - uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          working-directory: turbollm/core/bindings/android
+          script: ./gradlew -Pturbollm.ndkVersion="$NDK_VERSION" :turbollm-core:connectedDebugAndroidTest :r8-consumer:connectedReleaseAndroidTest

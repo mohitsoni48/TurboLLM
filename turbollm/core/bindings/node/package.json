@@ -1,0 +1,7 @@
+{
+  "name": "turbollm-core-node-build",
+  "private": true,
+  "napi": {
+    "binaryName": "turbollm-core"
+  }
+}

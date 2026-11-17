@@ -1,0 +1,8 @@
+{
+  "d1-float-in-int-key": "D-1",
+  "d1-negative-in-int-key": "D-1",
+  "d1-above-u32": "D-1",
+  "d2-offset-above-2p53": "D-2",
+  "d2-elements-2p150": "D-2",
+  "d2-elements-2p130": "D-2"
+}

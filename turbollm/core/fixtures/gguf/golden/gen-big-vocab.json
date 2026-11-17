@@ -1,0 +1,18 @@
+{
+  "parse": "{\"arch\":\"gemma4\",\"name\":\"Big Vocab\",\"quant\":\"Q4_K_M\",\"sizeLabel\":\"\",\"nativeCtx\":0,\"blockCount\":30,\"embedLen\":2048,\"headCountKv\":8,\"headDim\":0,\"expertCount\":0,\"nextnLayers\":0,\"hasChatTemplate\":true,\"reasoningEffort\":true,\"slidingWindow\":0,\"slidingWindowPattern\":[true,false,true],\"headDimSwa\":0,\"headCountKvPerLayer\":[8,2,8],\"fullAttentionInterval\":0,\"ssmInnerSize\":0,\"ssmStateSize\":0,\"ssmConvKernel\":0,\"dataEnd\":3882032}",
+  "cutShort": [
+    [
+      4357336,
+      false
+    ]
+  ],
+  "generated": {
+    "recipe": "big-vocab",
+    "args": [
+      60000,
+      90000
+    ],
+    "size": 4357336,
+    "sha256": "b502fe06df8fb2725d148a887bdabcb23250617a67b3bea638ab6ccbca584cc2"
+  }
+}
