@@ -437,6 +437,7 @@ export function ModelsScreen() {
           setSearch={setSearch}
           filter={filter}
           setFilter={setFilter}
+          answersAloudKey={status?.model?.audioOut === true ? status.model.key : undefined}
           facetCounts={facetCounts}
           listedCount={notHiddenByYou.length}
           hiddenCount={hiddenCount}
@@ -515,6 +516,7 @@ function LibraryTab({
   setSearch,
   filter,
   setFilter,
+  answersAloudKey,
   facetCounts,
   listedCount,
   hiddenCount,
@@ -556,6 +558,8 @@ function LibraryTab({
   setSearch: (s: string) => void
   filter: Filter
   setFilter: (f: Filter) => void
+  /** The key of the loaded model when it answers aloud (status audioOut), read once here so a row does not watch the status. */
+  answersAloudKey: string | undefined
   facetCounts: { vision: number; moe: number; nextn: number; embedding: number }
   /** The models the list can show: all of them but those hidden by hand, unless "Show hidden models" is on. */
   listedCount: number
@@ -772,6 +776,7 @@ function LibraryTab({
                     onDiscover={onDiscover}
                     busy={loadBusy}
                     loadingKey={loadingKey}
+                    answersAloudKey={answersAloudKey}
                     ejecting={actions.eject.isPending}
                     showIncompatible={showIncompatible}
                     isPinned={isPinned}
@@ -863,6 +868,7 @@ function ModelRow({
   onDiscover,
   busy,
   loadingKey,
+  answersAloudKey,
   ejecting,
   showIncompatible,
   isPinned,
@@ -886,6 +892,7 @@ function ModelRow({
   onDiscover: (m: ModelEntry) => void
   busy: boolean
   loadingKey: string | undefined
+  answersAloudKey: string | undefined
   ejecting: boolean
   /** "Show all" or Settings' "Show models for every engine" is on: a row the engine cannot run offers its Load. */
   showIncompatible: boolean
@@ -894,7 +901,6 @@ function ModelRow({
   /** Hide the model by hand, or unhide it (Config.hiddenModels on the daemon). */
   onToggleHidden: (m: ModelEntry) => void
 }) {
-  const { data: status } = useStatus()
   const variants = group.variants
   const multi = variants.length > 1
   // Default the selected quant to the loaded variant, else the first. Falls back to the
@@ -959,7 +965,7 @@ function ModelRow({
         {m.hasProfile && <CapChip>tuned</CapChip>}
         {/* Only the model that is loaded now, and only when its engine says it answers with speech (status audioOut):
             a library row cannot know that before a load, so nothing is shown for any other row. */}
-        {loaded && status?.model?.key === m.key && status.model.audioOut === true && (
+        {loaded && answersAloudKey === m.key && (
           <CapChip label="This model answers aloud: replies come back as speech with a player">Answers aloud</CapChip>
         )}
         {/* Listed by "Show hidden models", or because it is loaded: marked, with its Unhide right here in both layouts
