@@ -28,6 +28,7 @@ import { servingEngineKind } from '../engines/serving'
 import { engineTakesReasoningAsField, engineWithholdsVision, VISION_UNAVAILABLE } from '../engines/compat'
 import { runGenerationCore } from './generation-core'
 import { nonStringField } from '../util/string-fields'
+import { conversationBodyError, CREATE_FIELDS, PATCH_FIELDS, patchFields } from './conversation-body.js'
 
 /** The per-request code-routine trust decision. Exported ONLY so it can be behaviourally
  *  pinned — both generation entry points must call this, never inline the expression.
@@ -258,6 +259,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/folders', async (c) => {
     const b = await body<{ name?: string }>(c)
+    const notObject = conversationBodyError(b, [])
+    if (notObject) return err(c, 400, 'invalid_input', notObject)
     if (nonStringField(b, ['name'])) return err(c, 400, 'invalid_input', 'name must be a string.')
     const name = (b.name ?? '').trim()
     if (!name) return err(c, 400, 'invalid_input', 'Folder name required.')
@@ -266,6 +269,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.patch('/api/v1/folders/:id', async (c) => {
     const b = await body<{ name?: string }>(c)
+    const notObject = conversationBodyError(b, [])
+    if (notObject) return err(c, 400, 'invalid_input', notObject)
     if (nonStringField(b, ['name'])) return err(c, 400, 'invalid_input', 'name must be a string.')
     const name = (b.name ?? '').trim()
     if (!name) return err(c, 400, 'invalid_input', 'Folder name required.')
@@ -366,6 +371,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations', async (c) => {
     const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; skillIds?: string[]; allowedTools?: string[]; sampling?: Record<string, number>; preserveThinking?: boolean }>(c)
+    const bad = conversationBodyError(b, CREATE_FIELDS)
+    if (bad) return err(c, 400, 'invalid_input', bad)
     // Only keep ids that exist in the shared skill library; silently drop unknown ones.
     const validIds = new Set(new SkillStore(d.store.dir()).list().map((s) => s.id))
     const skillIds = Array.isArray(b.skillIds) ? b.skillIds.filter((sid) => validIds.has(sid)) : undefined
@@ -427,11 +434,14 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.patch('/api/v1/conversations/:id', async (c) => {
     const b = await body<{ title?: string; systemPrompt?: string; sampling?: Record<string, unknown>; skillIds?: string[]; preserveThinking?: boolean }>(c)
-    if (b.skillIds !== undefined) {
+    const bad = conversationBodyError(b, PATCH_FIELDS)
+    if (bad) return err(c, 400, 'invalid_input', bad)
+    const patch = patchFields(b)
+    if (Array.isArray(patch.skillIds)) {
       const validIds = new Set(new SkillStore(d.store.dir()).list().map((s) => s.id))
-      b.skillIds = b.skillIds.filter((sid) => validIds.has(sid))
+      patch.skillIds = (patch.skillIds as string[]).filter((sid) => validIds.has(sid))
     }
-    const ok = db.updateConversation(c.req.param('id'), b)
+    const ok = db.updateConversation(c.req.param('id'), patch as Parameters<typeof db.updateConversation>[1])
     if (!ok) return err(c, 404, 'not_found', 'Conversation not found.')
     return c.json(db.getConversation(c.req.param('id'))!)
   })
@@ -451,6 +461,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   // Body: { folderId: string | null } — null moves the conversation out of any folder.
   app.patch('/api/v1/conversations/:id/folder', async (c) => {
     const b = await body<{ folderId?: string | null }>(c)
+    const notObject = conversationBodyError(b, [])
+    if (notObject) return err(c, 400, 'invalid_input', notObject)
+    if (nonStringField(b, ['folderId'])) return err(c, 400, 'invalid_input', 'folderId must be a string.')
     const folderId = b.folderId ?? null
     const res = db.moveConversationToFolder(c.req.param('id'), folderId)
     if (!res.ok) {
