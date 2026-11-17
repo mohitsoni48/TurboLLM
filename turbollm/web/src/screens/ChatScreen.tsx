@@ -816,7 +816,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     const { readAloud } = useVoiceStore.getState()
     // A recording sent as audio to a model that answers aloud gets its answer as speech, which has its own player: the
     // browser's voices do not read the same words over it.
-    const replyAudio = asksForSpokenReply(status?.model, !!activeRemoteId, audio, images)
+    const replyAudio = asksForSpokenReply(status?.model, !!activeRemoteId, audio, images, audioAttachments.reduce((ms, a) => ms + (a.durationMs ?? 0), 0))
     const speakReply = (readAloud === 'always' || (readAloud === 'voice' && spoken)) && ttsAvailable() && !replyAudio
 
     const sentAttachments = outgoing
