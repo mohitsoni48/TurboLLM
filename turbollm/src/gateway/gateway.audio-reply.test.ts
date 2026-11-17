@@ -144,13 +144,14 @@ test('system and developer messages and the earlier turns become the text instru
   assert.equal(h.engine.received.filter((m) => m.type === 'input_audio_buffer.commit').length, 1, 'only the last turn\'s clip is the input')
 })
 
-test('a typed last turn is the input text; max_completion_tokens beats max_tokens and the settings cap bounds both', async (t) => {
+test('a typed last turn is the input text; max_completion_tokens beats max_tokens, and the text token limit setting does not apply to speech', async (t) => {
   const h = await harness(t, { maxTokens: 300 })
   await h.ask(spokenAsk({ messages: [{ role: 'user', content: 'What is the capital of France?' }], max_completion_tokens: 200, max_tokens: 100 }))
   assert.equal(h.engine.received.find((m) => m.type === 'session.update')!.session.max_output_tokens, 200)
   assert.deepEqual(h.engine.received.find((m) => m.type === 'conversation.item.create')!.item.content, [{ type: 'input_text', text: 'What is the capital of France?' }])
-  await h.ask(spokenAsk({ messages: [{ role: 'user', content: 'hi' }], max_tokens: 5000 }))
-  assert.equal(h.engine.received.filter((m) => m.type === 'session.update')[1].session.max_output_tokens, 300)
+  // Asked for nothing, the cap is the speech default whatever the text setting says (300 here would be about 24 s).
+  await h.ask(spokenAsk({ messages: [{ role: 'user', content: 'hi' }] }))
+  assert.equal(h.engine.received.filter((m) => m.type === 'session.update')[1].session.max_output_tokens, 1024)
 })
 
 test('a reply that used its whole budget is finish_reason "length"', async (t) => {
@@ -325,7 +326,7 @@ test('parseAudioChatRequest bounds the transcript to half the context', () => {
   const messages: unknown[] = []
   for (let i = 0; i < 20; i++) messages.push({ role: i % 2 ? 'assistant' : 'user', content: `turn ${i} ${'x'.repeat(200)}` })
   messages.push({ role: 'user', content: 'latest' })
-  const parsed = parseAudioChatRequest({ audio: { format: 'wav' }, messages }, 1000, 0)
+  const parsed = parseAudioChatRequest({ audio: { format: 'wav' }, messages }, 1000)
   assert.ok('request' in parsed)
   assert.ok(parsed.request.instructions.includes('turn 19 ') && !parsed.request.instructions.includes('turn 0 '))
 })

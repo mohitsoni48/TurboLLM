@@ -88,8 +88,6 @@ export interface AudioReplyCtx {
   upstream: ChatUpstream
   ac: AbortController
   turn: SpokenTurn
-  /** The reply's cap, from the settings' default when it names one. */
-  maxOutputTokens?: number
 }
 
 export interface AudioReplyOutcome {
@@ -116,6 +114,7 @@ export async function runAudioReply(d: Deps, emit: EmitSink, ctx: AudioReplyCtx)
   let aborted = false
   let failed = false
   let outputTokens: number | undefined
+  let generationMs: number | undefined
 
   noteLocalActivity()
   d.manager.generationStart()
@@ -125,13 +124,16 @@ export async function runAudioReply(d: Deps, emit: EmitSink, ctx: AudioReplyCtx)
       {
         instructions: instructionsFor(ctx),
         input: ctx.turn.input,
-        maxOutputTokens: ctx.maxOutputTokens && ctx.maxOutputTokens > 0 ? ctx.maxOutputTokens : DEFAULT_AUDIO_REPLY_MAX_TOKENS,
+        // Sized for speech, not the text turn's token limit setting: an audio token is a frame of speech (about 80 ms), so
+        // that limit would cut a reply to a few seconds.
+        maxOutputTokens: DEFAULT_AUDIO_REPLY_MAX_TOKENS,
       },
       ac.signal,
     )
     aborted = reply.status === 'cancelled' || ac.signal.aborted
     content = reply.text
     outputTokens = reply.outputTokens
+    generationMs = reply.generationMs
     if (content) await sink({ event: 'delta', data: { delta: content } })
     if (reply.audio) {
       // A full disk keeps the clip inline in the row, as an image is, rather than losing the reply.
@@ -151,7 +153,10 @@ export async function runAudioReply(d: Deps, emit: EmitSink, ctx: AudioReplyCtx)
   const totalMs = Date.now() - started
   const stats: Partial<MessageStats> = {
     totalMs,
-    ...(outputTokens === undefined ? {} : { genTokens: outputTokens, genMs: totalMs, tps: totalMs > 0 ? Math.round((outputTokens / totalMs) * 1000 * 10) / 10 : 0 }),
+    // Speed is of the generation alone (first output to the end of the reply), never of the whole turn, which also holds
+    // connecting, reading the recording and a stop's wait: without that timing the speed is left out, not guessed.
+    ...(outputTokens === undefined ? {} : { genTokens: outputTokens }),
+    ...(outputTokens !== undefined && generationMs ? { genMs: generationMs, tps: Math.round((outputTokens / generationMs) * 1000 * 10) / 10 } : {}),
     ctxMax: upstream.ctxMax,
     model: upstream.modelName,
     aborted,

@@ -45,7 +45,7 @@ export interface RealtimeCollector {
   result(cancelled?: 'cancelled'): AudioReply
 }
 
-export function createRealtimeCollector(): RealtimeCollector {
+export function createRealtimeCollector(now: () => number = Date.now): RealtimeCollector {
   let rate = 0
   let text = ''
   let finalText: string | null = null
@@ -54,6 +54,8 @@ export function createRealtimeCollector(): RealtimeCollector {
   let status: AudioReply['status'] = 'completed'
   let outputTokens: number | undefined
   let error: AudioReplyError | null = null
+  let firstOutputAt: number | null = null
+  let doneAt: number | null = null
 
   return {
     push(raw: unknown): void {
@@ -66,17 +68,24 @@ export function createRealtimeCollector(): RealtimeCollector {
           break
         }
         case 'response.output_text.delta':
-          if (typeof ev.delta === 'string') text += ev.delta
+          if (typeof ev.delta === 'string') {
+            text += ev.delta
+            firstOutputAt ??= now()
+          }
           break
         case 'response.output_text.done':
           // The full text, which settles any delta the stream lost.
           if (typeof ev.text === 'string') finalText = ev.text
           break
         case 'response.output_audio.delta':
-          if (typeof ev.delta === 'string') audio.push(Buffer.from(ev.delta, 'base64'))
+          if (typeof ev.delta === 'string') {
+            audio.push(Buffer.from(ev.delta, 'base64'))
+            firstOutputAt ??= now()
+          }
           break
         case 'response.done': {
           done = true
+          doneAt = now()
           const response = ev.response as { status?: unknown; usage?: { output_tokens?: unknown } } | undefined
           status = response?.status === 'cancelled' ? 'cancelled' : 'completed'
           const tokens = response?.usage?.output_tokens
@@ -108,6 +117,8 @@ export function createRealtimeCollector(): RealtimeCollector {
         audio: pcm.length ? { data: pcm16ToWav(pcm, rate || DEFAULT_OUTPUT_RATE), format: 'wav', sampleRate: rate || DEFAULT_OUTPUT_RATE } : null,
         status: cancelled ?? status,
         ...(outputTokens === undefined ? {} : { outputTokens }),
+        // From the first piece of output to the end of the reply; absent for a reply that was stopped before it ended.
+        ...(firstOutputAt !== null && doneAt !== null && !cancelled ? { generationMs: Math.max(0, doneAt - firstOutputAt) } : {}),
       }
     },
   }

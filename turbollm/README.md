@@ -675,6 +675,9 @@ A request that does not ask for audio is untouched.
 - **An audio request through the API names a model like any request.** With auto-swap on, a request for audio that
   names a model that is not loaded loads it first, and only then is told whether it can speak. A request that its own body
   makes unanswerable (`stream: true`, a bad format, an MP3 or empty clip) is refused before any model is loaded.
+- **A spoken reply is capped at about a minute of speech** (1024 tokens, which are 80 ms frames of sound) unless an API
+  request sets `max_tokens`; Settings' text token limit does not apply to it. A reply that reaches the cap ends with
+  `finish_reason: "length"` through the API; the chat, as for a text reply, shows nothing special.
 - Earlier turns are sent as text, trimmed to about half the model's context, oldest first.
 
 **Measured** on a cloud container with 4 vCPUs (Intel Xeon @ 2.10 GHz), 15 GB RAM and **no GPU**, a spoken

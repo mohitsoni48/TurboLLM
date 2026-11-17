@@ -27,12 +27,12 @@ interface Harness {
 }
 
 /** The real chat routes with a model that hears and (by default) answers aloud, on the fake realtime engine. */
-async function harness(t: { after: (fn: () => unknown) => void }, opts: { audioOut?: boolean; engine?: FakeRealtimeOptions; engineKind?: string; titles?: boolean } = {}): Promise<Harness> {
+async function harness(t: { after: (fn: () => unknown) => void }, opts: { audioOut?: boolean; engine?: FakeRealtimeOptions; engineKind?: string; titles?: boolean; textMaxTokens?: number } = {}): Promise<Harness> {
   const dir = tmpDir('tllm-chat-audio-reply-')
   const store = new ConversationStore(dir)
   const engine = await startFakeRealtimeEngine(opts.engine)
   const cfg = {
-    modelDefaults: { maxTokens: 0 },
+    modelDefaults: { maxTokens: opts.textMaxTokens ?? 0 },
     gateway: { autoSwap: true },
     daemon: { autoGenerateTitles: opts.titles ?? false, experimental: { memory: false }, autoMemoryEnabled: false },
     tools: { toolPolicies: {}, autoAllowAll: false },
@@ -119,6 +119,13 @@ test('a recording sent with replyAudio is answered with its text and a stored cl
   assert.equal(h.engine.received.filter((m) => m.type === 'input_audio_buffer.append').length, 3)
   await until(() => h.engine.closed() === 1, 'the session to close')
   assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
+})
+
+test('the text token limit setting does not cap a spoken reply: it gets the speech default', async (t) => {
+  const h = await harness(t, { textMaxTokens: 256 })
+  const conv = h.store.createConversation()
+  await (await send(h, conv.id, { audio: [WAV_URL], replyAudio: true })).text()
+  assert.equal(h.engine.received.find((m) => m.type === 'session.update')!.session.max_output_tokens, 1024)
 })
 
 test('the next turn sends earlier turns as text: the clip as [Voice message], the reply as its words, no audio of either', async (t) => {
@@ -316,4 +323,27 @@ test('a model without audio output still gets its ordinary text turn when audio 
   const res = await send(h, conv.id, { content: 'hi', audio: [WAV_URL] })
   assert.equal(res.status, 200)
   assert.equal(frames(await res.text()).at(-1)!.data.message.content, 'hello')
+})
+
+test('the stored speed is of the generation alone: from the first output to the end, or absent when the runtime gave no timing', async (t) => {
+  const { runAudioReply } = await import('./audio-reply-turn.js')
+  const h = await harness(t)
+  const run = async (reply: Record<string, unknown>) => {
+    const conv = h.store.createConversation()
+    const placeholder = h.store.addMessage(conv.id, 'assistant', '', { stats: { aborted: false } })
+    const upstream = { modelField: 'm', modelName: 'LFM3 Audio', ctxMax: 8192, target: h.engine.baseUrl, engineKind: 'llama-server', speaksAudio: true as const }
+    const runtime = { reply: async () => ({ text: 'hi', audio: null, status: 'completed' as const, ...reply }) }
+    await runAudioReply(h.d, () => {}, {
+      convId: conv.id, conv: h.store.getConversation(conv.id)!, history: [], assistantMsg: placeholder, upstream, ac: new AbortController(),
+      turn: { runtime, input: { kind: 'text', text: 'q' }, note: '' },
+    })
+    return h.store.getMessage(placeholder.id)!.stats
+  }
+  const timed = await run({ outputTokens: 40, generationMs: 2000 })
+  assert.equal(timed.genTokens, 40)
+  assert.equal(timed.genMs, 2000)
+  assert.equal(timed.tps, 20)
+  const untimed = await run({ outputTokens: 40 })
+  assert.equal(untimed.genTokens, 40)
+  assert.ok(!('genMs' in untimed) && !('tps' in untimed), 'no timing, no speed')
 })

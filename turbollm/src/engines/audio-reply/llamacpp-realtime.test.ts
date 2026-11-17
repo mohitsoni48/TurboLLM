@@ -85,6 +85,27 @@ test('zero bytes of audio is no clip; an unclosed <think> block is all reasoning
   assert.equal(spoken.result().audio?.sampleRate, 24000)
 })
 
+test('generation time runs from the first output, text or audio, to response.done, on the clock it is given', () => {
+  const events = loadRealtimeFixture('realtime-text-audio')
+  let clock = 0
+  const c = createRealtimeCollector(() => clock)
+  for (const e of events) {
+    // Connecting and reading the input take 5 s; the first text delta comes at 5000, the end at 7500.
+    clock = e.type === 'response.output_text.delta' && clock < 5000 ? 5000 : e.type === 'response.done' ? 7500 : clock
+    c.push(e)
+  }
+  assert.equal(c.result().generationMs, 2500)
+})
+
+test('a reply stopped before its end, or one with no output, reports no generation time', () => {
+  const c = createRealtimeCollector(() => 1)
+  c.push({ type: 'response.output_text.delta', delta: 'hi' })
+  assert.equal(c.result('cancelled').generationMs, undefined)
+  const none = createRealtimeCollector(() => 1)
+  none.push({ type: 'response.done', response: { status: 'completed' } })
+  assert.equal(none.result().generationMs, undefined)
+})
+
 // ── transport ───────────────────────────────────────────────────────────────────────────
 
 const noAbort = () => new AbortController().signal

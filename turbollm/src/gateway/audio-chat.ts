@@ -141,9 +141,10 @@ export function readAudioChatRequest(body: Record<string, unknown>): ReadAudioRe
   return { format, system: head.join('\n\n'), turns, input, note, ...(voice ? { voice } : {}), ...(asked === undefined ? {} : { asked }) }
 }
 
-/** PURE: what the runtime is asked for, once the loaded model's window (`ctxMax`, which bounds the transcript) and the
- *  settings' cap on a reply (`maxTokensLimit`, 0: none) are known. */
-export function buildAudioChatRequest(read: ReadAudioRequest, ctxMax: number, maxTokensLimit: number): ParsedAudioRequest {
+/** PURE: what the runtime is asked for, once the loaded model's window (`ctxMax`, which bounds the transcript) is known.
+ *  The cap is what the caller asked for, else DEFAULT_AUDIO_REPLY_MAX_TOKENS: the settings' text token limit is not
+ *  applied, since an audio token is a frame of speech (about 80 ms) and a text limit would cut a reply to seconds. */
+export function buildAudioChatRequest(read: ReadAudioRequest, ctxMax: number): ParsedAudioRequest {
   const wanted = read.asked ?? DEFAULT_AUDIO_REPLY_MAX_TOKENS
   return {
     format: read.format,
@@ -151,15 +152,15 @@ export function buildAudioChatRequest(read: ReadAudioRequest, ctxMax: number, ma
       instructions: withUserNote(flattenInstructions(read.system, read.turns, ctxMax), read.note),
       input: read.input,
       ...(read.voice ? { voice: read.voice } : {}),
-      maxOutputTokens: maxTokensLimit > 0 ? Math.min(wanted, maxTokensLimit) : wanted,
+      maxOutputTokens: wanted,
     },
   }
 }
 
 /** Both steps at once, for a caller that has the window already. */
-export function parseAudioChatRequest(body: Record<string, unknown>, ctxMax: number, maxTokensLimit: number): ParsedAudioRequest | Refusal {
+export function parseAudioChatRequest(body: Record<string, unknown>, ctxMax: number): ParsedAudioRequest | Refusal {
   const read = readAudioChatRequest(body)
-  return 'error' in read ? read : buildAudioChatRequest(read, ctxMax, maxTokensLimit)
+  return 'error' in read ? read : buildAudioChatRequest(read, ctxMax)
 }
 
 /** The error to answer with, as the gateway's own response. */
@@ -238,8 +239,7 @@ export async function handleAudioChatCompletion(c: Context, d: Deps, args: Audio
       },
     })
   }
-  const maxLimit = d.store.read().modelDefaults.maxTokens ?? 0
-  const parsed = buildAudioChatRequest(args.read, status.model?.ctx ?? 4096, maxLimit)
+  const parsed = buildAudioChatRequest(args.read, status.model?.ctx ?? 4096)
 
   // The same gate and bookkeeping a proxied chat request goes through (gateway.ts): one engine slot, so a spoken reply
   // queues behind a running generation rather than on top of it, and counts as one on the engine card meanwhile.

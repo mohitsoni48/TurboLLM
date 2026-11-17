@@ -16,6 +16,9 @@ export interface AudioReply {
   status: 'completed' | 'cancelled'
   /** What the engine counted as generated, when it said. */
   outputTokens?: number
+  /** How long the reply took to generate: from its first output (text or audio) to the engine's `response.done`, which
+   *  leaves out connecting and reading the input. Absent when the runtime did not see both ends. */
+  generationMs?: number
 }
 
 /** What a runtime is asked for: the whole context as text, and one new turn that is either a finished clip or text. */
