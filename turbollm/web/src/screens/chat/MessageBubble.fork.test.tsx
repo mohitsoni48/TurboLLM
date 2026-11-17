@@ -1,4 +1,4 @@
-// "Fork from here" (GitHub #323): on every message of a chat that can be changed, never in a read-only view, and not
+// "Fork from here" (GitHub issue 323): on every message of a chat that can be changed, never in a read-only view, and not
 // on the reply still being written.
 import { fireEvent, render, screen } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'

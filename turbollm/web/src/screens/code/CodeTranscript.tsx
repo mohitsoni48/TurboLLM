@@ -421,7 +421,7 @@ function CodeInstructionEntry({
    *  whenever a run is live (the backend 409s on this anyway — hidden here for a cleaner
    *  affordance rather than a guaranteed-fail click). */
   onRevert?: () => void
-  /** Revert's twin into a NEW session (GitHub #323): everything before this instruction, the original left as it
+  /** Revert's twin into a NEW session (GitHub issue 323): everything before this instruction, the original left as it
    *  is. Omitted exactly when onRevert is. */
   onFork?: () => void
 }) {
@@ -881,7 +881,7 @@ export function CodeTranscript({
    *  is live, and never shown on the FIRST message (nothing before it to revert to; `messages`
    *  here is already cut at any existing /clear point, so index 0 is always correct). */
   onRevert?: (messageId: string) => void
-  /** Fork from before a user message (GitHub #323): called with the id of the message just BEFORE it, the last one
+  /** Fork from before a user message (GitHub issue 323): called with the id of the message just BEFORE it, the last one
    *  the new session keeps. Shown on the same messages as onRevert. */
   onFork?: (uptoMessageId: string) => void
   /** The server-side message queue (turns waiting behind the active run), rendered inline as

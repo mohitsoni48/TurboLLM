@@ -91,7 +91,7 @@ export function regenerate(convId: string): Promise<{ ok: true }> {
   return req(`/api/v1/conversations/${encodeURIComponent(convId)}/regenerate`, { method: 'POST', json: {} })
 }
 
-/** A new chat with this one's settings and its history up to and including `messageId` (GitHub #323). */
+/** A new chat with this one's settings and its history up to and including `messageId` (GitHub issue 323). */
 export function forkConversation(convId: string, messageId: string): Promise<Conversation> {
   return req(`/api/v1/conversations/${encodeURIComponent(convId)}/fork`, { method: 'POST', json: { messageId } })
 }

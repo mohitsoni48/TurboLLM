@@ -634,7 +634,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
     const hasFileEdits = idx !== -1 && messages.slice(idx).some((m) => m.toolCalls.some((tc) => tc.name === 'edit' && !!tc.patch))
     setPendingRevert({ messageId, hasFileEdits })
   }
-  // Fork from before an instruction (GitHub #323): a new session keeps everything up to `uptoMessageId` and opens;
+  // Fork from before an instruction (GitHub issue 323): a new session keeps everything up to `uptoMessageId` and opens;
   // this one is left as it is.
   // One fork at a time: a double-click made two sessions (and two worktrees).
   const forking = useRef(false)

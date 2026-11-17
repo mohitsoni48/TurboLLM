@@ -725,7 +725,7 @@ export function MessageBubble({
   onEdit?: (m: Message) => void
   onDelete?: (m: Message) => void
   onRegenerate?: () => void
-  /** "Fork from here" (GitHub #323): a new chat with the history up to and including this message. */
+  /** "Fork from here" (GitHub issue 323): a new chat with the history up to and including this message. */
   onFork?: (m: Message) => void
   editingId: string | null
   onEditSave: (content: string) => void

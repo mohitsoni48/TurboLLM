@@ -1,4 +1,4 @@
-// Fork from before an instruction (GitHub #323): on the same user messages Revert is on, handing over the id of the
+// Fork from before an instruction (GitHub issue 323): on the same user messages Revert is on, handing over the id of the
 // message just before it, the last one the new session keeps.
 import { describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen } from '@testing-library/react'

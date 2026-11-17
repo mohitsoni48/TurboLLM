@@ -979,7 +979,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     await session.regenerate(activeId, replyId, turnSettings)
   }
 
-  // Fork from here (GitHub #323): the new chat opens; this one is left as it was.
+  // Fork from here (GitHub issue 323): the new chat opens; this one is left as it was.
   // One fork at a time: a double-click made two chats.
   const forking = useRef(false)
   const handleFork = async (m: Message) => {
