@@ -9,7 +9,7 @@ import { useLinks, useRemoteModels } from '../../lib/link-queries'
 import { findRemoteChoice, selectModel } from '../../lib/remote-models'
 import { chatModelsForPicker } from '../../lib/model-kind'
 import { useUiStore } from '../../stores/ui'
-import { compactCodeSession, execShellCommand, revertCodeSession, sendCodeQueuedTurnNow, startCodeRun, steerOutcomeMessage, stopCodeSession } from '../../lib/code-api'
+import { compactCodeSession, execShellCommand, forkCodeSession, revertCodeSession, sendCodeQueuedTurnNow, startCodeRun, steerOutcomeMessage, stopCodeSession } from '../../lib/code-api'
 import type { CodeAgent, QueuedTurn, ShellRun, SteerKind } from '../../lib/code-types'
 import {
   codeKeys, useClearCodeSession, useCodeSession, useCodeSessionLastUsage, useCodeSessionRename,
@@ -634,6 +634,24 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
     const hasFileEdits = idx !== -1 && messages.slice(idx).some((m) => m.toolCalls.some((tc) => tc.name === 'edit' && !!tc.patch))
     setPendingRevert({ messageId, hasFileEdits })
   }
+  // Fork from before an instruction (GitHub issue 323): a new session keeps everything up to `uptoMessageId` and opens;
+  // this one is left as it is.
+  // One fork at a time: a double-click made two sessions (and two worktrees).
+  const forking = useRef(false)
+  const runFork = async (uptoMessageId: string) => {
+    if (!effectiveSessionId || forking.current) return
+    forking.current = true
+    try {
+      const { sessionId } = await forkCodeSession(effectiveSessionId, uptoMessageId)
+      void qc.invalidateQueries({ queryKey: ['code-sessions'] })
+      navigate(`/workspace/code/${sessionId}`)
+      toast('Forked into a new session.')
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : 'Could not fork this session.')
+    } finally {
+      forking.current = false
+    }
+  }
   const runRevert = async (messageId: string, revertFiles: boolean) => {
     if (!effectiveSessionId) return
     try {
@@ -1079,6 +1097,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
                     liveAssistantId={live?.assistantId}
                     live={live ? { timeline: live.timeline, reasoning: live.reasoning, compacting: live.compacting, retry: live.retry, prefill: live.prefill } : null}
                     onRevert={live || queued.length > 0 || compacting ? undefined : openRevertConfirm}
+                    onFork={isTerminalSession || live || queued.length > 0 || compacting ? undefined : (id) => void runFork(id)}
                     queued={queued}
                     onSendNowQueued={(id) => void handleSendNow(id)}
                     shellRuns={shellRuns}

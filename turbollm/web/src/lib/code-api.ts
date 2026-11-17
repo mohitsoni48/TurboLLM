@@ -82,6 +82,13 @@ export function revertCodeSession(
   return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/revert`, { method: 'POST', json: { messageId, revertFiles } })
 }
 
+/** A new session on the same repo with this one's transcript up to and including `messageId` (GitHub issue 323). A
+ *  worktree session's fork gets a worktree of its own, branched from the original's branch. Rejects 409 while a run
+ *  is active. */
+export function forkCodeSession(id: string, messageId: string): Promise<{ sessionId: string; convId: string }> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/fork`, { method: 'POST', json: { messageId } })
+}
+
 export interface CodeSessionDetail {
   session: CodeSession
   conversation: Conversation

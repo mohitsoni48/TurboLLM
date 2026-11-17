@@ -554,7 +554,7 @@ export const UI_ACTIONS = [
 
   'toggle_thinking_block', 'toggle_tool_call_detail', 'toggle_source_row', 'toggle_sources_panel',
   'open_edit_message', 'cancel_edit_message', 'save_edited_message', 'save_edited_reply',
-  'delete_message', 'regenerate_message', 'switch_message_variant',
+  'delete_message', 'regenerate_message', 'switch_message_variant', 'fork_message',
 
   'open_model_settings', 'copy_chat_link', 'copy_chat_debug_info', 'export_chat',
   'dismiss_import_banner', 'use_suggested_prompt', 'scroll_to_latest', 'dismiss_clipboard_modal',
