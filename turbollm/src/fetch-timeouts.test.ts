@@ -1,11 +1,16 @@
 // Non-engine fetches must carry their own deadline: the daemon's global dispatcher has no 300 s backstop.
 import assert from 'node:assert/strict'
-import { afterEach, test } from 'node:test'
+import { afterEach, beforeEach, test } from 'node:test'
 import { fetchNpmLatest } from './app-update'
 import { latestGithubRelease } from './engines/download'
 
 const realFetch = globalThis.fetch
-afterEach(() => { globalThis.fetch = realFetch })
+// AbortSignal.timeout() runs on an unref'd timer and the hanging fetch below holds no handle, so on a quiet worker
+// nothing keeps the event loop alive: it empties before the deadline fires and node:test cancels the file with
+// "Promise resolution is still pending but the event loop has already resolved". Hold a ref'd handle per test.
+let keepAlive: NodeJS.Timeout
+beforeEach(() => { keepAlive = setInterval(() => {}, 1000) })
+afterEach(() => { clearInterval(keepAlive); globalThis.fetch = realFetch })
 
 /** A fetch that never answers and only ends when its signal aborts, like a silent registry. */
 function hangingFetch(seen: { signal?: AbortSignal | null }): typeof fetch {
