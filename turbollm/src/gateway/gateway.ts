@@ -31,7 +31,7 @@ import { classifyHarness } from '../telemetry/classify'
 import { anthropicContentError, mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
 import { analyzeTurn, applyAgentGuidance } from './agent-guidance'
 import { audioEndpointFor, handleAudioRequest } from './audio-endpoints'
-import { classifyGateError } from './gate-errors'
+import { classifyGateError, openAiChatGateError } from './gate-errors'
 import { asksForAudioOutput, audioRefusalResponse, handleAudioChatCompletion, readAudioChatRequest } from './audio-chat'
 import { handleJevRequest, jevEndpointFor } from './jev-endpoints'
 import { isJsonObject, NOT_A_JSON_OBJECT } from './jev-serving'
@@ -1505,15 +1505,8 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     try {
       chatGateRelease = await serving.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: 600_000 })
     } catch (e) {
-      const aborted = (e as Error).message === 'gate_acquire_aborted'
-      return c.json(
-        {
-          error: aborted
-            ? { message: 'Client disconnected while queued for the engine.', type: 'api_error', code: 'client_disconnected' }
-            : { message: 'Timed out waiting for a free engine slot.', type: 'api_error', code: 'engine_busy' },
-        },
-        aborted ? 400 : 503,
-      )
+      const failure = openAiChatGateError(e)
+      return c.json({ error: failure.error }, failure.status)
     }
   }
 

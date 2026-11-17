@@ -22,7 +22,7 @@ import { flattenInstructions, SPOKEN_REPLY_PLACEHOLDER, VOICE_MESSAGE_PLACEHOLDE
 import { decodeWavClips } from '../engines/audio-reply/wav'
 import { servingEngineKind } from '../engines/serving'
 import { extractParams, requestLogConfig, summarizeRequest } from '../observability/request-log'
-import { classifyGateError } from './gate-errors'
+import { openAiChatGateError } from './gate-errors'
 import type { RouteResult } from './model-router'
 
 /** Whether a chat body asks for speech back: `modalities` is an array containing "audio". Anything else is not an audio
@@ -248,8 +248,8 @@ export async function handleAudioChatCompletion(c: Context, d: Deps, args: Audio
     try {
       release = await accounting.gate.acquire('bg', { signal: args.signal, timeoutMs: 600_000 })
     } catch (e) {
-      const failure = classifyGateError(e)
-      return c.json({ error: { message: failure.message, type: failure.type, code: failure.status === 400 ? 'client_disconnected' : 'engine_busy' } }, failure.status)
+      const failure = openAiChatGateError(e)
+      return c.json({ error: failure.error }, failure.status)
     }
   }
   const cfg = requestLogConfig(d)

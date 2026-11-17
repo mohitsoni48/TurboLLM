@@ -256,10 +256,10 @@ test('audio longer than the recorder allows is refused before the router is aske
   assert.deepEqual(h.routed, [])
 })
 
-test('a request that cannot get the engine slot is described as every queued gateway request is', async (t) => {
+test('a request that cannot get the engine slot is told so as a proxied chat request is: api_error with a code', async (t) => {
   for (const [message, status, type, code] of [
-    ['gate_acquire_aborted', 400, 'invalid_request_error', 'client_disconnected'],
-    ['gate_acquire_timeout', 503, 'overloaded_error', 'engine_busy'],
+    ['gate_acquire_aborted', 400, 'api_error', 'client_disconnected'],
+    ['gate_acquire_timeout', 503, 'api_error', 'engine_busy'],
   ] as const) {
     const h = await harness(t, { gate: { acquire: async () => { throw new Error(message) } } })
     const res = await h.ask(spokenAsk())
