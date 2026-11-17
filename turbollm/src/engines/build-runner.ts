@@ -18,6 +18,7 @@ import { execFile, spawnSync, type ChildProcessByStdio } from 'node:child_proces
 import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync, type Dirent } from 'node:fs'
 import { rm } from 'node:fs/promises'
+import { availableParallelism, freemem } from 'node:os'
 import { basename, delimiter, dirname, join, normalize } from 'node:path'
 import {
   buildEnv,
@@ -487,6 +488,25 @@ export function sourceBuildDirOf(binPath: string, enginesRoot: string): string |
 export function pickGenerator(hasNinja: boolean, isWindows: boolean): 'Ninja' | 'NMake Makefiles' | 'Unix Makefiles' {
   if (hasNinja) return 'Ninja'
   return isWindows ? 'NMake Makefiles' : 'Unix Makefiles'
+}
+
+/** Memory one compile job may take: llama.cpp's CUDA template units (flash-attention, matmul) take several GB each;
+ *  plain C++ units far less. Kaggle's setup caps a CUDA build at 2 jobs on ~29 GB for the same reason. */
+const GB = 1024 ** 3
+const JOB_MEMORY_BYTES = { cuda: 6 * GB, cpu: 2 * GB }
+
+/** PURE: how many compile jobs a build runs at once (`cmake --build -j N`). A bare `-j` is unbounded for Makefiles
+ *  and CPUs + 2 for Ninja, and on a box with less memory than that many jobs need (WSL2 gets half the host's RAM)
+ *  the kernel's OOM killer takes compilers mid-build: the build hangs or the whole VM stalls (GitHub #330).
+ *  So: as many jobs as both the free memory and the CPUs allow, at least 1. `override` (TURBOLLM_BUILD_JOBS, the
+ *  name deploy/kaggle/setup.sh already uses) wins when it is a positive integer. Android keeps its fixed 2 (os.cpus()
+ *  is unreliable there, see configureAndCompile). */
+export function compileJobs(o: { cpus: number; freeMemBytes: number; cuda: boolean; android: boolean; override?: string }): number {
+  const forced = Number(o.override)
+  if (o.override && Number.isInteger(forced) && forced > 0) return forced
+  if (o.android) return 2
+  const byMemory = Math.floor(o.freeMemBytes / (o.cuda ? JOB_MEMORY_BYTES.cuda : JOB_MEMORY_BYTES.cpu))
+  return Math.max(1, Math.min(Math.max(1, Math.floor(o.cpus)), byMemory))
 }
 
 /** PURE: true when a macOS Metal build's compile log shows the fork's own source calling
@@ -1394,7 +1414,8 @@ async function buildFromSource(
     }
 
     // Compile just the server target (Ninja/Makefiles parallelize with -j; NMake ignores it).
-    // Android is capped at -j2, not unbounded like every other platform: llama.cpp's large
+    // The job count is sized to the free memory and CPUs (compileJobs): an unbounded -j ran out of
+    // memory on WSL2 and stalled the VM (GitHub #330). Android is capped at -j2: llama.cpp's large
     // per-model-architecture translation-unit set is memory-heavy to compile in parallel, and an
     // unbounded build reproducibly killed the whole session (not just the compiler — exit 255)
     // on a 2 GB emulator; a real low-RAM phone can hit the identical wall. `os.cpus()` isn't a
@@ -1403,7 +1424,11 @@ async function buildFromSource(
     // (confirmed live: -j2 compiled clean to 100% where unbounded died twice around 35-41%),
     // not a guess.
     hooks.phase('compiling')
-    const compileArgs = ['--build', buildSubdir, '-j', ...(isAndroid ? ['2'] : []), '--target', 'llama-server']
+    const cuda = cmakeArgs.includes('-DGGML_CUDA=ON')
+    const free = freemem()
+    const jobs = compileJobs({ cpus: availableParallelism(), freeMemBytes: free, cuda, android: isAndroid, override: process.env.TURBOLLM_BUILD_JOBS })
+    hooks.log(`Compiling with ${jobs} parallel job${jobs === 1 ? '' : 's'} (${(free / GB).toFixed(1)} GB free${cuda ? ', CUDA' : ''}; set TURBOLLM_BUILD_JOBS to change it).`)
+    const compileArgs = ['--build', buildSubdir, '-j', String(jobs), '--target', 'llama-server']
     if (isWindows) {
       const compileBat = join(buildRoot, '_tllm_build.bat')
       writeFileSync(compileBat, vcvarsBatch(vcvars!, compileArgs))

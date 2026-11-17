@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine, parseDefaultBranch, findEngineForCatalogEntry, catalogBranchesToScan, legacyBuildDirName, findCatalogBuildOnDisk, findNameConflict, isEngineInBuildDir } from './build-runner'
+import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, compileJobs, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine, parseDefaultBranch, findEngineForCatalogEntry, catalogBranchesToScan, legacyBuildDirName, findCatalogBuildOnDisk, findNameConflict, isEngineInBuildDir } from './build-runner'
 import { basename, delimiter, join, relative } from 'node:path'
 import fs, { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import fsp from 'node:fs/promises'
@@ -309,6 +309,37 @@ test('CMAKE_CONFIGURE_ARGS: enables CUDA + Release, allows an unrecognized-but-n
     '-DCMAKE_BUILD_TYPE=Release',
     '-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler',
   ])
+})
+
+const GiB = 1024 ** 3
+
+// GitHub #330: a bare -j on WSL2 (half the host's RAM) ran a CUDA build out of memory and stalled the VM.
+test('compileJobs: a CUDA build runs only as many jobs as the free memory holds', () => {
+  assert.equal(compileJobs({ cpus: 24, freeMemBytes: 15 * GiB, cuda: true, android: false }), 2)
+  assert.equal(compileJobs({ cpus: 24, freeMemBytes: 64 * GiB, cuda: true, android: false }), 10)
+  assert.equal(compileJobs({ cpus: 4, freeMemBytes: 64 * GiB, cuda: true, android: false }), 4, 'never more than the CPUs')
+})
+
+test('compileJobs: a CPU-only build budgets less memory per job', () => {
+  assert.equal(compileJobs({ cpus: 16, freeMemBytes: 15 * GiB, cuda: false, android: false }), 7)
+  assert.equal(compileJobs({ cpus: 16, freeMemBytes: 64 * GiB, cuda: false, android: false }), 16)
+})
+
+test('compileJobs: always at least one job, even with little free memory or no CPU count', () => {
+  assert.equal(compileJobs({ cpus: 8, freeMemBytes: 1 * GiB, cuda: true, android: false }), 1)
+  assert.equal(compileJobs({ cpus: 0, freeMemBytes: 64 * GiB, cuda: false, android: false }), 1)
+})
+
+test('compileJobs: Android keeps its fixed 2', () => {
+  assert.equal(compileJobs({ cpus: 1, freeMemBytes: 64 * GiB, cuda: false, android: true }), 2)
+})
+
+test('compileJobs: TURBOLLM_BUILD_JOBS wins when it is a positive integer, and is ignored otherwise', () => {
+  assert.equal(compileJobs({ cpus: 24, freeMemBytes: 15 * GiB, cuda: true, android: false, override: '6' }), 6)
+  assert.equal(compileJobs({ cpus: 1, freeMemBytes: 1 * GiB, cuda: false, android: true, override: '3' }), 3)
+  for (const bad of ['', '0', '-2', '1.5', 'many']) {
+    assert.equal(compileJobs({ cpus: 24, freeMemBytes: 15 * GiB, cuda: true, android: false, override: bad }), 2, `override ${JSON.stringify(bad)}`)
+  }
 })
 
 test('pickGenerator: Ninja when available regardless of platform', () => {
