@@ -16,7 +16,7 @@ import { koboldcppServerCommand } from './koboldcpp'
 import { llamafileServerCommand } from './llamafile'
 import { slotCacheDir } from './slot-cache'
 import { emitInvalidation } from '../events/bus'
-import { probeAudioInput } from './modalities'
+import { probeAudioInput, probeAudioOutput } from './modalities'
 import { rememberLitertLmModel, type LitertLmRequestInfo } from './litert-lm-request'
 import { litertlmHeaderFromFile } from '../models/litertlm'
 import { isTetheredGroupLeader, spawnTethered } from '../util/tether'
@@ -56,6 +56,10 @@ export interface ModelInfo {
    *  declares, where the engine is known to honour it; status() replaces it with the running engine's own answer once
    *  it has one (modalities.ts). Absent = no. */
   audio?: boolean
+  /** The model answers with speech as well as text (modalities.ts, audioOutputFromModels). Only ever set by status(),
+   *  from the running engine's own answer: there is no model-file fallback, because an engine that does not say so
+   *  has no adapter that could serve it. Absent = no. */
+  audioOut?: boolean
 }
 export interface ErrInfo {
   code: string
@@ -273,6 +277,11 @@ export class Manager {
   /** Whether the running engine says its model takes audio (modalities.ts); null until it has answered, and for an
    *  engine that does not say. */
   private audioInput: boolean | null = null
+  /** Whether the running engine says its model answers aloud; false until it has said so, and for an engine that does
+   *  not say (unlike audioInput, nothing else could vouch for it). */
+  private audioOutput = false
+  /** Settles once the probes behind audioInput and audioOutput have answered for the current load. */
+  private modalitiesLearned: Promise<void> = Promise.resolve()
   /** The idle watchdog (watchdogTick), armed only while an engine is live. An interval armed for the
    *  Manager's whole life kept every pool-slot Manager the gateway dropped (and its per-minute config clone) alive
    *  forever; armed this way, a stopped Manager holds no timer and is collected once nothing references it. */
@@ -565,6 +574,7 @@ export class Manager {
     this.state = 'starting'
     this.session = freshSession() // each running session starts with fresh stats (B4)
     this.audioInput = null
+    this.audioOutput = false
     this.port = port
     this.pid = child.pid ?? 0
     // Track the OS process on disk so a daemon that dies WITHOUT running its signal
@@ -617,6 +627,7 @@ export class Manager {
     this.session = freshSession()
     // The SDK says nothing of audio input: the model is reported without it (learnAudioInput asks a spawned engine only).
     this.audioInput = null
+    this.audioOutput = false
     this.port = 0
     this.pid = 0
     this.startedAt = Date.now()
@@ -822,10 +833,19 @@ export class Manager {
   status(): Status {
     const st: Status = { state: this.state, err: this.errInfo, port: this.port, pid: this.pid, model: null, loadElapsedMs: 0 }
     if ((this.state === 'running' || this.state === 'starting') && this.opts) {
-      st.model = this.audioInput === null ? this.opts.model : { ...this.opts.model, audio: this.audioInput }
+      const base = this.audioInput === null ? this.opts.model : { ...this.opts.model, audio: this.audioInput }
+      st.model = this.audioOutput ? { ...base, audioOut: true } : base
       if (this.state === 'starting') st.loadElapsedMs = Date.now() - this.startedAt
     }
     return st
+  }
+
+  /** Resolves when the engine's answers about what its model takes and gives (audio in, audio out) are in. They are
+   *  asked for just after the load turns `running`, without the load waiting, so a request that routed a model in
+   *  moments ago and needs the answer (an audio reply asked of the gateway) waits here rather than read "no". Already
+   *  resolved for a load that finished long ago, and never rejects. */
+  whenModalitiesKnown(): Promise<void> {
+    return this.modalitiesLearned
   }
 
   /** Ask the engine that just became ready whether its model takes audio, once per load. The answer changes what
@@ -835,6 +855,15 @@ export class Manager {
     if (audio === null || this.child !== child || this.state !== 'running') return
     this.audioInput = audio
     if (audio !== (this.opts?.model.audio === true)) announceEngineChange()
+  }
+
+  /** Ask the engine that just became ready whether its model answers aloud, once per load, in the same guarded way as
+   *  learnAudioInput. Only a "yes" changes anything: "no" and "does not say" are both the default. */
+  private async learnAudioOutput(child: ChildProcess, port: number): Promise<void> {
+    const audioOut = await loadTiming.audioOutput(port)
+    if (audioOut !== true || this.child !== child || this.state !== 'running') return
+    this.audioOutput = true
+    announceEngineChange()
   }
 
   /** Clear a terminal error so a stale failure (e.g. a vLLM load that failed because the
@@ -1019,6 +1048,7 @@ export class Manager {
     this.watchdog = null
     this.session = freshSession() // session ended — clear stats (B4)
     this.audioInput = null
+    this.audioOutput = false
     this.resolveExited?.()
   }
 
@@ -1089,7 +1119,7 @@ export class Manager {
         if (this.child === child && this.state === 'starting') {
           this.state = 'running'
           this.lastActivity = Date.now()
-          void this.learnAudioInput(child, port)
+          this.modalitiesLearned = Promise.all([this.learnAudioInput(child, port), this.learnAudioOutput(child, port)]).then(() => undefined, () => undefined)
         }
         return
       }
@@ -1300,6 +1330,7 @@ export const loadTiming = {
   sleep: (ms: number): Promise<void> => sleep(ms),
   probe: (port: number): Promise<ProbeResult> => probeHealth(port),
   audioInput: (port: number): Promise<boolean | null> => probeAudioInput(port),
+  audioOutput: (port: number): Promise<boolean | null> => probeAudioOutput(port),
   processActivity: (pid: number): number | null => readProcessActivity(pid),
   pollMs: 500,
 }

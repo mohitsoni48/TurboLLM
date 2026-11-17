@@ -9,7 +9,8 @@ import type { LevelMeter, VoiceInput } from './useVoiceInput'
 const BANNER = 'flex flex-wrap items-center gap-x-3 gap-y-2 border-b px-3 py-2 text-[13px] font-medium'
 const BANNER_STYLE = { borderColor: 'var(--instruction-border)', background: 'var(--status-banner-bg)', color: 'var(--accent)' }
 
-export function VoiceBar({ voice, autoStop }: { voice: VoiceInput; autoStop: boolean }) {
+/** `answersAloud`: the loaded model also speaks, so a recording sent as audio is answered in speech. Said only then. */
+export function VoiceBar({ voice, autoStop, answersAloud = false }: { voice: VoiceInput; autoStop: boolean; answersAloud?: boolean }) {
   const { phase } = voice
   if (phase === 'idle') return null
 
@@ -40,7 +41,7 @@ export function VoiceBar({ voice, autoStop }: { voice: VoiceInput; autoStop: boo
     )
   }
 
-  if (phase === 'choosing') return <Choice voice={voice} />
+  if (phase === 'choosing') return <Choice voice={voice} answersAloud={answersAloud} />
 
   return (
     <div className={BANNER} style={BANNER_STYLE} role="status">
@@ -53,14 +54,14 @@ export function VoiceBar({ voice, autoStop }: { voice: VoiceInput; autoStop: boo
 
 /** The question this feature exists to ask: the model can hear, so does the recording go to it as audio, or as the
  *  words in it? Asked once per recording until "Don't ask again" settles it (Settings → Voice changes it back). */
-function Choice({ voice }: { voice: VoiceInput }) {
+function Choice({ voice, answersAloud }: { voice: VoiceInput; answersAloud: boolean }) {
   const [remember, setRemember] = useState(false)
   return (
     <div className={BANNER} style={BANNER_STYLE} role="group" aria-label="How to send this recording">
       <AudioLines size={14} className="shrink-0" />
       <span className="min-w-0 flex-1">
         Recorded {formatClock(voice.pendingMs)}
-        <span className="ml-2 whitespace-nowrap text-[12px] font-normal text-muted">This model can hear audio.</span>
+        <span className="ml-2 whitespace-nowrap text-[12px] font-normal text-muted">{answersAloud ? 'This model can hear audio and answers aloud.' : 'This model can hear audio.'}</span>
       </span>
       <div className="flex flex-wrap items-center gap-2">
         <Button size="sm" onClick={() => voice.choose('audio', remember)} title="The model hears your voice itself: tone, language and anything that is not words">

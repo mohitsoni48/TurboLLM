@@ -31,6 +31,8 @@ import { classifyHarness } from '../telemetry/classify'
 import { anthropicContentError, mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
 import { analyzeTurn, applyAgentGuidance } from './agent-guidance'
 import { audioEndpointFor, handleAudioRequest } from './audio-endpoints'
+import { classifyGateError, openAiChatGateError } from './gate-errors'
+import { asksForAudioOutput, audioRefusalResponse, handleAudioChatCompletion, readAudioChatRequest } from './audio-chat'
 import { handleJevRequest, jevEndpointFor } from './jev-endpoints'
 import { isJsonObject, NOT_A_JSON_OBJECT } from './jev-serving'
 import { appendNudges, appendSystemRules, declaresTools, openAiRequestView } from './openai-guidance'
@@ -196,20 +198,6 @@ const BUSY_RETRY_AFTER_S = 5
  *  second, long before a reply ends (review L2). Not on ComfyUI's, whose render can run for minutes. */
 function setRetryAfter(c: Context, refusal: { reason?: RetryReason }): void {
   if (refusal.reason) c.header('Retry-After', String(BUSY_RETRY_AFTER_S))
-}
-
-/** Classifies a `gate.acquire()` failure into one {status, type, message} shape shared by both
- *  the streaming (SSE `error` event, ADR-347 — `status` unused there, a stream is always 200 by
- *  the time it can fail this way) and non-streaming (JSON error response, where `status` is what
- *  the client actually sees) call sites, so `type`/`message` wording can't silently drift between
- *  them. The gate-acquire and fetch() SEQUENCES themselves remain two separate copies (streaming
- *  needs to open the SSE connection before either call; non-streaming doesn't) — this only
- *  centralizes how a failure from either gets described. */
-function classifyGateError(e: unknown): { status: ContentfulStatusCode; type: string; message: string } {
-  const aborted = (e as Error).message === 'gate_acquire_aborted'
-  return aborted
-    ? { status: 400, type: 'invalid_request_error', message: 'Client disconnected while queued for the engine.' }
-    : { status: 503, type: 'overloaded_error', message: 'Timed out waiting for a free engine slot.' }
 }
 
 /** Same reasoning as classifyGateError, for a failed `fetch()` to the engine. */
@@ -1174,6 +1162,10 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       return c.json({ error: { type: 'invalid_request_error', code, message } }, 400)
     }
   }
+  // A request for audio that its own body already makes unanswerable (a stream, a bad format, an MP3, an empty clip) is
+  // refused here, before the router is asked for a model: it must not first unload one and load another.
+  const audioRead = isChat && parsedBody && asksForAudioOutput(parsedBody) ? readAudioChatRequest(parsedBody) : null
+  if (audioRead && 'error' in audioRead) return audioRefusalResponse(c, audioRead)
   if (isEmbeddings && embeddingsWithheldBeforeRouting(d, requestedModel)) return modelNotLoaded(c, EMBEDDINGS_REFUSAL)
   // An embeddings request reaches a running embedding model's pool slot even with auto-swap off (see the router).
   const routeResult = await d.modelRouter.route(requestedModel, { embeddings: isEmbeddings })
@@ -1234,6 +1226,23 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       },
       400,
     )
+  }
+
+  // A request that asks for speech back (`modalities` with "audio") is never proxied, to any engine kind: llama.cpp's
+  // /v1/chat/completions ignores `modalities` and answers 200 with text. It is answered by the spoken-reply runtime or
+  // refused (audio-chat.ts). A request that does not ask takes every line below unchanged.
+  if (audioRead && !('error' in audioRead) && parsedBody) {
+    const audioAc = clientAbort(c)
+    return handleAudioChatCompletion(c, d, {
+      body: parsedBody, read: audioRead, route: routeResult, requestedModel, harness: chatHarness, codeSessionId: chatCodeSessionId, signal: audioAc.signal,
+      accounting: {
+        manager: serving.manager,
+        gate: remote ? undefined : serving.gate,
+        recordUsage: (completionTokens, durationMs) => recordOpenAiUsage(
+          d, serving.manager, { usage: { prompt_tokens: 0, completion_tokens: completionTokens } }, 'openai', requestedModel || null, chatCodeSessionId, durationMs, chatHarness,
+        ),
+      },
+    })
   }
 
   // Local: the caller's header set, minus `host`, the hop-by-hop headers, TurboLLM's own
@@ -1496,15 +1505,8 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     try {
       chatGateRelease = await serving.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: 600_000 })
     } catch (e) {
-      const aborted = (e as Error).message === 'gate_acquire_aborted'
-      return c.json(
-        {
-          error: aborted
-            ? { message: 'Client disconnected while queued for the engine.', type: 'api_error', code: 'client_disconnected' }
-            : { message: 'Timed out waiting for a free engine slot.', type: 'api_error', code: 'engine_busy' },
-        },
-        aborted ? 400 : 503,
-      )
+      const failure = openAiChatGateError(e)
+      return c.json({ error: failure.error }, failure.status)
     }
   }
 

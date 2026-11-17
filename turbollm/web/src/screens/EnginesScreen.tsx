@@ -197,6 +197,7 @@ const ENGINE_META: Record<string, EngineMeta> = {
       'Widest model support — every GGUF quant',
       'Best-in-class CPU/GPU layer offload',
       'Mature, with an OpenAI-compatible server',
+      'Answers aloud with audio-to-audio models (LFM3-Audio, b11960+)',
     ],
     cons: ['Weaker under many concurrent users', 'GGUF only — find or convert models', 'Several prebuilt backends to pick from'],
   },

@@ -31,6 +31,7 @@ import { DEFAULT_REASONING_EFFORT, ReasoningEffortSelect, type ReasoningEffort }
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
 import { ToolApprovalBar } from './chat/ToolApprovalBar'
 import { VoiceBar } from './chat/VoiceBar'
+import { asksForSpokenReply } from '../lib/spoken-reply'
 import { useVoiceInput, type ComposerClip } from './chat/useVoiceInput'
 import { formatClock } from '../lib/voice/pcm'
 import { speaker, ttsAvailable, type SpeechStream } from '../lib/voice/tts'
@@ -813,7 +814,10 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     voiceUsed.current = false
     speaker.stop()
     const { readAloud } = useVoiceStore.getState()
-    const speakReply = (readAloud === 'always' || (readAloud === 'voice' && spoken)) && ttsAvailable()
+    // A recording sent as audio to a model that answers aloud gets its answer as speech, which has its own player: the
+    // browser's voices do not read the same words over it.
+    const replyAudio = asksForSpokenReply(status?.model, !!activeRemoteId, audio, images, audioAttachments.reduce((ms, a) => ms + (a.durationMs ?? 0), 0))
+    const speakReply = (readAloud === 'always' || (readAloud === 'voice' && spoken)) && ttsAvailable() && !replyAudio
 
     const sentAttachments = outgoing
     setInput('')
@@ -905,7 +909,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
 
       const textAttachmentNames = textAttachments.map((a) => a.file.name)
       speakNextReplyIn.current = speakReply ? convId : null
-      const { started, aborted } = await session.send(convId, { text, images, audio, docContext, textAttachmentNames }, turnSettings)
+      const { started, aborted } = await session.send(convId, { text, images, audio, replyAudio, docContext, textAttachmentNames }, turnSettings)
       // The session toasts the error itself and never rethrows. An abort is the user (or Eject)
       // stopping it, not a refusal.
       if (!started && !aborted) restoreComposer()
@@ -1608,7 +1612,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                 </div>
               )}
 
-              <VoiceBar voice={voice} autoStop={voiceAutoStop} />
+              <VoiceBar voice={voice} autoStop={voiceAutoStop} answersAloud={!activeRemoteId && status?.model?.audioOut === true} />
 
               <div className="flex items-end gap-2 p-2">
                 <button
