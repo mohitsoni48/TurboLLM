@@ -31,6 +31,7 @@ import { classifyHarness } from '../telemetry/classify'
 import { anthropicContentError, mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
 import { analyzeTurn, applyAgentGuidance } from './agent-guidance'
 import { audioEndpointFor, handleAudioRequest } from './audio-endpoints'
+import { classifyGateError } from './gate-errors'
 import { asksForAudioOutput, audioRefusalResponse, handleAudioChatCompletion, readAudioChatRequest } from './audio-chat'
 import { handleJevRequest, jevEndpointFor } from './jev-endpoints'
 import { isJsonObject, NOT_A_JSON_OBJECT } from './jev-serving'
@@ -197,20 +198,6 @@ const BUSY_RETRY_AFTER_S = 5
  *  second, long before a reply ends (review L2). Not on ComfyUI's, whose render can run for minutes. */
 function setRetryAfter(c: Context, refusal: { reason?: RetryReason }): void {
   if (refusal.reason) c.header('Retry-After', String(BUSY_RETRY_AFTER_S))
-}
-
-/** Classifies a `gate.acquire()` failure into one {status, type, message} shape shared by both
- *  the streaming (SSE `error` event, ADR-347 — `status` unused there, a stream is always 200 by
- *  the time it can fail this way) and non-streaming (JSON error response, where `status` is what
- *  the client actually sees) call sites, so `type`/`message` wording can't silently drift between
- *  them. The gate-acquire and fetch() SEQUENCES themselves remain two separate copies (streaming
- *  needs to open the SSE connection before either call; non-streaming doesn't) — this only
- *  centralizes how a failure from either gets described. */
-function classifyGateError(e: unknown): { status: ContentfulStatusCode; type: string; message: string } {
-  const aborted = (e as Error).message === 'gate_acquire_aborted'
-  return aborted
-    ? { status: 400, type: 'invalid_request_error', message: 'Client disconnected while queued for the engine.' }
-    : { status: 503, type: 'overloaded_error', message: 'Timed out waiting for a free engine slot.' }
 }
 
 /** Same reasoning as classifyGateError, for a failed `fetch()` to the engine. */

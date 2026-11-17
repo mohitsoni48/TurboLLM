@@ -22,6 +22,7 @@ import { flattenInstructions, SPOKEN_REPLY_PLACEHOLDER, VOICE_MESSAGE_PLACEHOLDE
 import { decodeWavClips } from '../engines/audio-reply/wav'
 import { servingEngineKind } from '../engines/serving'
 import { extractParams, requestLogConfig, summarizeRequest } from '../observability/request-log'
+import { classifyGateError } from './gate-errors'
 import type { RouteResult } from './model-router'
 
 /** Whether a chat body asks for speech back: `modalities` is an array containing "audio". Anything else is not an audio
@@ -218,10 +219,6 @@ export interface AudioChatArgs {
   accounting: AudioChatAccounting
 }
 
-function respond(c: Context, refusal: Refusal): Response {
-  return c.json({ error: refusal.error }, refusal.status)
-}
-
 /** Answers a chat request that asks for audio. Called once the router has chosen where the request goes. */
 export async function handleAudioChatCompletion(c: Context, d: Deps, args: AudioChatArgs): Promise<Response> {
   const { route, accounting } = args
@@ -232,7 +229,7 @@ export async function handleAudioChatCompletion(c: Context, d: Deps, args: Audio
   const status = d.manager.status()
   const runtime: AudioReplyRuntime | null = primary && status.model?.audioOut === true ? audioReplyRuntimeFor(route.engineKind ?? servingEngineKind(d)) : null
   if (!runtime) {
-    return respond(c, {
+    return audioRefusalResponse(c, {
       status: 409,
       error: {
         message: `'${args.requestedModel || status.model?.name || 'This model'}' cannot answer with audio. Audio output needs a local model that speaks, loaded on an engine that can return it.`,
@@ -251,10 +248,8 @@ export async function handleAudioChatCompletion(c: Context, d: Deps, args: Audio
     try {
       release = await accounting.gate.acquire('bg', { signal: args.signal, timeoutMs: 600_000 })
     } catch (e) {
-      const aborted = (e as Error).message === 'gate_acquire_aborted'
-      return c.json({ error: aborted
-        ? { message: 'Client disconnected while queued for the engine.', type: 'api_error', code: 'client_disconnected' }
-        : { message: 'Timed out waiting for a free engine slot.', type: 'api_error', code: 'engine_busy' } }, aborted ? 400 : 503)
+      const failure = classifyGateError(e)
+      return c.json({ error: { message: failure.message, type: failure.type, code: failure.status === 400 ? 'client_disconnected' : 'engine_busy' } }, failure.status)
     }
   }
   const cfg = requestLogConfig(d)
@@ -274,13 +269,13 @@ export async function handleAudioChatCompletion(c: Context, d: Deps, args: Audio
     const reply = await runtime.reply(route.target, parsed.request, args.signal)
     if (reply.status === 'cancelled' || args.signal.aborted) {
       logId && d.requestLog!.finalize(logId, { status: 400, error: { code: 'client_disconnected', message: 'Client disconnected before the reply finished.' }, durationMs: Date.now() - startedAt })
-      return respond(c, { status: 400, error: { message: 'Client disconnected before the reply finished.', type: 'api_error', code: 'client_disconnected' } })
+      return audioRefusalResponse(c, { status: 400, error: { message: 'Client disconnected before the reply finished.', type: 'api_error', code: 'client_disconnected' } })
     }
     if (!reply.audio) {
       // An engine that was asked for speech and gave none is an error, never the text with the audio left off.
       const message = `The engine returned a transcript of ${reply.text.length} characters but no audio.`
       logId && d.requestLog!.finalize(logId, { status: 502, error: { code: 'audio_not_returned', message }, durationMs: Date.now() - startedAt })
-      return respond(c, { status: 502, error: { message, type: 'api_error', code: 'audio_not_returned' } })
+      return audioRefusalResponse(c, { status: 502, error: { message, type: 'api_error', code: 'audio_not_returned' } })
     }
     const tokens = reply.outputTokens ?? 0
     const durationMs = Date.now() - startedAt
@@ -300,7 +295,7 @@ export async function handleAudioChatCompletion(c: Context, d: Deps, args: Audio
   } catch (e) {
     const failure = failureOf(e)
     logId && d.requestLog!.finalize(logId, { status: failure.status, error: { code: failure.error.code, message: failure.error.message }, durationMs: Date.now() - startedAt })
-    return respond(c, failure)
+    return audioRefusalResponse(c, failure)
   } finally {
     finish()
   }

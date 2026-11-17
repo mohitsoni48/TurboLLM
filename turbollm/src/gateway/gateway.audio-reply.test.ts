@@ -19,6 +19,7 @@ interface Opts {
   engineKind?: string
   route?: Record<string, unknown>
   maxTokens?: number
+  gate?: { acquire: () => Promise<() => void> }
 }
 
 async function harness(t: { after: (fn: () => unknown) => void }, opts: Opts = {}) {
@@ -43,6 +44,7 @@ async function harness(t: { after: (fn: () => unknown) => void }, opts: Opts = {
       recordCompletion: (c: Record<string, unknown>) => completions.push(c),
     },
     registry: { active: () => ({ kind: opts.engineKind ?? 'llama-server' }) },
+    ...(opts.gate ? { gate: opts.gate } : {}),
     db: { recordApiUsage: (u: Record<string, unknown>) => usage.push(u) },
   } as unknown as Deps
   const app = new Hono()
@@ -251,6 +253,21 @@ test('audio longer than the recorder allows is refused before the router is aske
   await refused(h, proxied, ask(wavB64(16000, 301 * 16000)), 400, 'audio_format_unsupported', /at most 5 minutes/)
   await refused(h, proxied, ask(wavB64(16000, 120 * 16000), wavB64(16000, 120 * 16000), wavB64(16000, 120 * 16000)), 400, 'audio_format_unsupported', /at most 5 minutes/)
   assert.deepEqual(h.routed, [])
+})
+
+test('a request that cannot get the engine slot is described as every queued gateway request is', async (t) => {
+  for (const [message, status, type, code] of [
+    ['gate_acquire_aborted', 400, 'invalid_request_error', 'client_disconnected'],
+    ['gate_acquire_timeout', 503, 'overloaded_error', 'engine_busy'],
+  ] as const) {
+    const h = await harness(t, { gate: { acquire: async () => { throw new Error(message) } } })
+    const res = await h.ask(spokenAsk())
+    assert.equal(res.status, status)
+    const e = await errorOf(res)
+    assert.equal(e.type, type)
+    assert.equal(e.code, code)
+    assert.equal(h.engine.opened(), 0)
+  }
 })
 
 test('a request with no audio object, or malformed messages, is a 400 invalid_request_error', async (t) => {
