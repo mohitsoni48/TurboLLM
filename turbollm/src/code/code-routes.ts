@@ -708,6 +708,54 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
   // Optionally (revertFiles) also reverse-applies every 'edit' tool call's stored patch for the
   // discarded messages, walking any touched file back to its pre-edit content — see revert.ts.
   // ALSO blocked while cleared (v33) — same mutual-exclusion rationale as /clear's own guard.
+  // ── fork from a message (GitHub #323) ─────────────────────────────────────────
+  // A new session on the same repo with this one's settings and its shown transcript up to and including
+  // `messageId` (ConversationStore.forkConversation; the mode comes along with the conversation). The original is
+  // never changed. A worktree session forks onto a NEW worktree branched from the original's branch, so the two
+  // never edit one working tree: it starts from that branch's last commit, so changes the original has not
+  // committed are not in the fork. Not while a run or a compaction is going: the transcript is still being written.
+  app.post('/api/v1/code/sessions/:id/fork', async (c) => {
+    const id = c.req.param('id')
+    const b = await body<{ messageId?: string }>(c)
+    if (nonStringField(b, ['messageId'])) return err(c, 400, 'invalid_input', 'messageId must be a string.')
+    const messageId = (b.messageId ?? '').trim()
+    if (!messageId) return err(c, 400, 'invalid_input', 'messageId is required.')
+
+    const run = db.getAgentRun(id)
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before forking.')
+    if (compacting.has(id)) return compactionInProgress(c)
+
+    let worktreePath: string | undefined
+    let worktreeBranch: string | undefined
+    if (run.worktreePath && run.worktreeBranch && run.repoRoot) {
+      const created = await createSessionWorktree({ repoRoot: run.repoRoot, branch: `${run.worktreeBranch}-fork`, base: run.worktreeBranch })
+      if (!created.ok) return err(c, 400, created.code, created.message)
+      worktreePath = created.path
+      worktreeBranch = created.branch
+    }
+
+    const forked = db.forkConversation(run.convId, messageId)
+    if (!forked.ok) {
+      if (worktreePath && run.repoRoot) await removeWorktree(run.repoRoot, worktreePath)
+      return err(c, 404, 'not_found', forked.reason === 'conversation_not_found' ? 'Session conversation not found.' : 'That message is not in this session.')
+    }
+    const fork = db.createAgentRun({
+      convId: forked.conversation.id,
+      title: `${run.title} (fork)`,
+      allowedTools: run.allowedTools,
+      agentId: run.agentId,
+      repoRoot: run.repoRoot,
+      repoBranch: run.repoBranch,
+      useWorktree: worktreePath ? true : run.useWorktree,
+      worktreeBranch: worktreeBranch ?? run.worktreeBranch,
+      worktreeBase: worktreePath ? run.worktreeBranch : run.worktreeBase,
+      worktreePath,
+      codeAgent: run.codeAgent,
+    })
+    return c.json({ sessionId: fork.id, convId: forked.conversation.id }, 201)
+  })
+
   app.post('/api/v1/code/sessions/:id/revert', async (c) => {
     const id = c.req.param('id')
     const b = await body<{ messageId?: string; revertFiles?: boolean }>(c)

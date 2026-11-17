@@ -1210,6 +1210,46 @@ export class ConversationStore {
       .run({ $cid: convId, $seq: upto.seq } as P) as unknown) as Changes).changes
   }
 
+  /** Fork (GitHub #323): a new conversation with `sourceId`'s settings and copies of its ACTIVE messages up to and
+   *  including `uptoMessageId`, the shown branch only (no hidden variants, so no variant_group or branch_of), renumbered
+   *  from seq 1. The source is never changed. Attachments are `attachment:<id>` references to files stored once by hash,
+   *  so the copies share them (the attachment janitor keeps a file any message still references). The compaction
+   *  summary comes along only when its cut is among the copied messages; otherwise the fork has none. Not the
+   *  completion marker, and not the per-session usage. One transaction: a fork is whole or absent. */
+  forkConversation(sourceId: string, uptoMessageId: string): { ok: true; conversation: Conversation } | { ok: false; reason: 'conversation_not_found' | 'message_not_found' } {
+    return this.transaction(() => {
+      const src = this.db.prepare(`SELECT title, compaction_summary, compaction_upto_message_id, compaction_tokens_before, compaction_applied_at FROM conversations WHERE id = $id`)
+        .get({ $id: sourceId } as P) as unknown as { title: string; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; compaction_applied_at: string | null } | undefined
+      if (!src) return { ok: false as const, reason: 'conversation_not_found' as const }
+      const upto = this.db.prepare(`SELECT seq FROM messages WHERE id = $id AND conv_id = $cid AND is_active = 1`).get({ $id: uptoMessageId, $cid: sourceId } as P) as unknown as { seq: number } | undefined
+      if (!upto) return { ok: false as const, reason: 'message_not_found' as const }
+
+      const id = randomUUID()
+      const now = new Date().toISOString()
+      this.db.prepare(`INSERT INTO conversations (id,title,system_prompt,model_key,sampling,expert_mode,tool_policy,kind,folder_id,tool_overrides,agent_id,read_scope,agent_mode,skill_ids,allowed_tools,preserve_thinking,tenant,owner,metadata,created_at,updated_at)
+        SELECT $id,$title,system_prompt,model_key,sampling,expert_mode,tool_policy,kind,folder_id,tool_overrides,agent_id,read_scope,agent_mode,skill_ids,allowed_tools,preserve_thinking,tenant,owner,metadata,$now,$now FROM conversations WHERE id = $src`)
+        .run({ $id: id, $title: `${src.title} (fork)`, $now: now, $src: sourceId } as P)
+
+      const sourceIds = (this.db.prepare(`SELECT id FROM messages WHERE conv_id = $cid AND is_active = 1 AND seq <= $seq ORDER BY seq ASC`)
+        .all({ $cid: sourceId, $seq: upto.seq } as P) as unknown as { id: string }[]).map((r) => r.id)
+      const copyMessage = this.db.prepare(`INSERT INTO messages (id,conv_id,seq,role,content,reasoning,attachments,stats,created_at,model_key,text_attachments,tool_calls,research_meta,is_active,edited,timeline,tenant,owner,status,metadata,doc_context)
+        SELECT $nid,$cid,$seq,role,content,reasoning,attachments,stats,created_at,model_key,text_attachments,tool_calls,research_meta,1,edited,timeline,tenant,owner,status,metadata,doc_context FROM messages WHERE id = $old`)
+      const copiedIds = new Map<string, string>()
+      sourceIds.forEach((old, i) => {
+        const nid = randomUUID()
+        copyMessage.run({ $nid: nid, $cid: id, $seq: i + 1, $old: old } as P)
+        copiedIds.set(old, nid)
+      })
+
+      const cut = src.compaction_upto_message_id ? copiedIds.get(src.compaction_upto_message_id) : undefined
+      if (cut && src.compaction_summary !== null) {
+        this.db.prepare(`UPDATE conversations SET compaction_summary = $s, compaction_upto_message_id = $cut, compaction_tokens_before = $t, compaction_applied_at = $at WHERE id = $id`)
+          .run({ $id: id, $s: src.compaction_summary, $cut: cut, $t: src.compaction_tokens_before, $at: src.compaction_applied_at } as P)
+      }
+      return { ok: true as const, conversation: this.getConversation(id)! }
+    })
+  }
+
   // ── Self-improvement: completion marker + per-agent lessons (redesign §2/§3) ──
 
   /** Mark a conversation's task complete (archives it from the active agent view). */

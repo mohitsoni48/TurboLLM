@@ -9,6 +9,7 @@ import {
   FilePlus,
   FileText,
   FolderTree,
+  GitBranch,
   HelpCircle,
   ListChecks,
   Loader2,
@@ -412,7 +413,7 @@ function ToolRun({ calls }: { calls: NormalizedCall[] }) {
  *  read as "yours" against the agent's left-aligned activity (ADR-262 keeps this
  *  alignment convention deliberately; only the rail was dropped). */
 function CodeInstructionEntry({
-  content, contextFiles, onRevert,
+  content, contextFiles, onRevert, onFork,
 }: {
   content: string
   contextFiles?: string[]
@@ -420,6 +421,9 @@ function CodeInstructionEntry({
    *  whenever a run is live (the backend 409s on this anyway — hidden here for a cleaner
    *  affordance rather than a guaranteed-fail click). */
   onRevert?: () => void
+  /** Revert's twin into a NEW session (GitHub #323): everything before this instruction, the original left as it
+   *  is. Omitted exactly when onRevert is. */
+  onFork?: () => void
 }) {
   return (
     // `group` on the OUTER wrapper (not the box) — the action row is a sibling BELOW the box, not
@@ -460,6 +464,17 @@ function CodeInstructionEntry({
             className="rounded p-1 text-faint transition-colors hover:text-ink"
           >
             <RotateCcw size={12} />
+          </button>
+        )}
+        {onFork && (
+          <button
+            type="button"
+            onClick={onFork}
+            title="Fork from before this message — a new session with everything up to here"
+            aria-label="Fork from before this message"
+            className="rounded p-1 text-faint transition-colors hover:text-ink"
+          >
+            <GitBranch size={12} />
           </button>
         )}
       </div>
@@ -594,7 +609,7 @@ function CodeCommentary({ content, streaming }: { content: string; streaming?: b
  *  turn (with its default-expanded diff tables) made each token cost grow with the transcript.
  *  While a run is live its props are stable — `message` is the query's own object and `onRevert`
  *  is undefined. */
-const CodeMessageEntry = memo(function CodeMessageEntry({ message, onRevert }: { message: Message; onRevert?: () => void }) {
+const CodeMessageEntry = memo(function CodeMessageEntry({ message, onRevert, onFork }: { message: Message; onRevert?: () => void; onFork?: () => void }) {
   if (message.role === 'user') {
     // A persisted `!command` (ADR-258) is a user message carrying a `shell` tool call — render it
     // as a terminal entry, not a chat-style instruction bubble.
@@ -614,7 +629,7 @@ const CodeMessageEntry = memo(function CodeMessageEntry({ message, onRevert }: {
     }
     return (
       <div className="tllm-rise-in">
-        <CodeInstructionEntry content={message.content} contextFiles={message.textAttachments} onRevert={onRevert} />
+        <CodeInstructionEntry content={message.content} contextFiles={message.textAttachments} onRevert={onRevert} onFork={onFork} />
       </div>
     )
   }
@@ -857,7 +872,7 @@ function CodeStreamingEntry({
 }
 
 export function CodeTranscript({
-  messages, liveAssistantId, live, onRevert, queued, onSendNowQueued, shellRuns,
+  messages, liveAssistantId, live, onRevert, onFork, queued, onSendNowQueued, shellRuns,
 }: {
   messages: Message[]
   liveAssistantId?: string
@@ -866,6 +881,9 @@ export function CodeTranscript({
    *  is live, and never shown on the FIRST message (nothing before it to revert to; `messages`
    *  here is already cut at any existing /clear point, so index 0 is always correct). */
   onRevert?: (messageId: string) => void
+  /** Fork from before a user message (GitHub #323): called with the id of the message just BEFORE it, the last one
+   *  the new session keeps. Shown on the same messages as onRevert. */
+  onFork?: (uptoMessageId: string) => void
   /** The server-side message queue (turns waiting behind the active run), rendered inline as
    *  translucent cards at the tail — AFTER the live turn, in send order — never interleaved above
    *  it (the ADR-199 ordering invariant; the caller has already excluded these from `messages`). */
@@ -886,11 +904,12 @@ export function CodeTranscript({
     <div className="flex flex-col gap-3">
       {messages
         .filter((m) => m.id !== liveAssistantId)
-        .map((m, i) => (
+        .map((m, i, shown) => (
           <CodeMessageEntry
             key={m.id}
             message={m}
             onRevert={onRevert && !live && i > 0 && m.role === 'user' ? () => onRevert(m.id) : undefined}
+            onFork={onFork && !live && i > 0 && m.role === 'user' ? () => onFork(shown[i - 1].id) : undefined}
           />
         ))}
       {live && (

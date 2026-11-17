@@ -1,7 +1,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ArrowDown, AudioLines, Copy, Download, Loader2, Mic, PanelLeft, Paperclip, Search, SendHorizontal, Share2, Shrink, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
-import { fetchSysInfo, getConversation, listMemoryFacts } from '../lib/chat-api'
+import { fetchSysInfo, forkConversation, getConversation, listMemoryFacts } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { chatKeys, useConversation, useConversationMutations } from '../lib/chat-queries'
 import { queryKeys, useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useShowAllEngineModels, useStatus, useSysInfo } from '../lib/queries'
@@ -979,6 +979,20 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     await session.regenerate(activeId, replyId, turnSettings)
   }
 
+  // Fork from here (GitHub #323): the new chat opens; this one is left as it was.
+  const handleFork = async (m: Message) => {
+    if (!activeId) return
+    try {
+      const forked = await forkConversation(activeId, m.id)
+      qc.setQueryData(chatKeys.detail(forked.id), forked)
+      void qc.invalidateQueries({ queryKey: ['conversations'] })
+      handleSelect(forked.id)
+      toast('Forked into a new chat.')
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : 'Could not fork this chat.')
+    }
+  }
+
   const handleDelete = (m: Message) => {
     if (!activeId) return
     mut.deleteMsg.mutate({ convId: activeId, msgId: m.id }, {
@@ -1472,6 +1486,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                       onEdit={readonly ? undefined : (msg) => setEditingId(msg.id)}
                       onDelete={readonly ? undefined : handleDelete}
                       onRegenerate={readonly ? undefined : () => handleRegenerate(m.id)}
+                      onFork={readonly ? undefined : handleFork}
                       editingId={editingId}
                       onEditSave={(content) => handleEditSave(m.id, content)}
                       onEditCancel={() => setEditingId(null)}
