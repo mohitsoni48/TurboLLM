@@ -198,6 +198,23 @@ test('a stop that lands while an engine error arrives keeps waiting for response
   assert.deepEqual(ws.calls, ['close'])
 })
 
+test('an engine error mid-reply cancels the reply as a stop does, resending until response.done, then rejects with the engine\'s error', async (t) => {
+  const engine = await withEngine(t, { mode: 'error' })
+  await assert.rejects(
+    requestRealtimeAudioReply(engine.baseUrl, spoken(), noAbort(), { cancelResendMs: 40 }),
+    (e: unknown) => e instanceof AudioReplyError && e.code === 'engine_error' && /failed mid-reply/.test(e.message),
+  )
+  assert.equal(engine.received.filter((m) => m.type === 'response.cancel').length, 2, 'sent again until the engine ended the reply')
+  assert.ok(engine.sent.includes('response.done'), 'the session was still open when the reply ended')
+  await until(() => engine.closed() === 1, 'the close')
+})
+
+test('an error before the reply was asked for rejects at once, with nothing to cancel', async (t) => {
+  const engine = await withEngine(t, { rejectVoice: 'robot' })
+  await assert.rejects(requestRealtimeAudioReply(engine.baseUrl, spoken({ voice: 'robot' }), noAbort()), (e: unknown) => e instanceof AudioReplyError && e.code === 'invalid_request')
+  assert.ok(!engine.received.some((m) => m.type === 'response.cancel'))
+})
+
 test('a stop the engine never acknowledges settles at the ceiling, still cancelled, and closes the session', async (t) => {
   const engine = await withEngine(t, { mode: 'silent' })
   const ac = new AbortController()

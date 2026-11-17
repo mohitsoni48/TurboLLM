@@ -191,7 +191,9 @@ export function requestRealtimeAudioReply(
     let settled = false
     let sessionSeen = false
     let requested = false
-    let stopping: 'abort' | 'timeout' | null = null
+    let stopping: 'abort' | 'timeout' | 'error' | null = null
+    /** The engine's own error, for a reply that failed after it had been asked for: told to the caller once it has stopped. */
+    let engineError: AudioReplyError | null = null
     let cancelTimerHandle: unknown = null
     let resendHandle: unknown = null
     let handshakeHandle: unknown = null
@@ -236,7 +238,7 @@ export function requestRealtimeAudioReply(
     // every `cancelResendMs` until the engine says `response.done`, and the session stays open until it has: closing
     // early would leave the reply generating on the engine's only slot. Only the ceiling, or a socket that is gone,
     // ends the wait without it. A socket that has not got as far as asking for a reply has nothing to cancel.
-    const stop = (why: 'abort' | 'timeout') => {
+    const stop = (why: 'abort' | 'timeout' | 'error') => {
       if (settled || stopping) return
       stopping = why
       if (!requested) {
@@ -257,6 +259,7 @@ export function requestRealtimeAudioReply(
     }
     const settleStopped = () => {
       if (stopping === 'timeout') finish(() => reject(timedOut()))
+      else if (stopping === 'error') finish(() => reject(engineError))
       else resolveWith('cancelled')
     }
     const onAbort = () => stop('abort')
@@ -280,7 +283,13 @@ export function requestRealtimeAudioReply(
       if (stopping && ev.type === 'error') return
       collector.push(ev)
       if (collector.error) {
-        finish(() => reject(collector.error))
+        // After the reply was asked for it may still be generating on the engine's only slot, and closing does not stop
+        // it: it is cancelled as a stop is, then the caller is told the engine's error. Before that (an unknown voice
+        // answers `session.update` with one) there is nothing to cancel.
+        if (requested && !collector.done) {
+          engineError = collector.error
+          stop('error')
+        } else finish(() => reject(collector.error))
         return
       }
       if (ev.type === 'session.created') {
@@ -313,6 +322,7 @@ export function requestRealtimeAudioReply(
       } else if (collector.done) {
         // A reply that ended after the budget ran out is still a timeout to the caller, whatever the engine made of the cancel.
         if (stopping === 'timeout') finish(() => reject(timedOut()))
+        else if (stopping === 'error') finish(() => reject(engineError))
         else resolveWith()
       }
     })

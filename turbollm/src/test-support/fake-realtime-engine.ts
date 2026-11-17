@@ -22,7 +22,9 @@ export interface FakeRealtimeOptions {
   /** `complete` plays the whole reply; `cancellable` stops after the first audio delta and finishes only when
    *  `response.cancel` arrives (with a cancelled `response.done`); `silent` says nothing after `response.create`
    *  and ignores `response.cancel` too, like an engine that is not answering. */
-  mode?: 'complete' | 'cancellable' | 'silent' | 'prefill'
+  mode?: 'complete' | 'cancellable' | 'silent' | 'prefill' | 'error'
+  /** `error` mode: the reply gets under way, then the engine reports an error but goes on generating, and ends the reply
+   *  (`response.done`, cancelled) only for the second `response.cancel` it receives. */
   /** `prefill` mode: how long after `response.create` the reply gets under way. A `response.cancel` that arrives before
    *  it is dropped without a word, as llama-server drops one during prefill; one after it is acknowledged. */
   prefillMs?: number
@@ -60,6 +62,7 @@ export async function startFakeRealtimeEngine(opts: FakeRealtimeOptions = {}): P
     ws.on('error', () => {})
     const send = (e: Json) => { if (ws.readyState === 1) { sent.push(e.type); ws.send(JSON.stringify(e)) } }
     let replying = false
+    let cancels = 0
     send(events[0])
     ws.on('message', (raw: Buffer) => {
       const msg = JSON.parse(String(raw)) as Json
@@ -71,6 +74,13 @@ export async function startFakeRealtimeEngine(opts: FakeRealtimeOptions = {}): P
       }
       if (msg.type === 'response.create') {
         if (mode === 'silent') return
+        if (mode === 'error') {
+          const reply = events.slice(2)
+          const firstAudio = reply.findIndex((e) => e.type === 'response.output_audio.delta')
+          reply.slice(0, firstAudio + 1).forEach(send)
+          send({ type: 'error', error: { type: 'server_error', message: 'the engine failed mid-reply' } })
+          return
+        }
         if (mode === 'prefill') {
           const reply = events.slice(2)
           const firstAudio = reply.findIndex((e) => e.type === 'response.output_audio.delta')
@@ -84,6 +94,10 @@ export async function startFakeRealtimeEngine(opts: FakeRealtimeOptions = {}): P
         if (mode === 'complete') return reply.forEach(send)
         const firstAudio = reply.findIndex((e) => e.type === 'response.output_audio.delta')
         reply.slice(0, firstAudio + 1).forEach(send)
+        return
+      }
+      if (msg.type === 'response.cancel' && mode === 'error' && ++cancels === 2) {
+        send(loadRealtimeFixture('realtime-cancelled').at(-1)!)
         return
       }
       if (msg.type === 'response.cancel' && (mode === 'cancellable' || (mode === 'prefill' && replying))) {
