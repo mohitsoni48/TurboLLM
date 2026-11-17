@@ -106,14 +106,32 @@ test('clips of one turn are joined back to back when they share a rate, and refu
 
 test('the clips of a turn are capped by their total duration, read from the headers before anything is decoded', () => {
   const silence = (ms: number, rate: number, channels: number, bytes: number) => Buffer.alloc(Math.round((ms / 1000) * rate) * channels * bytes)
-  const clip = (ms: number) => wav({ format: 1, channels: 1, rate: 16000, bits: 16, data: silence(ms, 16000, 1, 2) })
-  assert.throws(() => decodeWavClips([clip(MAX_SPOKEN_INPUT_MS + 1000)]), /301 s of audio, and at most 5 minutes/)
-  // Stereo float counts its channels and sample size.
-  const stereoFloat = wav({ format: 3, channels: 2, rate: 8000, bits: 32, data: silence(301_000, 8000, 2, 4) })
-  assert.throws(() => decodeWavClips([stereoFloat]), /at most 5 minutes/)
+  const clip = (ms: number, rate = 16000) => wav({ format: 1, channels: 1, rate, bits: 16, data: silence(ms, rate, 1, 2) })
+  const tooLong = /longer than 5 minutes/
+  assert.throws(() => decodeWavClips([clip(MAX_SPOKEN_INPUT_MS + 1000)]), tooLong)
   // The limit is on the total: three clips of two minutes are refused, though each alone is fine.
-  assert.throws(() => decodeWavClips([clip(120_000), clip(120_000), clip(120_000)]), /at most 5 minutes/)
-  // Within it, the clips decode and join.
-  assert.deepEqual(decodeWavClips([wav({ format: 1, channels: 1, rate: 16000, bits: 16, data: int16(1) }), wav({ format: 1, channels: 1, rate: 16000, bits: 16, data: int16(2) })]), { pcm16: int16(1, 2), sampleRate: 16000 })
+  assert.throws(() => decodeWavClips([clip(120_000), clip(120_000), clip(120_000)]), tooLong)
+  // The refusal is about length alone: it does not tell the sender to resend a PCM16 or float32 WAV.
+  assert.throws(() => decodeWavClips([clip(MAX_SPOKEN_INPUT_MS + 1000)]), (e: Error) => !/PCM16|float32|Unsupported/.test(e.message))
+  // What the recorder itself produces at its five-minute stop is accepted: it runs a capture block or two over, at 16 kHz
+  // and at the 48 kHz a device may capture at.
+  assert.ok(decodeWavClips([clip(300_032)]).pcm16.length > 0)
+  assert.ok(decodeWavClips([clip(300_100, 48000)]).pcm16.length > 0)
   assert.ok(decodeWavClips([clip(MAX_SPOKEN_INPUT_MS)]).pcm16.length > 0, 'exactly the limit is accepted')
+  assert.deepEqual(decodeWavClips([wav({ format: 1, channels: 1, rate: 16000, bits: 16, data: int16(1) }), wav({ format: 1, channels: 1, rate: 16000, bits: 16, data: int16(2) })]), { pcm16: int16(1, 2), sampleRate: 16000 })
+})
+
+test('the work is bounded as well as the seconds: too many samples in all, however short the clip', () => {
+  // 200 s of 48 kHz stereo float is under the duration limit and about 19 million samples.
+  const stereo = wav({ format: 3, channels: 2, rate: 48000, bits: 32, data: Buffer.alloc(200 * 48000 * 2 * 4) })
+  assert.throws(() => decodeWavClips([stereo]), /too much audio data/)
+  assert.ok(decodeWavClips([wav({ format: 3, channels: 2, rate: 48000, bits: 32, data: Buffer.alloc(60 * 48000 * 2 * 4) })]).pcm16.length > 0)
+})
+
+test('a file padded with empty chunks before its audio is refused rather than walked', () => {
+  const junk = Buffer.concat(Array.from({ length: 40 }, () => Buffer.concat([Buffer.from('JUNK'), Buffer.from([0, 0, 0, 0])])))
+  assert.throws(() => decodeWavToPcm16Mono(wav({ format: 1, channels: 1, rate: 16000, bits: 16, data: int16(1, 2), extra: junk })), /too many chunks/)
+  // The usual few (fmt, LIST, fact) are fine.
+  const few = Buffer.concat(Array.from({ length: 3 }, () => Buffer.concat([Buffer.from('LIST'), Buffer.from([0, 0, 0, 0])])))
+  assert.deepEqual(decodeWavToPcm16Mono(wav({ format: 1, channels: 1, rate: 16000, bits: 16, data: int16(1, 2), extra: few })).pcm16, int16(1, 2))
 })

@@ -251,8 +251,8 @@ test('audio longer than the recorder allows is refused before the router is aske
   const h = await harness(t)
   const proxied = proxyStub(t)
   const ask = (...data: string[]) => spokenAsk({ messages: [{ role: 'user', content: data.map((d) => ({ type: 'input_audio', input_audio: { data: d, format: 'wav' } })) }] })
-  await refused(h, proxied, ask(wavB64(16000, 301 * 16000)), 400, 'audio_format_unsupported', /at most 5 minutes/)
-  await refused(h, proxied, ask(wavB64(16000, 120 * 16000), wavB64(16000, 120 * 16000), wavB64(16000, 120 * 16000)), 400, 'audio_format_unsupported', /at most 5 minutes/)
+  await refused(h, proxied, ask(wavB64(16000, 311 * 16000)), 400, 'audio_format_unsupported', /longer than 5 minutes/)
+  await refused(h, proxied, ask(wavB64(16000, 120 * 16000), wavB64(16000, 120 * 16000), wavB64(16000, 120 * 16000)), 400, 'audio_format_unsupported', /longer than 5 minutes/)
   assert.deepEqual(h.routed, [])
 })
 

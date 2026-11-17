@@ -8,6 +8,7 @@ const FORMAT_EXTENSIBLE = 0xfffe
  *  rate would also make the engine's input chunks tiny. */
 const MIN_SAMPLE_RATE = 8000
 const MAX_SAMPLE_RATE = 192000
+const MAX_CHUNKS_BEFORE_DATA = 16
 
 /** Mono PCM16 samples and the rate they were recorded at. */
 export interface DecodedWav {
@@ -36,7 +37,11 @@ function readWavHeader(buf: Buffer): WavHeader {
   let bits = 0
   let data: Buffer | null = null
   let off = 12
+  let chunks = 0
   while (off + 8 <= buf.length) {
+    // A real file has a fmt chunk, perhaps LIST and fact, then data. A file padded with empty chunks would make this walk
+    // as costly as decoding, so only a handful are read.
+    if (++chunks > MAX_CHUNKS_BEFORE_DATA) fail('it has too many chunks before its audio')
     const id = buf.toString('ascii', off, off + 4)
     const size = buf.readUInt32LE(off + 4)
     const body = off + 8
@@ -70,7 +75,10 @@ function readWavHeader(buf: Buffer): WavHeader {
  *  channels are averaged, floats are scaled and clipped. Anything else (8, 24 or 32-bit integers, A-law, a compressed
  *  codec, a file that is not WAV at all) throws with a message that says what to send instead. */
 export function decodeWavToPcm16Mono(buf: Buffer): DecodedWav {
-  const { isFloat, channels, sampleRate, bytesPerSample, data } = readWavHeader(buf)
+  return decodeFromHeader(readWavHeader(buf))
+}
+
+function decodeFromHeader({ isFloat, channels, sampleRate, bytesPerSample, data }: WavHeader): DecodedWav {
   const frames = Math.floor(data.length / (bytesPerSample * channels))
   if (frames === 0) fail('it holds no audio')
   const out = Buffer.alloc(frames * 2)
@@ -85,23 +93,31 @@ export function decodeWavToPcm16Mono(buf: Buffer): DecodedWav {
   return { pcm16: out, sampleRate }
 }
 
-/** The most speech one turn may carry, in all its clips: the recorder's own limit (web/src/lib/voice/recorder.ts,
- *  MAX_RECORDING_MS). Decoding is a loop in JS on the daemon's one thread, so a clip longer than anyone can record is
- *  refused before it is decoded rather than stalling every stream and the status API while it is. */
-export const MAX_SPOKEN_INPUT_MS = 5 * 60_000
+/** The most speech one turn may carry, in all its clips: the recorder's own five minutes (web/src/lib/voice/recorder.ts,
+ *  MAX_RECORDING_MS) plus the little it runs over before it stops (it stops at the first capture block past the limit and
+ *  keeps what it collected until the caller's stop). Decoding is a loop in JS on the daemon's one thread, so a clip no one
+ *  could have recorded is refused before it is decoded rather than stalling every stream while it is. */
+export const MAX_SPOKEN_INPUT_MS = 5 * 60_000 + 10_000
 
-/** Decodes the clips of one turn and joins them (concatPcm16). Their total length is read from their headers alone
- *  and checked against MAX_SPOKEN_INPUT_MS before any sample is decoded. Throws as decodeWavToPcm16Mono does. */
+/** The most samples (frames times channels, over all clips) one turn may carry. Seconds alone bound playing time, not
+ *  work: a high-rate or multichannel clip is far more samples for the same seconds. This is five minutes of 48 kHz mono,
+ *  more than any recording the page makes, and keeps a decode to a fraction of a second. */
+export const MAX_SPOKEN_INPUT_SAMPLES = 16_000_000
+
+/** Decodes the clips of one turn and joins them (concatPcm16). Each header is read once; the total length and sample count
+ *  are checked against the limits above before any sample is decoded. Throws as decodeWavToPcm16Mono does. */
 export function decodeWavClips(wavs: Buffer[]): DecodedWav {
+  const headers = wavs.map(readWavHeader)
   let ms = 0
-  for (const wav of wavs) {
-    const { channels, sampleRate, bytesPerSample, data } = readWavHeader(wav)
-    ms += (data.length / (sampleRate * channels * bytesPerSample)) * 1000
+  let samples = 0
+  for (const { channels, sampleRate, bytesPerSample, data } of headers) {
+    const frames = data.length / (bytesPerSample * channels)
+    ms += (frames / sampleRate) * 1000
+    samples += frames * channels
   }
-  if (ms > MAX_SPOKEN_INPUT_MS) {
-    fail(`it is ${Math.round(ms / 1000)} s of audio, and at most ${MAX_SPOKEN_INPUT_MS / 60_000} minutes is read in one message`)
-  }
-  return concatPcm16(wavs.map((w) => decodeWavToPcm16Mono(w)))
+  if (ms > MAX_SPOKEN_INPUT_MS) throw new Error('The recording is longer than 5 minutes, which is the most read in one message.')
+  if (samples > MAX_SPOKEN_INPUT_SAMPLES) throw new Error('The recording holds too much audio data (its sample rate and channels times its length); send it as mono, or shorter.')
+  return concatPcm16(headers.map(decodeFromHeader))
 }
 
 /** Wraps mono PCM16 in the 44-byte header of a canonical WAV file. */

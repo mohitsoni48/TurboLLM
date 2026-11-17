@@ -267,8 +267,8 @@ test('an empty recording and an absurd sample rate are refused with 400 before a
 test('recordings longer than the recorder allows, in total, are refused with 400 before anything is stored or decoded', async (t) => {
   const h = await harness(t)
   const long = (seconds: number) => wavUrl(16000, seconds * 16000)
-  await refused(h, { audio: [long(301)], replyAudio: true }, 400, 'audio_format_unsupported', /at most 5 minutes/)
-  await refused(h, { audio: [long(120), long(120), long(120)], replyAudio: true }, 400, 'audio_format_unsupported', /at most 5 minutes/)
+  await refused(h, { audio: [long(311)], replyAudio: true }, 400, 'audio_format_unsupported', /longer than 5 minutes/)
+  await refused(h, { audio: [long(120), long(120), long(120)], replyAudio: true }, 400, 'audio_format_unsupported', /longer than 5 minutes/)
 })
 
 test('a WAV the decoder cannot read, images, and a replyAudio that is not a boolean are refused with 400', async (t) => {
