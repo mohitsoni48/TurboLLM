@@ -18,6 +18,7 @@ import { execFile, spawnSync, type ChildProcessByStdio } from 'node:child_proces
 import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync, type Dirent } from 'node:fs'
 import { rm } from 'node:fs/promises'
+import { availableParallelism, freemem } from 'node:os'
 import { basename, delimiter, dirname, join, normalize } from 'node:path'
 import {
   buildEnv,
@@ -487,6 +488,52 @@ export function sourceBuildDirOf(binPath: string, enginesRoot: string): string |
 export function pickGenerator(hasNinja: boolean, isWindows: boolean): 'Ninja' | 'NMake Makefiles' | 'Unix Makefiles' {
   if (hasNinja) return 'Ninja'
   return isWindows ? 'NMake Makefiles' : 'Unix Makefiles'
+}
+
+/** Memory one compile job may take: llama.cpp's CUDA template units (flash-attention, matmul) take several GB each;
+ *  plain C++ units far less. Kaggle's setup caps a CUDA build at 2 jobs on ~29 GB for the same reason. */
+const GB = 1024 ** 3
+const JOB_MEMORY_BYTES = { cuda: 4 * GB, cpu: 2 * GB }
+/** The most jobs TURBOLLM_BUILD_JOBS may ask for: a typo (`400`) should not start hundreds of compilers. */
+export const MAX_BUILD_JOBS = 64
+
+/** The memory a build may use: the system's free memory, or less when this process runs under a limit. On Linux
+ *  `os.freemem()` reads the host's /proc/meminfo and ignores a container's cgroup limit (Docker `--memory=8g` on a
+ *  64 GB host), while `process.availableMemory()` follows it. */
+export function buildMemoryBytes(freeMem: number, availableMemory?: number): number {
+  return availableMemory !== undefined && availableMemory > 0 ? Math.min(freeMem, availableMemory) : freeMem
+}
+
+/** PURE: how many compile jobs a build runs at once (`cmake --build -j N`). A bare `-j` is unbounded for Makefiles
+ *  and CPUs + 2 for Ninja, and on a box with less memory than that many jobs need (WSL2 gets half the host's RAM)
+ *  the kernel's OOM killer takes compilers mid-build: the build hangs or the whole VM stalls (GitHub #330).
+ *  So: as many jobs as both the free memory and the CPUs allow, at least 1.
+ *  - `override` (TURBOLLM_BUILD_JOBS, the name deploy/kaggle/setup.sh already uses) wins when it is a plain positive
+ *    integer, capped at MAX_BUILD_JOBS (`1e3`, `0x10` and `1.5` are not plain integers and are ignored).
+ *  - macOS: the CPU count. Its `os.freemem()` counts only completely unused pages, so a busy Mac reports under 2 GB
+ *    "free" with plenty reclaimable, and a Metal or CPU build has no multi-GB units anyway.
+ *  - Android keeps its fixed 2 (os.cpus() is unreliable there, see configureAndCompile). */
+export function compileJobs(o: { cpus: number; freeMemBytes: number; cuda: boolean; android: boolean; platform?: NodeJS.Platform; override?: string }): number {
+  if (o.override && /^[1-9]\d*$/.test(o.override.trim())) return Math.min(Number(o.override.trim()), MAX_BUILD_JOBS)
+  if (o.android) return 2
+  const cpus = Math.max(1, Math.floor(o.cpus))
+  if (o.platform === 'darwin') return cpus
+  const byMemory = Math.floor(o.freeMemBytes / (o.cuda ? JOB_MEMORY_BYTES.cuda : JOB_MEMORY_BYTES.cpu))
+  return Math.max(1, Math.min(cpus, byMemory))
+}
+
+/** PURE: the compile step's cmake argv: just the server target, at `jobs` parallel jobs. */
+export function compileArgsFor(buildSubdir: string, jobs: number): string[] {
+  return ['--build', buildSubdir, '-j', String(jobs), '--target', 'llama-server']
+}
+
+/** PURE: the build log's line about the job count. NMake ignores `-j` (one job at a time, whatever it is given);
+ *  one job is called out with how to get more, since it is the slow case. */
+export function compileJobsNote(o: { jobs: number; memBytes: number; cuda: boolean; generator: string }): string {
+  const free = `${(o.memBytes / GB).toFixed(1)} GB free${o.cuda ? ', CUDA' : ''}`
+  if (o.generator === 'NMake Makefiles') return `Compiling one job at a time: NMake runs no parallel jobs (${free}). Add ninja under Build environment for a faster build.`
+  if (o.jobs === 1) return `Compiling with 1 job: only that fits in the free memory (${free}). Close other apps or set TURBOLLM_BUILD_JOBS for more.`
+  return `Compiling with ${o.jobs} parallel jobs (${free}; set TURBOLLM_BUILD_JOBS to change it).`
 }
 
 /** PURE: true when a macOS Metal build's compile log shows the fork's own source calling
@@ -1394,7 +1441,8 @@ async function buildFromSource(
     }
 
     // Compile just the server target (Ninja/Makefiles parallelize with -j; NMake ignores it).
-    // Android is capped at -j2, not unbounded like every other platform: llama.cpp's large
+    // The job count is sized to the free memory and CPUs (compileJobs): an unbounded -j ran out of
+    // memory on WSL2 and stalled the VM (GitHub #330). Android is capped at -j2: llama.cpp's large
     // per-model-architecture translation-unit set is memory-heavy to compile in parallel, and an
     // unbounded build reproducibly killed the whole session (not just the compiler — exit 255)
     // on a 2 GB emulator; a real low-RAM phone can hit the identical wall. `os.cpus()` isn't a
@@ -1403,7 +1451,12 @@ async function buildFromSource(
     // (confirmed live: -j2 compiled clean to 100% where unbounded died twice around 35-41%),
     // not a guess.
     hooks.phase('compiling')
-    const compileArgs = ['--build', buildSubdir, '-j', ...(isAndroid ? ['2'] : []), '--target', 'llama-server']
+    // CMAKE_CONFIGURE_ARGS spells it exactly so (pinned by build-runner.test.ts).
+    const cuda = cmakeArgs.includes('-DGGML_CUDA=ON')
+    const memBytes = buildMemoryBytes(freemem(), process.availableMemory?.())
+    const jobs = compileJobs({ cpus: availableParallelism(), freeMemBytes: memBytes, cuda, android: isAndroid, platform: process.platform, override: process.env.TURBOLLM_BUILD_JOBS })
+    hooks.log(compileJobsNote({ jobs, memBytes, cuda, generator }))
+    const compileArgs = compileArgsFor(buildSubdir, jobs)
     if (isWindows) {
       const compileBat = join(buildRoot, '_tllm_build.bat')
       writeFileSync(compileBat, vcvarsBatch(vcvars!, compileArgs))
