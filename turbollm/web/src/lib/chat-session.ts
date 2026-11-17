@@ -222,8 +222,10 @@ export class ChatSession {
   // Record one generated token for `convId` and return its rolling 2-second tok/s estimate. In place: the timestamps
   // are in order, so only the oldest can have left the window. Copying and filtering the whole list per token cost
   // quadratic time on an attach's replay, where every frame lands within the window: 6,000 frames took 350 ms.
+  // performance.now(), not Date.now(): it only moves forward, so a wall-clock change mid-stream cannot strand stale
+  // entries in the window (the "in order" the trim relies on).
   private pushGenToken(convId: string) {
-    const now = Date.now()
+    const now = performance.now()
     const timestamps = (this.deltaTimestamps[convId] ??= [])
     timestamps.push(now)
     let expired = 0

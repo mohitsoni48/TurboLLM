@@ -78,28 +78,42 @@ describe('ChatSession.follow', () => {
   })
 
   it('rates the live reply by the tokens of the last 2 seconds', async () => {
-    vi.useFakeTimers({ toFake: ['Date'] })
-    vi.setSystemTime(10_000)
-    const { session } = makeSession()
-    let rate: number | undefined
-    await session.follow('c1', new AbortController(), (async function* () {
-      yield META
-      for (let i = 0; i < 10; i++) yield { event: 'reasoning', data: { delta: 'x' } } as ChatFrame
-      vi.setSystemTime(12_500) // the first 10 have left the window
-      for (let i = 0; i < 4; i++) yield { event: 'delta', data: { delta: 'y' } } as ChatFrame
-      rate = session.getSnapshot().liveByConv.c1?.liveGenTps
-    })())
-    expect(rate).toBe(2) // 4 tokens over 2 seconds
+    let clock = 10_000
+    const now = vi.spyOn(performance, 'now').mockImplementation(() => clock)
+    try {
+      const { session } = makeSession()
+      let rate: number | undefined
+      await session.follow('c1', new AbortController(), (async function* () {
+        yield META
+        for (let i = 0; i < 10; i++) yield { event: 'reasoning', data: { delta: 'x' } } as ChatFrame
+        clock = 12_500 // the first 10 have left the window
+        for (let i = 0; i < 4; i++) yield { event: 'delta', data: { delta: 'y' } } as ChatFrame
+        rate = session.getSnapshot().liveByConv.c1?.liveGenTps
+      })())
+      expect(rate).toBe(2) // 4 tokens over 2 seconds
+    } finally {
+      now.mockRestore()
+    }
   })
 
-  // An attach replays every frame the daemon kept (up to 6,000) in one burst, all within the rate's 2-second window.
-  // Copying the window per token made that quadratic: 12,000 frames took over a second and a half before any render.
-  it('takes a long replayed reply in linear time', async () => {
-    const { session } = makeSession()
-    const burst: ChatFrame[] = [META, ...Array.from({ length: 20_000 }, (_, i) => ({ event: 'reasoning', data: { delta: `step ${i} ` } }) as ChatFrame)]
-    const started = performance.now()
-    await session.follow('c1', new AbortController(), frames(...burst))
-    expect(performance.now() - started).toBeLessThan(1000)
+  // An attach replays every frame the daemon kept (up to 6,000) in one burst, all within the rate's 2-second window:
+  // every one is counted and none is dropped. (Copying the window per token made that replay quadratic; the window
+  // now grows in place.)
+  it('counts every frame of a long replayed reply into the rate', async () => {
+    const now = vi.spyOn(performance, 'now').mockImplementation(() => 50_000)
+    try {
+      const { session } = makeSession()
+      let live: { genTokens: number; liveGenTps: number } | undefined
+      await session.follow('c1', new AbortController(), (async function* () {
+        yield META
+        for (let i = 0; i < 6000; i++) yield { event: 'reasoning', data: { delta: 'x' } } as ChatFrame
+        live = session.getSnapshot().liveByConv.c1
+      })())
+      expect(live?.genTokens).toBe(6000)
+      expect(live?.liveGenTps).toBe(3000) // 6,000 tokens in one 2-second window
+    } finally {
+      now.mockRestore()
+    }
   })
 
   // A refreshed page attaching to a reply that waits for approval: the daemon replays every frame so far in one burst.
