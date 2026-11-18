@@ -289,6 +289,36 @@ test('latestBuildTagRelease: skips a newer release whose archives have not been 
   assert.equal(await latestBuildTagRelease('o/r'), 'b12395')
 })
 
+// b12405 was published with 7 assets (the cudart runtimes and one Android archive) while its neighbours carry 38:
+// the desktop archives were never uploaded. It is not empty, so the empty-release check let it through and the CUDA
+// update failed with "no release asset matching ...".
+test('latestBuildTagRelease: skips a newer release that has no desktop archive, only runtimes and Android', async (t) => {
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async () => new Response(JSON.stringify([
+    {
+      tag_name: 'b12405',
+      assets: [
+        { name: 'cudart-llama-bin-win-cuda-13.5-x64.zip' },
+        { name: 'cudart-llama-b12405-bin-ubuntu-cuda-13.5-x64.tar.gz' },
+        { name: 'llama-b12405-bin-android-arm64-snapdragon.tar.gz' },
+      ],
+    },
+    { tag_name: 'b12404', assets: [{ name: 'llama-b12404-bin-win-cuda-13.5-x64.zip' }] },
+  ]), { status: 200 })) as typeof fetch
+  assert.equal(await latestBuildTagRelease('o/r'), 'b12404')
+})
+
+test('latestBuildTagRelease: accepts a release whose only desktop archive is for macOS or Ubuntu', async (t) => {
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async () => new Response(JSON.stringify([
+    { tag_name: 'b12406', assets: [{ name: 'llama-b12406-bin-macos-arm64.tar.gz' }] },
+    { tag_name: 'b12405', assets: [{ name: 'llama-b12405-bin-ubuntu-x64.tar.gz' }] },
+  ]), { status: 200 })) as typeof fetch
+  assert.equal(await latestBuildTagRelease('o/r'), 'b12406')
+})
+
 // ─── CUDA toolkit-version drift (engine update 404) ────────────────────────────
 // Upstream bumps the Windows CUDA toolkit in the archive name (13.3 → 13.4 → 13.5) without notice, so a
 // hardcoded `cuda-13.3` URL 404s once the latest tag crosses a bump. Both the binary and its cudart

@@ -47,6 +47,26 @@ function splits(s: string): string[][] {
 }
 
 describe('readSseStream', () => {
+  // A stream the daemon holds open (a reply waiting for approval) never ends on its own. A consumer that stopped
+  // reading without cancelling kept its connection, and a page has six per host: leaked ones starved every request.
+  it('cancels the body when its consumer stops early, and only then', async () => {
+    // The reader's cancel, not the source's: cancelling a stream that has already ended never reaches its source.
+    const cancel = vi.spyOn(ReadableStreamDefaultReader.prototype, 'cancel')
+    try {
+      const open = () => new ReadableStream<Uint8Array>({
+        start(c) { c.enqueue(new TextEncoder().encode('event: a\ndata: 1\n\nevent: b\ndata: 2\n\n')) },
+      })
+      for await (const m of readSseStream(open())) { expect(m.event).toBe('a'); break }
+      expect(cancel).toHaveBeenCalledTimes(1)
+      await expect((async () => { for await (const _ of readSseStream(open())) throw new Error('consumer failed') })()).rejects.toThrow('consumer failed')
+      expect(cancel).toHaveBeenCalledTimes(2)
+      expect(await collect(['event: a\ndata: 1\n\n'])).toHaveLength(1) // read to its end: nothing to cancel
+      expect(cancel).toHaveBeenCalledTimes(2)
+    } finally {
+      cancel.mockRestore()
+    }
+  })
+
   it('dispatches a frame however the transport splits it', async () => {
     const frame = 'event: tool_call\ndata: {"id":"t1","status":"awaiting_approval"}\n\n'
     for (const chunks of splits(frame)) {

@@ -15,18 +15,29 @@ import type { Deps } from '../deps'
 import type { CustomChatAgent, BuiltinAgentOverride } from '../config/config'
 import { isLocalOrAuthenticated } from '../auth'
 import { listsMcpTool, MCP_AGENT_REFUSED_MESSAGE } from '../tools/tool-registry'
+import { body } from '../api/http'
+import { nonStringField } from '../util/string-fields'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function err(c: any, status: number, code: string, message: string) {
   return c.json({ error: { code, message } }, status)
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function body<T>(c: any): Promise<T> {
-  try { return (await c.req.json()) as T } catch { return {} as T }
-}
 
 const AGENT_CAP = 50
+
+/** The 400 message for an agent body whose fields are not the types the routes trim and store: a number, object or array
+ *  in name/description/systemPrompt threw (`.trim is not a function`, a config.json the validator then refused), and a
+ *  skillIds/tools that was not an array of strings was read as "none" (sanitizeStringArray), so `tools: "web_search"` or
+ *  `tools: [7]` silently left the agent with no tools. Absent and null fields are left as they are: the edit routes
+ *  read null as absent, as the create route already did (`?.`, `??`), where `name: null` used to throw. */
+function agentFieldsError(b: object): string | undefined {
+  const text = nonStringField(b, ['name', 'description', 'systemPrompt'])
+  if (text) return `${text} must be a string.`
+  const lists = b as Record<string, unknown>
+  const list = ['skillIds', 'tools'].find((f) => lists[f] != null && !(Array.isArray(lists[f]) && (lists[f] as unknown[]).every((x) => typeof x === 'string')))
+  return list ? `${list} must be an array of strings.` : undefined
+}
 
 function sanitizeStringArray(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
@@ -44,12 +55,14 @@ export function registerChatAgentRoutes(app: Hono, d: Deps): void {
     const id = c.req.param('id')
     if (!id.trim()) return err(c, 400, 'invalid_config_value', 'id is required.')
     const b = await body<BuiltinAgentOverride>(c)
+    const invalid = agentFieldsError(b)
+    if (invalid) return err(c, 400, 'invalid_config_value', invalid)
     const override: BuiltinAgentOverride = {}
-    if (b.name !== undefined) override.name = b.name.trim()
-    if (b.description !== undefined) override.description = b.description.trim()
-    if (b.systemPrompt !== undefined) override.systemPrompt = b.systemPrompt
-    if (b.skillIds !== undefined) override.skillIds = sanitizeStringArray(b.skillIds)
-    if (b.tools !== undefined) override.tools = sanitizeStringArray(b.tools)
+    if (b.name != null) override.name = b.name.trim()
+    if (b.description != null) override.description = b.description.trim()
+    if (b.systemPrompt != null) override.systemPrompt = b.systemPrompt
+    if (b.skillIds != null) override.skillIds = sanitizeStringArray(b.skillIds)
+    if (b.tools != null) override.tools = sanitizeStringArray(b.tools)
     if (Object.keys(d.store.snapshot().builtinAgentOverrides).length >= AGENT_CAP && !(id in d.store.snapshot().builtinAgentOverrides)) {
       return err(c, 400, 'too_many_agents', `Override limit reached (${AGENT_CAP}).`)
     }
@@ -67,6 +80,8 @@ export function registerChatAgentRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/chat-agents', async (c) => {
     const b = await body<Partial<CustomChatAgent>>(c)
+    const invalid = agentFieldsError(b)
+    if (invalid) return err(c, 400, 'invalid_config_value', invalid)
     // A chat routine runs every tool its agent lists with no approval (chat-runner.ts), so an
     // agent naming the owner's MCP tool is a standing approval to run it: the isLocalOrAuthenticated
     // bar adding the MCP server has (listsMcpTool). Without it a keyless Serve identity, Access JWT
@@ -98,19 +113,21 @@ export function registerChatAgentRoutes(app: Hono, d: Deps): void {
       return err(c, 404, 'not_found', 'Agent not found.')
     }
     const b = await body<Partial<CustomChatAgent>>(c)
+    const invalid = agentFieldsError(b)
+    if (invalid) return err(c, 400, 'invalid_config_value', invalid)
     // Same rule as the create route, for an edit that adds an MCP tool and for any edit of an agent
     // that has one: its system prompt and skills are what a chat routine runs that tool under.
     if ((listsMcpTool(existing.tools) || listsMcpTool(sanitizeStringArray(b.tools))) && !isLocalOrAuthenticated(c, d)) {
       return err(c, 403, 'api_key_required', MCP_AGENT_REFUSED_MESSAGE)
     }
-    if (b.name !== undefined && !b.name.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
+    if (b.name != null && !b.name.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
     d.store.update((cfg) => {
       const a = cfg.customAgents.find((x) => x.id === id)!
-      if (b.name !== undefined) a.name = b.name.trim()
-      if (b.description !== undefined) a.description = b.description.trim()
-      if (b.systemPrompt !== undefined) a.systemPrompt = b.systemPrompt
-      if (b.skillIds !== undefined) a.skillIds = sanitizeStringArray(b.skillIds)
-      if (b.tools !== undefined) a.tools = sanitizeStringArray(b.tools)
+      if (b.name != null) a.name = b.name.trim()
+      if (b.description != null) a.description = b.description.trim()
+      if (b.systemPrompt != null) a.systemPrompt = b.systemPrompt
+      if (b.skillIds != null) a.skillIds = sanitizeStringArray(b.skillIds)
+      if (b.tools != null) a.tools = sanitizeStringArray(b.tools)
     })
     return c.json(d.store.snapshot().customAgents.find((a) => a.id === id)!)
   })

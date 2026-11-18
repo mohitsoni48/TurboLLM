@@ -32,10 +32,11 @@ export async function* readSseStream(body: ReadableStream<Uint8Array>): AsyncGen
   let data = ''
   let hasData = false
   let id: string | undefined
+  let ended = false
   try {
     while (true) {
       const { done, value } = await reader.read()
-      if (done) break
+      if (done) { ended = true; break }
       buf += decoder.decode(value, { stream: true })
       const lines = buf.split('\n')
       buf = lines.pop() ?? ''
@@ -61,6 +62,10 @@ export async function* readSseStream(body: ReadableStream<Uint8Array>): AsyncGen
       }
     }
   } finally {
+    // A consumer that stops early (it returned, or threw) must close the body, not only let go of it: an open body
+    // keeps its connection, a stream the daemon holds open (a reply waiting for approval) never ends on its own, and
+    // a page gets six connections per host. Leaked ones once starved every other request.
+    if (!ended) await reader.cancel().catch(() => {})
     reader.releaseLock()
   }
 }
