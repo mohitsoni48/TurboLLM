@@ -1,7 +1,7 @@
 // '@skill-id' in the composer: a trailing '@partial' opens the skill picker, picking one completes the token, and a sent
 // message turns on every skill it names, the way '/skill-id' at the start of a message already does.
 import { describe, it, expect } from 'vitest'
-import { completeMention, findMentionedSkillIds, trailingMentionQuery } from './skill-mentions'
+import { completeMention, dismissMention, findMentionedSkillIds, trailingMentionQuery } from './skill-mentions'
 
 const skills = [{ id: 'web-research' }, { id: 'code-review' }, { id: 'web' }]
 
@@ -27,7 +27,19 @@ describe('completeMention', () => {
   })
 })
 
+describe('dismissMention', () => {
+  it('drops only the trailing token, keeping the message before it', () => {
+    expect(dismissMention('cc the report to @co')).toBe('cc the report to ')
+    expect(dismissMention('@co')).toBe('')
+  })
+})
+
 describe('findMentionedSkillIds', () => {
+  it('matches a name typed with capitals, and one followed by an apostrophe', () => {
+    expect(findMentionedSkillIds('@Web-Research please', skills)).toEqual(['web-research'])
+    expect(findMentionedSkillIds("what is @web-research's take", skills)).toEqual(['web-research'])
+  })
+
   it('returns the ids of known skills named with @, once each, in order', () => {
     expect(findMentionedSkillIds('ask @code-review and @web-research, then @code-review again', skills)).toEqual(['code-review', 'web-research'])
   })

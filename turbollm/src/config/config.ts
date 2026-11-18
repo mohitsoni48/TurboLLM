@@ -1543,7 +1543,7 @@ function normalize(c: Config): void {
     : []
   // Default skills: absent in older configs → []. Non-empty strings only, each once.
   c.defaultSkillIds = Array.isArray(c.defaultSkillIds)
-    ? [...new Set(c.defaultSkillIds.filter((id): id is string => typeof id === 'string' && id !== ''))]
+    ? [...new Set(c.defaultSkillIds.filter((id): id is string => typeof id === 'string' && id !== ''))].slice(-DEFAULT_SKILLS_CAP)
     : []
   // Built-in agent overrides (Customize → Agents "Edit" + Reset): absent in
   // pre-feature configs → {}. Filter to well-shaped entries.
@@ -1760,6 +1760,10 @@ function validate(c: Config): void {
 /** Preset cap is PER MODEL — at most this many in any one modelKey's array. (customAgents is a
  *  flat list so its cap is global; modelPresets is a Record<string, ModelPreset[]>.) */
 export const MODEL_PRESET_CAP = 50
+
+/** At most this many default skill ids (Config.defaultSkillIds): the skill library's own size limit, so nothing the
+ *  library can hold is turned away and a hand-edited list cannot grow past it. */
+export const DEFAULT_SKILLS_CAP = 200
 
 /** At most this many hidden model keys (Config.hiddenModels); past it the oldest is dropped, and that model shows again.
  *  Far above any library, so only a list no library could fill reaches it. */

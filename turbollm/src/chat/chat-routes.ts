@@ -19,7 +19,7 @@ import { buildSnapshot } from './chat-export'
 import type { ExportFormat } from './chat-export'
 import { pendingToolApprovalName, resolveToolApproval } from '../tools/approval-gate'
 import { isMcpToolName, listsMcpTool, MCP_APPROVAL_REFUSED_MESSAGE } from '../tools/tool-registry'
-import { SkillStore } from '../agents/skills'
+import { CHAT_UNSUPPORTED_SKILL_IDS, SkillStore } from '../agents/skills'
 import { saveSkillFromConversation, SKILL_AUTHORING_REFUSED } from '../agents/skill-jobs'
 import { extractMemoryFacts } from './memory'
 import { codeGateBlocks } from '../routines/routine-routes'
@@ -376,7 +376,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // Only keep ids that exist in the shared skill library; silently drop unknown ones.
     const validIds = new Set(new SkillStore(d.store.dir()).list().map((s) => s.id))
     const requestedSkillIds = Array.isArray(b.skillIds) ? b.skillIds : d.store.snapshot().defaultSkillIds
-    const skillIds = requestedSkillIds?.filter((sid) => validIds.has(sid))
+    const skillIds = requestedSkillIds?.filter((sid) => validIds.has(sid) && (Array.isArray(b.skillIds) || !CHAT_UNSUPPORTED_SKILL_IDS.has(sid)))
     // Tool allow-list baked in from a custom chat Agent (Customize → Agents). Not
     // validated against the live tool catalog — an MCP server disconnecting later
     // shouldn't retroactively corrupt the conversation's saved intent.

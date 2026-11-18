@@ -9,19 +9,20 @@ import { ApiError, track } from '../../lib/api'
 import { useSettings } from '../../lib/queries'
 import { fetchSkills, importSkillText, learnFromFolder, skillKeys } from '../../lib/agent-api'
 import type { Skill } from '../../lib/agent-types'
-import { CHAT_UNSUPPORTED_SKILLS } from '../../lib/skill-mentions'
+import { CHAT_UNSUPPORTED_SKILLS } from '../../lib/chat-skills'
 
 interface SkillCardProps {
   skill: Skill
   onOpen: () => void
-  onByDefault: boolean
-  onToggleByDefault: (on: boolean) => void
+  isDefault: boolean
+  onDefaultChange: (on: boolean) => void
+  saving: boolean
 }
 
-function SkillCard({ skill, onOpen, onByDefault, onToggleByDefault }: SkillCardProps) {
+function SkillCard({ skill, onOpen, isDefault, onDefaultChange, saving }: SkillCardProps) {
   return (
-    <div className="flex flex-col gap-2 rounded-xl border border-border bg-panel px-4 py-3.5 text-left transition-colors hover:border-accent hover:bg-panel-2">
-    <button type="button" onClick={() => { track('skills', 'open_skill'); onOpen() }} className="flex flex-col gap-2 text-left">
+    <div className="group flex flex-col gap-2 rounded-xl border border-border bg-panel px-4 py-3.5 text-left transition-colors hover:border-accent">
+    <button type="button" onClick={() => { track('skills', 'open_skill'); onOpen() }} className="flex flex-col gap-2 rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-accent">
       <div className="flex items-center gap-2">
         <div className="grid h-8 w-8 shrink-0 place-items-center rounded-lg" style={{ background: 'color-mix(in srgb, var(--accent) 14%, transparent)' }}>
           <Sparkles size={15} className="text-accent" />
@@ -47,7 +48,7 @@ function SkillCard({ skill, onOpen, onByDefault, onToggleByDefault }: SkillCardP
     {!CHAT_UNSUPPORTED_SKILLS.has(skill.id) && (
       <label className="mt-auto flex items-center justify-between gap-2 text-[12px] text-muted">
         On by default
-        <Switch aria-label={`On by default: ${skill.name}`} checked={onByDefault} onCheckedChange={onToggleByDefault} />
+        <Switch aria-label={`On by default: ${skill.name}`} checked={isDefault} onCheckedChange={onDefaultChange} disabled={saving} />
       </label>
     )}
     </div>
@@ -64,7 +65,7 @@ export function SkillsLibrary() {
   const setByDefault = (id: string, on: boolean) => {
     track('skills', on ? 'default_skill_on' : 'default_skill_off')
     const without = defaultSkillIds.filter((d) => d !== id)
-    save.mutate({ defaultSkillIds: on ? [...without, id] : without })
+    save.mutate({ defaultSkillIds: on ? [...without, id] : without }, { onError: () => toast.error('Could not save the default skills.') })
   }
 
   const [folder, setFolder] = useState('')
@@ -155,8 +156,9 @@ export function SkillsLibrary() {
               key={sk.id}
               skill={sk}
               onOpen={() => navigate(`/skills/${sk.id}`)}
-              onByDefault={defaultSkillIds.includes(sk.id)}
-              onToggleByDefault={(on) => setByDefault(sk.id, on)}
+              isDefault={defaultSkillIds.includes(sk.id)}
+              onDefaultChange={(on) => setByDefault(sk.id, on)}
+              saving={save.isPending}
             />
           ))}
         </div>

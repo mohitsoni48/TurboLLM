@@ -321,7 +321,7 @@ test('validateEvent: ui_action accepts the Phase 6s FsBrowser batch actions', ()
 })
 
 test('validateEvent: ui_action accepts the Phase 6t SkillsLibrary batch actions', () => {
-  const actions = ['open_skill', 'upload_skill_file', 'create_skill', 'learn_skill_from_folder']
+  const actions = ['open_skill', 'upload_skill_file', 'create_skill', 'learn_skill_from_folder', 'default_skill_on', 'default_skill_off']
   for (const action of actions) {
     const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'skills', action } }))
     assert.equal(r.ok, true, r.ok === false ? `skills/${action}: ${r.reason}` : '')

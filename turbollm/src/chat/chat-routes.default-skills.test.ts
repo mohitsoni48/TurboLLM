@@ -53,6 +53,13 @@ test('a default skill that no longer exists in the library is left out', async (
   } finally { h.cleanup() }
 })
 
+test('a default skill chat cannot run is left out', async () => {
+  const h = harness(['skill-creator', 'filesystem'])
+  try {
+    assert.deepEqual((await h.create({})).skillIds, ['skill-creator'])
+  } finally { h.cleanup() }
+})
+
 test('an explicit skillIds wins over the defaults, an empty list meaning none', async () => {
   const h = harness(['skill-creator'])
   try {

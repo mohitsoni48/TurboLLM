@@ -42,3 +42,10 @@ test('PATCH defaultSkillIds refuses anything that is not a list of strings', () 
     assert.equal(r.status, 400)
   }
 })
+
+test('the list is capped at the library limit, keeping the newest ids', () => {
+  const ids = Array.from({ length: 250 }, (_, i) => `skill-${i}`)
+  const kept = loadRaw({ defaultSkillIds: ids }).defaultSkillIds
+  assert.equal(kept.length, 200)
+  assert.equal(kept[199], 'skill-249')
+})

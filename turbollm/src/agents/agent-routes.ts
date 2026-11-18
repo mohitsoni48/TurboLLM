@@ -54,6 +54,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     if (!isValidSkillId(id)) return err(c, 400, 'invalid_config_value', 'invalid skill id.')
     if (isBuiltinSkill(id)) return err(c, 400, 'builtin_skill', 'Built-in skills cannot be deleted.')
     skills().delete(id)
+    d.store.update((cfg) => { cfg.defaultSkillIds = cfg.defaultSkillIds.filter((defaultId) => defaultId !== id) })
     return c.json({ ok: true })
   })
 

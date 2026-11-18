@@ -55,6 +55,13 @@ describe('SkillsLibrary: On by default', () => {
     expect(screen.queryByRole('switch', { name: 'On by default: Filesystem' })).toBeNull()
   })
 
+  it('holds the switches still while a save is in flight, so a second toggle cannot overwrite the first', async () => {
+    save.isPending = true
+    await renderLibrary()
+    expect(toggle('Code review').hasAttribute('disabled')).toBe(true)
+    save.isPending = false
+  })
+
   it('removes a skill from the default list', async () => {
     await renderLibrary()
     await userEvent.click(toggle('Web research'))

@@ -24,7 +24,8 @@ import {
 import { toast } from '../components/ui/sonner'
 import { focusManager, useQuery, useQueryClient } from '@tanstack/react-query'
 import { skillKeys, fetchSkills } from '../lib/agent-api'
-import { CHAT_UNSUPPORTED_SKILLS, completeMention, findMentionedSkillIds, trailingMentionQuery } from '../lib/skill-mentions'
+import { CHAT_UNSUPPORTED_SKILLS, skillIdsForNewConversation } from '../lib/chat-skills'
+import { completeMention, dismissMention, findMentionedSkillIds, trailingMentionQuery } from '../lib/skill-mentions'
 import { cn, readLastChatConvId, writeLastChatConvId } from '../lib/utils'
 import { useChatInAddress } from '../lib/chat-address'
 import { ThinkingBudgetSlider } from '../components/ThinkingBudgetSlider'
@@ -296,10 +297,14 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // Once activeId exists, conv.skillIds is the source of truth instead.
   // null = untouched, so a blank chat shows (and starts with) the skills switched on by default.
   const [pendingSkillSelection, setPendingSkillSelection] = useState<string[] | null>(null)
-  const defaultSkillIds = (settingsQ.data?.defaultSkillIds ?? []).filter((id) => !CHAT_UNSUPPORTED_SKILLS.has(id))
+  const savedDefaultSkillIds = settingsQ.data?.defaultSkillIds
+  const defaultSkillIds = useMemo(() => (savedDefaultSkillIds ?? []).filter((id) => !CHAT_UNSUPPORTED_SKILLS.has(id)), [savedDefaultSkillIds])
   const pendingSkillIds = pendingSkillSelection ?? defaultSkillIds
-  const setPendingSkillIds = (next: string[] | ((prev: string[]) => string[])) =>
-    setPendingSkillSelection((prev) => (typeof next === 'function' ? next(prev ?? defaultSkillIds) : next))
+  const setPendingSkillIds = useCallback(
+    (next: string[] | ((prev: string[]) => string[])) =>
+      setPendingSkillSelection((prev) => (typeof next === 'function' ? next(prev ?? defaultSkillIds) : next)),
+    [defaultSkillIds],
+  )
   const enabledSkillIds = conv?.skillIds ?? pendingSkillIds
 
   // Same pattern, extended to the other Thread-settings fields (GitHub #52 follow-up):
@@ -336,19 +341,19 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     }
   }, [hasConv, modelLoaded, pendingSystemPrompt, pendingSampling, pendingSkillIds, pendingPreserveThinking, draftOnChange])
 
-  // '/' picker: typing '/' (optionally followed by letters, at the START of an
-  // otherwise-empty composer) shows a filtered skill list. Selecting one enables
-  // that skill for the conversation and clears the token.
+  // Skill picker: typing '/' (optionally followed by letters, at the START of an otherwise-empty
+  // composer) or '@partial' (at the END of the text) shows a filtered skill list. Selecting one
+  // enables that skill for the conversation and completes the token.
   const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills, staleTime: 30_000 })
   const pickableSkills = (skillsQ.data ?? []).filter((s) => !CHAT_UNSUPPORTED_SKILLS.has(s.id))
   const slashMatch = /^\/([a-z0-9-]*)$/i.exec(input)
   const mentionQuery = trailingMentionQuery(input)
-  const skillPickerMatch = slashMatch !== null || mentionQuery !== null
+  const skillPickerTriggered = slashMatch !== null || mentionQuery !== null
   const skillPickerQuery = slashMatch?.[1]?.toLowerCase() ?? mentionQuery ?? ''
-  const filteredSkills = skillPickerMatch
+  const filteredSkills = skillPickerTriggered
     ? pickableSkills.filter((s) => !skillPickerQuery || s.id.includes(skillPickerQuery) || s.name.toLowerCase().includes(skillPickerQuery))
     : []
-  const skillPickerOpen = skillPickerMatch && filteredSkills.length > 0 && !live
+  const skillPickerOpen = skillPickerTriggered && filteredSkills.length > 0 && !live
   const [skillPickerIndex, setSkillPickerIndex] = useState(0)
   useEffect(() => { setSkillPickerIndex(0) }, [skillPickerQuery, skillPickerOpen])
 
@@ -870,12 +875,13 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
             sp = sp ? `${sp}\n\n${hwSection}` : hwSection
           } catch { /* non-fatal — proceed without hardware info */ }
         }
-        const initialSkillIds = Array.from(new Set([
-          ...pendingSkillIds,
-          ...(resolved?.skillIds ?? []),
-          ...(matchedSkill ? [matchedSkill.id] : []),
-          ...mentionedSkillIds,
-        ]))
+        const initialSkillIds = skillIdsForNewConversation({
+          selection: pendingSkillSelection,
+          defaults: defaultSkillIds,
+          agentSkillIds: resolved?.skillIds,
+          isBlankAgent: selectedPersonaId === 'blank',
+          named: [...(matchedSkill ? [matchedSkill.id] : []), ...mentionedSkillIds],
+        })
         // A system prompt set via Thread settings before the first message is an
         // explicit override — it wins over the agent's own default system prompt.
         const finalSystemPrompt = pendingSystemPrompt.trim() || sp
@@ -885,7 +891,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           modelKey: activeRemoteId ?? loadedChatModel?.key ?? '',
           systemPrompt: finalSystemPrompt || undefined,
           toolPolicy: selectedPersonaId === 'research' ? 'force_web_search' : undefined,
-          // Always the list the user saw: an empty one means none, not "fall back to the defaults".
+          // Undefined lets the daemon seed the defaults; any list, even an empty one, is exactly what the chat gets.
           skillIds: initialSkillIds,
           // Pass an explicit empty array through as-is (e.g. Blank's fixed []) — collapsing it
           // to undefined here would silently turn "zero tools" back into "unrestricted" before
@@ -1563,7 +1569,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         {/* Composer area (always visible; disabled when no model; hidden in readonly) */}
         {readonly ? null : <div className="mx-auto w-full max-w-3xl px-3 pb-3 md:px-8 md:pb-5">
           <div className="relative w-full">
-            {/* '/' skill picker */}
+            {/* '/' and '@' skill picker */}
             {skillPickerOpen && (
               <div className="absolute bottom-full left-0 mb-2 w-full max-w-sm overflow-hidden rounded-lg border border-border bg-panel shadow-[var(--shadow-2)]">
                 {filteredSkills.map((s, i) => (
@@ -1694,7 +1700,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                         return
                       }
                       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); selectSkill(filteredSkills[Math.min(skillPickerIndex, filteredSkills.length - 1)]); return }
-                      if (e.key === 'Escape') { e.preventDefault(); setInput(''); return }
+                      if (e.key === 'Escape') { e.preventDefault(); setInput(slashMatch ? '' : dismissMention(input)); return }
                     }
                     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() }
                     if (e.key === 'ArrowUp' && !input && !live) {

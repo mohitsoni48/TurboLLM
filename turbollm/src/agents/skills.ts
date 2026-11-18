@@ -163,6 +163,9 @@ export class SkillStore {
     } catch { return null }
   }
 }
+/** Library skills a chat cannot run (their tools need Code's filesystem access): never seeded into a new chat by default. */
+export const CHAT_UNSUPPORTED_SKILL_IDS: ReadonlySet<string> = new Set(['filesystem'])
+
 export function isBuiltinSkill(id: string): boolean {
   return BUILTIN_SKILLS.some((s) => s.id === id)
 }
