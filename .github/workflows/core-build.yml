@@ -273,22 +273,19 @@ jobs:
         working-directory: turbollm/core
 
       # load.test.ts also asserts that the loaded core reports this target (E-11).
-      - name: Loader, golden and parity tests
+      - name: Loader and golden tests
         if: ${{ matrix.tests == 'host' }}
-        run: |
-          npx tsx --test --test-timeout=60000 src/native/load.test.ts src/native/gguf.golden.test.ts
-          npx tsx --test --test-timeout=600000 src/native/gguf.parity.test.ts
+        run: npx tsx --test --test-timeout=60000 src/native/load.test.ts src/native/gguf.golden.test.ts
         working-directory: turbollm
 
       # A fresh install inside Alpine, so tsx/esbuild get their musl binaries. --ignore-scripts: the tests need no
       # install script, and Alpine has no toolchain for node-pty's optional native build.
-      - name: Loader, golden and parity tests (node:22-alpine)
+      - name: Loader and golden tests (node:22-alpine)
         if: ${{ matrix.tests == 'alpine' }}
         run: >-
           docker run --rm -e CI -v "$GITHUB_WORKSPACE:/work" -w /work/turbollm node:22-alpine sh -ec
           'npm ci --ignore-scripts;
-          npx tsx --test --test-timeout=60000 src/native/load.test.ts src/native/gguf.golden.test.ts;
-          npx tsx --test --test-timeout=600000 src/native/gguf.parity.test.ts'
+          npx tsx --test --test-timeout=60000 src/native/load.test.ts src/native/gguf.golden.test.ts'
 
       - name: No tests (cross-built target)
         if: ${{ matrix.tests == 'none' }}

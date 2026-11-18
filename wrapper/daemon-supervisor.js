@@ -7,8 +7,7 @@
 // (another user's, as `sudo turbollm` leaves it), and CORE_UNAVAILABLE_EXIT_CODE when its native core could not load
 // (missing from the install, or built for another system): gone too, but the app tells the user why (main.js
 // onDaemonLost). The constants mirror turbollm/src/daemon-restart.ts, turbollm/src/daemon-pid.ts and
-// turbollm/src/cli.ts. daemon-supervisor.test.js pins the first three now; it pins 69 once turbollm/src/cli.ts
-// declares CORE_UNAVAILABLE_EXIT_CODE (rust-core T22), and skips that check until then.
+// turbollm/src/cli.ts; daemon-supervisor.test.js pins all four.
 
 const { spawnSync } = require('node:child_process')
 const { accessSync, constants, realpathSync, statSync } = require('node:fs')

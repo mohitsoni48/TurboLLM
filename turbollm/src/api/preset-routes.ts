@@ -11,16 +11,13 @@ import { randomUUID } from 'node:crypto'
 import type { Deps } from '../deps'
 import { MODEL_PRESET_CAP, ownEntry, type ModelPreset } from '../config/config'
 import { isUserSetOnly, launchFieldsRefusal, loadsWithNow, validateLoadProfileFields } from './profile-validate'
+import { body } from './http'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function err(c: any, status: number, code: string, message: string) {
   return c.json({ error: { code, message } }, status)
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function body<T>(c: any): Promise<T> {
-  try { return (await c.req.json()) as T } catch { return {} as T }
-}
 
 export function registerPresetRoutes(app: Hono, d: Deps): void {
   // Every handler: `c.req.param()` is already percent-decoded (decoding again broke keys with

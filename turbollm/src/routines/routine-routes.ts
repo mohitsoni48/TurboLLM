@@ -11,6 +11,7 @@ import { CODING_AGENT_CHOICES } from './schema'
 import { isTextClassifierKey } from '../models/text-classifier'
 import { nonStringField } from '../util/string-fields'
 import { InvalidCursorError } from '../chat/db'
+import { body } from '../api/http'
 
 type Status = 200 | 201 | 400 | 401 | 403 | 404 | 409 | 500 | 503
 
@@ -18,9 +19,6 @@ function err(c: Context, status: Status, code: string, message: string) {
   return c.json({ error: { code, message } }, status)
 }
 
-async function body<T>(c: Context): Promise<T> {
-  try { return (await c.req.json()) as T } catch { return {} as T }
-}
 
 /** Exported (Phase 4) so `routine-tools.ts` can type its tool arguments against the exact same
  *  request shape the REST layer accepts, rather than declaring a parallel copy that can drift. */

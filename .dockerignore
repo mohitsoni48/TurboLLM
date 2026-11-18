@@ -9,6 +9,15 @@ deploy
 *.cmd
 lib
 
+# The Rust core's build trees (rust-core plan T23c, QA PG-5): core/target alone is 1-2 GB, and a host-built
+# .node (win32 on a Windows host) must never reach a Linux build stage. Dockerfile.nvidia and Dockerfile.amd build
+# the Linux binary in their own Rust stage; the test images get it in dist/native/, re-included below.
+turbollm/core/target
+turbollm/core/fixtures/gguf/.corpus-cache
+turbollm/core/bindings/android/**/build
+turbollm/core/bindings/android/.gradle
+turbollm/core/bindings/node/*.node
+
 # Dockerfile.test builds turbollm/dist on the HOST first, then COPYs it in,
 # rather than bundling in-container (that OOM-crashed the 1.9 GiB test VM —
 # see Dockerfile.test's header comment). Everything else stays excluded:

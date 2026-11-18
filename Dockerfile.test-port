@@ -17,7 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY turbollm/package*.json ./
 RUN npm ci
+# turbollm/dist is a host build: stage the Linux core into it first (rust-core plan T23b, P-12).
 COPY turbollm/dist ./dist
+RUN test -f dist/native/turbollm-core.linux-x64-gnu.node || (echo "run core/scripts/stage-linux-binary.mjs first" >&2; exit 1)
 COPY turbollm/bin ./bin
 COPY turbollm/src/webdist ./dist/webdist
 

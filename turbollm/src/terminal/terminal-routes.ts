@@ -26,8 +26,8 @@ import { hashKey, isLanExposed, isLocalUpgrade, isLoopbackAddress, keyHashStillA
 import { sessionAuth } from '../code/session-auth'
 import { agentCwd } from '../code/worktree'
 import { createAgentTerminal, getManager } from './terminal-service'
+import { body } from '../api/http'
 
-async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
 
 const require = createRequire(import.meta.url)
 
