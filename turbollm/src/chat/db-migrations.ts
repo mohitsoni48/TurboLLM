@@ -681,6 +681,12 @@ export const MIGRATIONS: ReadonlyArray<Migration> = [
         CREATE INDEX IF NOT EXISTS idx_api_usage_code_session_ctx ON api_usage(code_session_id, ctx_used);
       `)
   },
+  // GitHub #52: the chat agent a conversation runs under (a built-in persona id or a custom agent's id), so switching
+  // the agent mid-chat, and any device that opens the chat, name the same agent. Separate from `agent_id`, which
+  // belongs to background agent runs (kind = 'agent'). Null on older chats: the browser's own memory of it is the fallback.
+  (ctx) => {
+    if (!ctx.hasColumn('conversations', 'chat_agent_id')) ctx.db.exec(`ALTER TABLE conversations ADD COLUMN chat_agent_id TEXT;`)
+  },
 ]
 
 function contextFor(db: SqlDb): MigrationContext {

@@ -370,7 +370,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/conversations', async (c) => {
-    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; skillIds?: string[]; allowedTools?: string[]; sampling?: Record<string, number>; preserveThinking?: boolean }>(c)
+    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; chatAgentId?: string; skillIds?: string[]; allowedTools?: string[]; sampling?: Record<string, number>; preserveThinking?: boolean }>(c)
     const bad = conversationBodyError(b, CREATE_FIELDS)
     if (bad) return err(c, 400, 'invalid_input', bad)
     // Only keep ids that exist in the shared skill library; silently drop unknown ones.
@@ -382,7 +382,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const allowedTools = Array.isArray(b.allowedTools) ? b.allowedTools.filter((t) => typeof t === 'string') : undefined
     const sampling = (b.sampling && typeof b.sampling === 'object') ? b.sampling : undefined
     const preserveThinking = typeof b.preserveThinking === 'boolean' ? b.preserveThinking : undefined
-    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy, skillIds, allowedTools, sampling, preserveThinking })
+    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy, chatAgentId: b.chatAgentId, skillIds, allowedTools, sampling, preserveThinking })
     return c.json(conv, 201)
   })
 
@@ -433,9 +433,14 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.patch('/api/v1/conversations/:id', async (c) => {
-    const b = await body<{ title?: string; systemPrompt?: string; sampling?: Record<string, unknown>; skillIds?: string[]; preserveThinking?: boolean }>(c)
+    const b = await body<{ title?: string; systemPrompt?: string; toolPolicy?: string | null; allowedTools?: string[] | null; chatAgentId?: string | null; sampling?: Record<string, unknown>; skillIds?: string[]; preserveThinking?: boolean }>(c)
     const bad = conversationBodyError(b, PATCH_FIELDS)
     if (bad) return err(c, 400, 'invalid_input', bad)
+    // A routine run's chat takes its tools from the routine's agent (routines/chat-runner.ts), so changing its agent, tool list or
+    // tool policy here would change only what the page shows: refuse it rather than pretend.
+    if (['chatAgentId', 'allowedTools', 'toolPolicy'].some((f) => (b as Record<string, unknown>)[f] !== undefined) && db.getConversation(c.req.param('id'))?.agentId) {
+      return err(c, 409, 'routine_conversation', 'This conversation belongs to a routine run. Its tools come from the routine\u2019s agent, so its agent cannot be switched here.')
+    }
     const patch = patchFields(b)
     if (Array.isArray(patch.skillIds)) {
       const validIds = new Set(new SkillStore(d.store.dir()).list().map((s) => s.id))

@@ -130,6 +130,12 @@ export interface Conversation {
   /** Tool-name allow-list baked in from a custom chat Agent at creation (Customize →
    *  Agents). Undefined/empty = unrestricted (every built-in persona). */
   allowedTools?: string[]
+  /** Set on a conversation a routine run made (kind chat, run by the scheduler): its tools come from that routine's agent, not from
+   *  the conversation, so the chat's own agent cannot be switched. Not the chat agent (see `chatAgentId`). */
+  agentId?: string
+  /** The chat agent this conversation runs under (a built-in persona id or a custom agent's id), kept on the daemon so every
+   *  device names the same one. Undefined on chats from before it existed: the browser's own memory is the fallback. */
+  chatAgentId?: string
   /** GitHub #52: when true, past turns' reasoning is resent to the engine (not just
    *  their final answer) so the model can see its own prior thinking. On by default for
    *  new conversations; conversations from before this default flipped stay off. */
