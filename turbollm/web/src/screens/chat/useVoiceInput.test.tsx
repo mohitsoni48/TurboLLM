@@ -45,10 +45,10 @@ const onText = vi.fn()
 const onClip = vi.fn()
 const notify = vi.fn()
 
-function mount(modelHears: boolean) {
+function mount(modelHears: boolean, extra: Partial<VoiceInputOptions> = {}) {
   const qc = new QueryClient()
   const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={qc}>{children}</QueryClientProvider>
-  const initial: VoiceInputOptions = { modelHears, onText, onClip, notify }
+  const initial: VoiceInputOptions = { modelHears, onText, onClip, notify, ...extra }
   return renderHook((props: VoiceInputOptions) => useVoiceInput(props), { wrapper, initialProps: initial })
 }
 
@@ -546,5 +546,59 @@ describe('useVoiceInput unmount', () => {
     const signal = (transcribe.mock.calls[0][1] as { signal: AbortSignal }).signal
     hook.unmount()
     expect(signal.aborted).toBe(true)
+  })
+})
+
+// Hands-free voice mode borrows the saved settings for as long as it is on and never rewrites them: the first version set
+// audioMode to "text" and readAloud on for good, and left auto-stop as the user had it, so with it off a hands-free
+// recording never ended by itself.
+describe('useVoiceInput while hands-free voice mode is on', () => {
+  beforeEach(() => { stt.available = true })
+
+  it('never asks "audio or text?": the clip goes as text, and the saved choice stays "ask"', async () => {
+    transcribe.mockResolvedValueOnce(said('hello there'))
+    const hook = mount(true, { handsFree: () => true })
+    await begin(hook)
+    await finish(hook)
+    expect(hook.result.current.phase).not.toBe('choosing')
+    expect(onText).toHaveBeenCalledWith('hello there')
+    expect(onClip).not.toHaveBeenCalled()
+    expect(useVoiceStore.getState().audioMode).toBe('ask')
+  })
+
+  it('keeps an explicit "audio" choice: the clip is attached as it is', async () => {
+    useVoiceStore.setState({ audioMode: 'audio' })
+    const hook = mount(true, { handsFree: () => true })
+    await begin(hook)
+    await finish(hook)
+    expect(onClip).toHaveBeenCalledTimes(1)
+    expect(transcribe).not.toHaveBeenCalled()
+  })
+
+  it('ends the recording on silence even when the saved auto-stop is off, and leaves that setting off', async () => {
+    useVoiceStore.setState({ autoStop: false })
+    const hook = mount(true, { handsFree: () => true })
+    await begin(hook)
+    expect(recorderOptions().autoStop).toBe(true)
+    expect(useVoiceStore.getState().autoStop).toBe(false)
+  })
+
+  it('is read when the recording starts, so the same hook follows the mode on and off', async () => {
+    useVoiceStore.setState({ autoStop: false })
+    let handsFree = true
+    const hook = mount(true, { handsFree: () => handsFree })
+    await begin(hook)
+    expect(recorderOptions().autoStop).toBe(true)
+    await act(async () => { hook.result.current.cancel() })
+    handsFree = false
+    await begin(hook)
+    expect(recorderOptions().autoStop).toBe(false)
+  })
+
+  it('with the mode off, "ask" still asks (nothing else about the composer\u2019s microphone changed)', async () => {
+    const hook = mount(true, { handsFree: () => false })
+    await begin(hook)
+    await finish(hook)
+    expect(hook.result.current.phase).toBe('choosing')
   })
 })
