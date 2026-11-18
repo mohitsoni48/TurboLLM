@@ -4,7 +4,7 @@ import { closeAllLifelines, killTetheredSync, refuseNewTetheredSpawns, setJobSen
 import { JobSentinel } from './util/win-job-sentinel'
 import { checkOrphansReaped } from './util/pid1'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { constants as osConstants } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -28,6 +28,7 @@ import { killTrackedTerminalsSync } from './terminal/terminal-manager'
 import { killTrackedTunnelsSync } from './remote/child-process'
 import { TELEMETRY_ENV } from './telemetry/disabled'
 import { bootDaemon } from './boot'
+import { CoreLoadError } from './native/load'
 
 // What this daemon's parent promised it (util/boot-env.ts): the desktop app's supervision, a restart keeper, a stdin
 // lifeline. Read first, bound to the parent's pid and removed from process.env, so nothing spawned below inherits
@@ -217,6 +218,12 @@ if (argv[0] === 'mcp-server') {
   process.exit(0)
 }
 
+// Like --help, before the config and the daemon: it never loads the native core.
+if (hasFlag('--version', '-v')) {
+  console.log(version)
+  process.exit(0)
+}
+
 // ── --help / -h ───────────────────────────────────────────────────────────────
 if (hasFlag('--help', '-h')) {
   process.stdout.write(
@@ -256,6 +263,7 @@ if (hasFlag('--help', '-h')) {
     `                 setting says (same as TURBOLLM_TELEMETRY=off). For CI,\n` +
     `                 containers, and scripted daemons.\n` +
     `  --stop         Stop a running TurboLLM daemon and exit\n` +
+    `  --version, -v  Print the version and exit\n` +
     `  --help, -h     Show this help message\n\n` +
     `Examples:\n` +
     `  npx turbollm                     # start on default port, open browser\n` +
@@ -386,9 +394,14 @@ function startJobSentinel(): void {
 
 // ── The daemon (boot.ts) ──────────────────────────────────────────────────────
 // Booted only here, after the data-dir guard and the job sentinel above: the reaps of a previous run's leftovers (the
-// first thing it does) are side effects the guard keeps a second daemon from, and they spawn (Tailscale's CLI), which
-// the sentinel must be up for. In it, in this order: the services, the app, the listener and the in-place rebind, then
-// auto-load. What follows here (the orphan check, the restart, the shutdown, the exit net) is this process's own.
+// first thing it does once its native core has loaded) are side effects the guard keeps a second daemon from, and they
+// spawn (Tailscale's CLI), which the sentinel must be up for. In it, in this order: the services, the app, the listener
+// and the in-place rebind, then auto-load. What follows here (the orphan check, the restart, the shutdown, the exit
+// net) is this process's own.
+//
+// A core that cannot load ends the start with CORE_UNAVAILABLE_EXIT_CODE (sysexits EX_UNAVAILABLE, plan P-5), on
+// which the desktop app shows the loader's message instead of quitting as after a crash (wrapper/daemon-supervisor.js).
+const CORE_UNAVAILABLE_EXIT_CODE = 69
 const daemon = await bootDaemon({
   store,
   version,
@@ -397,8 +410,26 @@ const daemon = await bootDaemon({
   tunnel: hasFlag('--tunnel'),
   openBrowser: !hasFlag('--no-open'),
   printToken: hasFlag('--print-token'),
-})
+}).catch(exitIfCoreUnavailable)
 const { deps } = daemon
+
+function exitIfCoreUnavailable(err: unknown): never {
+  if (!(err instanceof CoreLoadError)) throw err
+  reportDaemonFatal(err.message)
+  console.error(err.message)
+  return process.exit(CORE_UNAVAILABLE_EXIT_CODE)
+}
+
+// For a supervisor that does not read this process's stderr (E-53). Written synchronously, before the exit; a write
+// that fails must not hide the message, which stderr still carries.
+function reportDaemonFatal(message: string): void {
+  const fatalFile = process.env.TURBOLLM_DAEMON_FATAL_FILE
+  if (!fatalFile) return
+  const fatal = { code: 'core_unavailable', exitCode: CORE_UNAVAILABLE_EXIT_CODE, message, at: new Date().toISOString() }
+  try {
+    writeFileSync(fatalFile, JSON.stringify(fatal))
+  } catch { /* stderr still says why */ }
+}
 
 // Whether anything reaps TurboLLM's orphans, its tethered children's watchers among them (util/pid1.ts): a container
 // whose PID 1 is node itself, or `tail`, leaves every one of them a zombie. Linux only, off the boot path; it warns.

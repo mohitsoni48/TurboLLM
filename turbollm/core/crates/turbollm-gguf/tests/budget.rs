@@ -1,5 +1,6 @@
 //! The read-amount assertions of `gguf.test.ts` rows 31-33 (plan section 3): a huge value is skipped by seeking,
-//! never read, and a header needing more than the budget stops within it.
+//! never read, and a header needing more than the budget stops within it. `gguf.ts:N` / `gguf.test.ts:N` point at the
+//! deleted `turbollm/src/gguf/` as of commit `0ad9f454` (recover with `git show 0ad9f454:turbollm/src/gguf/gguf.ts`).
 
 mod support;
 

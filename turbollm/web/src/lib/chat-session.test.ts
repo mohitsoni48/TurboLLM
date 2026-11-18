@@ -60,16 +60,79 @@ describe('ChatSession.follow', () => {
     const ac = new AbortController()
     const seen: string[] = []
     session.subscribe(() => seen.push(session.getSnapshot().liveByConv.c1?.content ?? '<none>'))
-    const started = await session.follow('c1', ac, frames(
+    // One frame per task, as a live reply arrives (one network read per token): each change is notified as it lands.
+    async function* live(...list: ChatFrame[]): AsyncGenerator<ChatFrame> {
+      for (const f of list) { await new Promise((r) => setTimeout(r, 0)); yield f }
+    }
+    const started = await session.follow('c1', ac, live(
       META,
       { event: 'reasoning', data: { delta: 'hm' } },
       { event: 'delta', data: { delta: 'Hel' } },
       { event: 'delta', data: { delta: 'lo' } },
     ))
     expect(started).toBe(true)
+    expect(seen).toContain('Hel')
     expect(seen).toContain('Hello')
     // The stream ended without done: the live view goes, the conversation has the rest.
     expect(session.getSnapshot().liveByConv.c1).toBeUndefined()
+  })
+
+  it('rates the live reply by the tokens of the last 2 seconds', async () => {
+    let clock = 10_000
+    const now = vi.spyOn(performance, 'now').mockImplementation(() => clock)
+    try {
+      const { session } = makeSession()
+      let rate: number | undefined
+      await session.follow('c1', new AbortController(), (async function* () {
+        yield META
+        for (let i = 0; i < 10; i++) yield { event: 'reasoning', data: { delta: 'x' } } as ChatFrame
+        clock = 12_500 // the first 10 have left the window
+        for (let i = 0; i < 4; i++) yield { event: 'delta', data: { delta: 'y' } } as ChatFrame
+        rate = session.getSnapshot().liveByConv.c1?.liveGenTps
+      })())
+      expect(rate).toBe(2) // 4 tokens over 2 seconds
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  // An attach replays every frame the daemon kept (up to 6,000) in one burst, all within the rate's 2-second window:
+  // every one is counted and none is dropped. (Copying the window per token made that replay quadratic; the window
+  // now grows in place.)
+  it('counts every frame of a long replayed reply into the rate', async () => {
+    const now = vi.spyOn(performance, 'now').mockImplementation(() => 50_000)
+    try {
+      const { session } = makeSession()
+      let live: { genTokens: number; liveGenTps: number } | undefined
+      await session.follow('c1', new AbortController(), (async function* () {
+        yield META
+        for (let i = 0; i < 6000; i++) yield { event: 'reasoning', data: { delta: 'x' } } as ChatFrame
+        live = session.getSnapshot().liveByConv.c1
+      })())
+      expect(live?.genTokens).toBe(6000)
+      expect(live?.liveGenTps).toBe(3000) // 6,000 tokens in one 2-second window
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  // A refreshed page attaching to a reply that waits for approval: the daemon replays every frame so far in one burst.
+  // Notifying React per frame made it throw "Maximum update depth exceeded", and the approval bar never showed.
+  it('notifies a replayed burst of frames once at its start and once at its end, with the final state', async () => {
+    const { session } = makeSession()
+    let calls = 0
+    const states: string[] = []
+    session.subscribe(() => { calls++; const l = session.getSnapshot().liveByConv.c1; states.push(l ? `${l.reasoning.length}:${l.timeline.map((b) => b.kind).join(',')}` : '<none>') })
+    const burst: ChatFrame[] = [META, ...Array.from({ length: 400 }, () => ({ event: 'reasoning', data: { delta: 'x' } }) as ChatFrame),
+      { event: 'tool_call', data: { id: 't1', name: 'run_code', args: { code: '2 + 2' }, status: 'awaiting_approval' } }]
+    const ac = new AbortController()
+    const following = session.follow('c1', ac, (async function* () { yield* burst; await new Promise((r) => ac.signal.addEventListener('abort', r)) })())
+    await new Promise((r) => setTimeout(r, 5))
+    expect(calls).toBeLessThanOrEqual(3)
+    expect(states.at(-1)).toBe('400:tool')
+    expect(session.getSnapshot().liveByConv.c1?.timeline.find((b) => b.kind === 'tool')).toMatchObject({ call: { status: 'awaiting_approval' } })
+    ac.abort()
+    await following
   })
 
   it('keeps the text so far across a repeated meta, and clears it on reset', async () => {

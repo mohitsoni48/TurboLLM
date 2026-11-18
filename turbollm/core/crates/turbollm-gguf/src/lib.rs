@@ -1,3 +1,6 @@
+//! The `gguf.ts:N` / `gguf.test.ts:N` references in this crate point at the TypeScript parser in `turbollm/src/gguf/`
+//! as of commit `0ad9f454`, deleted by ADR-465 (recover it with `git show 0ad9f454:turbollm/src/gguf/gguf.ts`).
+
 mod error;
 mod jsnum;
 mod meta;

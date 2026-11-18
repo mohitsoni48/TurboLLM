@@ -3,7 +3,7 @@
 // GET responses are cached in-memory for 5 minutes (key = full URL) for graceful
 // degradation. Network/auth failures surface as a typed HfError so routes can map
 // them to a stable error envelope.
-import { quantFromName } from '../gguf/gguf'
+import { quantFromName } from '../native/gguf'
 import { isSdkRow, readsOnlyLitertlm, type EngineFormatRef } from '../engines/compat'
 import { detectJev } from '../models/jev'
 import { litertlmQuantFromName, litertlmTarget, type LitertlmTarget } from '../models/litertlm'

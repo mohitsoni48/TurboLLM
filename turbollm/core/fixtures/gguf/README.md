@@ -1,10 +1,11 @@
 # GGUF fixtures
 
-Language-neutral fixtures for the GGUF header parser. Every runtime (the TypeScript parser while it still
-exists, the Rust crate `turbollm-gguf`, the napi addon, the Kotlin bindings) must reproduce them exactly.
+Language-neutral fixtures for the GGUF header parser. Every runtime (the Rust crate `turbollm-gguf`, the napi
+addon, the Kotlin bindings) must reproduce them exactly.
 
-**After `src/gguf/` is deleted these files are the specification. Re-bless them only from Rust, in review.**
-Never hand-edit a golden.
+**The TS oracle is deleted; goldens are the spec.** The TypeScript parser (`src/gguf/`) that wrote them and its
+writer `core/scripts/gguf-goldens.ts` were deleted with the switch to the native core (rust-core T22). A golden
+changes only when the parser's behaviour changes on purpose, re-blessed from Rust in review.
 
 ## Layout
 
@@ -24,7 +25,7 @@ core/fixtures/gguf/
 
 ## Formats
 
-- **`parse` is a JSON string** holding the exact compact text the oracle produced, so a runtime compares
+- **`parse` is a JSON string** holding the exact compact text the TypeScript oracle produced, so a runtime compares
   bytes without re-serialising the golden: `JSON.stringify(result)` for a success, or
   `JSON.stringify({ error: { code, message } })` for a `GgufError`. The oracle is `parseGgufAsync(path, maxRead)`
   (the daemon's path); the synchronous `parseGguf` is never an oracle.
@@ -32,8 +33,8 @@ core/fixtures/gguf/
   file's own size.
 - **Generated fixtures** (above the 64 KiB cap) are not committed. Their golden adds
   `"generated": { "recipe", "args", "size", "sha256" }` and, where the test used a read cap, `"maxRead"`.
-  A runtime rebuilds the bytes from the recipe (a port of the builder in `core/scripts/gguf-goldens.ts`),
-  must hit the same `sha256`, then compares. Recipes: `big-vocab(tokens, merges)`,
+  A runtime rebuilds the bytes from the recipe (the Rust ports are in
+  `crates/turbollm-gguf/tests/support/builders.rs`), must hit the same `sha256`, then compares. Recipes: `big-vocab(tokens, merges)`,
   `huge-description(length)`, `long-name(length)`.
 - **`quant-names.json`**: `null` where the TypeScript `quantFromName` returns `"?"`.
 - **Declared divergences** (architecture 3.3): `golden/<id>.json` is the expected Rust output and
@@ -43,34 +44,35 @@ core/fixtures/gguf/
 ## Real-header corpus
 
 `corpus.json` is `[{ "id", "repo", "revision", "file", "bytes", "sha256", "fileSize" }]`: a pinned prefix of a real,
-ungated GGUF. `bytes` is the smallest 64 KiB-rounded prefix (capped at `fileSize`) the oracle parses to the same
-result as a longer prefix; `revision` is a full commit sha (`github:<owner>/<repo>` entries are served by
+ungated GGUF. `bytes` is the smallest 64 KiB-rounded prefix (capped at `fileSize`) the TypeScript oracle parsed to
+the same result as a longer prefix; `revision` is a full commit sha (`github:<owner>/<repo>` entries are served by
 raw.githubusercontent.com, every other repo by Hugging Face). Slices are fetched by HTTP Range into the
 gitignored `.corpus-cache/` and never committed; no token is ever sent.
 
 ```
 node core/scripts/fetch-gguf-corpus.mjs                    # every entry, sha256-verified; cached good slices are skipped
 node core/scripts/fetch-gguf-corpus.mjs --entry <id>       # one entry
-npx tsx core/scripts/fetch-gguf-corpus.mjs --discover <repo> <file> <id>   # pin a new entry (prints its JSON)
 node core/scripts/fetch-gguf-corpus.mjs --snapshot-listing # rewrite hf-listing.json from the pinned revisions
 ```
 
-A corpus golden records `cutShort` at `fileSize` and at `bytes`. A slice that is not fetched is skipped by
-`gguf-goldens.ts` with a notice; with `CI=true` it fails.
+A corpus golden records `cutShort` at `fileSize` and at `bytes`. A new corpus entry and its golden are written
+by hand and reviewed as a spec change: the mode that pinned entries ran the TypeScript oracle and is gone.
 
 ## Regenerating
 
-From `turbollm/`:
+The TS oracle is deleted; goldens are the spec. Nothing regenerates them. They are checked by:
 
 ```
-npx tsx core/scripts/gguf-goldens.ts --check   # exit 1 and the differing paths on any byte difference
-npx tsx core/scripts/gguf-goldens.ts --write   # only when the parser's behaviour changed on purpose
+cargo xtask goldens-check                       # from core/: the folder is complete and within its rules
+cargo test -p turbollm-gguf                     # from core/: Rust reproduces every golden byte for byte
+npx tsx --test src/native/gguf.golden.test.ts   # from turbollm/: the napi facade does too
 ```
 
 ## The 33 `gguf.test.ts` cases mapped to fixtures
 
 Legend: **C** crafted file + golden; **Q** rows in `quant-names.json`; **G** generated fixture; **B** Rust
-budget test (`crates/turbollm-gguf/tests/budget.rs`). Line numbers are `src/gguf/gguf.test.ts` at `0ad9f454`.
+budget test (`crates/turbollm-gguf/tests/budget.rs`). Line numbers are the deleted `src/gguf/gguf.test.ts` at
+`0ad9f454`.
 
 | # | Line | Test | Fixture(s) |
 |---|---|---|---|

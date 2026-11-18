@@ -27,7 +27,7 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import type { ConfigStore } from '../config/config'
 import { DOWNLOAD_CONCURRENCY } from '../config/config-bounds'
-import { ggufCutShort } from '../gguf/gguf'
+import { ggufCutShort } from '../native/gguf'
 import type { HfModelFiles } from '../hf/hf'
 import { httpGet, type DownloadGet } from './http-get'
 import { emitInvalidation } from '../events/bus'
@@ -1093,7 +1093,7 @@ export class DownloadManager {
       // load. A GGUF's header says how long the file must be (GgufMeta.dataEnd), so one whose
       // length was never known is checked before it is finished. The .part holds a good prefix and
       // is kept, so Resume asks for the rest. Other files of unknown length cannot be checked.
-      if (rec.total <= 0 && /\.gguf$/i.test(rec.dest) && ggufCutShort(part, rec.received)) {
+      if (rec.total <= 0 && /\.gguf$/i.test(rec.dest) && (await ggufCutShort(part, rec.received))) {
         throw new DownloadError(
           'download_incomplete',
           'The server closed the connection before the whole file arrived. Resume to download the rest.',

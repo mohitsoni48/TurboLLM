@@ -1,7 +1,8 @@
 # TurboLLM core (Rust)
 
 The native core of TurboLLM: one Rust code base that the Node daemon, the Android SDK and the nodejs-mobile Android
-app all call. Phase 1 holds the GGUF header parser (`turbollm-gguf`), ported from `src/gguf/gguf.ts`.
+app all call. Phase 1 holds the GGUF header parser (`turbollm-gguf`), ported from `src/gguf/gguf.ts` (deleted once the daemon
+switched to the core).
 
 The end state has three layers (see `docs/plans/rust-core/ROADMAP.md` in the docs repo, section "Three layers"):
 
@@ -97,9 +98,9 @@ npm `android-arm64` target, which is for Termux.
 
 `fixtures/gguf/README.md` describes the formats. The rules:
 
-- **Never hand-edit a golden.** They are written by `npx tsx core/scripts/gguf-goldens.ts --write` (from `turbollm/`)
-  while the TypeScript parser exists, and re-blessed only from Rust, in review, after it is deleted.
-  `npx tsx core/scripts/gguf-goldens.ts --check` and `cargo xtask goldens-check` check the folder.
+- **The TS oracle is deleted; goldens are the spec.** The TypeScript parser that wrote them is gone (rust-core T22).
+  A golden changes only when the parser's behaviour changes on purpose, re-blessed from Rust in review.
+  `cargo xtask goldens-check` checks the folder.
 - The real-header corpus (15 pinned prefixes of public GGUF files, about 115 MB) is fetched into the gitignored
   `fixtures/gguf/.corpus-cache/` with `node core/scripts/fetch-gguf-corpus.mjs` (from `turbollm/`). A missing slice is
   skipped with a notice locally and fails on CI.
@@ -109,8 +110,8 @@ npm `android-arm64` target, which is for Termux.
   - D-3: the cut-short check keeps the 256 MiB read budget; TS's sync path has none.
   - D-4: I/O errors carry the Rust `io::Error` text, not Node's `ENOENT: ...`.
   - D-5: a read starting above 2^53 - 1 is an `io` error "position out of range" (TS throws a `RangeError`).
-  Any other difference is a bug. `src/native/gguf.parity.test.ts` (5,000 seeded mutations, 20,000 file names) fails on
-  an undeclared one while the TS parser still exists.
+  Any other difference was a bug. The differential test that checked this against the TS parser was deleted with it;
+  the goldens, which include these divergences, now pin the behaviour.
 
 ## Version
 

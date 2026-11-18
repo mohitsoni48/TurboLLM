@@ -20,6 +20,7 @@ import { detectHardware } from '../engines/hardware'
 import { getSysInfo, type SysInfo } from '../sysinfo/sysinfo'
 import type { ConfigStore } from '../config/config'
 import type { Emitter } from '../telemetry/emit'
+import { body as readBody } from './http'
 
 export interface OnboardingPatch {
   status?: string
@@ -92,7 +93,7 @@ export function registerOnboardingRoutes(
   app.get('/api/v1/onboarding', (c) => c.json(normalizeOnboarding(deps.store.snapshot().onboarding)))
 
   app.put('/api/v1/onboarding', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as OnboardingPatch
+    const body = await readBody<OnboardingPatch>(c)
     const current = normalizeOnboarding(deps.store.snapshot().onboarding)
     const next = applyOnboardingPatch(current, body, Date.now())
     deps.store.update((cfg) => { cfg.onboarding = next })
