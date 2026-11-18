@@ -5,8 +5,17 @@
 import { nonStringField } from '../util/string-fields'
 
 const isStringArray = (v: unknown): boolean => Array.isArray(v) && v.every((x) => typeof x === 'string')
-const isSamplingValue = (v: unknown): boolean =>
-  (typeof v === 'number' && Number.isFinite(v)) || typeof v === 'boolean' || typeof v === 'string' || isStringArray(v)
+/** The sampler settings generation-core maps to the engine's numeric parameters (its SAMPLING_KEYS): a string or flag there only fails at chat time. */
+const NUMERIC_SAMPLING_KEYS: ReadonlySet<string> = new Set(['temp', 'topP', 'topK', 'minP', 'repeatPenalty', 'presencePenalty', 'frequencyPenalty'])
+const isFiniteNumber = (v: unknown): boolean => typeof v === 'number' && Number.isFinite(v)
+
+/** The 400 message for one sampler setting, or undefined when it is fine. The known numeric keys must be finite numbers and `stop` a
+ *  list of strings; any other key (passed through to the engine as it is) may be a number, a flag, a name or a list of strings. */
+function samplingValueError(key: string, v: unknown): string | undefined {
+  if (NUMERIC_SAMPLING_KEYS.has(key)) return isFiniteNumber(v) ? undefined : `sampling.${key} must be a number.`
+  if (key === 'stop') return isStringArray(v) ? undefined : 'sampling.stop must be an array of strings.'
+  return isFiniteNumber(v) || typeof v === 'boolean' || typeof v === 'string' || isStringArray(v) ? undefined : `sampling.${key} must be a number, boolean, string or array of strings.`
+}
 
 /** Fields a PATCH may set to null to clear them. Every other field's column is NOT NULL (or has no "cleared" state), so
  *  a null there reads as "absent", exactly as it does on create. */
@@ -41,9 +50,11 @@ export function conversationBodyError(b: unknown, fields: readonly string[]): st
   }
   const s = fields.includes('sampling') ? body.sampling : undefined
   if (s != null && (typeof s !== 'object' || Array.isArray(s))) return 'sampling must be an object.'
-  // Each value is spread into the engine request as a sampler setting: a number, a flag, a name, or the `stop` list.
-  const badSampling = s == null ? undefined : Object.entries(s).find(([, v]) => !isSamplingValue(v))
-  if (badSampling) return `sampling.${badSampling[0]} must be a number, boolean, string or array of strings.`
+  // Each value is spread into the engine request as a sampler setting (see samplingValueError).
+  for (const [key, v] of Object.entries(s ?? {})) {
+    const bad = samplingValueError(key, v)
+    if (bad) return bad
+  }
   if (fields.includes('preserveThinking') && body.preserveThinking != null && typeof body.preserveThinking !== 'boolean') {
     return 'preserveThinking must be a boolean.'
   }
