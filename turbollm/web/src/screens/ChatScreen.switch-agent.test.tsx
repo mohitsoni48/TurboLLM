@@ -295,5 +295,34 @@ describe('ChatScreen — switching the agent of a chat that has messages', () =>
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1))
     expect(localStorage.getItem('tllm.persona.conv.c1')).toBeNull()
     expect((await agentButton()).textContent).toContain('Default')
+    expect(trackSpy).not.toHaveBeenCalledWith('chat', 'switch_agent')
+  })
+
+  it('a line the user appended to the generated prompt asks before it is replaced (the usual way a prompt is edited)', async () => {
+    mockLibrary = [loadedRow()]
+    conv = { ...BASE_CONV, systemPrompt: `${promptOf('default')}\n\nAnswer in French.` }
+    await renderScreen()
+    await pick(/Blank/)
+    expect(await screen.findByText('Replace this chat’s system prompt?')).toBeTruthy()
+    expect(updateMutateAsync).not.toHaveBeenCalled()
+  })
+
+  it('does not ask for a prompt the agent generated, even with memory facts and personalization after it', async () => {
+    mockLibrary = [loadedRow()]
+    localStorage.setItem('tllm.personal.userName', 'Sam')
+    conv = { ...BASE_CONV, systemPrompt: buildAgentConfig('default', resolveAgents(customAgents, {}).find((a) => a.id === 'default'), getPersonalization(), { memoryFacts: ['likes tea'] }).systemPrompt }
+    await renderScreen()
+    await pick(/Blank/)
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1))
+    expect(screen.queryByText('Replace this chat’s system prompt?')).toBeNull()
+  })
+
+  it('a conversation a routine run made keeps its agent: its tools come from the routine, so a switch would only change the label', async () => {
+    mockLibrary = [loadedRow()]
+    conv = { ...BASE_CONV, agentId: 'routine-agent-1' }
+    await renderScreen()
+    await waitFor(() => expect(screen.getByText('Default')).toBeTruthy())
+    expect(screen.queryByRole('button', { name: /Change agent/ })).toBeNull()
+    expect(screen.getByText('Default').closest('span[title]')!.getAttribute('title')).toContain('a routine run keeps the agent')
   })
 })

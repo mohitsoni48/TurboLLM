@@ -49,22 +49,44 @@ export function skillIdsAfterSwitch(current: readonly string[], previous: Resolv
   return Array.from(new Set([...current.filter((id) => !leaving.has(id)), ...next.agentSkillIds]))
 }
 
-/** The PATCH body that moves a running conversation onto `next`. `null` clears the tool allow-list or the policy, which
- *  a plain `undefined` could not do over JSON. */
 const NO_PERSONALIZATION: Personalization = { assistantName: '', userName: '', customInstructions: '' }
 const withoutDate = (text: string) => text.replace(/^Today's date is .*$/m, '')
 
-/** Whether a chat's system prompt is something other than what `agentId` generates. A chat's prompt is baked in when it is
- *  created: capability text, the date, the agent's own prompt, then the user's personalization and memory. Anything that
- *  does not start with that (the date aside) was written in Thread settings, or the agent itself was edited since, and a
- *  switch replaces it, so the user is asked first. An empty prompt is what Blank generates. */
-export function promptLooksCustomised(current: string, agentId: string, agent: ResolvedAgent | undefined): boolean {
-  const expected = buildSystemPrompt(agentId, agent?.systemPrompt ?? '', NO_PERSONALIZATION)
-  // Blank generates nothing, and every string starts with the empty string: any text there is the user's own.
-  if (!expected) return current.trim() !== ''
-  return !withoutDate(current).startsWith(withoutDate(expected))
+/** The sections a chat's creation (or a switch) appends after the agent's own prompt: the assistant's name, the user's name,
+ *  the user's custom instructions (Settings, Personalization), the memory facts, and for the Expert agent the hardware.
+ *  Each is one block, separated from the rest by a blank line (buildSystemPrompt, hardwareSection). */
+function isGeneratedBlock(block: string, personalization: Personalization): boolean {
+  if (/^Your name is [^\n]+\.$/.test(block) || /^The user's name is [^\n]+\.$/.test(block)) return true
+  const custom = personalization.customInstructions.trim()
+  if (custom && block === custom) return true
+  if (block.startsWith('What you know about the user from past conversations:\n')) {
+    return block.split('\n').slice(1).every((line) => /^- \S/.test(line))
+  }
+  return /^## User's hardware\nGPU: [^\n]*\nRAM: \d+ GB\nOS: [^\n]*$/.test(block)
 }
 
+/** Whether a chat's system prompt holds something `agentId` did not generate. A chat's prompt is baked in when it is created:
+ *  capability text, the date, the agent's own prompt, then blocks for the user's personalization, memory and (Expert) hardware.
+ *  Text that is not one of those blocks (a line appended in Thread settings, a prompt replaced outright, an agent edited since)
+ *  is the user's, and a switch replaces it, so the user is asked first. The blocks are matched by shape, not by value: memory
+ *  facts and personalization change over time, and a changed value must not read as an edit. The one value compared is the
+ *  user's custom instructions, which have no shape; changing them after the chat began shows the dialog once (noise, not loss).
+ *  Text glued onto the end of a memory fact or a name line reads as part of it (that line has no shape to tell it apart).
+ *  An empty prompt is what Blank generates. */
+export function promptLooksCustomised(current: string, agentId: string, agent: ResolvedAgent | undefined, personalization: Personalization = NO_PERSONALIZATION): boolean {
+  const expected = withoutDate(buildSystemPrompt(agentId, agent?.systemPrompt ?? '', NO_PERSONALIZATION))
+  const actual = withoutDate(current)
+  // Blank generates nothing, and every string starts with the empty string: any text there is the user's own.
+  if (!expected) return actual.trim() !== ''
+  if (!actual.startsWith(expected)) return true
+  const tail = actual.slice(expected.length)
+  if (tail === '') return false
+  if (!tail.startsWith('\n\n')) return true
+  return !tail.slice(2).split('\n\n').every((block) => isGeneratedBlock(block, personalization))
+}
+
+/** The PATCH body that moves a running conversation onto `next`. `null` clears the tool allow-list or the policy, which
+ *  a plain `undefined` could not do over JSON. */
 export function agentSwitchPatch(agentId: string, next: AgentConversationConfig, skillIds: string[]) {
   return {
     chatAgentId: agentId,
@@ -73,4 +95,23 @@ export function agentSwitchPatch(agentId: string, next: AgentConversationConfig,
     toolPolicy: next.toolPolicy ?? null,
     skillIds,
   }
+}
+
+/** The open chat as it is after a switch, from what the PATCH answered. The answer is the stored chat without its messages,
+ *  and JSON drops a cleared (undefined) field, so spreading it over the old chat would keep the old `allowedTools` and
+ *  `toolPolicy`: the fields the switch sends are replaced outright instead. */
+export function conversationAfterSwitch<C extends { messages?: unknown }>(
+  old: C,
+  updated: { chatAgentId?: string; systemPrompt?: string; allowedTools?: string[]; toolPolicy?: string; skillIds?: string[] },
+): C {
+  return {
+    ...old,
+    ...updated,
+    chatAgentId: updated.chatAgentId,
+    systemPrompt: updated.systemPrompt,
+    allowedTools: updated.allowedTools,
+    toolPolicy: updated.toolPolicy,
+    skillIds: updated.skillIds,
+    messages: old.messages,
+  } as C
 }

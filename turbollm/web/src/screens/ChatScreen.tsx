@@ -41,7 +41,7 @@ import { readAloudOptions } from '../lib/voice/use-tts'
 import { useVoiceStore } from '../stores/voice'
 import { ContextMeter } from './chat/ContextMeter'
 import { AgentSwitcher } from './chat/AgentSwitcher'
-import { agentSwitchPatch, buildAgentConfig, hardwareSection, promptLooksCustomised, skillIdsAfterSwitch } from '../lib/agent-conversation'
+import { agentSwitchPatch, buildAgentConfig, conversationAfterSwitch, hardwareSection, promptLooksCustomised, skillIdsAfterSwitch } from '../lib/agent-conversation'
 import { CompactionDivider } from './chat/CompactionDivider'
 import { ChatFindBar } from './chat/ChatFindBar'
 import { ConversationSidebar } from './chat/ConversationSidebar'
@@ -304,7 +304,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // The agent this chat runs under: the one the daemon stored with it, else this browser's memory of it (chats from before the
   // daemon kept it), else the default. Not `selectedPersonaId`, which is the empty chat's picker and is not re-seeded for every
   // way a chat can open (a routine run shown inside this screen, another device's chat).
-  const chatAgentId = activeId ? (conv?.chatAgentId ?? getConvAgentId(activeId, isAndroid)) : selectedPersonaId
+  const chatAgentId = activeId ? (conv?.chatAgentId || getConvAgentId(activeId, isAndroid)) : selectedPersonaId
   const [switchingAgent, setSwitchingAgent] = useState(false)
   const [confirmSwitchTo, setConfirmSwitchTo] = useState<string | null>(null)
   // The latest of what a switch reads after its awaits: the handler closed over the render that started it.
@@ -688,7 +688,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // messages are untouched. Not while a reply is running: its system prompt and tools must not change under it.
   const switchAgentBlocked = readonly
     ? 'this chat is read-only'
-    : embedded || convIdOverride
+    : embedded || convIdOverride || conv?.agentId
       ? 'a routine run keeps the agent it was set up with'
       : conv?.expertMode
         ? 'this is the built-in TurboLLM Expert thread'
@@ -700,7 +700,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const requestSwitchAgent = (agentId: string) => {
     if (switchAgentBlocked || !activeId) return
     const current = allAgents.find((a) => a.id === chatAgentId)
-    if (promptLooksCustomised(conv?.systemPrompt ?? '', chatAgentId, current)) setConfirmSwitchTo(agentId)
+    if (promptLooksCustomised(conv?.systemPrompt ?? '', chatAgentId, current, getPersonalization())) setConfirmSwitchTo(agentId)
     else void handleSwitchAgent(agentId)
   }
 
@@ -726,11 +726,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       if (fresh.live) { toast.error('A reply started while switching. Switch the agent once it finishes.'); return }
       const previous = allAgents.find((a) => a.id === fresh.chatAgentId)
       const config = buildAgentConfig(agentId, next, getPersonalization(), { memoryFacts, hardware })
-      track('chat', 'switch_agent')
       const updated = await mut.update.mutateAsync({ id: convId, ...agentSwitchPatch(agentId, config, skillIdsAfterSwitch(fresh.enabledSkillIds, previous, config)) })
+      track('chat', 'switch_agent')
       setConvAgentId(convId, agentId)
       // Show it at once: the PATCH answers with the stored chat (no messages), the refetch that follows is not needed to name the agent.
-      qc.setQueryData(chatKeys.detail(convId), (old: Conversation | undefined) => (old ? { ...old, ...updated, messages: old.messages } : old))
+      qc.setQueryData(chatKeys.detail(convId), (old: Conversation | undefined) => (old ? conversationAfterSwitch(old, updated) : old))
       // Only follow the switch on screen if this chat is still the open one (the PATCH was awaited).
       if (chatChoices.current === choicesAtStart) setSelectedPersonaId(agentId)
       toast.success(`Agent switched to ${next.name}`)

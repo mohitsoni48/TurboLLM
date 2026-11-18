@@ -286,3 +286,34 @@ test('a chat keeps its agent id: set on create, changed and cleared by PATCH, re
     h.cleanup()
   }
 })
+
+test('an empty chatAgentId is refused on create and update, and a routine run’s conversation cannot change its agent', async () => {
+  const h = harness()
+  try {
+    const conv = h.store.createConversation({ chatAgentId: 'blank' })
+    for (const empty of ['', '   ']) {
+      assert.equal((await h.send('POST', '/api/v1/conversations', { chatAgentId: empty })).status, 400, `POST chatAgentId=${JSON.stringify(empty)}`)
+      const res = await h.send('PATCH', `/api/v1/conversations/${conv.id}`, { chatAgentId: empty })
+      assert.equal(res.status, 400, `PATCH chatAgentId=${JSON.stringify(empty)}`)
+      assert.deepEqual(await res.json(), { error: { code: 'invalid_input', message: 'chatAgentId must not be empty.' } })
+    }
+    assert.equal(h.store.getConversation(conv.id)!.chatAgentId, 'blank', 'nothing changed')
+    // null still clears it: that is "no agent", not an empty one.
+    assert.equal((await h.send('PATCH', `/api/v1/conversations/${conv.id}`, { chatAgentId: null })).status, 200)
+    assert.equal(h.store.getConversation(conv.id)!.chatAgentId, undefined)
+
+    // A conversation a routine run made carries that routine's agent id; its tools come from that agent.
+    const run = h.store.createConversation({ agentId: 'agent-1', allowedTools: ['web_search'], toolPolicy: 'force_web_search' })
+    const url = `/api/v1/conversations/${run.id}`
+    for (const body of [{ chatAgentId: 'blank' }, { allowedTools: [] }, { allowedTools: null }, { toolPolicy: null }]) {
+      const res = await h.send('PATCH', url, body)
+      assert.equal(res.status, 409, JSON.stringify(body))
+      assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'routine_conversation')
+    }
+    const after = h.store.getConversation(run.id)!
+    assert.deepEqual([after.allowedTools, after.toolPolicy, after.chatAgentId], [['web_search'], 'force_web_search', undefined], 'refused bodies changed nothing')
+    assert.equal((await h.send('PATCH', url, { title: 'Renamed run' })).status, 200, 'everything else about it can still be edited')
+  } finally {
+    h.cleanup()
+  }
+})

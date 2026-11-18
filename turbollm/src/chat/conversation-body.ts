@@ -36,6 +36,8 @@ export function conversationBodyError(b: unknown, fields: readonly string[]): st
   const body = b as Record<string, unknown>
   const text = nonStringField(body, fields.filter((f) => ['title', 'systemPrompt', 'modelKey', 'toolPolicy', 'chatAgentId'].includes(f)))
   if (text) return `${text} must be a string.`
+  // An empty id would be stored, and `??` would then show it as an agent called "" instead of falling back (the header said "Choose agent").
+  if (fields.includes('chatAgentId') && typeof body.chatAgentId === 'string' && body.chatAgentId.trim() === '') return 'chatAgentId must not be empty.'
   for (const f of fields.filter((x) => x === 'skillIds' || x === 'allowedTools')) {
     if (body[f] != null && !isStringArray(body[f])) return `${f} must be an array of strings.`
   }
