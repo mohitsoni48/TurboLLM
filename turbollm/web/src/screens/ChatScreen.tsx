@@ -32,6 +32,7 @@ import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
 import { ToolApprovalBar } from './chat/ToolApprovalBar'
 import { VoiceBar } from './chat/VoiceBar'
 import { useVoiceInput, type ComposerClip } from './chat/useVoiceInput'
+import { useConversationMode, type ConversationMode } from './chat/useConversationMode'
 import { formatClock } from '../lib/voice/pcm'
 import { speaker, ttsAvailable, type SpeechStream } from '../lib/voice/tts'
 import { readAloudOptions } from '../lib/voice/use-tts'
@@ -143,6 +144,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // Voice (useVoiceInput, further down): whether what is in the composer was spoken, and the chat whose next reply
   // is to be read aloud as it streams.
   const voiceUsed = useRef(false)
+  /** Whether the latest send() reached the daemon (read by the voice loop, which sends before the reply is over). */
+  const lastSendStarted = useRef(false)
   const speakNextReplyIn = useRef<string | null>(null)
   // `durationMs`: a voice clip's length, for its chip. Clips have file.type audio/wav and go out as `audio`.
   const [attachments, setAttachments] = useState<{ file: File; dataUrl: string; durationMs?: number }[]>([])
@@ -772,6 +775,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // `overrideAttachments`: what a voice message sends when it goes out the moment it is recorded, before the
   // attachment state it was added to has rendered.
   const send = async (overrideInput?: string, overrideAttachments?: typeof attachments) => {
+    lastSendStarted.current = false
     const rawText = (overrideInput ?? input).trim()
     const outgoing = overrideAttachments ?? attachments
     if ((!rawText && outgoing.length === 0) || live) return
@@ -813,7 +817,10 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     voiceUsed.current = false
     speaker.stop()
     const { readAloud } = useVoiceStore.getState()
-    const speakReply = (readAloud === 'always' || (readAloud === 'voice' && spoken)) && ttsAvailable()
+    // Hands-free voice mode reads every reply to the end (it is how the loop knows when to listen again), whatever the saved
+    // setting says: the setting itself is left alone.
+    const handsFree = !!conversationRef.current?.active
+    const speakReply = (readAloud === 'always' || (readAloud === 'voice' && spoken) || handsFree) && ttsAvailable()
 
     const sentAttachments = outgoing
     setInput('')
@@ -906,6 +913,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       const textAttachmentNames = textAttachments.map((a) => a.file.name)
       speakNextReplyIn.current = speakReply ? convId : null
       const { started, aborted } = await session.send(convId, { text, images, audio, docContext, textAttachmentNames }, turnSettings)
+      lastSendStarted.current = started
       // The session toasts the error itself and never rethrows. An abort is the user (or Eject)
       // stopping it, not a refusal.
       if (!started && !aborted) restoreComposer()
@@ -1079,6 +1087,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // ── voice ──────────────────────────────────────────────────────────────────
   const navigate = useNavigate()
   const voiceAutoStop = useVoiceStore((v) => v.autoStop)
+  // Settings → Voice opts into the hands-free beta; without it the composer offers dictation only.
+  const conversationEnabled = useVoiceStore((v) => v.conversation)
   // Only this machine's own engine says whether its model hears audio; a linked machine's model is taken not to, so
   // a recording for it is converted to text here first.
   const modelHears = !activeRemoteId && status?.model?.audio === true
@@ -1086,11 +1096,26 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // "Send automatically" only when a send can go out now. One that send() would refuse (a reply still streaming, no
   // model ready) leaves what was said in the chat box, where it used to be dropped.
   const autoSendNow = () => useVoiceStore.getState().autoSend && !composerLocked
+  // Full voice mode (useConversationMode, below useVoiceInput): when it is on, a spoken message
+  // always goes straight out - hands-free means no look at the chat box - and the loop is told so.
+  const conversationRef = useRef<ConversationMode | null>(null)
+  // The spoken message counts as handed over at once (the loop then waits for the reply). A send the chat refused, or that
+  // failed before streaming, tells the loop when send() returns, so it does not wait for a reply that is not coming.
+  const sendForConversation = (conv: ConversationMode, go: () => Promise<void>) => {
+    conv.emit({ type: 'message-sent' })
+    void go().then(() => { if (!lastSendStarted.current) conv.emit({ type: 'send-failed' }) })
+  }
   const voice = useVoiceInput({
     modelHears,
+    handsFree: () => !!conversationRef.current?.active,
     onText: (text) => {
       voiceUsed.current = true
       const combined = input.trim() ? `${input.trimEnd()} ${text}` : text
+      const conv = conversationRef.current
+      if (conv?.active) {
+        sendForConversation(conv, () => send(combined))
+        return
+      }
       if (autoSendNow()) {
         void send(combined)
         return
@@ -1100,6 +1125,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     },
     onClip: (clip: ComposerClip) => {
       voiceUsed.current = true
+      const conv = conversationRef.current
+      if (conv?.active) {
+        sendForConversation(conv, () => send(undefined, [...attachments, clip]))
+        return
+      }
       if (autoSendNow()) {
         void send(undefined, [...attachments, clip])
         return
@@ -1109,7 +1139,23 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     },
     notify: (message, kind) => { if (kind === 'error') toast.error(message); else toast(message) },
   })
+  const conversation = useConversationMode({
+    voice,
+    replyStreaming: !!live || daemonGenerating,
+    canListen: ready,
+    chatKey: activeId,
+    stopReply: () => { void handleStop() },
+    enabled: conversationEnabled,
+  })
+  conversationRef.current = conversation
   const onMicClick = () => {
+    // Voice conversation on: a tap on the mic is barge-in (stop the reply, hear me now), except
+    // mid-recording, where it still finishes the clip like always.
+    if (conversation.active) {
+      if (voice.phase === 'recording') { void voice.stop(); return }
+      conversation.interrupt()
+      return
+    }
     if (voice.phase === 'recording') { void voice.stop(); return }
     if (voice.phase !== 'idle') return
     if (voice.block) {
@@ -1122,6 +1168,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     void voice.start()
   }
   const micLabel = voice.phase === 'recording' ? 'Finish recording' : 'Record a voice message'
+  const conversationLabel = conversation.active ? 'Stop voice conversation' : 'Start a voice conversation (hands-free)'
   const composerEmpty = !input.trim() && attachments.length === 0
 
   // Reading the reply aloud while it is written. A turn that asked for it (send) is spoken from its first complete
@@ -1630,6 +1677,19 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                 />
                 {/* The microphone has its own place from sm up. Below it (a phone) the chat box has no width to
                     give, so it takes the Send button's place while there is nothing to send (below). */}
+                {conversationEnabled && (
+                  <button
+                    type="button"
+                    onClick={() => (conversation.active ? conversation.disable() : conversation.enable())}
+                    disabled={(composerLocked && !conversation.active) || !!voice.block}
+                    className="hidden h-9 w-9 shrink-0 place-items-center rounded-md hover:bg-panel-2 disabled:opacity-40 sm:grid"
+                    title={conversationLabel}
+                    aria-label={conversationLabel}
+                    aria-pressed={conversation.active}
+                  >
+                    <AudioLines size={15} className={conversation.active ? undefined : 'text-muted'} style={conversation.active ? { color: 'var(--accent)' } : undefined} />
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={onMicClick}
@@ -1699,6 +1759,19 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                   <>
                     {/* Phone widths: with nothing typed or attached there is nothing to send, so this place is
                         the microphone's. From sm up it has its own button beside the paperclip. */}
+                    {conversationEnabled && (composerEmpty || conversation.active) && (
+                      <Button
+                        size="icon"
+                        variant={conversation.active ? 'default' : 'outline'}
+                        className="sm:hidden"
+                        onClick={() => (conversation.active ? conversation.disable() : conversation.enable())}
+                        disabled={(composerLocked && !conversation.active) || !!voice.block}
+                        aria-label={conversationLabel}
+                        aria-pressed={conversation.active}
+                      >
+                        <AudioLines size={15} />
+                      </Button>
+                    )}
                     {composerEmpty && (
                       <Button
                         size="icon"
