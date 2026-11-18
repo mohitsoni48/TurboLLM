@@ -1,27 +1,31 @@
 import { describe, expect, it } from 'vitest'
 import {
+  CONVERSATION_OFF,
   applyConversation,
   reduceConversation,
   type ConversationEvent,
   type ConversationPhase,
+  type ConversationState,
 } from './conversation-mode'
 
-/** Run one event and return [next phase, effect types in order]. */
-function step(phase: ConversationPhase, event: ConversationEvent): [ConversationPhase, string[]] {
-  const t = reduceConversation(phase, event)
-  return [t.phase, t.effects.map((e) => e.type)]
+const on = (phase: ConversationPhase): ConversationState => ({ on: true, phase })
+
+/** Run one event and return [next state, effect types in order]. */
+function step(state: ConversationState, event: ConversationEvent): [ConversationState, string[]] {
+  const t = reduceConversation(state, event)
+  return [t.state, t.effects.map((e) => e.type)]
 }
 
 /** Drive a whole turn as a script of events, collecting every effect. */
-function run(script: ConversationEvent[], from: ConversationPhase = 'idle'): { phase: ConversationPhase; effects: string[] } {
-  let phase = from
+function run(script: ConversationEvent[], from: ConversationState = CONVERSATION_OFF): { state: ConversationState; effects: string[] } {
+  let state = from
   const effects: string[] = []
   for (const event of script) {
-    const t = reduceConversation(phase, event)
-    phase = t.phase
+    const t = reduceConversation(state, event)
+    state = t.state
     effects.push(...t.effects.map((e) => e.type))
   }
-  return { phase, effects }
+  return { state, effects }
 }
 
 const TURN: ConversationEvent[] = [
@@ -33,143 +37,190 @@ const TURN: ConversationEvent[] = [
 ]
 
 describe('the hands-free turn', () => {
-  it('walks record -> transcribe -> generate -> speak -> record again', () => {
+  it('walks record -> transcribe -> generate -> speak -> record again, with the mode on throughout', () => {
     const phases: ConversationPhase[] = []
-    let phase: ConversationPhase = 'idle'
+    let state = CONVERSATION_OFF
     for (const event of TURN) {
-      phase = applyConversation(phase, event)
-      phases.push(phase)
+      state = applyConversation(state, event)
+      expect(state.on).toBe(true)
+      phases.push(state.phase)
     }
     expect(phases).toEqual(['recording', 'transcribing', 'generating', 'speaking', 'recording'])
   })
 
   it('opens the mic on start and again only after the reply has been read to the end', () => {
-    const { effects } = run(TURN)
-    expect(effects).toEqual(['start-recording', 'start-recording'])
+    expect(run(TURN).effects).toEqual(['start-recording', 'start-recording'])
   })
 
   it('keeps the mic shut while the reply is still speaking, so it cannot record TurboLLM itself', () => {
-    // During speaking, no start-recording effect may be produced by any event other than
-    // speak-done or an explicit interrupt.
+    // During speaking, no start-recording effect may come from any event other than speak-done, an explicit tap or start.
     for (const event of TURN) {
-      const [, effects] = step('speaking', event)
-      if (event.type === 'speak-done' || event.type === 'interrupt' || event.type === 'start') continue
+      const [, effects] = step(on('speaking'), event)
+      if (event.type === 'speak-done' || event.type === 'start') continue
       expect(effects).not.toContain('start-recording')
     }
   })
 })
 
-describe('barge-in', () => {
-  it('a tap while the reply is speaking stops the speech and starts listening at once', () => {
-    const [phase, effects] = step('speaking', { type: 'interrupt' })
-    expect(phase).toBe('recording')
+describe('barge-in: a tap on the mic', () => {
+  it('while the reply is speaking stops the speech and starts listening at once', () => {
+    const [state, effects] = step(on('speaking'), { type: 'interrupt' })
+    expect(state).toEqual(on('recording'))
     expect(effects).toEqual(['stop-speaking', 'start-recording'])
   })
 
-  it('a tap while the reply is still generating starts listening without waiting for it', () => {
-    const [phase, effects] = step('generating', { type: 'interrupt' })
-    expect(phase).toBe('recording')
+  it('while the reply is still being written stops that reply, then listens (the mode stays on)', () => {
+    const [state, effects] = step(on('generating'), { type: 'interrupt' })
+    expect(state).toEqual(on('recording'))
+    expect(effects).toEqual(['stop-reply', 'start-recording'])
+  })
+
+  it('while a clip is being transcribed drops the transcription and listens again', () => {
+    const [state, effects] = step(on('transcribing'), { type: 'interrupt' })
+    expect(state).toEqual(on('recording'))
+    expect(effects).toEqual(['cancel-recording', 'start-recording'])
+  })
+
+  it('between turns (idle, mode on) starts the next turn', () => {
+    const [state, effects] = step(on('idle'), { type: 'interrupt' })
+    expect(state).toEqual(on('recording'))
     expect(effects).toEqual(['start-recording'])
   })
 
-  it('a tap while already recording changes nothing (the clip is already live)', () => {
-    const [phase, effects] = step('recording', { type: 'interrupt' })
-    expect(phase).toBe('recording')
+  it('while already recording changes nothing (the screen finishes the live clip)', () => {
+    const [state, effects] = step(on('recording'), { type: 'interrupt' })
+    expect(state).toEqual(on('recording'))
     expect(effects).toEqual([])
+  })
+
+  it('with the mode off does nothing', () => {
+    expect(step(CONVERSATION_OFF, { type: 'interrupt' })).toEqual([CONVERSATION_OFF, []])
   })
 })
 
 describe('turning the mode off', () => {
-  it('cancels an open recording and detaches mid-turn work', () => {
-    const [phase, effects] = step('recording', { type: 'stop' })
-    expect(phase).toBe('idle')
-    expect(effects).toEqual(['cancel-recording', 'detach'])
+  it('cancels an open recording', () => {
+    const [state, effects] = step(on('recording'), { type: 'stop' })
+    expect(state).toEqual(CONVERSATION_OFF)
+    expect(effects).toEqual(['cancel-recording'])
   })
 
-  it('stops the speech and detaches when off arrives mid-read-aloud', () => {
-    const [phase, effects] = step('speaking', { type: 'stop' })
-    expect(phase).toBe('idle')
-    expect(effects).toEqual(['stop-speaking', 'detach'])
+  it('cancels a transcription in progress', () => {
+    const [state, effects] = step(on('transcribing'), { type: 'stop' })
+    expect(state).toEqual(CONVERSATION_OFF)
+    expect(effects).toEqual(['cancel-recording'])
   })
 
-  it('only detaches when the turn is between mic and speaker', () => {
-    for (const phase of ['transcribing', 'generating'] as const) {
-      const [next, effects] = step(phase, { type: 'stop' })
-      expect(next).toBe('idle')
-      expect(effects).toEqual(['detach'])
-    }
+  it('stops the speech when off arrives mid-read-aloud', () => {
+    const [state, effects] = step(on('speaking'), { type: 'stop' })
+    expect(state).toEqual(CONVERSATION_OFF)
+    expect(effects).toEqual(['stop-speaking'])
   })
 
-  it('is a no-op from idle', () => {
-    const [phase, effects] = step('idle', { type: 'stop' })
-    expect(phase).toBe('idle')
+  it('leaves a reply that is still being written to finish: it is the normal chat again', () => {
+    const [state, effects] = step(on('generating'), { type: 'stop' })
+    expect(state).toEqual(CONVERSATION_OFF)
     expect(effects).toEqual([])
+  })
+
+  it('is a no-op when already off', () => {
+    expect(step(CONVERSATION_OFF, { type: 'stop' })).toEqual([CONVERSATION_OFF, []])
   })
 })
 
 describe('restart from anywhere', () => {
   it('start while speaking stops the old speech before opening the mic', () => {
-    const [phase, effects] = step('speaking', { type: 'start' })
-    expect(phase).toBe('recording')
+    const [state, effects] = step(on('speaking'), { type: 'start' })
+    expect(state).toEqual(on('recording'))
     expect(effects).toEqual(['stop-speaking', 'start-recording'])
   })
 
+  it('start while a reply is being written stops it first', () => {
+    expect(step(on('generating'), { type: 'start' })[1]).toEqual(['stop-reply', 'start-recording'])
+  })
+
   it('start while already recording ends that clip first, so it is never sent twice', () => {
-    const [phase, effects] = step('recording', { type: 'start' })
-    expect(phase).toBe('recording')
+    const [state, effects] = step(on('recording'), { type: 'start' })
+    expect(state).toEqual(on('recording'))
     expect(effects).toEqual(['cancel-recording', 'start-recording'])
   })
 })
 
-describe('failure paths end the turn, not the mode', () => {
-  it('a clip with no speech in it goes back to idle and is never transcribed', () => {
-    const { phase, effects } = run([{ type: 'start' }, { type: 'clip-empty' }])
-    expect(phase).toBe('idle')
-    expect(effects).toEqual(['start-recording'])
+describe('a failure ends the turn, never the mode', () => {
+  // The review's first finding: every failure path used to return to the same idle that "mode off" is.
+  const FAILURES: Array<[string, ConversationEvent[]]> = [
+    ['a clip with no speech in it', [{ type: 'start' }, { type: 'clip-empty' }]],
+    ['a transcription that came back empty or failed', [{ type: 'start' }, { type: 'clip-ended' }, { type: 'clip-empty' }]],
+    ['a send that was refused', [{ type: 'start' }, { type: 'clip-ended' }, { type: 'send-failed' }]],
+    ['a send refused after the message was handed over', [{ type: 'start' }, { type: 'clip-ended' }, { type: 'message-sent' }, { type: 'send-failed' }]],
+    ['a reply that never started or failed', [{ type: 'start' }, { type: 'clip-ended' }, { type: 'message-sent' }, { type: 'reply-failed' }]],
+    ['a reply that cannot be read aloud', [...TURN.slice(0, 3), { type: 'speak-failed' }]],
+    ['speech that broke off', [...TURN.slice(0, 4), { type: 'speak-failed' }]],
+  ]
+  for (const [what, script] of FAILURES) {
+    it(`${what}: phase idle, mode still on`, () => {
+      const { state } = run(script)
+      expect(state).toEqual(on('idle'))
+    })
+  }
+
+  it('the next tap after a failed turn starts a fresh one', () => {
+    const { state, effects } = run([{ type: 'start' }, { type: 'clip-empty' }, { type: 'interrupt' }])
+    expect(state).toEqual(on('recording'))
+    expect(effects).toEqual(['start-recording', 'start-recording'])
   })
 
-  it('a cancelled clip can never reach transcribing (no empty message sends)', () => {
-    const [phase] = step('idle', { type: 'message-sent' })
-    expect(phase).toBe('idle')
-  })
-
-  it('a failed send returns to idle, ready for the next turn', () => {
-    const { phase } = run([{ type: 'start' }, { type: 'clip-ended' }, { type: 'send-failed' }])
-    expect(phase).toBe('idle')
-  })
-
-  it('a failed reply returns to idle without speaking', () => {
-    const { phase, effects } = run([{ type: 'start' }, { type: 'clip-ended' }, { type: 'message-sent' }, { type: 'reply-failed' }])
-    expect(phase).toBe('idle')
+  it('a failed reply returns to idle without touching the speaker', () => {
+    const { effects } = run([{ type: 'start' }, { type: 'clip-ended' }, { type: 'message-sent' }, { type: 'reply-failed' }])
     expect(effects).not.toContain('stop-speaking')
   })
+})
 
-  it('a reply that cannot be read aloud waits for the user instead of looping silently', () => {
-    const { phase, effects } = run([...TURN.slice(0, 4), { type: 'speak-failed' }])
-    expect(phase).toBe('idle')
-    expect(effects).toEqual(['start-recording'])
+describe('the audio route (a model that hears the clip itself)', () => {
+  // useVoiceInput's attach() hands the clip over and only then lets the recorder go: the message is sent while the loop is
+  // still in recording. That used to be ignored, and the recorder's release then read as an empty clip that killed the loop.
+  it('hands the clip over straight from recording, and the recorder letting go afterwards changes nothing', () => {
+    const { state } = run([{ type: 'start' }, { type: 'message-sent' }, { type: 'clip-empty' }])
+    expect(state).toEqual(on('generating'))
+  })
+
+  it('the reply then speaks and the loop goes on', () => {
+    const { state, effects } = run([{ type: 'start' }, { type: 'message-sent' }, { type: 'clip-empty' }, { type: 'reply-done' }, { type: 'speak-done' }])
+    expect(state).toEqual(on('recording'))
+    expect(effects).toEqual(['start-recording', 'start-recording'])
   })
 })
 
 describe('stray events are ignored', () => {
   it('late events from a finished turn do not move an idle machine', () => {
     for (const event of TURN.slice(1)) {
-      const [phase, effects] = step('idle', event)
-      expect(phase).toBe('idle')
+      const [state, effects] = step(on('idle'), event)
+      expect(state).toEqual(on('idle'))
       expect(effects).toEqual([])
     }
   })
 
+  it('nothing but start wakes a machine that is off', () => {
+    for (const event of [...TURN.slice(1), { type: 'send-failed' } as ConversationEvent, { type: 'reply-failed' } as ConversationEvent]) {
+      expect(step(CONVERSATION_OFF, event)).toEqual([CONVERSATION_OFF, []])
+    }
+  })
+
   it('a reply-done for a reply the user already barged into does not re-open the speaker', () => {
-    // generating -> interrupt -> recording; the old reply then finishes anyway.
-    const { phase, effects } = run([
+    // generating -> tap -> recording; the old reply then finishes anyway.
+    const { state, effects } = run([
       { type: 'start' },
       { type: 'clip-ended' },
       { type: 'message-sent' },
       { type: 'interrupt' },
       { type: 'reply-done' },
     ])
-    expect(phase).toBe('recording')
-    expect(effects).toEqual(['start-recording', 'start-recording'])
+    expect(state).toEqual(on('recording'))
+    expect(effects).toEqual(['start-recording', 'stop-reply', 'start-recording'])
+  })
+
+  it('a clip-empty that arrives after the message was handed over does not end the turn', () => {
+    expect(step(on('generating'), { type: 'clip-empty' })).toEqual([on('generating'), []])
+    expect(step(on('speaking'), { type: 'clip-empty' })).toEqual([on('speaking'), []])
   })
 })
