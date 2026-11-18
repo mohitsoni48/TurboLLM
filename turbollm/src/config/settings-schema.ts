@@ -449,6 +449,14 @@ export const SETTINGS = [
   row('pdfReading', (c) => c.tools.pdfReading ?? false, [
     bool('pdfReading', (c, v) => { c.tools.pdfReading = v }, { label: '"Read PDFs in fetch_url"', get: (c) => c.tools.pdfReading }),
   ], { effect: 'rebuildTools' }),
+  // Skills switched on for every new chat (Skills library → "On by default"). Unknown ids are not refused here: the library
+  // can change after the save, so conversation creation filters them against what exists then.
+  row('defaultSkillIds', (c) => c.defaultSkillIds, [
+    field<string[]>('defaultSkillIds', {
+      parse: (raw) => stringList(raw) ?? invalid('defaultSkillIds must be an array of skill ids.'),
+      set: (c, v) => { c.defaultSkillIds = [...new Set(v)] },
+    }),
+  ]),
   // How long a chat reply waits for its tool calls' approvals (execute-with-approval.ts). Not host-only like
   // toolPolicies: the wait running out runs nothing (the call is answered as not run), so no value of it lets a tool run.
   row('chatApprovalWaitMinutes', (c) => c.tools.chatApprovalWaitMinutes ?? CHAT_APPROVAL_WAIT_MINUTES.default, [
