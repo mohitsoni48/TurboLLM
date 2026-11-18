@@ -1087,6 +1087,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // ── voice ──────────────────────────────────────────────────────────────────
   const navigate = useNavigate()
   const voiceAutoStop = useVoiceStore((v) => v.autoStop)
+  // Settings → Voice opts into the hands-free beta; without it the composer offers dictation only.
+  const conversationEnabled = useVoiceStore((v) => v.conversation)
   // Only this machine's own engine says whether its model hears audio; a linked machine's model is taken not to, so
   // a recording for it is converted to text here first.
   const modelHears = !activeRemoteId && status?.model?.audio === true
@@ -1143,6 +1145,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     canListen: ready,
     chatKey: activeId,
     stopReply: () => { void handleStop() },
+    enabled: conversationEnabled,
   })
   conversationRef.current = conversation
   const onMicClick = () => {
@@ -1674,17 +1677,19 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                 />
                 {/* The microphone has its own place from sm up. Below it (a phone) the chat box has no width to
                     give, so it takes the Send button's place while there is nothing to send (below). */}
-                <button
-                  type="button"
-                  onClick={() => (conversation.active ? conversation.disable() : conversation.enable())}
-                  disabled={(composerLocked && !conversation.active) || !!voice.block}
-                  className="hidden h-9 w-9 shrink-0 place-items-center rounded-md hover:bg-panel-2 disabled:opacity-40 sm:grid"
-                  title={conversationLabel}
-                  aria-label={conversationLabel}
-                  aria-pressed={conversation.active}
-                >
-                  <AudioLines size={15} className={conversation.active ? undefined : 'text-muted'} style={conversation.active ? { color: 'var(--accent)' } : undefined} />
-                </button>
+                {conversationEnabled && (
+                  <button
+                    type="button"
+                    onClick={() => (conversation.active ? conversation.disable() : conversation.enable())}
+                    disabled={(composerLocked && !conversation.active) || !!voice.block}
+                    className="hidden h-9 w-9 shrink-0 place-items-center rounded-md hover:bg-panel-2 disabled:opacity-40 sm:grid"
+                    title={conversationLabel}
+                    aria-label={conversationLabel}
+                    aria-pressed={conversation.active}
+                  >
+                    <AudioLines size={15} className={conversation.active ? undefined : 'text-muted'} style={conversation.active ? { color: 'var(--accent)' } : undefined} />
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={onMicClick}
@@ -1754,7 +1759,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                   <>
                     {/* Phone widths: with nothing typed or attached there is nothing to send, so this place is
                         the microphone's. From sm up it has its own button beside the paperclip. */}
-                    {(composerEmpty || conversation.active) && (
+                    {conversationEnabled && (composerEmpty || conversation.active) && (
                       <Button
                         size="icon"
                         variant={conversation.active ? 'default' : 'outline'}

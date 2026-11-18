@@ -43,6 +43,9 @@ export interface ConversationModeOptions {
   chatKey: string | null
   /** Stop the reply that is still being written (barge-in). */
   stopReply: () => void
+  /** The Settings → Voice opt-in for the beta. The master switch: the mode cannot be turned on without it, and turning it off
+   *  while the mode is on ends the mode (so a composer that no longer offers it cannot keep a live loop running). */
+  enabled: boolean
 }
 
 export interface ConversationMode {
@@ -120,7 +123,7 @@ export function useConversationMode(options: ConversationModeOptions): Conversat
   dispatchRef.current = dispatch
 
   const enable = useCallback(() => {
-    if (!latest.current.canListen) return
+    if (!latest.current.canListen || !latest.current.enabled) return
     dispatch({ type: 'start' })
   }, [dispatch])
   const disable = useCallback(() => dispatch({ type: 'stop' }), [dispatch])
@@ -203,6 +206,15 @@ export function useConversationMode(options: ConversationModeOptions): Conversat
     document.addEventListener('visibilitychange', onHide)
     return () => document.removeEventListener('visibilitychange', onHide)
   }, [])
+
+  // The opt-in revoked (in Settings, or in another tab: see the store's storage listener) ends the mode, whatever is mid-flight.
+  const enabled = options.enabled
+  const prevEnabled = useRef(enabled)
+  useEffect(() => {
+    const was = prevEnabled.current
+    prevEnabled.current = enabled
+    if (was && !enabled && stateRef.current.on) dispatchRef.current({ type: 'stop' })
+  }, [enabled])
 
   // Another chat, or a new one, is not this loop's: the mode ends. The new chat a first message creates is.
   const chatKey = options.chatKey

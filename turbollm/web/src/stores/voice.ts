@@ -139,3 +139,11 @@ export const useVoiceStore = create<VoiceState>((set) => ({
     set({ ttsRate: clamped })
   },
 }))
+
+// The opt-in is per browser, so another tab turning it off tells this one by a `storage` event: without it a loop already running here
+// would go on after the user switched the beta off elsewhere. (`key` is null when the whole storage was cleared.)
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (e) => {
+    if (e.key === KEYS.conversation || e.key === null) useVoiceStore.setState({ conversation: read(KEYS.conversation) === 'true' })
+  })
+}

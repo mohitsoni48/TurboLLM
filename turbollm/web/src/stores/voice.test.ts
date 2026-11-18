@@ -135,3 +135,27 @@ describe('useVoiceStore onlineVoices', () => {
     expect((await loadStore()).getState().onlineVoices).toBe(false)
   })
 })
+
+describe('useVoiceStore conversation opt-in across tabs', () => {
+  it('follows another tab turning it off or on', async () => {
+    localStorage.setItem('tllm.voice.conversation', 'true')
+    const store = await loadStore()
+    expect(store.getState().conversation).toBe(true)
+    localStorage.setItem('tllm.voice.conversation', 'false')
+    window.dispatchEvent(new StorageEvent('storage', { key: 'tllm.voice.conversation', newValue: 'false' }))
+    expect(store.getState().conversation).toBe(false)
+    localStorage.setItem('tllm.voice.conversation', 'true')
+    window.dispatchEvent(new StorageEvent('storage', { key: 'tllm.voice.conversation', newValue: 'true' }))
+    expect(store.getState().conversation).toBe(true)
+  })
+
+  it('reads off when the other tab cleared all of storage, and ignores other keys', async () => {
+    localStorage.setItem('tllm.voice.conversation', 'true')
+    const store = await loadStore()
+    window.dispatchEvent(new StorageEvent('storage', { key: 'tllm.voice.ttsRate', newValue: '1.5' }))
+    expect(store.getState().conversation).toBe(true)
+    localStorage.clear()
+    window.dispatchEvent(new StorageEvent('storage', { key: null }))
+    expect(store.getState().conversation).toBe(false)
+  })
+})

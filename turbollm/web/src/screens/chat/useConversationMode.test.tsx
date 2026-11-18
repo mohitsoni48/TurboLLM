@@ -23,7 +23,7 @@ const fakeSpeaker = vi.hoisted(() => {
 })
 vi.mock('../../lib/voice/tts', () => ({ speaker: fakeSpeaker }))
 
-interface Props { voicePhase: VoicePhase; replyStreaming: boolean; canListen: boolean; chatKey: string | null }
+interface Props { voicePhase: VoicePhase; replyStreaming: boolean; canListen: boolean; chatKey: string | null; enabled: boolean }
 
 let visibility: DocumentVisibilityState = 'visible'
 
@@ -31,13 +31,14 @@ function setup(initial: Partial<Props> = {}) {
   const start = vi.fn(async () => {})
   const cancel = vi.fn()
   const stopReply = vi.fn()
-  const props: Props = { voicePhase: 'idle', replyStreaming: false, canListen: true, chatKey: 'chat-1', ...initial }
+  const props: Props = { voicePhase: 'idle', replyStreaming: false, canListen: true, chatKey: 'chat-1', enabled: true, ...initial }
   const hook = renderHook((p: Props) => useConversationMode({
     voice: { phase: p.voicePhase, start, cancel },
     replyStreaming: p.replyStreaming,
     canListen: p.canListen,
     chatKey: p.chatKey,
     stopReply,
+    enabled: p.enabled,
   }), { initialProps: props })
   const update = (change: Partial<Props>) => {
     Object.assign(props, change)
@@ -332,5 +333,48 @@ describe('the low findings', () => {
     expect(h.result.current.active).toBe(false)
     h.voice('idle') // the cancelled recording lets go: nothing wakes the machine
     expect(h.result.current.phase).toBe('idle')
+  })
+})
+
+// #329's review: nothing checked that the opt-in actually gates the loop. Deleting the gate failed no test.
+describe('the Settings opt-in is the master switch', () => {
+  it('cannot be turned on while the opt-in is off', () => {
+    const h = setup({ enabled: false })
+    act(() => h.result.current.enable())
+    expect(h.result.current.active).toBe(false)
+    expect(h.start).not.toHaveBeenCalled()
+  })
+
+  it('turning the opt-in off while the mode is on ends it and drops the clip in progress', () => {
+    const h = setup()
+    act(() => h.result.current.enable())
+    h.voice('starting', 'recording')
+    h.update({ enabled: false })
+    expect(h.result.current.active).toBe(false)
+    expect(h.cancel).toHaveBeenCalled()
+  })
+
+  it('turning it off mid-reply stops the speech', () => {
+    vi.useFakeTimers()
+    const h = setup()
+    act(() => h.result.current.enable())
+    h.voice('starting', 'recording', 'transcribing')
+    act(() => h.result.current.emit({ type: 'message-sent' }))
+    h.voice('idle')
+    h.update({ replyStreaming: true })
+    fakeSpeaker.queue = ['reply-1']
+    h.update({ replyStreaming: false })
+    expect(h.result.current.phase).toBe('speaking')
+    fakeSpeaker.stop.mockClear()
+    h.update({ enabled: false })
+    expect(h.result.current.active).toBe(false)
+    expect(fakeSpeaker.stop).toHaveBeenCalled()
+  })
+
+  it('turning it off while the mode is off changes nothing, and it can be turned on again afterwards', () => {
+    const h = setup({ enabled: false })
+    h.update({ enabled: true })
+    act(() => h.result.current.enable())
+    expect(h.result.current.active).toBe(true)
   })
 })
