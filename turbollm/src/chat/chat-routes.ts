@@ -375,7 +375,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (bad) return err(c, 400, 'invalid_input', bad)
     // Only keep ids that exist in the shared skill library; silently drop unknown ones.
     const validIds = new Set(new SkillStore(d.store.dir()).list().map((s) => s.id))
-    const skillIds = Array.isArray(b.skillIds) ? b.skillIds.filter((sid) => validIds.has(sid)) : undefined
+    const requestedSkillIds = Array.isArray(b.skillIds) ? b.skillIds : d.store.snapshot().defaultSkillIds
+    const skillIds = requestedSkillIds?.filter((sid) => validIds.has(sid))
     // Tool allow-list baked in from a custom chat Agent (Customize → Agents). Not
     // validated against the live tool catalog — an MCP server disconnecting later
     // shouldn't retroactively corrupt the conversation's saved intent.

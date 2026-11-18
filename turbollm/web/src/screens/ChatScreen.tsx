@@ -24,6 +24,7 @@ import {
 import { toast } from '../components/ui/sonner'
 import { focusManager, useQuery, useQueryClient } from '@tanstack/react-query'
 import { skillKeys, fetchSkills } from '../lib/agent-api'
+import { CHAT_UNSUPPORTED_SKILLS, completeMention, findMentionedSkillIds, trailingMentionQuery } from '../lib/skill-mentions'
 import { cn, readLastChatConvId, writeLastChatConvId } from '../lib/utils'
 import { useChatInAddress } from '../lib/chat-address'
 import { ThinkingBudgetSlider } from '../components/ThinkingBudgetSlider'
@@ -293,7 +294,12 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
 
   // Skills enabled before a conversation exists yet (first message hasn't been sent).
   // Once activeId exists, conv.skillIds is the source of truth instead.
-  const [pendingSkillIds, setPendingSkillIds] = useState<string[]>([])
+  // null = untouched, so a blank chat shows (and starts with) the skills switched on by default.
+  const [pendingSkillSelection, setPendingSkillSelection] = useState<string[] | null>(null)
+  const defaultSkillIds = (settingsQ.data?.defaultSkillIds ?? []).filter((id) => !CHAT_UNSUPPORTED_SKILLS.has(id))
+  const pendingSkillIds = pendingSkillSelection ?? defaultSkillIds
+  const setPendingSkillIds = (next: string[] | ((prev: string[]) => string[])) =>
+    setPendingSkillSelection((prev) => (typeof next === 'function' ? next(prev ?? defaultSkillIds) : next))
   const enabledSkillIds = conv?.skillIds ?? pendingSkillIds
 
   // Same pattern, extended to the other Thread-settings fields (GitHub #52 follow-up):
@@ -334,19 +340,20 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // otherwise-empty composer) shows a filtered skill list. Selecting one enables
   // that skill for the conversation and clears the token.
   const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills, staleTime: 30_000 })
-  const CHAT_UNSUPPORTED_SKILLS = new Set(['filesystem'])
   const pickableSkills = (skillsQ.data ?? []).filter((s) => !CHAT_UNSUPPORTED_SKILLS.has(s.id))
-  const skillPickerMatch = /^\/([a-z0-9-]*)$/i.exec(input)
-  const skillPickerQuery = skillPickerMatch?.[1]?.toLowerCase() ?? ''
+  const slashMatch = /^\/([a-z0-9-]*)$/i.exec(input)
+  const mentionQuery = trailingMentionQuery(input)
+  const skillPickerMatch = slashMatch !== null || mentionQuery !== null
+  const skillPickerQuery = slashMatch?.[1]?.toLowerCase() ?? mentionQuery ?? ''
   const filteredSkills = skillPickerMatch
     ? pickableSkills.filter((s) => !skillPickerQuery || s.id.includes(skillPickerQuery) || s.name.toLowerCase().includes(skillPickerQuery))
     : []
-  const skillPickerOpen = !!skillPickerMatch && filteredSkills.length > 0 && !live
+  const skillPickerOpen = skillPickerMatch && filteredSkills.length > 0 && !live
   const [skillPickerIndex, setSkillPickerIndex] = useState(0)
   useEffect(() => { setSkillPickerIndex(0) }, [skillPickerQuery, skillPickerOpen])
 
   const selectSkill = (skill: { id: string; name: string }) => {
-    setInput(`/${skill.id} `)
+    setInput(slashMatch ? `/${skill.id} ` : completeMention(input, skill.id))
     setTimeout(autoResize, 0)
     if (activeId) {
       const next = Array.from(new Set([...enabledSkillIds, skill.id]))
@@ -795,6 +802,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     const skillMatch = /^\/([a-z0-9-]+)(?:\s+([\s\S]*))?$/.exec(rawText)
     const matchedSkill = skillMatch ? pickableSkills.find((s) => s.id === skillMatch[1]) : undefined
     const text = matchedSkill ? (skillMatch?.[2] ?? '').trim() : rawText
+    // '@skill-id' anywhere in the message turns that skill on too, and stays in the text as the user wrote it.
+    const mentionedSkillIds = findMentionedSkillIds(text, pickableSkills)
 
     // Discriminate by file.type (authoritative, same as the preview thumbnail below) rather
     // than sniffing the extracted dataUrl content — a text/PDF attachment whose content
@@ -865,6 +874,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           ...pendingSkillIds,
           ...(resolved?.skillIds ?? []),
           ...(matchedSkill ? [matchedSkill.id] : []),
+          ...mentionedSkillIds,
         ]))
         // A system prompt set via Thread settings before the first message is an
         // explicit override — it wins over the agent's own default system prompt.
@@ -875,7 +885,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           modelKey: activeRemoteId ?? loadedChatModel?.key ?? '',
           systemPrompt: finalSystemPrompt || undefined,
           toolPolicy: selectedPersonaId === 'research' ? 'force_web_search' : undefined,
-          skillIds: initialSkillIds.length ? initialSkillIds : undefined,
+          // Always the list the user saw: an empty one means none, not "fall back to the defaults".
+          skillIds: initialSkillIds,
           // Pass an explicit empty array through as-is (e.g. Blank's fixed []) — collapsing it
           // to undefined here would silently turn "zero tools" back into "unrestricted" before
           // the request ever reaches the backend (GitHub #52).
@@ -892,14 +903,15 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         if (thinkingBudget !== readThinkingBudget(null)) localStorage.setItem(`tllm.thinkingBudget.${convId}`, String(thinkingBudget))
         if (reasoningEffort !== readReasoningEffort(null)) localStorage.setItem(`tllm.reasoningEffort.${convId}`, reasoningEffort)
         setActiveId(convId)
-        setPendingSkillIds([])
+        setPendingSkillSelection(null)
         setPendingSystemPrompt('')
         setPendingSampling({})
         setPendingPreserveThinking(true)
-      } else if (matchedSkill && !enabledSkillIds.includes(matchedSkill.id)) {
-        // Existing conversation missing this skill — enable it before sending so the
+      } else {
+        const missing = [...(matchedSkill ? [matchedSkill.id] : []), ...mentionedSkillIds].filter((id) => !enabledSkillIds.includes(id))
+        // Existing conversation missing a named skill — enable it before sending so the
         // system-prompt injection picks it up on this very turn, not the next one.
-        await mut.update.mutateAsync({ id: convId, skillIds: Array.from(new Set([...enabledSkillIds, matchedSkill.id])) })
+        if (missing.length) await mut.update.mutateAsync({ id: convId, skillIds: Array.from(new Set([...enabledSkillIds, ...missing])) })
       }
       if (matchedSkill) toast.success(`Using skill: ${matchedSkill.name}`)
 
@@ -1564,7 +1576,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                       i === skillPickerIndex ? 'bg-panel-2' : 'hover:bg-panel-2',
                     )}
                   >
-                    <span className="text-ink">/{s.id}{enabledSkillIds.includes(s.id) ? ' · already on' : ''}</span>
+                    <span className="text-ink">{slashMatch ? '/' : '@'}{s.id}{enabledSkillIds.includes(s.id) ? ' · already on' : ''}</span>
                     {s.description && <span className="text-[12px] text-muted">{s.description}</span>}
                   </button>
                 ))}
@@ -1677,7 +1689,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                         // (Enter still does that, now unambiguous once the text is a full match).
                         e.preventDefault()
                         const s = filteredSkills[Math.min(skillPickerIndex, filteredSkills.length - 1)]
-                        setInput(`/${s.id}`)
+                        setInput(slashMatch ? `/${s.id}` : completeMention(input, s.id).trimEnd())
                         setTimeout(autoResize, 0)
                         return
                       }

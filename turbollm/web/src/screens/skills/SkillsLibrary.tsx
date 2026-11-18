@@ -3,18 +3,25 @@ import { useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { FolderInput, Plus, Sparkles, Upload, Wrench } from 'lucide-react'
 import { Button } from '../../components/ui/button'
+import { Switch } from '../../components/ui/switch'
 import { toast } from '../../components/ui/sonner'
 import { ApiError, track } from '../../lib/api'
+import { useSettings } from '../../lib/queries'
 import { fetchSkills, importSkillText, learnFromFolder, skillKeys } from '../../lib/agent-api'
 import type { Skill } from '../../lib/agent-types'
+import { CHAT_UNSUPPORTED_SKILLS } from '../../lib/skill-mentions'
 
-function SkillCard({ skill, onOpen }: { skill: Skill; onOpen: () => void }) {
+interface SkillCardProps {
+  skill: Skill
+  onOpen: () => void
+  onByDefault: boolean
+  onToggleByDefault: (on: boolean) => void
+}
+
+function SkillCard({ skill, onOpen, onByDefault, onToggleByDefault }: SkillCardProps) {
   return (
-    <button
-      type="button"
-      onClick={() => { track('skills', 'open_skill'); onOpen() }}
-      className="flex flex-col gap-2 rounded-xl border border-border bg-panel px-4 py-3.5 text-left transition-colors hover:border-accent hover:bg-panel-2"
-    >
+    <div className="flex flex-col gap-2 rounded-xl border border-border bg-panel px-4 py-3.5 text-left transition-colors hover:border-accent hover:bg-panel-2">
+    <button type="button" onClick={() => { track('skills', 'open_skill'); onOpen() }} className="flex flex-col gap-2 text-left">
       <div className="flex items-center gap-2">
         <div className="grid h-8 w-8 shrink-0 place-items-center rounded-lg" style={{ background: 'color-mix(in srgb, var(--accent) 14%, transparent)' }}>
           <Sparkles size={15} className="text-accent" />
@@ -37,6 +44,13 @@ function SkillCard({ skill, onOpen }: { skill: Skill; onOpen: () => void }) {
         </div>
       )}
     </button>
+    {!CHAT_UNSUPPORTED_SKILLS.has(skill.id) && (
+      <label className="mt-auto flex items-center justify-between gap-2 text-[12px] text-muted">
+        On by default
+        <Switch aria-label={`On by default: ${skill.name}`} checked={onByDefault} onCheckedChange={onToggleByDefault} />
+      </label>
+    )}
+    </div>
   )
 }
 
@@ -45,6 +59,13 @@ export function SkillsLibrary() {
   const qc = useQueryClient()
   const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills, staleTime: 0 })
   const skills = skillsQ.data ?? []
+  const { query: settingsQ, save } = useSettings()
+  const defaultSkillIds = settingsQ.data?.defaultSkillIds ?? []
+  const setByDefault = (id: string, on: boolean) => {
+    track('skills', on ? 'default_skill_on' : 'default_skill_off')
+    const without = defaultSkillIds.filter((d) => d !== id)
+    save.mutate({ defaultSkillIds: on ? [...without, id] : without })
+  }
 
   const [folder, setFolder] = useState('')
   const [learning, setLearning] = useState(false)
@@ -83,7 +104,7 @@ export function SkillsLibrary() {
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
           <h2 className="mb-1 text-[13px] font-semibold uppercase tracking-wide text-faint">Skills</h2>
-          <p className="text-[12px] text-muted">The shared library — enable any of these in a chat, or via '/' in the composer.</p>
+          <p className="text-[12px] text-muted">The shared library — enable any of these in a chat, via '/' or '@' in the composer, or switch one on by default for every new chat.</p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <input ref={uploadRef} type="file" accept=".md,text/markdown" hidden onChange={(e) => void handleUpload(e)} />
@@ -130,7 +151,13 @@ export function SkillsLibrary() {
         // 240px, not 185px — see AgentsLibrary (GitHub #84).
         <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))' }}>
           {skills.map((sk) => (
-            <SkillCard key={sk.id} skill={sk} onOpen={() => navigate(`/skills/${sk.id}`)} />
+            <SkillCard
+              key={sk.id}
+              skill={sk}
+              onOpen={() => navigate(`/skills/${sk.id}`)}
+              onByDefault={defaultSkillIds.includes(sk.id)}
+              onToggleByDefault={(on) => setByDefault(sk.id, on)}
+            />
           ))}
         </div>
       )}
