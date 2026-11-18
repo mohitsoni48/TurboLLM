@@ -29,6 +29,8 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     const b = await body<Partial<Skill>>(c)
     const notText = nonStringField(b, ['id', 'name', 'description', 'instructions'])
     if (notText) return err(c, 400, 'invalid_config_value', `${notText} must be a string.`)
+    // The list is written to the skill file as it is, so `tools: [7, {}]` would fail later, at the first chat that loads the skill.
+    if (b.tools != null && !(Array.isArray(b.tools) && b.tools.every((t) => typeof t === 'string'))) return err(c, 400, 'invalid_config_value', 'tools must be an array of strings.')
     if (!b.id?.trim() || !/^[a-z0-9-]+$/.test(b.id)) return err(c, 400, 'invalid_config_value', 'id must be kebab-case (a-z0-9-).')
     if (!b.name?.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
     if (isBuiltinSkill(b.id)) return err(c, 400, 'builtin_skill', 'Cannot overwrite a built-in skill.')

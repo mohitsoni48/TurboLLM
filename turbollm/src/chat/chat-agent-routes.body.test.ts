@@ -201,3 +201,20 @@ test('a tools or skillIds list with a non-string in it is refused, not read as "
     h.cleanup()
   }
 })
+
+// Review of #332: the skill's tools were stored unchecked, so `tools: [7, {}]` was written to the skill file and failed later.
+test('POST /skills refuses a tools list with a non-string in it', async () => {
+  const h = harness()
+  try {
+    for (const bad of ['web_search', [7, {}], [null], { a: 1 }]) {
+      const res = await h.send('POST', '/api/v1/skills', { id: 'ok-id', name: 'N', instructions: 'i', tools: bad })
+      assert.equal(res.status, 400, `tools=${JSON.stringify(bad)}: ${await res.clone().text()}`)
+      assert.deepEqual(await res.json(), { error: { code: 'invalid_config_value', message: 'tools must be an array of strings.' } })
+    }
+    const ok = await h.send('POST', '/api/v1/skills', { id: 'ok-id', name: 'N', instructions: 'i', tools: ['web_search'] })
+    assert.equal(ok.status, 201)
+    assert.equal((await h.send('POST', '/api/v1/skills', { id: 'no-tools', name: 'N', instructions: 'i' })).status, 201, 'tools stays optional')
+  } finally {
+    h.cleanup()
+  }
+})

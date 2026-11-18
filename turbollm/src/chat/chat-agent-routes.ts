@@ -80,8 +80,6 @@ export function registerChatAgentRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/chat-agents', async (c) => {
     const b = await body<Partial<CustomChatAgent>>(c)
-    const invalid = agentFieldsError(b)
-    if (invalid) return err(c, 400, 'invalid_config_value', invalid)
     // A chat routine runs every tool its agent lists with no approval (chat-runner.ts), so an
     // agent naming the owner's MCP tool is a standing approval to run it: the isLocalOrAuthenticated
     // bar adding the MCP server has (listsMcpTool). Without it a keyless Serve identity, Access JWT
@@ -90,6 +88,8 @@ export function registerChatAgentRoutes(app: Hono, d: Deps): void {
     if (listsMcpTool(sanitizeStringArray(b.tools)) && !isLocalOrAuthenticated(c, d)) {
       return err(c, 403, 'api_key_required', MCP_AGENT_REFUSED_MESSAGE)
     }
+    const invalid = agentFieldsError(b)
+    if (invalid) return err(c, 400, 'invalid_config_value', invalid)
     if (!b.name?.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
     if (d.store.snapshot().customAgents.length >= AGENT_CAP) {
       return err(c, 400, 'too_many_agents', `Agent limit reached (${AGENT_CAP}).`)
@@ -113,13 +113,13 @@ export function registerChatAgentRoutes(app: Hono, d: Deps): void {
       return err(c, 404, 'not_found', 'Agent not found.')
     }
     const b = await body<Partial<CustomChatAgent>>(c)
-    const invalid = agentFieldsError(b)
-    if (invalid) return err(c, 400, 'invalid_config_value', invalid)
     // Same rule as the create route, for an edit that adds an MCP tool and for any edit of an agent
     // that has one: its system prompt and skills are what a chat routine runs that tool under.
     if ((listsMcpTool(existing.tools) || listsMcpTool(sanitizeStringArray(b.tools))) && !isLocalOrAuthenticated(c, d)) {
       return err(c, 403, 'api_key_required', MCP_AGENT_REFUSED_MESSAGE)
     }
+    const invalid = agentFieldsError(b)
+    if (invalid) return err(c, 400, 'invalid_config_value', invalid)
     if (b.name != null && !b.name.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
     d.store.update((cfg) => {
       const a = cfg.customAgents.find((x) => x.id === id)!
