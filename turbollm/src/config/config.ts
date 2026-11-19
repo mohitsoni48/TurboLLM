@@ -275,12 +275,13 @@ export interface GitHub {
   token: string
 }
 /** Web-search backend selection (F-020). */
-export type SearchProvider = 'tavily' | 'kagi' | 'searxng'
+export type SearchProvider = 'tavily' | 'kagi' | 'searxng' | 'keenable'
 export interface SearchConfig {
   provider: SearchProvider
   tavilyApiKey?: string
   kagiApiKey?: string
   searxngUrl?: string
+  keenableApiKey?: string
 }
 
 /** Built-in tool configuration (v0.7.0). */
@@ -1409,12 +1410,13 @@ function normalize(c: Config): void {
   // legacy tavily.apiKey into search.tavilyApiKey so existing keys keep working.
   const sl = (tl.search ?? {}) as Partial<SearchConfig>
   const provider: SearchProvider =
-    sl.provider === 'kagi' || sl.provider === 'searxng' ? sl.provider : 'tavily'
+    sl.provider === 'kagi' || sl.provider === 'searxng' || sl.provider === 'keenable' ? sl.provider : 'tavily'
   c.tools.search = {
     provider,
     tavilyApiKey: sl.tavilyApiKey ?? c.tools.tavily?.apiKey ?? undefined,
     kagiApiKey: sl.kagiApiKey ?? undefined,
     searxngUrl: typeof sl.searxngUrl === 'string' && sl.searxngUrl.trim() ? sl.searxngUrl.trim() : undefined,
+    keenableApiKey: typeof sl.keenableApiKey === 'string' && sl.keenableApiKey.trim() ? sl.keenableApiKey.trim() : undefined,
   }
   // Tool approval-gate policies (replaces the old F-019 requireRunCodeConfirmation stub):
   // always a plain object; strip any invalid values rather than crash on a garbled config.
