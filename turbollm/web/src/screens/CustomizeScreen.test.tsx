@@ -15,7 +15,7 @@ vi.mock('../lib/queries', () => ({
     query: {
       data: {
         mcp: { servers: mcpServers },
-        search: { provider: 'tavily', tavilyKeySet: false, kagiKeySet: false, searxngUrl: '' },
+        search: { provider: 'tavily', tavilyKeySet: false, kagiKeySet: false, keenableKeySet: false, searxngUrl: '' },
       },
     },
     save: mut(),

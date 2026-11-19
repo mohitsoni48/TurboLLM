@@ -50,7 +50,7 @@ export type LocalEntry = {
  *  they're kept out of LOCAL_MCPS entirely and rendered as their own "Built-in web search"
  *  picker in the Customize screen, each with its own config, not a 3-way form shared by all. */
 export type BuiltinSearchEntry = {
-  id: 'tavily' | 'kagi' | 'searxng'
+  id: 'tavily' | 'kagi' | 'searxng' | 'keenable'
   name: string
   desc: string
   iconSlug?: string
@@ -60,6 +60,7 @@ export const BUILTIN_SEARCH: BuiltinSearchEntry[] = [
   { id: 'tavily', name: 'Tavily', desc: 'AI-search API tuned for LLMs.' },
   { id: 'kagi', name: 'Kagi', desc: 'Premium search with no ads or tracking.', iconSlug: 'kagi' },
   { id: 'searxng', name: 'SearXNG', desc: 'Self-hosted meta-search, fully local — no API key required.', iconSlug: 'searxng' },
+  { id: 'keenable', name: 'Keenable', desc: 'Web search that works without a key. Keyless requests are logged with the query and IP.' },
 ]
 
 // Only entries where a static API key / Bearer token is confirmed to work against the

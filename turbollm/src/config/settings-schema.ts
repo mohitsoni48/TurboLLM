@@ -212,7 +212,7 @@ function agentsMdCandidates(key: 'agentsMdProjectCandidates' | 'agentsMdGlobalCa
 /** Search provider config (F-020). `search` is the canonical block; every key/URL is write-only and '' clears it. */
 const searchBlock = (c: Config): SearchConfig => (c.tools.search ??= { provider: 'tavily' })
 const orUndefined = (v: string): string | undefined => v.trim() || undefined
-function searchSecret(key: 'tavilyApiKey' | 'kagiApiKey' | 'searxngUrl', label: string, get: HostOnly['get']): SettingField {
+function searchSecret(key: 'tavilyApiKey' | 'kagiApiKey' | 'searxngUrl' | 'keenableApiKey', label: string, get: HostOnly['get']): SettingField {
   return field<string>(`search.${key}`, { type: 'string', set: (c, v) => { searchBlock(c)[key] = orUndefined(v) }, hostOnly: { label, get } })
 }
 
@@ -362,15 +362,17 @@ export const SETTINGS = [
     provider: c.tools.search?.provider ?? 'tavily',
     tavilyKeySet: !!c.tools.search?.tavilyApiKey,
     kagiKeySet: !!c.tools.search?.kagiApiKey,
+    keenableKeySet: !!c.tools.search?.keenableApiKey,
     searxngUrl: c.tools.search?.searxngUrl ?? '',
   }), [
     // An unknown provider is ignored, not refused.
     field<unknown>('search.provider', {
-      set: (c, v) => { if (v === 'tavily' || v === 'kagi' || v === 'searxng') searchBlock(c).provider = v },
+      set: (c, v) => { if (v === 'tavily' || v === 'kagi' || v === 'searxng' || v === 'keenable') searchBlock(c).provider = v },
     }),
     searchSecret('tavilyApiKey', 'the Tavily API key', (c) => [c.tools.search?.tavilyApiKey, c.tools.tavily?.apiKey]),
     searchSecret('kagiApiKey', 'the Kagi API key', (c) => c.tools.search?.kagiApiKey),
     searchSecret('searxngUrl', 'the SearXNG URL', (c) => c.tools.search?.searxngUrl),
+    searchSecret('keenableApiKey', 'the Keenable API key', (c) => c.tools.search?.keenableApiKey),
   ], { alwaysWrite: searchBlock, effect: 'rebuildTools' }),
   // Legacy alias: top-level tavilyApiKey maps onto search.tavilyApiKey and keeps tools.tavily for read. Written after the
   // search block, so it wins over search.tavilyApiKey in the same body. Host-only through search.tavilyApiKey's check.

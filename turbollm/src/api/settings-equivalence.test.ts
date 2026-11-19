@@ -175,7 +175,7 @@ const BOOLEAN_FIELDS = [
 ]
 const STRING_FIELDS = [
   'machineName', 'hfToken', 'ghToken', 'tavilyApiKey', 'cloudDeploy.runpodTemplateId', 'search.tavilyApiKey', 'search.kagiApiKey',
-  'search.searxngUrl', 'remoteAccess.cloudflare.tunnelToken', 'remoteAccess.cloudflare.hostname',
+  'search.searxngUrl', 'search.keenableApiKey', 'remoteAccess.cloudflare.tunnelToken', 'remoteAccess.cloudflare.hostname',
   'remoteAccess.cloudflare.accessTeamDomain', 'remoteAccess.cloudflare.accessAud', 'remoteAccess.ngrok.authtoken',
   'remoteAccess.ngrok.domain', 'remoteAccess.custom.publicUrl',
 ]
@@ -208,7 +208,7 @@ const VALUES: Record<string, unknown[]> = {
   chatApprovalWaitMinutes: [0, 30, 1440, 1441, -1, 1.5, '30', null],
   experimental: [5, null],
   search: [5, null, {}, 'x'],
-  'search.provider': ['kagi', 'searxng', 'tavily', 'bing', 5, null],
+  'search.provider': ['kagi', 'searxng', 'tavily', 'keenable', 'bing', 5, null],
   remoteAccess: [5, null],
   'remoteAccess.provider': ['ngrok', 'cloudflare-named', 'cloudflare-quick', 'bogus', 5],
   'remoteAccess.ingressPort': [7000, 6996, 7100, 0, 'x', null],
