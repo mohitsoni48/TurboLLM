@@ -10,7 +10,7 @@ import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import type { EmitSink } from './emit-sink.js'
 import type { ChatRun, ChatRunMeta } from './chat-runs.js'
 import type { ChatTurns } from './chat-turns.js'
-import { isAttachmentRef, isAudioAttachment, isCanonicalDataUrl, isImageAttachmentRef } from './attachments.js'
+import { downloadFileName, isAttachmentRef, isAudioAttachment, isCanonicalDataUrl, isDownloadAttachmentRef, isImageAttachmentRef } from './attachments.js'
 import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent, VOICE_MESSAGE_PLACEHOLDER, type EngineMessage } from './chat-compaction.js'
 
 import type { ConversationStore, Message, PageOpts, ToolCallRecord } from './db'
@@ -426,14 +426,22 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   // lanAuth admits the same callers, and a remote-access token needs models:use (auth.ts requiredCapability). The id
   // is checked against the one shape the store writes, so it can only name a file in the attachments folder. Its
   // name is the hash of its bytes, so it never changes: cacheable for good.
+  // A file run_python made for download (a CSV, JSON, text or Python file, GitHub #52) is only ever a download: saved
+  // under `?name=` (cleaned, and always with the file's own extension: attachments.ts downloadFileName), never shown
+  // on the daemon's origin, and sandboxed should a browser render it anyway.
   app.get('/api/v1/attachments/:id', async (c) => {
-    const file = db.attachments.file(c.req.param('id'))
+    const id = c.req.param('id')
+    const file = db.attachments.file(id)
     const bytes = file ? await readFile(file.path).catch(() => null) : null
     if (!file || !bytes) return err(c, 404, 'not_found', 'Attachment not found.')
+    const download: Record<string, string> = isDownloadAttachmentRef(`attachment:${id}`)
+      ? { 'Content-Disposition': contentDisposition(downloadFileName(c.req.query('name') ?? '', id)), 'Content-Security-Policy': 'sandbox' }
+      : {}
     return c.body(new Uint8Array(bytes), 200, {
       'Content-Type': file.mime,
       'Cache-Control': 'private, max-age=31536000, immutable',
       'X-Content-Type-Options': 'nosniff',
+      ...download,
     })
   })
 
@@ -1244,6 +1252,14 @@ function importOpenAiMessages(
   }
 
   return c.json({ id: newConv.id }, 201)
+}
+
+/** A Content-Disposition that always downloads, under `name` (already cleaned: downloadFileName). `filename` is the
+ *  ASCII fallback for old clients; `filename*` carries the name as written (RFC 6266). */
+function contentDisposition(name: string): string {
+  const ascii = name.replace(/[^\x20-\x7e]/g, '_')
+  const encoded = encodeURIComponent(name).replace(/['()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`)
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`
 }
 
 // ── LAN share target (F-023) ───────────────────────────────────────────────────

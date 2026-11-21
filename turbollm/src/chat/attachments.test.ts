@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { AttachmentStore, attachmentRefId, audioAttachmentFormat, isAttachmentRef, isAudioAttachment, isImageAttachmentRef } from './attachments'
+import { AttachmentStore, attachmentRefId, audioAttachmentFormat, downloadFileName, isAttachmentRef, isAudioAttachment, isDownloadAttachmentRef, isImageAttachmentRef } from './attachments'
 import { IN_MEMORY_DATA_DIR } from './db'
 import { tmpDir } from '../test-support/tmp'
 
@@ -275,4 +275,64 @@ test('resolveMedia never sends a clip, another stored file or a malformed refere
   }]
   await store.resolveMedia(messages)
   assert.deepEqual(messages[0].content, [{ type: 'text', text: 'look' }])
+})
+
+// Files made for download (GitHub #52): CSV, JSON, text and Python from run_python, in through saveFile only.
+
+const CSV_BYTES = Buffer.from('name,total\nada,3\n')
+const CSV_ID = `${createHash('sha256').update(CSV_BYTES).digest('hex')}.csv`
+
+test('save never stores a download type: a text/csv data URL a client sends stays inline', async () => {
+  const { store, dir } = freshStore()
+  const url = `data:text/csv;base64,${CSV_BYTES.toString('base64')}`
+  assert.deepEqual(await store.save([url]), [url])
+  assert.ok(!existsSync(join(dir, 'attachments', CSV_ID)))
+})
+
+test('saveFile stores a download content-addressed, and it is served, never inlined, and collected like any file', async () => {
+  const { store, dir } = freshStore()
+  const ref = await store.saveFile(CSV_BYTES, 'csv')
+  assert.equal(ref, `attachment:${CSV_ID}`)
+  assert.ok(isAttachmentRef(ref!) && isDownloadAttachmentRef(ref!) && !isImageAttachmentRef(ref!) && !isAudioAttachment(ref!))
+  assert.deepEqual(readFileSync(join(dir, 'attachments', CSV_ID)), CSV_BYTES)
+  assert.deepEqual(store.file(CSV_ID), { path: join(dir, 'attachments', CSV_ID), mime: 'text/csv; charset=utf-8' })
+  assert.equal(await store.saveFile(CSV_BYTES, 'csv'), ref, 'the same bytes are the same file')
+  assert.equal(await store.inline(ref!), null)
+  for (const [ext, mime] of [['json', 'application/json; charset=utf-8'], ['txt', 'text/plain; charset=utf-8'], ['py', 'text/x-python; charset=utf-8']]) {
+    const r = await store.saveFile(Buffer.from(`x-${ext}`), ext)
+    assert.equal(store.file(attachmentRefId(r!)!)!.mime, mime, ext)
+  }
+
+  backdate(join(dir, 'attachments', CSV_ID), 2 * 3600_000)
+  assert.equal(await store.collectGarbage(new Set([CSV_ID]), 3600_000), 0, 'kept while a row names it')
+  assert.equal(await store.collectGarbage(new Set(), 3600_000), 1, 'collected once none does')
+  assert.ok(!existsSync(join(dir, 'attachments', CSV_ID)))
+})
+
+test('saveFile takes only the download types, and the store names no page or picture it could serve as one', async () => {
+  const { store } = freshStore()
+  for (const ext of ['html', 'htm', 'svg', 'js', 'png', 'wav', 'CSV', '', '../csv']) assert.equal(await store.saveFile(CSV_BYTES, ext), null, ext)
+  const hex = 'f'.repeat(64)
+  for (const id of [`${hex}.html`, `${hex}.svg`, `${hex}.js`, `${hex}.CSV`]) assert.equal(store.file(id), null, id)
+  assert.equal(await new AttachmentStore(IN_MEMORY_DATA_DIR).saveFile(CSV_BYTES, 'csv'), null, 'an in-memory database has no folder')
+})
+
+test('downloadFileName keeps the name without folders, control characters or quotes, always with the file\'s own extension', () => {
+  const id = CSV_ID
+  const cases: Array<[string, string]> = [
+    ['cleaned.csv', 'cleaned.csv'],
+    ['Cleaned.CSV', 'Cleaned.csv'],
+    ['../../etc/passwd', 'passwd.csv'],
+    ['..\\..\\Windows\\win.ini', 'win.ini.csv'],
+    ['page.html', 'page.html.csv'],
+    ['a\r\nX-Evil: 1.csv', 'a__X-Evil_ 1.csv'],
+    ['say "hi".csv', 'say _hi_.csv'],
+    ['données été.csv', 'données été.csv'],
+    ['...', 'file.csv'],
+    ['', 'file.csv'],
+    ['.csv', 'file.csv'],
+    [`${'x'.repeat(300)}.csv`, `${'x'.repeat(124)}.csv`],
+  ]
+  for (const [name, want] of cases) assert.equal(downloadFileName(name, id), want, JSON.stringify(name))
+  assert.equal(downloadFileName('data.csv', `${'0'.repeat(64)}.json`), 'data.csv.json')
 })

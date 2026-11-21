@@ -17,6 +17,11 @@
 //
 // Files are shared by every row that names them (the same picture sent twice is one file). Nothing deletes a file when
 // a row goes; collectGarbage removes files no row names any more (attachment-janitor.ts).
+//
+// The store also keeps the CSV, JSON, text and Python files a run_python call made, for the user to download (GitHub
+// #52). They come in only through saveFile, never through save: a message's images and clips, and the janitor's
+// backfill, can only ever store media. They are never inlined (they are not media an engine takes) and are served only
+// as downloads (chat-routes.ts).
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, statSync, unlinkSync, utimesSync } from 'node:fs'
 import { readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
@@ -30,8 +35,17 @@ const IMAGE_MIME_BY_EXT: Record<string, string> = {
   png: 'image/png', jpg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', avif: 'image/avif',
 }
 const MIME_BY_EXT: Record<string, string> = { ...IMAGE_MIME_BY_EXT, ...AUDIO_MIME_BY_EXT }
+/** Files made for download (run_python's outputs, GitHub #52). Kept apart from MIME_BY_EXT, which EXT_BY_MIME and so
+ *  save() are built from: no data URL a client sends can become one of these. */
+const DOWNLOAD_MIME_BY_EXT: Record<string, string> = {
+  csv: 'text/csv; charset=utf-8', json: 'application/json; charset=utf-8', txt: 'text/plain; charset=utf-8',
+  py: 'text/x-python; charset=utf-8',
+}
+const FILE_MIME_BY_EXT: Record<string, string> = { ...MIME_BY_EXT, ...DOWNLOAD_MIME_BY_EXT }
 const EXT_BY_MIME = Object.fromEntries(Object.entries(MIME_BY_EXT).map(([ext, mime]) => [mime, ext]))
-const ID_PATTERN = /^[0-9a-f]{64}\.(png|jpg|gif|webp|bmp|avif|wav|mp3)$/
+const ID_PATTERN = /^[0-9a-f]{64}\.(png|jpg|gif|webp|bmp|avif|wav|mp3|csv|json|txt|py)$/
+/** The longest name a download is saved under. */
+const MAX_DOWNLOAD_NAME = 128
 const AUDIO_DATA_URL_PATTERN = /^data:(audio\/[a-z0-9.+-]+);base64,/
 const DATA_URL_PATTERN = /^data:([a-z]+\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/]*={0,2})$/
 const TEMP_SUFFIX = '.tmp'
@@ -53,6 +67,29 @@ export function attachmentRefId(attachment: string): string | null {
 export function isImageAttachmentRef(attachment: string): boolean {
   const id = attachmentRefId(attachment)
   return id !== null && Object.hasOwn(IMAGE_MIME_BY_EXT, id.slice(id.lastIndexOf('.') + 1))
+}
+
+/** Whether `attachment` is a stored reference to a file made for download (a CSV, JSON, text or Python file). */
+export function isDownloadAttachmentRef(attachment: string): boolean {
+  const id = attachmentRefId(attachment)
+  return id !== null && Object.hasOwn(DOWNLOAD_MIME_BY_EXT, id.slice(id.lastIndexOf('.') + 1))
+}
+
+/** The file extensions saveFile takes. */
+export function isDownloadExtension(ext: string): boolean {
+  return Object.hasOwn(DOWNLOAD_MIME_BY_EXT, ext)
+}
+
+/** The name a download of `id` is saved under: `name` as the user or the code gave it, without any folder, control
+ *  character or quote, at most MAX_DOWNLOAD_NAME characters, and always ending in the stored file's own extension (a
+ *  CSV is never saved as `page.html`, which a browser would open as a page). `file.<ext>` when nothing is left. */
+export function downloadFileName(name: string, id: string): string {
+  const ext = id.slice(id.lastIndexOf('.') + 1)
+  let base = name.slice(Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\')) + 1)
+  base = Array.from(base, (ch) => (ch < ' ' || ch === '\u007f' || '"*:<>?|'.includes(ch) ? '_' : ch)).join('').replace(/[.\s]+$/, '')
+  if (base.toLowerCase().endsWith(`.${ext}`)) base = base.slice(0, -(ext.length + 1))
+  base = base.slice(0, MAX_DOWNLOAD_NAME - ext.length - 1).replace(/^[.\s]+|[.\s]+$/g, '')
+  return `${base || 'file'}.${ext}`
 }
 
 /** The audio format of a voice clip attachment (`wav`, `mp3`): a stored reference by its extension, a data URL by its
@@ -132,6 +169,21 @@ export class AttachmentStore {
     return `${REF_PREFIX}${id}`
   }
 
+  /** Stores a file made for download (`ext` one of csv, json, txt, py) and returns its reference, or null when `ext`
+   *  is not one of those or the file could not be written. Same content-addressed name and write as save. */
+  async saveFile(bytes: Buffer, ext: string): Promise<string | null> {
+    if (!this.folder || !isDownloadExtension(ext)) return null
+    const id = `${createHash('sha256').update(bytes).digest('hex')}.${ext}`
+    const path = join(this.folder, id)
+    if (this.touch(path)) return `${REF_PREFIX}${id}`
+    try {
+      await this.writeOnce(path, bytes)
+    } catch {
+      return null
+    }
+    return `${REF_PREFIX}${id}`
+  }
+
   /** Marks an existing file as just used, so a collection already under way leaves it (it spares files younger than
    *  its grace period). Synchronous, like collectGarbage's stat and unlink: the two never interleave. False when the
    *  file does not exist. */
@@ -159,10 +211,12 @@ export class AttachmentStore {
     }
   }
 
-  /** The data URL a reference was saved from; any other attachment unchanged; null when its file is gone. */
+  /** The data URL a reference was saved from; any other attachment unchanged; null when its file is gone, and for a
+   *  file made for download, which is no image or clip and is never sent inline (the External Chat API leaves it out). */
   async inline(attachment: string): Promise<string | null> {
     const id = attachmentRefId(attachment)
     if (id === null) return attachment
+    if (isDownloadAttachmentRef(attachment)) return null
     const file = this.file(id)
     if (!file) return null
     try {
@@ -212,7 +266,7 @@ export class AttachmentStore {
   /** The file behind `id`, or null when `id` is not exactly a name this store writes (so never a path elsewhere). */
   file(id: string): { path: string; mime: string } | null {
     if (!this.folder || !ID_PATTERN.test(id)) return null
-    return { path: join(this.folder, id), mime: MIME_BY_EXT[id.slice(id.lastIndexOf('.') + 1)] }
+    return { path: join(this.folder, id), mime: FILE_MIME_BY_EXT[id.slice(id.lastIndexOf('.') + 1)] }
   }
 
   /** Deletes every file not in `referenced` (ids) and older than `graceMs`, and temp files a crashed write left. The
