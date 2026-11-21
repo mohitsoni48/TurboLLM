@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
-import { CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, FileText, GitBranch, HelpCircle, Loader2, Pencil, RefreshCw, Trash2, XCircle } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, FileText, GitBranch, HelpCircle, Loader2, Pencil, RefreshCw, Trash2, XCircle } from 'lucide-react'
 import type { ClaimVerdict, LiveToolCall, Message, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord, ToolOutput } from '../../lib/chat-types'
 import type { LiveBlock } from '../../lib/live-timeline'
 import { activateVariant, getMessageVariants } from '../../lib/chat-api'
@@ -228,6 +228,8 @@ type CardCall = {
   files?: string[]
   /** run_python only: each of `files` with the name the code gave it. */
   outputs?: ToolOutput[]
+  /** run_python only: the files not kept, the chat's files having reached their limit. */
+  notKept?: string[]
   /** Code mode only — pi's edit tool real diff output (turbollm/src/code/code-session.ts). */
   diff?: string
   /** Set only by the completed-message mapping below, which is the only place with SIBLING
@@ -268,13 +270,22 @@ function DiffView({ diff }: { diff: string }) {
 }
 
 /** The files a run_python call handed back, shown under its card whether or not the card is expanded: its images as
- *  pictures, its CSV, JSON, text and Python files as downloads under the names the code gave them. */
-function ToolFiles({ files, outputs }: { files?: string[]; outputs?: ToolOutput[] }) {
+ *  pictures, its CSV, JSON, text and Python files as downloads under the names the code gave them, and a warning naming
+ *  the files the chat had no room for. */
+function ToolFiles({ files, outputs, notKept }: { files?: string[]; outputs?: ToolOutput[]; notKept?: string[] }) {
   const images = files?.filter(isImageAttachment) ?? []
   const downloads = outputs?.filter((o) => isDownloadAttachment(o.file)) ?? []
-  if (!images.length && !downloads.length) return null
+  if (!images.length && !downloads.length && !notKept?.length) return null
   return (
     <div className="flex flex-col gap-2 border-t border-border px-3 py-2">
+      {notKept && notKept.length > 0 && (
+        <p className="flex min-w-0 items-start gap-1.5 text-[11px] leading-snug text-warning">
+          <AlertTriangle size={12} className="mt-px shrink-0" />
+          <span className="min-w-0 break-words">
+            Not kept, this chat's files have reached their limit: {notKept.join(', ')}. Deleting older messages with files makes room.
+          </span>
+        </p>
+      )}
       {images.length > 0 && (
         <div className="flex flex-wrap gap-2">
           {images.map((f) => <AttachmentImage key={f} attachment={f} />)}
@@ -321,7 +332,7 @@ function ToolCallCard({ call }: { call: CardCall }) {
           />
         )}
       </button>
-      <ToolFiles files={call.files} outputs={call.outputs} />
+      <ToolFiles files={call.files} outputs={call.outputs} notKept={call.notKept} />
       {expanded && hasDiff && <DiffView diff={call.diff!} />}
       {expanded && !hasDiff && call.result && (
         <pre className="max-h-48 overflow-auto border-t border-border px-3 pb-3 pt-2 font-mono text-[11px] leading-relaxed text-muted whitespace-pre-wrap">
@@ -398,7 +409,7 @@ function InlineToolStep({ call, superseded }: { call: LiveToolCall; superseded?:
           />
         )}
       </button>
-      <ToolFiles files={call.files} outputs={call.outputs} />
+      <ToolFiles files={call.files} outputs={call.outputs} notKept={call.notKept} />
       {expanded && hasDiff && <DiffView diff={call.diff!} />}
       {expanded && !hasDiff && call.result && (
         <pre className="max-h-48 overflow-auto border-t border-border px-3 pb-3 pt-2 font-mono text-[11px] leading-relaxed text-muted whitespace-pre-wrap">
@@ -960,6 +971,7 @@ export function MessageBubble({
     result: tc.error ?? tc.result,
     files: tc.files,
     outputs: tc.outputs,
+    notKept: tc.notKept,
     diff: tc.diff,
     // The two-phase update protocol leaves BOTH the preview and the apply in a finished
     // transcript. This mapping is the only place that sees the whole list, so it is the only

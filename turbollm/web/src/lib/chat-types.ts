@@ -36,6 +36,8 @@ export interface ToolCallRecord {
   files?: string[]
   /** run_python only: each of `files` with the name the code gave it. */
   outputs?: ToolOutput[]
+  /** run_python only: the files the run made that were not kept, the chat's files having reached their limit. */
+  notKept?: string[]
   /** Code mode only (pi's edit tool result) — a unified diff of the change, when the
    *  backend forwards one. Not currently persisted across a page reload; present only
    *  on records read straight off the live SSE stream. */
@@ -54,6 +56,8 @@ export interface LiveToolCall {
   files?: string[]
   /** run_python only: each of `files` with the name the code gave it. */
   outputs?: ToolOutput[]
+  /** run_python only: the files the run made that were not kept, the chat's files having reached their limit. */
+  notKept?: string[]
   /** Code mode only — pi edit tool's real diff/patch output, carried on the terminal
    *  tool_call SSE event (see turbollm/src/code/code-session.ts's tool_result hook). */
   diff?: string
@@ -207,7 +211,7 @@ export type ChatSseEvent =
   | { event: 'progress';  data: { phase: string; processed: number; total: number; pct: number; tps: number } }
   | { event: 'reasoning'; data: { delta: string } }
   | { event: 'delta';     data: { delta: string } }
-  | { event: 'tool_call'; data: { id: string; name: string; args: Record<string, unknown>; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string; files?: string[]; outputs?: ToolOutput[]; diff?: string; patch?: string; firstChangedLine?: number } }
+  | { event: 'tool_call'; data: { id: string; name: string; args: Record<string, unknown>; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string; files?: string[]; outputs?: ToolOutput[]; notKept?: string[]; diff?: string; patch?: string; firstChangedLine?: number } }
   /** A note about this turn for the user: e.g. the loaded model cannot call tools, so none were sent. */
   | { event: 'notice';    data: { message: string } }
   /** `message`: the reply as the daemon saved it (null when it was deleted meanwhile). */

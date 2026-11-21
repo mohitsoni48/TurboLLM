@@ -63,7 +63,7 @@ const MAX_INPUT_FILES = 20
 
 /** What a chat turn hands the tool: runs code in this chat's sandbox. */
 export interface SandboxTurn {
-  run(args: Record<string, unknown>, signal: AbortSignal): Promise<{ result: string; files: string[]; outputs?: ToolOutput[] }>
+  run(args: Record<string, unknown>, signal: AbortSignal): Promise<{ result: string; files: string[]; outputs?: ToolOutput[]; notKept?: string[] }>
 }
 
 /** A file name the sandbox can take: no folders, nothing outside a plain set of characters. */
@@ -238,12 +238,13 @@ export function csvHasFormulaCells(text: string): boolean {
 /** The files a chat may keep, all its rows together (GitHub #52): images and files for download. */
 export const MAX_CHAT_FILES_BYTES = 500 * 1024 * 1024
 
-/** What a run hands back: the tool result the model reads, the references the reply row keeps, and each file as the
- *  code named it. */
+/** What a run hands back: the tool result the model reads, the references the reply row keeps, each file as the code
+ *  named it, and the files the chat had no room for. */
 export interface DescribedRun {
   result: string
   files: string[]
   outputs: ToolOutput[]
+  notKept: string[]
 }
 
 /** The tool result the model reads, and the files the reply row keeps. `room` is the bytes the chat may still keep
@@ -310,7 +311,7 @@ export async function describeRun(r: SandboxRunResult, store: Pick<AttachmentSto
   if (noRoom.length) lines.push(`Not kept for the user, this chat's files have reached ${MAX_CHAT_FILES_BYTES / 1024 / 1024} MB: ${noRoom.join(', ')}. Deleting older messages with files makes room.`)
   if (r.skipped.length) lines.push(`Not returned (only png, jpg, csv, json, txt and py files are, up to 20 per run and 25 MB each): ${r.skipped.slice(0, 20).join(', ')}${r.skipped.length > 20 ? `, and ${r.skipped.length - 20} more` : ''}`)
   if (!lines.length) lines.push('(no output; use print() to see values)')
-  return { result: cut(lines.join('\n\n'), budget), files: refs, outputs }
+  return { result: cut(lines.join('\n\n'), budget), files: refs, outputs, notKept: noRoom }
 }
 
 /** `text` up to `max` characters, with a note of how long it was when it is cut. */

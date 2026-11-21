@@ -833,6 +833,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
           let callError: string | undefined
           let callFiles: string[] | undefined
           let callOutputs: ToolOutput[] | undefined
+          let callNotKept: string[] | undefined
 
           if (blocked !== undefined) {
             result = blocked
@@ -896,6 +897,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
             callError = approved.error
             callFiles = approved.files
             callOutputs = approved.outputs
+            callNotKept = approved.notKept
           }
 
           // F-021: track web_search calls and accumulate research sources.
@@ -926,7 +928,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
             } catch { /* parsing is best-effort */ }
           }
 
-          allToolCalls.push({ id: tc.id, name: tc.name, args: parsedArgs, result: callError ? undefined : result, error: callError, ...(callFiles ? { files: callFiles } : {}), ...(callOutputs ? { outputs: callOutputs } : {}) })
+          allToolCalls.push({ id: tc.id, name: tc.name, args: parsedArgs, result: callError ? undefined : result, error: callError, ...(callFiles ? { files: callFiles } : {}), ...(callOutputs ? { outputs: callOutputs } : {}), ...(callNotKept ? { notKept: callNotKept } : {}) })
           replyChanged('toolCall')
 
           // Inject tool result into iterMessages

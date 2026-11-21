@@ -35,4 +35,13 @@ describe('MessageBubble — run_python files', () => {
     expect(fetched.some((u) => u.endsWith('.png'))).toBe(true)
     expect(fetched.some((u) => u.includes('.csv')), 'the CSV is fetched only when the user downloads it').toBe(false)
   })
+
+  it('names the files the chat had no room for under the card, however long the result is', () => {
+    const full: Message = {
+      ...reply, attachments: [],
+      toolCalls: [{ id: 't2', name: 'run_python', args: { code: 'x' }, result: `Output:\n${'x'.repeat(5_000)}`, notKept: ['big-1.txt', 'big-2.txt'] }],
+    }
+    render(<QueryClientProvider client={new QueryClient()}><MessageBubble message={full} isLast editingId={null} onEdit={() => {}} onEditSave={() => {}} onEditCancel={() => {}} /></QueryClientProvider>)
+    expect(screen.getByText(/Not kept, this chat's files have reached their limit: big-1\.txt, big-2\.txt\./)).toBeTruthy()
+  })
 })

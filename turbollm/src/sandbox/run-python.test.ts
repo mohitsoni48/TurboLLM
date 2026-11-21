@@ -327,10 +327,12 @@ test('describeRun: files beyond the chat\'s room are not kept, and both the mode
     { name: 'b.csv', bytes: Buffer.alloc(30, 'b') },
   ] }), store, RESULT_MAX_CHARS, 100)
   assert.deepEqual(r.outputs.map((o) => o.name), ['a.csv', 'b.csv'], 'the chart did not fit what was left; the smaller CSV after it did')
+  assert.deepEqual(r.notKept, ['chart.png'], 'named apart from the result too, for the card')
   assert.match(r.result, /Not kept for the user, this chat's files have reached 500 MB: chart\.png\. Deleting older messages with files makes room\./)
   assert.match(r.result, /a\.csv:\na{60}/, 'a CSV that was not kept still comes back to the model as text')
   const none = await describeRun(result({ files: [{ name: 'c.csv', bytes: Buffer.from('c') }] }), store, RESULT_MAX_CHARS, 0)
   assert.deepEqual(none.files, [])
+  assert.deepEqual(none.notKept, ['c.csv'])
   assert.match(none.result, /c\.csv:\nc/)
 })
 

@@ -429,6 +429,10 @@ export interface ToolCallRecord {
   /** run_python only: each file in `files` as the code named it, for the user to see and download, and for a fresh
    *  sandbox to get back under that name. */
   outputs?: ToolOutput[]
+  /** run_python only: the files the run made that were not kept, because the chat's files reached their limit
+   *  (MAX_CHAT_FILES_BYTES), by the names the code gave them. Shown on the card: the result says so too, but its last
+   *  line is past what the card shows of a long result. */
+  notKept?: string[]
   /** Code mode only (pi's edit tool result) — a display-oriented diff and a standard unified
    *  patch of the change. Persisted so the diff panel and revert-to-message (code-routes.ts's
    *  revert endpoint) both still have this after a page reload, not just on the live SSE

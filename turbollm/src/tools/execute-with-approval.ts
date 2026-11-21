@@ -85,7 +85,7 @@ export async function executeToolCallWithApproval(params: {
    *  run_python. Without it run_python is refused before its policy is read, as is any run_python a caller with
    *  nobody to ask (`interactive` false) gets: every run must be seen before it starts (GitHub #52). */
   sandbox?: SandboxTurn
-}): Promise<{ result: string; error?: string; files?: string[]; outputs?: ToolOutput[] }> {
+}): Promise<{ result: string; error?: string; files?: string[]; outputs?: ToolOutput[]; notKept?: string[] }> {
   const { tools, sink, convId, id, name, args, globalPolicies, convOverrides, signal, interactive, agentAllowedTools, autoAllowAll } = params
 
   // Refused before its policy is read: an 'ask' would put the approval to a caller whose own
@@ -168,6 +168,7 @@ export async function executeToolCallWithApproval(params: {
   let error: string | undefined
   let files: string[] | undefined
   let outputs: ToolOutput[] | undefined
+  let notKept: string[] | undefined
   try {
     if (name === RUN_PYTHON && params.sandbox) {
       // Reached only through an approved 'ask' (resolveToolPolicy never allows it outright).
@@ -175,6 +176,7 @@ export async function executeToolCallWithApproval(params: {
       result = ran.result
       if (ran.files.length) files = ran.files
       if (ran.outputs?.length) outputs = ran.outputs
+      if (ran.notKept?.length) notKept = ran.notKept
     } else {
       const call: ToolCall = { id, name, args }
       result = await tools.executeTool(call, params.isCodeAuthorized ?? false, { refuseMcp: params.refuseMcp, refuseMcpAgentsAndRoutines: params.refuseMcpAgentsAndRoutines })
@@ -184,6 +186,6 @@ export async function executeToolCallWithApproval(params: {
     result = `Error: ${error}`
   }
 
-  await sink({ event: 'tool_call', data: { id, name, args, status: error ? 'error' : 'done', result, ...(files ? { files } : {}), ...(outputs ? { outputs } : {}) } })
-  return { result, error, files, outputs }
+  await sink({ event: 'tool_call', data: { id, name, args, status: error ? 'error' : 'done', result, ...(files ? { files } : {}), ...(outputs ? { outputs } : {}), ...(notKept ? { notKept } : {}) } })
+  return { result, error, files, outputs, notKept }
 }
