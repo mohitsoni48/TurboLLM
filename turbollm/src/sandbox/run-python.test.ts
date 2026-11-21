@@ -5,7 +5,10 @@ import type { SandboxManager } from './sandbox-manager'
 import { SandboxError, type SandboxFile, type SandboxRunResult } from './sandbox-process'
 
 const PNG = Buffer.from('89504e470d0a1a0a', 'hex')
+/** Stored files by reference, for the fake store's read. */
+const STORED: Record<string, Buffer> = {}
 const store = {
+  read: async (a: string) => STORED[a] ?? null,
   inline: async (a: string) => (a === 'attachment:abc.png' ? `data:image/png;base64,${PNG.toString('base64')}` : a.startsWith('data:') ? a : null),
   save: async (urls: string[]) => urls.map((u) => (u.startsWith('data:image/') ? `attachment:${'0'.repeat(64)}.png` : u)),
   saveFile: async (_bytes: Buffer, ext: string) => `attachment:${'1'.repeat(64)}.${ext}`,
@@ -68,14 +71,43 @@ test('turnFiles: over 20 files, the newest are the ones sent', async () => {
 const user = (name: string) => ({ role: 'user' as const, toolCalls: [], attachments: [], textAttachments: [name], docContext: `[Attached: ${name}]\nx` })
 const reply = (ran: boolean) => ({ role: 'assistant' as const, toolCalls: ran ? [{ id: 't', name: 'run_python', args: {} }] : [], attachments: [], textAttachments: [] })
 
-test('filesFor: a fresh sandbox gets every user row; a warm one only the rows since the last run_python call', () => {
+test('filesFor: a fresh sandbox gets every row, replies included; a warm one only the user rows since the last run_python call', () => {
   // The real chat this came from: sales.csv in turn 1, a run, and a follow-up with no attachment after the sandbox
   // closed when idle. The follow-up's run must still find sales.csv.
   const rows = [user('sales.csv'), reply(true), user('extra.csv'), reply(false), user('q.txt')] as never[]
-  const names = (r: ReturnType<typeof filesFor>) => r.map((x) => x.textAttachments![0])
-  assert.deepEqual(names(filesFor(rows, true)), ['sales.csv', 'extra.csv', 'q.txt'])
+  const names = (r: ReturnType<typeof filesFor>) => r.map((x) => (x.role === 'user' ? x.textAttachments![0] : `reply:${x.toolCalls.length}`))
+  assert.deepEqual(names(filesFor(rows, true)), ['sales.csv', 'reply:1', 'extra.csv', 'reply:0', 'q.txt'])
   assert.deepEqual(names(filesFor(rows, false)), ['extra.csv', 'q.txt'])
   assert.deepEqual(names(filesFor([user('a.csv')] as never[], false)), ['a.csv'])
+})
+
+// A file earlier code made (cleaned.csv) was lost when the sandbox closed: the next run's code could not open it.
+test('turnFiles: a fresh sandbox gets back the files earlier runs made, the newest version of each name winning', async () => {
+  const ref = (c: string, ext: string) => `attachment:${c.repeat(64)}.${ext}`
+  STORED[ref('2', 'csv')] = Buffer.from('v1')
+  STORED[ref('3', 'csv')] = Buffer.from('v2')
+  STORED[ref('4', 'png')] = PNG
+  STORED[ref('5', 'json')] = Buffer.from('{}')
+  const ran = (outputs: Array<{ name: string; file: string }>, name = 'run_python') =>
+    ({ id: 't', name, args: {}, outputs: outputs.map((o) => ({ ...o, size: 1 })) })
+  const rows = [
+    user('sales.csv'),
+    { role: 'assistant' as const, attachments: [ref('4', 'png')], textAttachments: [], toolCalls: [
+      ran([{ name: 'cleaned.csv', file: ref('2', 'csv') }, { name: 'chart.png', file: ref('4', 'png') }]),
+      ran([{ name: 'cleaned.csv', file: ref('3', 'csv') }, { name: '../evil/sales.csv', file: ref('5', 'json') }]),
+      ran([{ name: 'other.json', file: ref('5', 'json') }], 'web_search'),
+      ran([{ name: 'gone.txt', file: ref('6', 'txt') }]),
+    ] },
+  ] as never[]
+  const files = await turnFiles(rows, store)
+  assert.deepEqual(files.map((f) => [f.name, f.bytes.toString('hex')]), [
+    ['chart.png', PNG.toString('hex')],
+    ['cleaned.csv', Buffer.from('v2').toString('hex')],
+    ['sales.csv', Buffer.from('{}').toString('hex')],
+  ], 'the second run\'s cleaned.csv; the code\'s sales.csv (no folders) over the user\'s older one; not another tool\'s; a gone file left out; the chart not counted as image-1')
+  // A user who attaches a new version after the run wins it back.
+  const again = await turnFiles([...rows, user('cleaned.csv')] as never[], store)
+  assert.equal(again.find((f) => f.name === 'cleaned.csv')!.bytes.toString(), 'x')
 })
 
 const result = (over: Partial<SandboxRunResult>): SandboxRunResult => ({ ok: true, stdout: '', stderr: '', files: [], skipped: [], ...over })
@@ -216,7 +248,7 @@ test('sandboxTurn: the turn\'s files go in with its first run only, and again in
   assert.deepEqual(calls.map((f) => f.length), [1, 0, 1])
   // The chat's first run is not a "new sandbox" to the model; the one after the kill is.
   assert.doesNotMatch(first.result, /new sandbox/)
-  assert.match(after.result, /^This run started a new sandbox: variables from earlier runs are gone\. The files attached in this chat are back in the folder: image-1\.png\./)
+  assert.match(after.result, /^This run started a new sandbox: variables from earlier runs are gone\. The files of this chat are back in the folder: image-1\.png\./)
 })
 
 test('sandboxTurn: a follow-up after the sandbox closed gets the chat\'s earlier files, and is told it is a new sandbox', async () => {

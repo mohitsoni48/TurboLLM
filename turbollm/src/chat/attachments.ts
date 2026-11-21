@@ -211,6 +211,19 @@ export class AttachmentStore {
     }
   }
 
+  /** The bytes of the stored file a reference names, of any type (run_python hands a fresh sandbox the files earlier
+   *  runs made). Null when `attachment` is not a reference or its file is gone. */
+  async read(attachment: string): Promise<Buffer | null> {
+    const id = attachmentRefId(attachment)
+    const file = id === null ? null : this.file(id)
+    if (!file) return null
+    try {
+      return await readFile(file.path)
+    } catch {
+      return null
+    }
+  }
+
   /** The data URL a reference was saved from; any other attachment unchanged; null when its file is gone, and for a
    *  file made for download, which is no image or clip and is never sent inline (the External Chat API leaves it out). */
   async inline(attachment: string): Promise<string | null> {

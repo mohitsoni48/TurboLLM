@@ -5,15 +5,16 @@
 // an interactive call with one runs it (execute-with-approval.ts). Every run asks first, with Allow once only
 // (tool-policy.ts, and the approve route refuses the standing approvals).
 //
-// Files in: the images and documents attached to the message this turn answers. Documents arrive as the text the web
-// client extracted (ChatScreen.tsx joins them as `[Attached: <name>]\n<text>`), so only text formats go in.
+// Files in: the images and documents attached in the chat, and in a fresh sandbox the files earlier runs handed back
+// (turnFiles). Documents arrive as the text the web client extracted (ChatScreen.tsx joins them as
+// `[Attached: <name>]\n<text>`), so only text formats go in.
 // Files out: PNG and JPEG are shown in the chat; CSV, JSON, text and Python are given to the user to download and come
 // back to the model as text. All go to the chat's attachment store (chat/attachments.ts) and are named on the reply's
 // own row, which is what keeps the attachment janitor from collecting them and what frees them when the chat is
 // deleted. A chat keeps at most MAX_CHAT_FILES_BYTES of them.
 import type { ToolDefinition } from '../tools/tool-registry'
 import { attachmentRefId, type AttachmentStore } from '../chat/attachments'
-import type { Message, ToolOutput } from '../chat/db'
+import type { Message, ToolCallRecord, ToolOutput } from '../chat/db'
 import type { SandboxManager } from './sandbox-manager'
 import { SandboxError, RUN_TIMEOUT_MS, type SandboxFile, type SandboxRunResult } from './sandbox-process'
 
@@ -95,13 +96,19 @@ type UserFiles = Pick<Message, 'attachments' | 'textAttachments' | 'docContext'>
 /** A row of the chat before the turn's reply, as the run reads it. */
 export type ChatRow = Pick<Message, 'role' | 'toolCalls'> & UserFiles
 
-/** The files user messages carry, oldest message first, as a run starts with them: images (`image-N`, numbered across
- *  the chat) and text documents, under safe names. A name a newer message attaches again is the newer file (the user
- *  sent a new version); two files with one name in the same message keep both (`-2`). Newest first under the caps. */
-export async function turnFiles(rows: UserFiles[], store: Pick<AttachmentStore, 'inline'>): Promise<SandboxFile[]> {
+/** The files a run starts with, oldest row first: from a user row, its images (`image-N`, numbered across the chat)
+ *  and text documents; from a reply, the files its run_python calls handed back (ToolCallRecord.outputs), under the
+ *  names the code gave them. All under safe names. A name a newer row has again is the newer file (the user sent a new
+ *  version, or later code wrote it again); two files with one name in the same user message keep both (`-2`), and in
+ *  one reply the last run's file wins. Newest first under the caps. */
+export async function turnFiles(rows: Array<UserFiles & Partial<Pick<ChatRow, 'role' | 'toolCalls'>>>, store: Pick<AttachmentStore, 'inline' | 'read'>): Promise<SandboxFile[]> {
   const perRow: Array<Array<{ name: string; bytes: Buffer }>> = []
   let img = 0
   for (const row of rows) {
+    if (row.role === 'assistant') {
+      perRow.push(await outputsOf(row.toolCalls ?? [], store))
+      continue
+    }
     const mine: Array<{ name: string; bytes: Buffer }> = []
     for (const a of row.attachments ?? []) {
       const url = await store.inline(a)
@@ -137,12 +144,33 @@ export async function turnFiles(rows: UserFiles[], store: Pick<AttachmentStore, 
   return chosen.flat()
 }
 
-/** Which user rows' files a run starts with. A fresh sandbox gets every file attached in the chat, so a follow-up
- *  question after the sandbox closed still finds them. A warm one has them already, perhaps changed by earlier code:
- *  it gets only the rows since the chat's last run_python call, the ones it has not been sent. */
-export function filesFor(rows: ChatRow[], fresh: boolean): UserFiles[] {
+/** The files a reply's run_python calls handed back, by name, the last call's file winning a name. A file that is gone
+ *  is left out. */
+async function outputsOf(calls: ToolCallRecord[], store: Pick<AttachmentStore, 'read'>): Promise<Array<{ name: string; bytes: Buffer }>> {
+  const byName = new Map<string, { name: string; file: string }>()
+  for (const call of calls) {
+    if (call.name !== RUN_PYTHON) continue
+    for (const o of call.outputs ?? []) {
+      const name = safeName(o.name, 'output')
+      byName.delete(name.toLowerCase()) // re-added at the end: the last write is the newest
+      byName.set(name.toLowerCase(), { name, file: o.file })
+    }
+  }
+  const out: Array<{ name: string; bytes: Buffer }> = []
+  for (const { name, file } of byName.values()) {
+    const bytes = await store.read(file)
+    if (bytes) out.push({ name, bytes })
+  }
+  return out
+}
+
+/** Which rows' files a run starts with. A fresh sandbox gets every file of the chat, the user's and the ones earlier
+ *  code made, so a follow-up question after the sandbox closed still finds them. A warm one has them already, perhaps
+ *  changed by earlier code: it gets only the user rows since the chat's last run_python call, the ones it has not been
+ *  sent. */
+export function filesFor(rows: ChatRow[], fresh: boolean): ChatRow[] {
   const users = (from: number) => rows.slice(from).filter((r) => r.role === 'user')
-  if (fresh) return users(0)
+  if (fresh) return rows.filter((r) => r.role === 'user' || r.role === 'assistant')
   const lastRun = rows.findLastIndex((r) => r.role === 'assistant' && (r.toolCalls ?? []).some((t) => t.name === RUN_PYTHON))
   return users(lastRun + 1)
 }
@@ -309,7 +337,7 @@ export function chatFilesBytes(rows: Array<Pick<Message, 'attachments'>>, more: 
 export function sandboxTurn(o: {
   convId: string
   manager: SandboxManager
-  store: Pick<AttachmentStore, 'inline' | 'save' | 'saveFile' | 'size'>
+  store: Pick<AttachmentStore, 'inline' | 'read' | 'save' | 'saveFile' | 'size'>
   history: () => ChatRow[]
   /** The characters a result may take (resultBudget of the loaded model's context), read at each run. */
   resultChars?: () => number
@@ -338,7 +366,7 @@ export function sandboxTurn(o: {
         const done = await describeRun(r, o.store, o.resultChars?.() ?? RESULT_MAX_CHARS, Math.max(0, room))
         for (const f of done.files) keptThisTurn.add(f)
         if (!fresh || !ranBefore) return done
-        const back = files.length ? ` The files attached in this chat are back in the folder: ${files.map((f) => f.name).join(', ')}.` : ''
+        const back = files.length ? ` The files of this chat are back in the folder: ${files.map((f) => f.name).join(', ')}.` : ''
         return { ...done, result: `This run started a new sandbox: variables from earlier runs are gone.${back}\n\n${done.result}` }
       } catch (e) {
         // Each of these ended the process: the next run starts a new sandbox.

@@ -336,3 +336,13 @@ test('downloadFileName keeps the name without folders, control characters or quo
   for (const [name, want] of cases) assert.equal(downloadFileName(name, id), want, JSON.stringify(name))
   assert.equal(downloadFileName('data.csv', `${'0'.repeat(64)}.json`), 'data.csv.json')
 })
+
+test('read returns the bytes of any stored file, and null for anything that is not a stored reference', async () => {
+  const { store } = freshStore()
+  const csv = await store.saveFile(CSV_BYTES, 'csv')
+  const [png] = await store.save([PNG_URL])
+  assert.deepEqual(await store.read(csv!), CSV_BYTES)
+  assert.deepEqual(await store.read(png), PNG_BYTES)
+  for (const other of [PNG_URL, `attachment:${'9'.repeat(64)}.csv`, 'attachment:../turbollm.db', ''])
+    assert.equal(await store.read(other), null, other)
+})
