@@ -35,6 +35,13 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   that limit yet). Each chat keeps its own sandbox, closed after 10 minutes idle. Not offered to routines, Code
   sessions, the External Chat API, remote-access tokens or keyless LAN callers, and only the host or a caller with an
   API key can allow a run.
+- **Files from `run_python` to download.** CSV, JSON, text and Python files a run saves now appear under its card as
+  download chips with their names and sizes, as well as coming back to the model. They are only ever served as
+  downloads, under their own extension, never opened as a page. A CSV with cells a spreadsheet may run as formulas
+  (starting with = + - or @) is marked with a warning. Files the code made come back into a fresh sandbox, so a
+  follow-up still finds `cleaned.csv` after the sandbox closed when idle. A chat keeps at most 500 MB of files;
+  deleting a message or the chat frees its files at the next daily cleanup. An exported chat carries no files and
+  says so, and an imported chat's tool calls cannot point at files.
 
 ## [1.15.2] - 2026-11-15
 
