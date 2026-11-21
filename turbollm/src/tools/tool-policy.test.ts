@@ -36,3 +36,16 @@ test('resolveToolPolicy: a global "deny" wins over "Allow for this chat"', () =>
   assert.equal(resolveToolPolicy('run_code', { run_code: 'deny' }, { run_code: 'allow' }), 'deny')
   assert.equal(resolveToolPolicy('run_code', { run_code: 'deny' }, { run_code: 'allow' }, true), 'deny')
 })
+
+test('resolveToolPolicy: run_python asks before every call whatever is set (GitHub #52)', () => {
+  assert.equal(resolveToolPolicy('run_python', {}, {}), 'ask')
+  assert.equal(resolveToolPolicy('run_python', { run_python: 'allow' }, {}), 'ask')
+  assert.equal(resolveToolPolicy('run_python', {}, { run_python: 'allow' }), 'ask')
+  assert.equal(resolveToolPolicy('run_python', {}, {}, true), 'ask')
+  assert.equal(resolveToolPolicy('run_python', { run_python: 'allow' }, { run_python: 'allow' }, true), 'ask')
+})
+
+test('resolveToolPolicy: a Deny still blocks run_python, globally or for the chat', () => {
+  assert.equal(resolveToolPolicy('run_python', { run_python: 'deny' }, {}), 'deny')
+  assert.equal(resolveToolPolicy('run_python', {}, { run_python: 'deny' }), 'deny')
+})

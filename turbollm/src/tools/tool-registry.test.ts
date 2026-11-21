@@ -649,3 +649,14 @@ test('executeTool: fetch_url observes tools.pdfReading from config, and updateCo
     assert.match(on, /Dummy PDF file/)
   } finally { stub.restore() }
 })
+
+test('run_python is offered only when asked for, and executeTool never runs it (GitHub #52)', async () => {
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG)
+  const names = async (opts?: Parameters<ToolRegistry['buildToolDefinitions']>[0]) => (await reg.buildToolDefinitions(opts)).map((t) => t.function.name)
+  assert.equal((await names()).includes('run_python'), false)
+  assert.equal((await names({ forGeneration: true })).includes('run_python'), false)
+  assert.equal((await names({ forGeneration: true, sandbox: true })).includes('run_python'), true)
+  // A Code session, a routine or anything else reaching the registry directly is refused: only the approval executor
+  // runs it, with a live chat turn's sandbox.
+  assert.match(await reg.executeTool({ id: 'x', name: 'run_python', args: { code: 'print(1)' } }, true), /only available in a chat on this computer/)
+})

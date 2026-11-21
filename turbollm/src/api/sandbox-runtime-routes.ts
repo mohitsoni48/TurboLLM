@@ -39,6 +39,8 @@ export function registerSandboxRuntimeRoutes(app: Hono, d: Deps): void {
 
   app.delete('/api/v1/sandbox/runtime', guard, async (c) => {
     try {
+      // A running Deno holds its own binary open (Windows refuses to delete it) and reads the Pyodide folder.
+      await d.sandbox?.closeAll()
       await d.sandboxRuntime!.remove()
     } catch (e) {
       if (e instanceof SandboxRuntimeError) return err(c, 409, e.code, e.message)

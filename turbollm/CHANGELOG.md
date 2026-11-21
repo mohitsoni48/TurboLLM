@@ -23,7 +23,16 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **`run_python` chat tool** (Experimental, with the Python sandbox switched on and its runtime installed; desktop
+  only). A chat model can run Python (Pyodide inside Deno) on the files attached in the chat: pandas, numpy,
+  matplotlib, Pillow and sympy, with no network, no access to your files, no environment and no programs. Every run
+  asks first and shows the whole code, with **Allow once** only: Allow for this chat, Always Allow and Auto-allow all
+  do not apply to it, and a Deny in Tool permissions still blocks it. Charts and images it saves appear on the reply;
+  CSV, JSON and text come back to the model. A run is stopped after 60 seconds, and Python's memory is capped at
+  512 MB. Each chat keeps its own sandbox, closed after 10 minutes idle. Not offered to routines, Code sessions, the
+  External Chat API, remote-access tokens or keyless LAN callers.
 
 ## [1.15.2] - 2026-11-15
 
