@@ -403,15 +403,32 @@ export interface MessageStats {
   aborted: boolean
 }
 
+/** A file a run_python call handed back (GitHub #52). */
+export interface ToolOutput {
+  /** The name the code saved it under, in the sandbox's folder. */
+  name: string
+  /** Its attachment reference (`attachment:<id>`). */
+  file: string
+  /** Its size in bytes. */
+  size: number
+  /** A CSV with a cell a spreadsheet may run as a formula (one starting with = + - @, a tab or a carriage return, that
+   *  is not a plain number). */
+  formulaCells?: true
+}
+
 export interface ToolCallRecord {
   id: string
   name: string
   args: Record<string, unknown>
   result?: string
   error?: string
-  /** run_python only (GitHub #52): the images the run handed back, as attachment references (`attachment:<id>`). The
-   *  reply row's own `attachments` names them too, which is what the attachment janitor keeps. */
+  /** run_python only (GitHub #52): the files the run handed back (images, and files for download), as attachment
+   *  references (`attachment:<id>`). The reply row's own `attachments` names them too, which is what the attachment
+   *  janitor keeps. */
   files?: string[]
+  /** run_python only: each file in `files` as the code named it, for the user to see and download, and for a fresh
+   *  sandbox to get back under that name. */
+  outputs?: ToolOutput[]
   /** Code mode only (pi's edit tool result) — a display-oriented diff and a standard unified
    *  patch of the change. Persisted so the diff panel and revert-to-message (code-routes.ts's
    *  revert endpoint) both still have this after a page reload, not just on the live SSE

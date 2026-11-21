@@ -44,11 +44,11 @@ export interface ChatSnapshot {
   files_included: false
 }
 
-/** Tool-call records without their references to stored files (run_python's `files`, GitHub #52). An export carries
+/** Tool-call records without their references to stored files (run_python's `files` and `outputs`, GitHub #52). An export carries
  *  no files, so in an export file such a reference names a file of the chat it came from, or nothing. Export drops
  *  them, and import drops them again, so an imported chat never reaches a file it did not bring. */
 export function withoutFileRefs(calls: ToolCallRecord[]): ToolCallRecord[] {
-  return calls.map(({ files: _files, ...rest }) => rest)
+  return calls.map(({ files: _files, outputs: _outputs, ...rest }) => rest)
 }
 
 /**

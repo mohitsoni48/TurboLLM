@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { describeRun, documentsFrom, filesFor, imageType, pythonError, resultBudget, RUN_PYTHON_TOOL, safeName, sandboxTurn, turnFiles } from './run-python'
+import { chatFilesBytes, csvHasFormulaCells, describeRun, documentsFrom, filesFor, imageType, pythonError, RESULT_MAX_CHARS, resultBudget, RUN_PYTHON_TOOL, safeName, sandboxTurn, turnFiles } from './run-python'
 import type { SandboxManager } from './sandbox-manager'
 import { SandboxError, type SandboxFile, type SandboxRunResult } from './sandbox-process'
 
@@ -8,6 +8,8 @@ const PNG = Buffer.from('89504e470d0a1a0a', 'hex')
 const store = {
   inline: async (a: string) => (a === 'attachment:abc.png' ? `data:image/png;base64,${PNG.toString('base64')}` : a.startsWith('data:') ? a : null),
   save: async (urls: string[]) => urls.map((u) => (u.startsWith('data:image/') ? `attachment:${'0'.repeat(64)}.png` : u)),
+  saveFile: async (_bytes: Buffer, ext: string) => `attachment:${'1'.repeat(64)}.${ext}`,
+  size: () => 0,
 }
 
 test('run_python: its description is fixed text (the prompt cache)', () => {
@@ -78,14 +80,20 @@ test('filesFor: a fresh sandbox gets every user row; a warm one only the rows si
 
 const result = (over: Partial<SandboxRunResult>): SandboxRunResult => ({ ok: true, stdout: '', stderr: '', files: [], skipped: [], ...over })
 
-test('describeRun: images to the store and the reply, text files back to the model, the rest named', async () => {
+test('describeRun: images shown, text files given to download and back to the model, the rest named', async () => {
   const big = 'x'.repeat(9000)
   const r = await describeRun(result({
     stdout: '12\n',
     files: [{ name: 'chart.png', bytes: PNG }, { name: 'out.csv', bytes: Buffer.from('a,b') }, { name: 'big.txt', bytes: Buffer.from(big) }],
     skipped: ['evil.exe'],
   }), store)
-  assert.deepEqual(r.files, [`attachment:${'0'.repeat(64)}.png`])
+  assert.deepEqual(r.files, [`attachment:${'0'.repeat(64)}.png`, `attachment:${'1'.repeat(64)}.csv`, `attachment:${'1'.repeat(64)}.txt`])
+  assert.deepEqual(r.outputs, [
+    { name: 'chart.png', file: `attachment:${'0'.repeat(64)}.png`, size: PNG.length },
+    { name: 'out.csv', file: `attachment:${'1'.repeat(64)}.csv`, size: 3 },
+    { name: 'big.txt', file: `attachment:${'1'.repeat(64)}.txt`, size: 9000 },
+  ])
+  assert.match(r.result, /Given to the user to download: out\.csv, big\.txt/)
   assert.match(r.result, /^Output:\n12/)
   assert.match(r.result, /out\.csv:\na,b/)
   assert.match(r.result, /\[cut off: 9000 characters in all\]/)
@@ -171,7 +179,7 @@ test('describeRun: a module the runtime does not ship is not sent to micropip', 
 // with onload, were stored and shown as images. Served as image/png with nosniff, nothing ran; they are no longer kept.
 test('describeRun: a .png or .jpg that is not really one is not stored or shown', async () => {
   const saved: string[] = []
-  const counting = { save: async (u: string[]) => { saved.push(...u); return u.map(() => `attachment:${'0'.repeat(64)}.png`) } }
+  const counting = { ...store, save: async (u: string[]) => { saved.push(...u); return u.map(() => `attachment:${'0'.repeat(64)}.png`) } }
   const JPEG = Buffer.from('ffd8ffe000104a464946', 'hex')
   const r = await describeRun(result({ files: [
     { name: 'chart.png', bytes: Buffer.from("<html><body><script>alert('x')</script></body></html>") },
@@ -187,7 +195,7 @@ test('describeRun: a .png or .jpg that is not really one is not stored or shown'
 })
 
 test('describeRun: an image the store could not keep is not claimed as shown', async () => {
-  const r = await describeRun(result({ files: [{ name: 'c.png', bytes: PNG }] }), { save: async (u: string[]) => u })
+  const r = await describeRun(result({ files: [{ name: 'c.png', bytes: PNG }] }), { save: async (u: string[]) => u, saveFile: async () => null })
   assert.deepEqual(r.files, [])
   assert.match(r.result, /could not be saved/)
 })
@@ -229,4 +237,65 @@ test('sandboxTurn: empty code, and a sandbox failure, come back as the tool\'s e
   // A process that ended on its own (Deno.exit, a crash) says the same: the next run is a new sandbox.
   const crashed = { has: () => false, run: async () => { throw new SandboxError('crashed', 'The sandbox stopped unexpectedly.') } } as unknown as SandboxManager
   assert.match((await sandboxTurn({ convId: 'c1', manager: crashed, store, history: () => [] }).run({ code: 'x' }, ac.signal)).result, /^Error: The sandbox stopped unexpectedly\. Variables from earlier runs are gone\.$/)
+})
+
+test('csvHasFormulaCells: a cell a spreadsheet may run, quoted or not, but not a plain number', () => {
+  for (const csv of ['a\n=SUM(A1)', 'a,@x', 'x,"=1"', 'a,b\r\n+cmd,1', 'a,\t=1', 'a,"say ""hi""",-x', '=HYPERLINK("http://x","y")', 'a,"=1'])
+    assert.equal(csvHasFormulaCells(csv), true, JSON.stringify(csv))
+  for (const csv of ['a,b\n1,2', 'n\n-5\n+3.2\n-1e5\n.5', 'a,-,+,=,@', 'x,"a=1"', '', 'note\n"hello, =world"', 'a,b\r\n1,2\r\n'])
+    assert.equal(csvHasFormulaCells(csv), false, JSON.stringify(csv))
+})
+
+test('describeRun: a CSV with formula cells is marked; JSON and text are never scanned', async () => {
+  const r = await describeRun(result({ files: [
+    { name: 'risky.csv', bytes: Buffer.from('a\n=1+1') },
+    { name: 'safe.csv', bytes: Buffer.from('a\n-1') },
+    { name: 'x.txt', bytes: Buffer.from('=1+1') },
+  ] }), store)
+  assert.deepEqual(r.outputs.map((o) => [o.name, o.formulaCells ?? false]), [['risky.csv', true], ['safe.csv', false], ['x.txt', false]])
+})
+
+test('describeRun: files beyond the chat\'s room are not kept, and both the model and the user are told', async () => {
+  const r = await describeRun(result({ files: [
+    { name: 'a.csv', bytes: Buffer.alloc(60, 'a') },
+    { name: 'chart.png', bytes: Buffer.concat([PNG, Buffer.alloc(52)]) },
+    { name: 'b.csv', bytes: Buffer.alloc(30, 'b') },
+  ] }), store, RESULT_MAX_CHARS, 100)
+  assert.deepEqual(r.outputs.map((o) => o.name), ['a.csv', 'b.csv'], 'the chart did not fit what was left; the smaller CSV after it did')
+  assert.match(r.result, /Not kept for the user, this chat's files have reached 500 MB: chart\.png\. Deleting older messages with files makes room\./)
+  assert.match(r.result, /a\.csv:\na{60}/, 'a CSV that was not kept still comes back to the model as text')
+  const none = await describeRun(result({ files: [{ name: 'c.csv', bytes: Buffer.from('c') }] }), store, RESULT_MAX_CHARS, 0)
+  assert.deepEqual(none.files, [])
+  assert.match(none.result, /c\.csv:\nc/)
+})
+
+test('chatFilesBytes: each stored file once, however many rows name it, plus files not on a row yet', () => {
+  const ref = (c: string, ext = 'png') => `attachment:${c.repeat(64)}.${ext}`
+  const sizes: Record<string, number> = { [`${'a'.repeat(64)}.png`]: 10, [`${'b'.repeat(64)}.csv`]: 20, [`${'c'.repeat(64)}.json`]: 40 }
+  const sized = { size: (id: string) => sizes[id] ?? null }
+  const rows = [{ attachments: [ref('a'), 'data:image/png;base64,AAAA'] }, { attachments: [ref('a'), ref('b', 'csv')] }, { attachments: [ref('d')] }]
+  assert.equal(chatFilesBytes(rows, [], sized), 30, 'a named twice counts once; an inline image and a gone file count nothing')
+  assert.equal(chatFilesBytes(rows, [ref('c', 'json'), ref('b', 'csv')], sized), 70)
+})
+
+test('sandboxTurn: the chat\'s 500 MB counts what its rows name and what this turn already kept', async () => {
+  const BIG = 300 * 1024 * 1024
+  const old = `attachment:${'a'.repeat(64)}.png`
+  const sized = { ...store, size: (id: string) => (id === old.slice('attachment:'.length) ? BIG : id.endsWith('.csv') ? BIG / 2 : null) }
+  let warm = false
+  const manager = {
+    has: () => warm,
+    run: async () => { warm = true; return result({ files: [{ name: 'out.csv', bytes: Buffer.alloc(8) }] }) },
+  } as unknown as SandboxManager
+  const turn = sandboxTurn({ convId: 'c1', manager, store: sized, history: () => [{ role: 'assistant', toolCalls: [], attachments: [old], textAttachments: [] }] })
+  const first = await turn.run({ code: 'x' }, new AbortController().signal)
+  assert.equal(first.files.length, 1, 'kept: 300 MB used, room left')
+  const second = await turn.run({ code: 'x' }, new AbortController().signal)
+  assert.equal(second.files.length, 1, 'the same bytes again: the store counts the stored CSV once')
+  const full = { ...sized, saveFile: async (_b: Buffer, ext: string) => `attachment:${'e'.repeat(64)}.${ext}`, size: (id: string) => (id.startsWith('e') ? 250 * 1024 * 1024 : sized.size(id)) }
+  const turn2 = sandboxTurn({ convId: 'c2', manager, store: full, history: () => [{ role: 'assistant', toolCalls: [], attachments: [old], textAttachments: [] }] })
+  assert.equal((await turn2.run({ code: 'x' }, new AbortController().signal)).files.length, 1, '300 MB used: kept')
+  const over = await turn2.run({ code: 'x' }, new AbortController().signal)
+  assert.deepEqual(over.files, [], '300 MB on rows + 250 MB kept earlier this turn: no room')
+  assert.match(over.result, /this chat's files have reached 500 MB: out\.csv/)
 })

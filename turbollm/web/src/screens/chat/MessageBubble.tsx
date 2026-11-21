@@ -264,12 +264,14 @@ function DiffView({ diff }: { diff: string }) {
   )
 }
 
-/** The images a run_python call handed back, shown under its card whether or not the card is expanded. */
+/** The images a run_python call handed back, shown under its card whether or not the card is expanded. Its files for
+ *  download are in `files` too, and are not pictures. */
 function ToolFiles({ files }: { files?: string[] }) {
-  if (!files?.length) return null
+  const images = files?.filter(isImageAttachment) ?? []
+  if (!images.length) return null
   return (
     <div className="flex flex-wrap gap-2 border-t border-border px-3 py-2">
-      {files.map((f) => <AttachmentImage key={f} attachment={f} />)}
+      {images.map((f) => <AttachmentImage key={f} attachment={f} />)}
     </div>
   )
 }

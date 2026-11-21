@@ -2,7 +2,9 @@
 // and that the images a run hands back are named on the reply's own row (which keeps the attachment janitor off them).
 // The engine is a fetch double and the sandbox a stand-in manager; the real Deno is the escape suite's job.
 import assert from 'node:assert/strict'
+import { existsSync, readFileSync } from 'node:fs'
 import { test, type TestContext } from 'node:test'
+import { AttachmentJanitor } from './attachment-janitor.js'
 import { Hono } from 'hono'
 import { registerChatRoutes } from './chat-routes.js'
 import { ChatRuns } from './chat-runs.js'
@@ -14,6 +16,7 @@ import type { SandboxFile } from '../sandbox/sandbox-process'
 import { tmpDir } from '../test-support/tmp'
 
 const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex')
+const CSV = 'month,total\nJan,=SUM(B1:B2)\n'
 
 /** Round 1 asks for run_python; later rounds answer in text. Records each request's tool names. */
 function scriptedEngine(t: TestContext) {
@@ -72,7 +75,7 @@ function routes(t: TestContext, o: { sandboxOn: boolean }) {
       has: () => runs.length > 0,
       run: async (convId: string, code: string, files: SandboxFile[]) => {
         runs.push({ convId, code, files })
-        return { ok: true, stdout: '2\n', stderr: '', files: [{ name: 'chart.png', bytes: PNG }], skipped: [] }
+        return { ok: true, stdout: '2\n', stderr: '', files: [{ name: 'chart.png', bytes: PNG }, { name: 'cleaned.csv', bytes: Buffer.from(CSV) }], skipped: [] }
       },
     },
   } as unknown as Deps
@@ -126,10 +129,45 @@ test('run_python: offered with the sandbox on, asks even with Allow and Auto-all
   assert.deepEqual(h.runs[0].files.map((f) => [f.name, f.bytes.toString()]), [['sales.csv', 'month,sales\nJan,3']], 'the turn\'s document went in')
   const r = reply(h.store, conv.id)!
   const files = r.toolCalls[0].files ?? []
-  assert.equal(files.length, 1)
+  assert.equal(files.length, 2)
   assert.match(files[0], /^attachment:[0-9a-f]{64}\.png$/)
-  assert.deepEqual(r.attachments, files, 'the reply row names the chart, so the janitor keeps it')
+  assert.match(files[1], /^attachment:[0-9a-f]{64}\.csv$/)
+  assert.deepEqual(r.attachments, files, 'the reply row names the chart and the CSV, so the janitor keeps them')
+  assert.deepEqual(r.toolCalls[0].outputs, [
+    { name: 'chart.png', file: files[0], size: PNG.length },
+    { name: 'cleaned.csv', file: files[1], size: CSV.length, formulaCells: true },
+  ])
   assert.match(r.toolCalls[0].result ?? '', /Shown to the user in the chat: chart\.png/)
+  assert.match(r.toolCalls[0].result ?? '', /Given to the user to download: cleaned\.csv/)
+  assert.equal(readFileSync(h.store.attachments.file(files[1].slice('attachment:'.length))!.path, 'utf8'), CSV)
+})
+
+// Every way a reply's files stop being named frees them: the janitor collects a file no row names (attachments.ts).
+// A deleted message, a deleted chat (also what the retention sweep and a Code session delete do) and the External
+// Chat API's deletes all remove rows; nothing else has to know about the files.
+test('run_python: a reply\'s files are freed by the janitor once its message, or its chat, is deleted', async (t) => {
+  for (const how of ['message', 'chat'] as const) {
+    const engine = scriptedEngine(t)
+    const h = routes(t, { sandboxOn: true })
+    const conv = h.store.createConversation()
+    const sent = h.app.request(`/api/v1/conversations/${conv.id}/messages`, json({ content: 'chart this' }))
+    void Promise.resolve(sent).then((r) => r.body?.cancel())
+    await waitFor(() => (engine.offered.length ? true : undefined), 'the first request')
+    await settle()
+    await h.app.request(`/api/v1/conversations/${conv.id}/tool-calls/call_1/approve`, json({ toolName: 'run_python', decision: 'allow' }))
+    await waitFor(() => (reply(h.store, conv.id)?.content === 'Here is your chart.' ? true : undefined), 'the reply')
+    await settle()
+    const r = reply(h.store, conv.id)!
+    const paths = (r.toolCalls[0].files ?? []).map((f) => h.store.attachments.file(f.slice('attachment:'.length))!.path)
+    assert.equal(paths.length, 2, how)
+    const janitor = new AttachmentJanitor({ db: h.store, log: () => {}, graceMs: 0 })
+    await janitor.run()
+    assert.ok(paths.every((p) => existsSync(p)), `${how}: kept while the reply names them`)
+    if (how === 'message') h.store.deleteMessage(r.id)
+    else h.store.deleteConversation(conv.id)
+    await janitor.run()
+    assert.ok(paths.every((p) => !existsSync(p)), `${how}: freed once deleted`)
+  }
 })
 
 test('run_python: not offered with the sandbox off, and a call made anyway is refused without running', async (t) => {

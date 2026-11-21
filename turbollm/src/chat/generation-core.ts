@@ -25,7 +25,7 @@ import { needsExtraPass } from './think-utils'
 import type { ReasoningEffort } from './reasoning-effort'
 import type { EmitSink } from './emit-sink.js'
 import type { EngineMessage } from './chat-compaction.js'
-import type { ClaimVerdict, Conversation, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
+import type { ClaimVerdict, Conversation, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord, ToolOutput } from './db'
 import { checkReply } from '../tools/research-referee.js'
 import { executeToolCallWithApproval, newApprovalWaitBudget } from '../tools/execute-with-approval'
 import { buildSaveSkillTool } from '../agents/agent-tools'
@@ -832,6 +832,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
           let result: string
           let callError: string | undefined
           let callFiles: string[] | undefined
+          let callOutputs: ToolOutput[] | undefined
 
           if (blocked !== undefined) {
             result = blocked
@@ -894,6 +895,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
             result = approved.result
             callError = approved.error
             callFiles = approved.files
+            callOutputs = approved.outputs
           }
 
           // F-021: track web_search calls and accumulate research sources.
@@ -924,7 +926,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
             } catch { /* parsing is best-effort */ }
           }
 
-          allToolCalls.push({ id: tc.id, name: tc.name, args: parsedArgs, result: callError ? undefined : result, error: callError, ...(callFiles ? { files: callFiles } : {}) })
+          allToolCalls.push({ id: tc.id, name: tc.name, args: parsedArgs, result: callError ? undefined : result, error: callError, ...(callFiles ? { files: callFiles } : {}), ...(callOutputs ? { outputs: callOutputs } : {}) })
           replyChanged('toolCall')
 
           // Inject tool result into iterMessages

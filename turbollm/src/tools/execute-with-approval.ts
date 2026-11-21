@@ -6,6 +6,7 @@ import { isMcpToolName, type ToolRegistry, type ToolCall } from './tool-registry
 import { type ToolPolicy, resolveToolPolicy } from './tool-policy'
 import { waitForToolApproval } from './approval-gate'
 import { RUN_PYTHON, RUN_PYTHON_UNAVAILABLE, type SandboxTurn } from '../sandbox/run-python'
+import type { ToolOutput } from '../chat/db'
 
 /** The result a call gets when its approval wait (approvalWaitMinutes) ran out. */
 export function approvalTimeoutResult(minutes: number): string {
@@ -84,7 +85,7 @@ export async function executeToolCallWithApproval(params: {
    *  run_python. Without it run_python is refused before its policy is read, as is any run_python a caller with
    *  nobody to ask (`interactive` false) gets: every run must be seen before it starts (GitHub #52). */
   sandbox?: SandboxTurn
-}): Promise<{ result: string; error?: string; files?: string[] }> {
+}): Promise<{ result: string; error?: string; files?: string[]; outputs?: ToolOutput[] }> {
   const { tools, sink, convId, id, name, args, globalPolicies, convOverrides, signal, interactive, agentAllowedTools, autoAllowAll } = params
 
   // Refused before its policy is read: an 'ask' would put the approval to a caller whose own
@@ -166,12 +167,14 @@ export async function executeToolCallWithApproval(params: {
   let result = ''
   let error: string | undefined
   let files: string[] | undefined
+  let outputs: ToolOutput[] | undefined
   try {
     if (name === RUN_PYTHON && params.sandbox) {
       // Reached only through an approved 'ask' (resolveToolPolicy never allows it outright).
       const ran = await params.sandbox.run(args, signal)
       result = ran.result
       if (ran.files.length) files = ran.files
+      if (ran.outputs?.length) outputs = ran.outputs
     } else {
       const call: ToolCall = { id, name, args }
       result = await tools.executeTool(call, params.isCodeAuthorized ?? false, { refuseMcp: params.refuseMcp, refuseMcpAgentsAndRoutines: params.refuseMcpAgentsAndRoutines })
@@ -181,6 +184,6 @@ export async function executeToolCallWithApproval(params: {
     result = `Error: ${error}`
   }
 
-  await sink({ event: 'tool_call', data: { id, name, args, status: error ? 'error' : 'done', result, ...(files ? { files } : {}) } })
-  return { result, error, files }
+  await sink({ event: 'tool_call', data: { id, name, args, status: error ? 'error' : 'done', result, ...(files ? { files } : {}), ...(outputs ? { outputs } : {}) } })
+  return { result, error, files, outputs }
 }

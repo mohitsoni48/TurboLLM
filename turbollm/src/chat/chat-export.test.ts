@@ -188,7 +188,8 @@ test('buildSnapshot: persona is the chat’s own agent when the daemon kept it, 
 })
 
 test('buildSnapshot: says files are not included and leaves out the tool calls\' file references (GitHub #52)', () => {
-  const toolCalls = [{ id: 'tc1', name: 'run_python', args: { code: 'x' }, result: 'ok', files: [`attachment:${'a'.repeat(64)}.png`] }]
+  const file = `attachment:${'a'.repeat(64)}.png`
+  const toolCalls = [{ id: 'tc1', name: 'run_python', args: { code: 'x' }, result: 'ok', files: [file], outputs: [{ name: 'chart.png', file, size: 8 }] }]
   const snap = buildSnapshot(makeConv({ messages: [makeMsg('assistant', 'Here', { toolCalls })] }), makeCfg(), VERSION, EXPORTED_AT, 'export')
   assert.equal(snap.files_included, false)
   assert.deepEqual(snap.messages[0].tool_calls, [{ id: 'tc1', name: 'run_python', args: { code: 'x' }, result: 'ok' }])

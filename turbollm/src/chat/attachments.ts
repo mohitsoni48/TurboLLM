@@ -263,6 +263,17 @@ export class AttachmentStore {
     return part
   }
 
+  /** The size in bytes of the file behind `id`, or null when there is none. */
+  size(id: string): number | null {
+    const file = this.file(id)
+    if (!file) return null
+    try {
+      return statSync(file.path).size
+    } catch {
+      return null
+    }
+  }
+
   /** The file behind `id`, or null when `id` is not exactly a name this store writes (so never a path elsewhere). */
   file(id: string): { path: string; mime: string } | null {
     if (!this.folder || !ID_PATTERN.test(id)) return null

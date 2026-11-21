@@ -44,7 +44,7 @@ test('import leaves out the file references in tool calls and skips entries that
         { role: 'user', content: 'Plot it' },
         {
           role: 'assistant', content: 'Done',
-          tool_calls: [{ id: 't1', name: 'run_python', args: { code: 'plot()' }, result: 'ok', files: [OTHER_CHATS_IMAGE] }, null, 7, ['x']],
+          tool_calls: [{ id: 't1', name: 'run_python', args: { code: 'plot()' }, result: 'ok', files: [OTHER_CHATS_IMAGE], outputs: [{ name: 'chart.png', file: OTHER_CHATS_IMAGE, size: 8 }] }, null, 7, ['x']],
         },
       ],
     })
