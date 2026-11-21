@@ -186,3 +186,11 @@ test('buildSnapshot: persona is the chat’s own agent when the daemon kept it, 
   assert.equal(snap({ chatAgentId: 'blank' }).persona, 'blank')
   assert.equal(snap({ chatAgentId: '', toolPolicy: 'force_web_search' }).persona, 'research', 'an empty id falls back to the guess')
 })
+
+test('buildSnapshot: says files are not included and leaves out the tool calls\' file references (GitHub #52)', () => {
+  const toolCalls = [{ id: 'tc1', name: 'run_python', args: { code: 'x' }, result: 'ok', files: [`attachment:${'a'.repeat(64)}.png`] }]
+  const snap = buildSnapshot(makeConv({ messages: [makeMsg('assistant', 'Here', { toolCalls })] }), makeCfg(), VERSION, EXPORTED_AT, 'export')
+  assert.equal(snap.files_included, false)
+  assert.deepEqual(snap.messages[0].tool_calls, [{ id: 'tc1', name: 'run_python', args: { code: 'x' }, result: 'ok' }])
+  assert.equal(toolCalls[0].files.length, 1, 'the chat\'s own record is not changed')
+})

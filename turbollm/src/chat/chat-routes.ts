@@ -15,7 +15,7 @@ import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFro
 
 import type { ConversationStore, Message, PageOpts, ToolCallRecord } from './db'
 import { InvalidCursorError } from './db'
-import { buildSnapshot } from './chat-export'
+import { buildSnapshot, withoutFileRefs } from './chat-export'
 import type { ExportFormat } from './chat-export'
 import { pendingToolApprovalName, resolveToolApproval } from '../tools/approval-gate'
 import { isMcpToolName, listsMcpTool, MCP_APPROVAL_REFUSED_MESSAGE } from '../tools/tool-registry'
@@ -1153,7 +1153,11 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
         const role = m.role as string
         if (role !== 'user' && role !== 'assistant') continue
         const content = typeof m.content === 'string' ? m.content : ''
-        const toolCalls = Array.isArray(m.tool_calls) ? m.tool_calls as ToolCallRecord[] : undefined
+        // Without their file references (chat-export.ts withoutFileRefs): the file brings no files, and a reference in
+        // it could name another chat's. An entry that is not an object is skipped rather than crashing the import.
+        const toolCalls = Array.isArray(m.tool_calls)
+          ? withoutFileRefs((m.tool_calls as unknown[]).filter((t): t is ToolCallRecord => typeof t === 'object' && t !== null && !Array.isArray(t)))
+          : undefined
         db.addMessage(newConv.id, role as 'user' | 'assistant', content, {
           toolCalls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined,
         })
