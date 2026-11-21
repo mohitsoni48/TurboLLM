@@ -328,6 +328,9 @@ test('downloadFileName keeps the name without folders, control characters or quo
     ['a\r\nX-Evil: 1.csv', 'a__X-Evil_ 1.csv'],
     ['say "hi".csv', 'say _hi_.csv'],
     ['données été.csv', 'données été.csv'],
+    ['report‮fdp.csv', 'report_fdp.csv'],
+    ['zero​width⁦.csv', 'zero_width_.csv'],
+    ['line break.csv', 'line_break.csv'],
     ['...', 'file.csv'],
     ['', 'file.csv'],
     ['.csv', 'file.csv'],

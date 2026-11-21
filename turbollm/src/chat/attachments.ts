@@ -82,11 +82,14 @@ export function isDownloadExtension(ext: string): boolean {
 
 /** The name a download of `id` is saved under: `name` as the user or the code gave it, without any folder, control
  *  character or quote, at most MAX_DOWNLOAD_NAME characters, and always ending in the stored file's own extension (a
- *  CSV is never saved as `page.html`, which a browser would open as a page). `file.<ext>` when nothing is left. */
+ *  CSV is never saved as `page.html`, which a browser would open as a page). Invisible format characters go too (a
+ *  right-to-left override shows `report‮fdp.csv` as `reportvsc.pdf`; a zero-width space hides in a name), and line
+ *  and paragraph separators. `file.<ext>` when nothing is left. */
 export function downloadFileName(name: string, id: string): string {
   const ext = id.slice(id.lastIndexOf('.') + 1)
   let base = name.slice(Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\')) + 1)
-  base = Array.from(base, (ch) => (ch < ' ' || ch === '\u007f' || '"*:<>?|'.includes(ch) ? '_' : ch)).join('').replace(/[.\s]+$/, '')
+  const unsafe = (ch: string) => ch < ' ' || ch === '\u007f' || '"*:<>?|'.includes(ch) || /[\p{Cf}\p{Zl}\p{Zp}]/u.test(ch)
+  base = Array.from(base, (ch) => (unsafe(ch) ? '_' : ch)).join('').replace(/[.\s]+$/, '')
   if (base.toLowerCase().endsWith(`.${ext}`)) base = base.slice(0, -(ext.length + 1))
   base = base.slice(0, MAX_DOWNLOAD_NAME - ext.length - 1).replace(/^[.\s]+|[.\s]+$/g, '')
   return `${base || 'file'}.${ext}`
