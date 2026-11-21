@@ -202,8 +202,12 @@ function formulaCell(cell: string): boolean {
 }
 
 /** Whether a CSV has a cell a spreadsheet may run as a formula. Quoted fields are read unquoted ("=1" is a formula
- *  cell too); a field with a quote that is never closed runs to the end of the text, as a spreadsheet would read it. */
+ *  cell too); a field with a quote that is never closed runs to the end of the text, as a spreadsheet would read it.
+ *  A leading byte order mark is skipped (Excel drops it and reads the first cell after it), and `;` splits cells as `,`
+ *  does, since Excel reads `;` as the separator where the list separator is `;`. */
 export function csvHasFormulaCells(text: string): boolean {
+  if (text.startsWith('﻿')) text = text.slice(1)
+  const ends = (c: string | undefined) => c === ',' || c === ';' || c === '\n'
   let i = 0
   while (i <= text.length) {
     let cell = ''
@@ -214,9 +218,9 @@ export function csvHasFormulaCells(text: string): boolean {
         else if (text[i] === '"') { i++; break }
         else cell += text[i++]
       }
-      while (i < text.length && text[i] !== ',' && text[i] !== '\n') cell += text[i++]
+      while (i < text.length && !ends(text[i])) cell += text[i++]
     } else {
-      while (i < text.length && text[i] !== ',' && text[i] !== '\n') cell += text[i++]
+      while (i < text.length && !ends(text[i])) cell += text[i++]
       if (cell.endsWith('\r') && text[i] === '\n') cell = cell.slice(0, -1)
     }
     if (formulaCell(cell)) return true

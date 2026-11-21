@@ -278,6 +278,13 @@ test('csvHasFormulaCells: a cell a spreadsheet may run, quoted or not, but not a
     assert.equal(csvHasFormulaCells(csv), false, JSON.stringify(csv))
 })
 
+test('csvHasFormulaCells: a byte order mark before the first cell, and `;` as the separator, do not hide a formula', () => {
+  for (const csv of ['﻿=1+1', '﻿a\n=1+1', 'a;=1+1', 'a;"=1"\n1;2', 'a,b;@x'])
+    assert.equal(csvHasFormulaCells(csv), true, JSON.stringify(csv))
+  for (const csv of ['﻿a,b\n1,2', 'a;b\n1;2', 'n;-5;+3.2', '"a;=1"'])
+    assert.equal(csvHasFormulaCells(csv), false, JSON.stringify(csv))
+})
+
 test('describeRun: a CSV with formula cells is marked; JSON and text are never scanned', async () => {
   const r = await describeRun(result({ files: [
     { name: 'risky.csv', bytes: Buffer.from('a\n=1+1') },
