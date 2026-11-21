@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { AttachmentStore, attachmentRefId, audioAttachmentFormat, isAttachmentRef, isAudioAttachment } from './attachments'
+import { AttachmentStore, attachmentRefId, audioAttachmentFormat, isAttachmentRef, isAudioAttachment, isImageAttachmentRef } from './attachments'
 import { IN_MEMORY_DATA_DIR } from './db'
 import { tmpDir } from '../test-support/tmp'
 
@@ -251,4 +251,28 @@ test('collectGarbage reclaims an unreferenced clip and keeps a referenced one', 
   assert.equal(await store.collectGarbage(new Set([attachmentRefId(kept)!]), 3600_000), 1)
   assert.ok(existsSync(join(folder, attachmentRefId(kept)!)))
   assert.ok(!existsSync(join(folder, attachmentRefId(orphan)!)))
+})
+
+test('isImageAttachmentRef is a stored image only: not a clip, an inline image, or a malformed or other stored file', () => {
+  const hex = 'c'.repeat(64)
+  for (const ext of ['png', 'jpg', 'gif', 'webp', 'bmp', 'avif']) assert.equal(isImageAttachmentRef(`attachment:${hex}.${ext}`), true, ext)
+  for (const other of [`attachment:${hex}.wav`, `attachment:${hex}.mp3`, `attachment:${hex}.csv`, `attachment:${hex}`, 'attachment:../x.png', PNG_URL, ''])
+    assert.equal(isImageAttachmentRef(other), false, other)
+})
+
+test('resolveMedia never sends a clip, another stored file or a malformed reference as an image (GitHub #52)', async () => {
+  const { store } = freshStore()
+  const [clip] = await store.save([`data:audio/wav;base64,${Buffer.from('RIFF0000WAVE').toString('base64')}`])
+  assert.ok(isAudioAttachment(clip) && isAttachmentRef(clip))
+  const messages = [{
+    role: 'user',
+    content: [
+      { type: 'text', text: 'look' },
+      { type: 'image_url', image_url: { url: clip } },
+      { type: 'image_url', image_url: { url: `attachment:${'d'.repeat(64)}.csv` } },
+      { type: 'image_url', image_url: { url: 'attachment:garbage' } },
+    ],
+  }]
+  await store.resolveMedia(messages)
+  assert.deepEqual(messages[0].content, [{ type: 'text', text: 'look' }])
 })

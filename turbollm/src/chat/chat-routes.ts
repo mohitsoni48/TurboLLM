@@ -10,7 +10,7 @@ import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import type { EmitSink } from './emit-sink.js'
 import type { ChatRun, ChatRunMeta } from './chat-runs.js'
 import type { ChatTurns } from './chat-turns.js'
-import { isAttachmentRef, isAudioAttachment, isCanonicalDataUrl } from './attachments.js'
+import { isAttachmentRef, isAudioAttachment, isCanonicalDataUrl, isImageAttachmentRef } from './attachments.js'
 import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent, VOICE_MESSAGE_PLACEHOLDER, type EngineMessage } from './chat-compaction.js'
 
 import type { ConversationStore, Message, PageOpts, ToolCallRecord } from './db'
@@ -626,6 +626,10 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // A clip is told from an image by what it is, not by the field it came in (chat-compaction.ts mediaPart): sent
     // as an image it would pass every check made on `audio` and still reach the engine as audio.
     if (images.some(isAudioAttachment)) return err(c, 400, 'invalid_input', 'A voice clip goes in audio, not in images.')
+    // A stored file stands in `images` only when it is an image: any other (a file run_python made for download,
+    // GitHub #52) would be sent to the engine as one.
+    if (images.some((a) => a.startsWith('attachment:') && !isImageAttachmentRef(a)))
+      return err(c, 400, 'invalid_input', 'Only images go in images.')
     // A message is valid if it has typed text OR carries an image, a voice clip or a file
     // attachment — image-only / voice-only / file-only sends are allowed.
     if (!content && images.length === 0 && audio.length === 0 && textAttachments.length === 0)

@@ -26,10 +26,10 @@ const REF_PREFIX = 'attachment:'
 /** The audio a clip may be: what the engines that hear audio decode (llama.cpp reads WAV and MP3; the page records
  *  WAV). The extension is also the `format` the clip's `input_audio` part names. */
 const AUDIO_MIME_BY_EXT: Record<string, string> = { wav: 'audio/wav', mp3: 'audio/mpeg' }
-const MIME_BY_EXT: Record<string, string> = {
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
   png: 'image/png', jpg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', avif: 'image/avif',
-  ...AUDIO_MIME_BY_EXT,
 }
+const MIME_BY_EXT: Record<string, string> = { ...IMAGE_MIME_BY_EXT, ...AUDIO_MIME_BY_EXT }
 const EXT_BY_MIME = Object.fromEntries(Object.entries(MIME_BY_EXT).map(([ext, mime]) => [mime, ext]))
 const ID_PATTERN = /^[0-9a-f]{64}\.(png|jpg|gif|webp|bmp|avif|wav|mp3)$/
 const AUDIO_DATA_URL_PATTERN = /^data:(audio\/[a-z0-9.+-]+);base64,/
@@ -46,6 +46,13 @@ export function attachmentRefId(attachment: string): string | null {
   if (!attachment.startsWith(REF_PREFIX)) return null
   const id = attachment.slice(REF_PREFIX.length)
   return ID_PATTERN.test(id) ? id : null
+}
+
+/** Whether `attachment` is a stored reference to an image: not a voice clip, and not any other file the store keeps.
+ *  Only these may stand where an image goes (a message's `images`, an engine's `image_url` part). */
+export function isImageAttachmentRef(attachment: string): boolean {
+  const id = attachmentRefId(attachment)
+  return id !== null && Object.hasOwn(IMAGE_MIME_BY_EXT, id.slice(id.lastIndexOf('.') + 1))
 }
 
 /** The audio format of a voice clip attachment (`wav`, `mp3`): a stored reference by its extension, a data URL by its
@@ -184,7 +191,10 @@ export class AttachmentStore {
   private async resolvePart(part: ContentPart): Promise<ContentPart | null> {
     if (part?.type === 'image_url') {
       const url = part.image_url?.url
-      if (typeof url !== 'string' || !isAttachmentRef(url)) return part
+      if (typeof url !== 'string' || !url.startsWith(REF_PREFIX)) return part
+      // A clip, any other stored file or a malformed reference is never sent as an image, nor as a reference no
+      // engine understands.
+      if (!isImageAttachmentRef(url)) return null
       const inlined = await this.inline(url)
       return inlined === null ? null : { ...part, image_url: { ...part.image_url, url: inlined } }
     }
