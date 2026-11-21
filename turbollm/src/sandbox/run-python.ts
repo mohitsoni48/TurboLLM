@@ -100,8 +100,9 @@ export type ChatRow = Pick<Message, 'role' | 'toolCalls'> & UserFiles
  *  and text documents; from a reply, the files its run_python calls handed back (ToolCallRecord.outputs), under the
  *  names the code gave them. All under safe names. A name a newer row has again is the newer file (the user sent a new
  *  version, or later code wrote it again); two files with one name in the same user message keep both (`-2`), and in
- *  one reply the last run's file wins. Newest first under the caps. */
-export async function turnFiles(rows: Array<UserFiles & Partial<Pick<ChatRow, 'role' | 'toolCalls'>>>, store: Pick<AttachmentStore, 'inline' | 'read'>): Promise<SandboxFile[]> {
+ *  one reply the last run's file wins. Newest first under the caps; the names the caps left out go in `leftOut`, newest
+ *  first. */
+export async function turnFiles(rows: Array<UserFiles & Partial<Pick<ChatRow, 'role' | 'toolCalls'>>>, store: Pick<AttachmentStore, 'inline' | 'read'>, leftOut: string[] = []): Promise<SandboxFile[]> {
   const perRow: Array<Array<{ name: string; bytes: Buffer }>> = []
   let img = 0
   for (const row of rows) {
@@ -133,7 +134,12 @@ export async function turnFiles(rows: Array<UserFiles & Partial<Pick<ChatRow, 'r
       if (taken.has(f.name.toLowerCase())) continue // a newer message has this name
       let n = f.name
       for (let k = 2; here.has(n.toLowerCase()); k++) n = f.name.replace(/(\.[^.]*)?$/, (ext) => `-${k}${ext}`)
-      if (count >= MAX_INPUT_FILES || total + f.bytes.length > MAX_INPUT_TOTAL) continue
+      if (count >= MAX_INPUT_FILES || total + f.bytes.length > MAX_INPUT_TOTAL) {
+        // Taken all the same: an older, smaller file of this name must not come back in its place.
+        here.add(n.toLowerCase())
+        leftOut.push(n)
+        continue
+      }
       here.add(n.toLowerCase())
       chosen[i].push({ name: n, bytes: f.bytes })
       count++
@@ -360,7 +366,8 @@ export function sandboxTurn(o: {
       try {
         const fresh = !o.manager.has(o.convId)
         const rows = fresh || !sent ? o.history() : []
-        const files = fresh || !sent ? await turnFiles(filesFor(rows, fresh), o.store) : []
+        const leftOut: string[] = []
+        const files = fresh || !sent ? await turnFiles(filesFor(rows, fresh), o.store, leftOut) : []
         // A new sandbox after earlier runs in this chat: the model may count on variables that are gone.
         const ranBefore = ranHere || rows.some((r) => r.role === 'assistant' && (r.toolCalls ?? []).some((t) => t.name === RUN_PYTHON))
         sent = true
@@ -369,9 +376,12 @@ export function sandboxTurn(o: {
         const room = MAX_CHAT_FILES_BYTES - chatFilesBytes(rows.length ? rows : o.history(), keptThisTurn, o.store)
         const done = await describeRun(r, o.store, o.resultChars?.() ?? RESULT_MAX_CHARS, Math.max(0, room))
         for (const f of done.files) keptThisTurn.add(f)
-        if (!fresh || !ranBefore) return done
+        const notIn = leftOut.length
+          ? `Not in the folder, a run starts with at most ${MAX_INPUT_FILES} files and ${MAX_INPUT_TOTAL / 1024 / 1024} MB, the newest first: ${leftOut.join(', ')}.`
+          : ''
+        if (!fresh || !ranBefore) return notIn ? { ...done, result: `${notIn}\n\n${done.result}` } : done
         const back = files.length ? ` The files of this chat are back in the folder: ${files.map((f) => f.name).join(', ')}.` : ''
-        return { ...done, result: `This run started a new sandbox: variables from earlier runs are gone.${back}\n\n${done.result}` }
+        return { ...done, result: `This run started a new sandbox: variables from earlier runs are gone.${back}${notIn ? ` ${notIn}` : ''}\n\n${done.result}` }
       } catch (e) {
         // Each of these ended the process: the next run starts a new sandbox.
         const gone = e instanceof SandboxError && (e.code === 'timeout' || e.code === 'crashed' || e.code === 'violation')

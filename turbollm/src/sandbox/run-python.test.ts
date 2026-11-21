@@ -62,10 +62,24 @@ test('turnFiles: across the chat, a name sent again is the newer file, and image
 
 test('turnFiles: over 20 files, the newest are the ones sent', async () => {
   const rows = Array.from({ length: 25 }, (_, i) => ({ attachments: [], textAttachments: [`f${i}.txt`], docContext: `[Attached: f${i}.txt]\n${i}` }))
-  const names = (await turnFiles(rows, store)).map((f) => f.name)
+  const leftOut: string[] = []
+  const names = (await turnFiles(rows, store, leftOut)).map((f) => f.name)
   assert.equal(names.length, 20)
   assert.equal(names[0], 'f5.txt')
   assert.equal(names[19], 'f24.txt')
+  assert.deepEqual(leftOut, ['f4.txt', 'f3.txt', 'f2.txt', 'f1.txt', 'f0.txt'], 'the ones left out, newest first')
+})
+
+test('turnFiles: when the newest file of a name is over the caps, an older one of that name does not come back instead', async () => {
+  const ref = (c: string) => `attachment:${c.repeat(64)}.csv`
+  STORED[ref('7')] = Buffer.from('old')
+  STORED[ref('8')] = Buffer.alloc(100 * 1024 * 1024 + 1)
+  const ran = (file: string) => ({ role: 'assistant' as const, attachments: [], textAttachments: [], toolCalls: [{ id: 't', name: 'run_python', args: {}, outputs: [{ name: 'data.csv', file, size: 1 }] }] })
+  const leftOut: string[] = []
+  const files = await turnFiles([ran(ref('7')), ran(ref('8'))] as never[], store, leftOut)
+  assert.deepEqual(files, [])
+  assert.deepEqual(leftOut, ['data.csv'])
+  delete STORED[ref('8')]
 })
 
 const user = (name: string) => ({ role: 'user' as const, toolCalls: [], attachments: [], textAttachments: [name], docContext: `[Attached: ${name}]\nx` })
@@ -258,6 +272,18 @@ test('sandboxTurn: a follow-up after the sandbox closed gets the chat\'s earlier
   const r = await sandboxTurn({ convId: 'c1', manager, store, history: () => history }).run({ code: 'print(1)' }, new AbortController().signal)
   assert.deepEqual(calls[0].map((f) => f.name), ['sales.csv'])
   assert.match(r.result, /new sandbox.*back in the folder: sales\.csv\./)
+})
+
+test('sandboxTurn: the files the caps left out are named, in a fresh sandbox and in a warm one', async () => {
+  const history = Array.from({ length: 22 }, (_, i) => user(`f${i}.txt`)) as never[]
+  const run = async (warm: boolean, rows: never[]) => {
+    const manager = { has: () => warm, run: async () => result({ stdout: 'ok' }) } as unknown as SandboxManager
+    return (await sandboxTurn({ convId: 'c1', manager, store, history: () => rows }).run({ code: 'x' }, new AbortController().signal)).result
+  }
+  const fresh = await run(false, [...history, reply(true)] as never[])
+  assert.match(fresh, /^This run started a new sandbox: .* back in the folder: f2\.txt, .*, f21\.txt\. Not in the folder, a run starts with at most 20 files and 100 MB, the newest first: f1\.txt, f0\.txt\.\n\nOutput:\nok/)
+  const warm = await run(true, history)
+  assert.match(warm, /^Not in the folder, .*: f1\.txt, f0\.txt\.\n\nOutput:\nok/)
 })
 
 test('sandboxTurn: empty code, and a sandbox failure, come back as the tool\'s error text', async () => {
