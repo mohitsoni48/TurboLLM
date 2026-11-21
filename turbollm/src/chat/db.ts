@@ -405,8 +405,12 @@ export interface MessageStats {
 
 /** A file a run_python call handed back (GitHub #52). */
 export interface ToolOutput {
-  /** The name the code saved it under, in the sandbox's folder. */
+  /** The name the code saved it under, made plain for showing and downloading (`résumé.csv` is `resume.csv`, and a
+   *  second `data.csv` beside `Data.csv` is `data-2.csv`). */
   name: string
+  /** The name the code saved it under in the sandbox's folder, when `name` is not that name: a fresh sandbox gets the
+   *  file back under it, where the code looks for it. Never shown. */
+  sandboxName?: string
   /** Its attachment reference (`attachment:<id>`). */
   file: string
   /** Its size in bytes. */

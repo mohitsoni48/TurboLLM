@@ -31,6 +31,15 @@ const MAX_RESULT_PAYLOAD = MAX_TOTAL + 2 * TEXT_LIMIT
 /** A name the host may give an output. Only ever a label: outputs are stored under ids the daemon makes up. */
 const OUTPUT_NAME = /^[A-Za-z0-9._ ()-]{1,128}$/
 
+/** A name a file may have in the sandbox's folder, the code's own (`résumé.csv`, `Data.csv` beside `data.csv`): at most
+ *  128 characters, no folder, and nothing invisible or a control character. Never shown or used outside the sandbox: a
+ *  fresh sandbox gets an output back under it (run-python.ts turnFiles). The host sends one (`as`) only when it is not
+ *  the output's name, and only when it passes this same rule (sandbox-host.mjs sandboxName). */
+export function isSandboxName(name: unknown): name is string {
+  return typeof name === 'string' && name.length >= 1 && name.length <= 128 && name !== '.' && name !== '..'
+    && !/[/\\\p{C}\p{Zl}\p{Zp}]/u.test(name)
+}
+
 /** The host script, beside this module: src/sandbox/ under tsx, dist/ once built (package.json's build copies it). */
 export function sandboxHostPath(): string {
   return fileURLToPath(new URL('./sandbox-host.mjs', import.meta.url))
@@ -47,6 +56,9 @@ export class SandboxError extends Error {
 export interface SandboxFile {
   name: string
   bytes: Buffer
+  /** An output only: the name the code gave it in the sandbox's folder, when `name` (made plain for showing and
+   *  downloading) is not that name. */
+  as?: string
 }
 
 export interface SandboxRunResult {
@@ -242,18 +254,19 @@ export function checkResult(frame: Frame): SandboxRunResult | null {
   const skipped = h.skipped ?? []
   if (!Array.isArray(skipped) || skipped.length > MAX_SKIPPED || !skipped.every((s) => typeof s === 'string' && s.length <= 256)) return null
   let total = 0
-  const named: Array<{ name: string; size: number }> = []
+  const named: Array<{ name: string; size: number; as?: string }> = []
   for (const f of h.files as unknown[]) {
-    const { name, size } = (f ?? {}) as { name?: unknown; size?: unknown }
+    const { name, size, as } = (f ?? {}) as { name?: unknown; size?: unknown; as?: unknown }
     if (typeof name !== 'string' || !OUTPUT_NAME.test(name) || name === '.' || name === '..' || !sizeOk(size, MAX_FILE)) return null
+    if (as !== undefined && (!isSandboxName(as) || as === name)) return null
     total += size
-    named.push({ name, size })
+    named.push({ name, size, ...(as !== undefined ? { as } : {}) })
   }
   if (total > MAX_TOTAL || h.stdout + h.stderr + total !== frame.payload.length) return null
   let off = 0
   const slice = (n: number) => frame.payload.subarray(off, (off += n))
   const stdout = slice(h.stdout).toString('utf8')
   const stderr = slice(h.stderr).toString('utf8')
-  const files = named.map((f) => ({ name: f.name, bytes: Buffer.from(slice(f.size)) }))
+  const files = named.map((f) => ({ name: f.name, bytes: Buffer.from(slice(f.size)), ...(f.as !== undefined ? { as: f.as } : {}) }))
   return { ok: h.ok, error: h.ok ? undefined : (h.error as string | undefined)?.slice(0, 4000), stdout, stderr, files, skipped: skipped as string[] }
 }

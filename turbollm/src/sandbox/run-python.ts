@@ -16,7 +16,7 @@ import type { ToolDefinition } from '../tools/tool-registry'
 import { attachmentRefId, type AttachmentStore } from '../chat/attachments'
 import type { Message, ToolCallRecord, ToolOutput } from '../chat/db'
 import type { SandboxManager } from './sandbox-manager'
-import { SandboxError, RUN_TIMEOUT_MS, type SandboxFile, type SandboxRunResult } from './sandbox-process'
+import { isSandboxName, SandboxError, RUN_TIMEOUT_MS, type SandboxFile, type SandboxRunResult } from './sandbox-process'
 
 export const RUN_PYTHON = 'run_python'
 
@@ -98,10 +98,11 @@ export type ChatRow = Pick<Message, 'role' | 'toolCalls'> & UserFiles
 
 /** The files a run starts with, oldest row first: from a user row, its images (`image-N`, numbered across the chat)
  *  and text documents; from a reply, the files its run_python calls handed back (ToolCallRecord.outputs), under the
- *  names the code gave them. All under safe names. A name a newer row has again is the newer file (the user sent a new
- *  version, or later code wrote it again); two files with one name in the same user message keep both (`-2`), and in
- *  one reply the last run's file wins. Newest first under the caps; the names the caps left out go in `leftOut`, newest
- *  first. */
+ *  names the code gave them (ToolOutput.sandboxName when it has one: `résumé.csv`, not the `resume.csv` shown). All
+ *  under safe names. Names match exactly, as in the sandbox's folder (`Data.csv` and `data.csv` are two files). A name
+ *  a newer row has again is the newer file (the user sent a new version, or later code wrote it again); two files with
+ *  one name in the same user message keep both (`-2`), and in one reply the last run's file wins. Newest first under
+ *  the caps; the names the caps left out go in `leftOut`, newest first. */
 export async function turnFiles(rows: Array<UserFiles & Partial<Pick<ChatRow, 'role' | 'toolCalls'>>>, store: Pick<AttachmentStore, 'inline' | 'read'>, leftOut: string[] = []): Promise<SandboxFile[]> {
   const perRow: Array<Array<{ name: string; bytes: Buffer }>> = []
   let img = 0
@@ -131,16 +132,16 @@ export async function turnFiles(rows: Array<UserFiles & Partial<Pick<ChatRow, 'r
   for (let i = perRow.length - 1; i >= 0; i--) {
     const here = new Set<string>()
     for (const f of perRow[i]) {
-      if (taken.has(f.name.toLowerCase())) continue // a newer message has this name
+      if (taken.has(f.name)) continue // a newer message has this name
       let n = f.name
-      for (let k = 2; here.has(n.toLowerCase()); k++) n = f.name.replace(/(\.[^.]*)?$/, (ext) => `-${k}${ext}`)
+      for (let k = 2; here.has(n); k++) n = f.name.replace(/(\.[^.]*)?$/, (ext) => `-${k}${ext}`)
       if (count >= MAX_INPUT_FILES || total + f.bytes.length > MAX_INPUT_TOTAL) {
         // Taken all the same: an older, smaller file of this name must not come back in its place.
-        here.add(n.toLowerCase())
+        here.add(n)
         leftOut.push(n)
         continue
       }
-      here.add(n.toLowerCase())
+      here.add(n)
       chosen[i].push({ name: n, bytes: f.bytes })
       count++
       total += f.bytes.length
@@ -150,16 +151,16 @@ export async function turnFiles(rows: Array<UserFiles & Partial<Pick<ChatRow, 'r
   return chosen.flat()
 }
 
-/** The files a reply's run_python calls handed back, by name, the last call's file winning a name. A file that is gone
- *  is left out. */
+/** The files a reply's run_python calls handed back, by the names the code gave them, the last call's file winning a
+ *  name. A file that is gone is left out. */
 async function outputsOf(calls: ToolCallRecord[], store: Pick<AttachmentStore, 'read'>): Promise<Array<{ name: string; bytes: Buffer }>> {
   const byName = new Map<string, { name: string; file: string }>()
   for (const call of calls) {
     if (call.name !== RUN_PYTHON) continue
     for (const o of call.outputs ?? []) {
-      const name = safeName(o.name, 'output')
-      byName.delete(name.toLowerCase()) // re-added at the end: the last write is the newest
-      byName.set(name.toLowerCase(), { name, file: o.file })
+      const name = isSandboxName(o.sandboxName) ? o.sandboxName : safeName(o.name, 'output')
+      byName.delete(name) // re-added at the end: the last write is the newest
+      byName.set(name, { name, file: o.file })
     }
   }
   const out: Array<{ name: string; bytes: Buffer }> = []
@@ -291,9 +292,9 @@ export async function describeRun(r: SandboxRunResult, store: Pick<AttachmentSto
     }
     left -= f.bytes.length
     refs.push(saved)
-    ;(image ? shown : given).push(f.name)
+    ;(image ? shown : given).push(f.as === undefined ? f.name : `${f.name} (${f.as} in the folder)`)
     const formulaCells = ext === 'csv' && csvHasFormulaCells(f.bytes.toString('utf8'))
-    outputs.push({ name: f.name, file: saved, size: f.bytes.length, ...(formulaCells ? { formulaCells: true as const } : {}) })
+    outputs.push({ name: f.name, ...(f.as !== undefined ? { sandboxName: f.as } : {}), file: saved, size: f.bytes.length, ...(formulaCells ? { formulaCells: true as const } : {}) })
   }
   // Text files come back while the result's budget lasts; the rest are named, so the model can read what it needs in
   // another run.

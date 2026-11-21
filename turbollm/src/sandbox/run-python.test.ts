@@ -41,10 +41,11 @@ test('safeName: no folders, no odd characters, never empty', () => {
 test('turnFiles: images and text documents, under unique names; other formats stay out', async () => {
   const files = await turnFiles([{
     attachments: ['attachment:abc.png', 'attachment:gone.png'],
-    textAttachments: ['data.csv', 'report.pdf', 'Data.csv'],
-    docContext: '[Attached: data.csv]\na\n\n[Attached: report.pdf]\nextracted\n\n[Attached: Data.csv]\nb',
+    textAttachments: ['data.csv', 'report.pdf', 'Data.csv', 'data.csv'],
+    docContext: '[Attached: data.csv]\na\n\n[Attached: report.pdf]\nextracted\n\n[Attached: Data.csv]\nb\n\n[Attached: data.csv]\nc',
   }], store)
-  assert.deepEqual(files.map((f) => f.name), ['image-1.png', 'data.csv', 'Data-2.csv'])
+  // The sandbox's folder tells Data.csv from data.csv; only the same name twice needs a -2.
+  assert.deepEqual(files.map((f) => f.name), ['image-1.png', 'data.csv', 'Data.csv', 'data-2.csv'])
   assert.deepEqual(files[0].bytes, PNG)
   assert.equal(files[1].bytes.toString(), 'a')
   assert.deepEqual(await turnFiles([], store), [])
@@ -122,6 +123,24 @@ test('turnFiles: a fresh sandbox gets back the files earlier runs made, the newe
   // A user who attaches a new version after the run wins it back.
   const again = await turnFiles([...rows, user('cleaned.csv')] as never[], store)
   assert.equal(again.find((f) => f.name === 'cleaned.csv')!.bytes.toString(), 'x')
+})
+
+test('turnFiles: an output comes back under the name the code gave it, not the plain one shown to the user', async () => {
+  const ref = (c: string) => `attachment:${c.repeat(64)}.csv`
+  STORED[ref('a')] = Buffer.from('cv')
+  STORED[ref('b')] = Buffer.from('upper')
+  STORED[ref('c')] = Buffer.from('lower')
+  STORED[ref('d')] = Buffer.from('bad')
+  const rows = [{ role: 'assistant' as const, attachments: [], textAttachments: [], toolCalls: [{ id: 't', name: 'run_python', args: {}, outputs: [
+    { name: 'resume.csv', sandboxName: 'résumé.csv', file: ref('a'), size: 2 },
+    { name: 'Data.csv', file: ref('b'), size: 5 },
+    { name: 'data-2.csv', sandboxName: 'data.csv', file: ref('c'), size: 5 },
+    { name: 'x.csv', sandboxName: '../x.csv', file: ref('d'), size: 3 },
+  ] }] }] as never[]
+  const files = await turnFiles(rows, store)
+  assert.deepEqual(files.map((f) => [f.name, f.bytes.toString()]), [
+    ['résumé.csv', 'cv'], ['Data.csv', 'upper'], ['data.csv', 'lower'], ['x.csv', 'bad'],
+  ], 'Data.csv and data.csv are two files in the folder; a sandbox name that breaks the rule falls back to the plain one')
 })
 
 const result = (over: Partial<SandboxRunResult>): SandboxRunResult => ({ ok: true, stdout: '', stderr: '', files: [], skipped: [], ...over })
@@ -309,6 +328,12 @@ test('csvHasFormulaCells: a byte order mark before the first cell, and `;` as th
     assert.equal(csvHasFormulaCells(csv), true, JSON.stringify(csv))
   for (const csv of ['﻿a,b\n1,2', 'a;b\n1;2', 'n;-5;+3.2', '"a;=1"'])
     assert.equal(csvHasFormulaCells(csv), false, JSON.stringify(csv))
+})
+
+test('describeRun: an output keeps the name the code gave it, and the model is told both names', async () => {
+  const r = await describeRun(result({ files: [{ name: 'resume.csv', as: 'résumé.csv', bytes: Buffer.from('a') }, { name: 'plain.csv', bytes: Buffer.from('b') }] }), store)
+  assert.deepEqual(r.outputs.map((o) => [o.name, o.sandboxName]), [['resume.csv', 'résumé.csv'], ['plain.csv', undefined]])
+  assert.match(r.result, /Given to the user to download: resume\.csv \(résumé\.csv in the folder\), plain\.csv$/)
 })
 
 test('describeRun: a CSV with formula cells is marked; JSON and text are never scanned', async () => {
