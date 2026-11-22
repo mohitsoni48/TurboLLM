@@ -24,6 +24,7 @@ import {
 import { toast } from '../components/ui/sonner'
 import { focusManager, useQuery, useQueryClient } from '@tanstack/react-query'
 import { skillKeys, fetchSkills } from '../lib/agent-api'
+import { CHAT_UNSUPPORTED_SKILLS } from '../lib/agent-types'
 import { cn, readLastChatConvId, writeLastChatConvId } from '../lib/utils'
 import { useChatInAddress } from '../lib/chat-address'
 import { ThinkingBudgetSlider } from '../components/ThinkingBudgetSlider'
@@ -292,8 +293,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   }, [editingId, conv?.messages])
 
   // Skills enabled before a conversation exists yet (first message hasn't been sent).
-  // Once activeId exists, conv.skillIds is the source of truth instead.
-  const [pendingSkillIds, setPendingSkillIds] = useState<string[]>([])
+  // Once activeId exists, conv.skillIds is the source of truth instead. Null until this blank
+  // chat's skills are changed: until then it follows Settings' "Skills in new chats" (GitHub
+  // issue 340); a change, unticking every one included, is this chat's own choice.
+  const [pendingSkillChoice, setPendingSkillIds] = useState<string[] | null>(null)
+  const pendingSkillIds = pendingSkillChoice ?? settingsQ.data?.defaultChatSkillIds ?? []
   const enabledSkillIds = conv?.skillIds ?? pendingSkillIds
 
   // Same pattern, extended to the other Thread-settings fields (GitHub #52 follow-up):
@@ -334,7 +338,6 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // otherwise-empty composer) shows a filtered skill list. Selecting one enables
   // that skill for the conversation and clears the token.
   const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills, staleTime: 30_000 })
-  const CHAT_UNSUPPORTED_SKILLS = new Set(['filesystem'])
   const pickableSkills = (skillsQ.data ?? []).filter((s) => !CHAT_UNSUPPORTED_SKILLS.has(s.id))
   const skillPickerMatch = /^\/([a-z0-9-]*)$/i.exec(input)
   const skillPickerQuery = skillPickerMatch?.[1]?.toLowerCase() ?? ''
@@ -352,7 +355,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       const next = Array.from(new Set([...enabledSkillIds, skill.id]))
       mut.update.mutate({ id: activeId, skillIds: next })
     } else {
-      setPendingSkillIds((prev) => Array.from(new Set([...prev, skill.id])))
+      setPendingSkillIds(Array.from(new Set([...pendingSkillIds, skill.id])))
     }
     toast.success(`Skill enabled: ${skill.name}`)
     setTimeout(() => inputRef.current?.focus(), 0)
@@ -892,7 +895,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         if (thinkingBudget !== readThinkingBudget(null)) localStorage.setItem(`tllm.thinkingBudget.${convId}`, String(thinkingBudget))
         if (reasoningEffort !== readReasoningEffort(null)) localStorage.setItem(`tllm.reasoningEffort.${convId}`, reasoningEffort)
         setActiveId(convId)
-        setPendingSkillIds([])
+        setPendingSkillIds(null)
         setPendingSystemPrompt('')
         setPendingSampling({})
         setPendingPreserveThinking(true)

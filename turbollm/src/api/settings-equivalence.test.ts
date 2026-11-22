@@ -21,7 +21,7 @@ process.env.TURBOLLM_TELEMETRY = 'off' // a telemetryLevel change would otherwis
 const GOLDEN = join(import.meta.dirname, 'fixtures', 'settings-golden.json')
 const WRITE = process.env.TURBOLLM_SETTINGS_GOLDEN === 'write'
 /** Top-level payload keys added after the recording. */
-const NEW_KEYS = ['downloadConcurrency', 'engineLoadStallSeconds', 'pdfReading', 'speechToText']
+const NEW_KEYS = ['downloadConcurrency', 'engineLoadStallSeconds', 'pdfReading', 'speechToText', 'defaultChatSkillIds']
 /** Top-level config blocks added after the recording: the config a PATCH leaves is hashed without them, as the
  *  payload is compared without NEW_KEYS. Their own rules are their own tests' (settings-speech-to-text.test.ts). */
 const NEW_CONFIG_KEYS = ['speechToText']

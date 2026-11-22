@@ -38,6 +38,8 @@ vi.mock('../lib/queries', () => ({
 }))
 // Its live gauges poll hooks this file does not mock; the System tab is only opened for Restart.
 vi.mock('./settings/HardwareSection', () => ({ HardwareSection: () => null }))
+// It reads the skill library through a query this file does not provide; ChatSkillsSection.test.tsx covers it.
+vi.mock('./settings/ChatSkillsSection', () => ({ ChatSkillsSection: () => null }))
 vi.mock('../lib/api', async (orig) => ({ ...(await orig<typeof import('../lib/api')>()), track: () => {} }))
 
 describe('SettingsScreen drafts', () => {

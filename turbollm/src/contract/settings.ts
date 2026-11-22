@@ -89,6 +89,8 @@ export type DaemonSettings = {
    *  means "use the OS hostname" — the daemon resolves the fallback, never the browser. */
   machineName: string
   autoGenerateTitles: boolean
+  /** GitHub #340: the skills every new web-UI chat starts with (ids from the skill library). [] = none. */
+  defaultChatSkillIds: string[]
   /** Release 3: background extraction of durable facts from the user's own chat messages,
    *  injected into future new conversations. Off by default (opt-in trust surface). */
   autoMemoryEnabled: boolean

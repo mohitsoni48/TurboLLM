@@ -26,6 +26,7 @@ import {
 import { ModelDirs } from './models/ModelDirs'
 import { ToolPermissionsSection } from './settings/ToolPermissionsSection'
 import { CodeContextSection } from './settings/CodeContextSection'
+import { ChatSkillsSection } from './settings/ChatSkillsSection'
 import { CodeAgentSection } from './settings/CodeAgentSection'
 import { useCodeFeatureEnabled } from '../lib/platform'
 import { MemorySection } from './settings/MemorySection'
@@ -573,6 +574,9 @@ export function SettingsScreen() {
                   />
                 </label>
               </section>
+
+              {/* Skills every new chat starts with (GitHub issue 340): saves on change, outside this form's Save. */}
+              <ChatSkillsSection />
 
               {/* Startup */}
               <section className="rounded-lg border border-border bg-panel p-4">

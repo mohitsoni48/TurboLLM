@@ -137,6 +137,9 @@ function stringList(raw: unknown): string[] | undefined {
 
 const ABSOLUTE_PATH = /^([a-zA-Z]:[\\/]|[\\/])/
 
+/** The most skills new chats may start with: each one's instructions go into every turn's system prompt. */
+const MAX_DEFAULT_CHAT_SKILLS = 50
+
 // ── escape hatches: rules beyond a type and a bound ──
 
 /** Listen port (spec 08 §2). config.validate() enforces 1024–65535 and would throw on update(); refused here for a clean
@@ -245,6 +248,19 @@ export const SETTINGS = [
     field<string>('machineName', { type: 'string', parse: (raw) => (raw as string).trim().slice(0, 64), set: (c, v) => { c.daemon.machineName = v } }),
   ]),
   row('autoGenerateTitles', (c) => c.daemon.autoGenerateTitles, [bool('autoGenerateTitles', (c, v) => { c.daemon.autoGenerateTitles = v })]),
+  // Skills every new web-UI chat starts with (GitHub #340; config.ts's DaemonConfig). Not checked against the skill
+  // library here: a skill deleted later is skipped where skills are read (chat-routes.ts keeps only ids that exist).
+  // Read through stringList: a hand-edited config.json may hold anything there, and the UI is promised a list.
+  row('defaultChatSkillIds', (c) => stringList(c.daemon.defaultChatSkillIds) ?? [], [
+    field<string[]>('defaultChatSkillIds', {
+      type: 'array',
+      parse: (raw) => {
+        const ids = stringList(raw) ?? []
+        return ids.length > MAX_DEFAULT_CHAT_SKILLS ? invalid(`defaultChatSkillIds: at most ${MAX_DEFAULT_CHAT_SKILLS} skills.`) : [...new Set(ids)]
+      },
+      set: (c, v) => { c.daemon.defaultChatSkillIds = v },
+    }),
+  ]),
   row('autoMemoryEnabled', (c) => c.daemon.autoMemoryEnabled, [bool('autoMemoryEnabled', (c, v) => { c.daemon.autoMemoryEnabled = v })]),
   row('openBrowserOnStart', (c) => c.daemon.openBrowserOnStart, [bool('openBrowserOnStart', (c, v) => { c.daemon.openBrowserOnStart = v })]),
   row('autoLoadOnStart', (c) => c.autoLoadOnStart, [bool('autoLoadOnStart', (c, v) => { c.autoLoadOnStart = v })]),

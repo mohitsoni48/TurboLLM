@@ -156,6 +156,11 @@ export interface Daemon {
   openBrowserOnStart: boolean
   theme: string
   autoGenerateTitles: boolean
+  /** GitHub #340: the skills (SKILL.md library ids) every NEW web-UI chat starts with, so a skill used everywhere
+   *  need not be ticked per chat. The web UI pre-ticks them on a blank chat (Thread settings can still untick them for
+   *  that chat) and sends them as the new conversation's skillIds; the daemon never adds them on its own, so an API
+   *  client's chat gets exactly the skillIds it sends. Absent (older configs) = none. */
+  defaultChatSkillIds?: string[]
   /** Release 3: background extraction of durable facts from the user's own chat messages,
    *  injected into future new conversations. Off by default — unlike autoGenerateTitles,
    *  this builds a persistent cross-conversation profile of the user, so it's opt-in

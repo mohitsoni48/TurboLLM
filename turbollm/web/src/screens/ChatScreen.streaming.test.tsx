@@ -30,6 +30,8 @@ beforeEach(() => {
   convs.clear()
   engineState = 'running'
   skills = []
+  settingsData = undefined
+  createCalls.length = 0
   updateMutateAsync = vi.fn(() => Promise.resolve())
 })
 
@@ -42,13 +44,17 @@ vi.mock('../lib/queries', async (importOriginal) => {
     useModelActions: () => ({ load: { mutate: vi.fn(), isPending: false }, eject: { mutate: vi.fn(), isPending: false } }),
     useModelDetail: () => ({ data: undefined }),
     useEngines: () => ({ data: undefined }),
-    useSettings: () => ({ query: { data: undefined } }),
+    useSettings: () => ({ query: { data: settingsData } }),
     useSysInfo: () => ({ data: undefined }),
     useChatAgents: () => ({ data: [] }),
     useBuiltinAgentOverrides: () => ({ data: {} }),
   }
 })
 
+/** GET /settings as the screen reads it (undefined = not loaded). */
+let settingsData: { defaultChatSkillIds?: string[] } | undefined
+/** What each POST /conversations (mut.create) was sent. */
+const createCalls: unknown[] = []
 /** 'stopped' = no model ready to answer. */
 let engineState = 'running'
 /** What GET /skills lists. */
@@ -95,7 +101,7 @@ vi.mock('../lib/chat-queries', async (importOriginal) => {
       mutationHookCalls++
       const idle = () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false })
       return {
-        create: { ...idle(), mutateAsync: vi.fn(() => Promise.resolve({ id: 'new1' })) },
+        create: { ...idle(), mutateAsync: vi.fn((v: unknown) => { createCalls.push(v); return Promise.resolve({ id: 'new1' }) }) },
         update: { ...idle(), mutateAsync: (...args: unknown[]) => updateMutateAsync(...(args as [])) }, compact: { ...idle(), isPending: compactingConv !== null, variables: compactingConv ? { convId: compactingConv } : undefined }, deleteMsg: idle(), editMsg: { ...idle(), mutate: editMsgMutate }, regenerate: { ...idle(), mutateAsync: regenerateSpy },
         stop: { ...idle(), mutateAsync: stopSpy }, undoCompaction: idle(), remove: idle(), moveToFolder: idle(),
         createFolder: idle(), deleteFolder: idle(), renameFolder: idle(),
@@ -268,6 +274,26 @@ describe('ChatScreen — a new chat keeps the thinking budget picked before its 
     expect(sendCalls[0][6]).toBe(0)
     expect(sendCalls[1][0]).toBe('new1')
     expect(sendCalls[1][6]).toBe(0)
+  })
+})
+
+// GitHub issue 340: Settings' "Skills in new chats" are what a blank chat starts with.
+describe('ChatScreen — skills a new chat starts with', () => {
+  it('creates a new chat with the skills set for new chats', async () => {
+    settingsData = { defaultChatSkillIds: ['web', 'compose'] }
+    nextGen = quickStream()
+    await renderScreen('/chat')
+    await sendText('hello')
+    await waitFor(() => expect(createCalls).toHaveLength(1))
+    expect(createCalls[0]).toMatchObject({ skillIds: ['web', 'compose'] })
+  })
+
+  it('creates it with no skills when none are set, as before', async () => {
+    nextGen = quickStream()
+    await renderScreen('/chat')
+    await sendText('hello')
+    await waitFor(() => expect(createCalls).toHaveLength(1))
+    expect((createCalls[0] as { skillIds?: string[] }).skillIds).toBeUndefined()
   })
 })
 

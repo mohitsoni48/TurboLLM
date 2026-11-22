@@ -18,11 +18,10 @@ import { ApiError, track } from '../../lib/api'
 import { toast } from '../../components/ui/sonner'
 import { skillKeys, fetchSkills } from '../../lib/agent-api'
 import { cn } from '../../lib/utils'
-
 // Skills a plain chat can't use yet — they grant filesystem tools that aren't wired
 // into chat (reserved for the future Code surface). Hidden from the picker so toggling
 // them on never promises a capability that silently doesn't work.
-const CHAT_UNSUPPORTED_SKILLS = new Set(['filesystem'])
+import { CHAT_UNSUPPORTED_SKILLS } from '../../lib/agent-types'
 
 // Sampling fields per spec 07 §5 (identical to spec 05 §2 sliders). `modelField` maps
 // each slider to the matching key on the currently-loaded model's own Sampling block,
