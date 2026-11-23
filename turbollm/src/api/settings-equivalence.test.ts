@@ -27,6 +27,9 @@ const NEW_KEYS = ['downloadConcurrency', 'engineLoadStallSeconds', 'pdfReading',
 const NEW_CONFIG_KEYS = ['speechToText', 'defaultSkillIds']
 /** `experimental` flags added after the recording, dropped from the payload and from the config hash alike. */
 const NEW_EXPERIMENTAL = ['sandbox']
+/** `search` payload keys added after the recording. Keenable's own rules are its own tests' (search-providers.test.ts,
+ *  server.settings-gate.test.ts). */
+const NEW_SEARCH_KEYS = ['keenableKeySet']
 
 type Remote = 'none' | 'off' | 'on'
 
@@ -62,14 +65,18 @@ function mkDeps(cfg: Config, remote: Remote) {
 
 const hash = (v: unknown) => createHash('sha256').update(JSON.stringify(v)).digest('hex').slice(0, 16)
 
-function withoutNewExperimental(experimental: unknown): unknown {
-  if (!experimental || typeof experimental !== 'object') return experimental
-  return Object.fromEntries(Object.entries(experimental).filter(([k]) => !NEW_EXPERIMENTAL.includes(k)))
+function without(block: unknown, keys: string[]): unknown {
+  if (!block || typeof block !== 'object') return block
+  return Object.fromEntries(Object.entries(block).filter(([k]) => !keys.includes(k)))
 }
 
+const withoutNewExperimental = (experimental: unknown): unknown => without(experimental, NEW_EXPERIMENTAL)
+
 function withoutNewKeys(payload: Record<string, unknown>): Record<string, unknown> {
-  const kept = Object.fromEntries(Object.entries(payload).filter(([k]) => !NEW_KEYS.includes(k)))
-  return 'experimental' in kept ? { ...kept, experimental: withoutNewExperimental(kept.experimental) } : kept
+  const kept: Record<string, unknown> = Object.fromEntries(Object.entries(payload).filter(([k]) => !NEW_KEYS.includes(k)))
+  if ('experimental' in kept) kept.experimental = withoutNewExperimental(kept.experimental)
+  if ('search' in kept) kept.search = without(kept.search, NEW_SEARCH_KEYS)
+  return kept
 }
 
 function configAsRecorded(c: Config): unknown {

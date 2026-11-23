@@ -61,7 +61,7 @@ export type McpServer = {
 /** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */
 export type ToolPolicy = 'ask' | 'allow' | 'deny'
 
-export type SearchProvider = 'tavily' | 'kagi' | 'searxng'
+export type SearchProvider = 'tavily' | 'kagi' | 'searxng' | 'keenable'
 
 /** Remote access (ADR-422): the settings-payload mirror of the daemon's redacted `remoteAccess` block. Secrets are
  *  write-only — the `has*` booleans say whether one is stored, never what it is, same posture as hfToken/ghTokenSet.
@@ -139,6 +139,7 @@ export type DaemonSettings = {
     provider: SearchProvider
     tavilyKeySet: boolean
     kagiKeySet: boolean
+    keenableKeySet: boolean
     searxngUrl: string
   }
   /** MCP server list. */
@@ -224,6 +225,7 @@ export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'spee
     tavilyApiKey?: string
     kagiApiKey?: string
     searxngUrl?: string
+    keenableApiKey?: string
   }
 }
 

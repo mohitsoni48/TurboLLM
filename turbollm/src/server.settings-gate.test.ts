@@ -126,6 +126,9 @@ const HOST_ONLY: [string, (cfg: Config) => unknown][] = [
   ['search.tavilyApiKey', () => ({ search: { tavilyApiKey: 'tvly-attacker' } })],
   ['search.tavilyApiKey', () => ({ tavilyApiKey: 'tvly-attacker' })], // the legacy top-level alias
   ['search.kagiApiKey', () => ({ search: { kagiApiKey: 'kagi-attacker' } })],
+  ['search.keenableApiKey', () => ({ search: { keenableApiKey: 'kee-attacker' } })],
+  // Keenable works keyless, so selecting it alone would send the owner's searches to a third party.
+  ['search.provider', () => ({ search: { provider: 'keenable' } })],
   ['search.searxngUrl', () => ({ search: { provider: 'searxng', searxngUrl: 'https://evil.example' } })],
   // Capture on records the host's Code prompts for the caller to read; the log off blinds the owner.
   ['requestLog.captureBodies', (cfg) => ({ requestLog: { captureBodies: !cfg.requestLog.captureBodies } })],
