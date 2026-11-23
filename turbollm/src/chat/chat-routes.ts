@@ -29,6 +29,9 @@ import { engineTakesReasoningAsField, engineWithholdsVision, VISION_UNAVAILABLE 
 import { runGenerationCore } from './generation-core'
 import { nonStringField } from '../util/string-fields'
 import { conversationBodyError, CREATE_FIELDS, PATCH_FIELDS, patchFields } from './conversation-body.js'
+import { isSandboxEnabled } from '../sandbox/gate'
+import { resultBudget, sandboxTurn, type SandboxTurn } from '../sandbox/run-python'
+import { ALWAYS_ASK_TOOLS } from '../tools/tool-policy'
 
 /** The per-request code-routine trust decision. Exported ONLY so it can be behaviourally
  *  pinned — both generation entry points must call this, never inline the expression.
@@ -49,6 +52,7 @@ export function chatCodeAuthorization(c: Context, d: Deps): boolean {
 /** The approve route's refusal of a Code session's pending tool call to a caller codeAuth would
  *  not let into Code. */
 const CODE_APPROVAL_REFUSED_MESSAGE = 'Allowing a Code tool call requires a valid API key from a non-host device.'
+const RUN_PYTHON_APPROVAL_REFUSED_MESSAGE = 'Allowing a Python run requires a valid API key from a non-host device.'
 
 const COMPACTING_MESSAGE = 'This chat is being compacted. Try again when it finishes.'
 
@@ -484,7 +488,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   // Lists the tools currently available to the chat loop (name + description only —
   // no parameters schema; the frontend just needs this to render Tool Permissions).
   app.get('/api/v1/tools', async (c) => {
-    const defs = d.tools ? await d.tools.buildToolDefinitions() : []
+    const defs = d.tools ? await d.tools.buildToolDefinitions({ sandbox: isSandboxEnabled(d) && !!d.sandbox }) : []
     return c.json({ tools: defs.map((t) => ({ name: t.function.name, description: t.function.description ?? '' })) })
   })
 
@@ -503,6 +507,14 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
     const conv = db.getConversation(convId)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
+
+    // run_python asks before every run (tool-policy.ts ALWAYS_ASK_TOOLS): a standing approval for it would only be
+    // saved, never honored, and the client offers none. Refused rather than saved, by either name.
+    if (decision === 'allow_chat' || decision === 'always_allow') {
+      const pendingName = pendingToolApprovalName(`${convId}:${toolCallId}`)
+      if (ALWAYS_ASK_TOOLS.has(toolName) || (pendingName !== undefined && ALWAYS_ASK_TOOLS.has(pendingName)))
+        return err(c, 400, 'invalid_input', 'This tool can only be allowed one call at a time.')
+    }
 
     // A Code session's ask-mode approvals (bash/edit/write and the owner's MCP tools,
     // code-session.ts) wait on the same gate under the Code conversation's id, and are answered
@@ -524,11 +536,14 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // below). The name the pending call was registered with decides as well as the body's
     // toolName, which the caller picks (execute-with-approval.ts and code-session.ts record it).
     // A deny runs nothing and stays open. api_key_required: the web client opens its key prompt
-    // on it, as for "Always Allow" below.
+    // on it, as for "Always Allow" below. run_python (ALWAYS_ASK_TOOLS) runs the model's code on
+    // this machine, so allowing one is held to the same bar.
     if (decision !== 'deny' && !isLocalOrAuthenticated(c, d)) {
       const pendingName = pendingToolApprovalName(`${convId}:${toolCallId}`)
       if (isMcpToolName(toolName) || (pendingName !== undefined && isMcpToolName(pendingName)))
         return err(c, 403, 'api_key_required', MCP_APPROVAL_REFUSED_MESSAGE)
+      if (ALWAYS_ASK_TOOLS.has(toolName) || (pendingName !== undefined && ALWAYS_ASK_TOOLS.has(pendingName)))
+        return err(c, 403, 'api_key_required', RUN_PYTHON_APPROVAL_REFUSED_MESSAGE)
     }
 
     let decisionToApply: 'allow' | 'deny'
@@ -1305,6 +1320,28 @@ function localEngineWithholdsVision(d: Deps, upstream: ChatUpstream): boolean {
 // The engine's error, read and shown as every path shows it (engines/engine-error.ts).
 export { streamChunkError, engineErrorText } from '../engines/engine-error'
 
+/** This turn's Python sandbox (GitHub #52), or undefined when run_python must not be offered: the sandbox is off or
+ *  not installed, or the caller may not act on the host. That is the isLocalOrAuthenticated bar adding an MCP server
+ *  is held to (`isCodeAuthorized`, the same decision as refuseMcp): sandboxed code runs on this machine, and a remote
+ *  token or a keyless LAN, Serve or Access caller approving its own run must not get that. */
+function chatSandbox(d: Deps, convId: string, assistantId: string, isCodeAuthorized: boolean): SandboxTurn | undefined {
+  if (!isCodeAuthorized || !d.sandbox || !isSandboxEnabled(d) || !d.sandboxRuntime?.view().installed) return undefined
+  return sandboxTurn({
+    convId,
+    manager: d.sandbox,
+    store: d.db.attachments,
+    // The chat's active rows before this turn's placeholder, read at the call: the files every user message attached,
+    // and where the last run_python call was.
+    history: () => {
+      const msgs = d.db.getMessages(convId)
+      const at = msgs.findIndex((m) => m.id === assistantId)
+      return msgs.slice(0, at < 0 ? msgs.length : at)
+    },
+    // A run's result is sized to the loaded model's context, which a fixed cap did not fit.
+    resultChars: () => resultBudget(d.manager.status().model?.ctx),
+  })
+}
+
 /** The whole generation turn: engine call(s), tool loop, and the ONE write-back that persists
  *  the reply. Exported ONLY so tests can drive it with a sink of their own — the persistence
  *  invariant this function owns (GitHub #177: generated output must survive a failing sink, an
@@ -1360,17 +1397,23 @@ export async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx)
     }
   }
 
+  // The reply row names the images its run_python calls handed back (ToolCallRecord.files): the attachment janitor keeps
+  // only files some row's attachments name, so a deleted reply or chat frees them (GitHub #52).
+  const withFiles = <R extends { toolCalls: ToolCallRecord[] }>(reply: R) => {
+    const files = reply.toolCalls.flatMap((t) => t.files ?? [])
+    return files.length ? { ...reply, attachments: files } : reply
+  }
   const outcome = await runGenerationCore(d, ctx, {
     sink: emit,
     persistence: {
-      saveProgress: (reply) => { db.updateMessage(assistantMsg.id, reply) },
+      saveProgress: (reply) => { db.updateMessage(assistantMsg.id, withFiles(reply)) },
       trackProgressSave: (save) => {
         d.chatTurns.addReplySave(save)
         return () => d.chatTurns.removeReplySave(save)
       },
       restoreUnproduced,
       finalize: (reply) => {
-        db.updateMessage(assistantMsg.id, reply)
+        db.updateMessage(assistantMsg.id, withFiles(reply))
         db.touchConversation(convId)
         return db.getMessage(assistantMsg.id)!
       },
@@ -1398,6 +1441,7 @@ export async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx)
       isCodeAuthorized: ctx.isCodeAuthorized,
       // An MCP call the model makes anyway, unoffered, is refused before any approval prompt.
       refuseMcp: !ctx.isCodeAuthorized,
+      sandbox: chatSandbox(d, convId, assistantMsg.id, ctx.isCodeAuthorized),
     },
     onSettled: () => d.chatTurns.release(convId, ac),
     onSaveSkill: () => saveSkillFromConversation(d, convId),

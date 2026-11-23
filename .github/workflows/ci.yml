@@ -254,6 +254,16 @@ jobs:
           fi
         working-directory: turbollm
 
+      # The Python sandbox (GitHub #52) needs Deno, which has no Android build: its host script ships only with the
+      # desktop package (package.json's build copies it).
+      - name: The Python sandbox's host stays out of the bundle
+        run: |
+          if ls -1 dist-android | grep -q 'sandbox-host'; then
+            echo "::error::the Android bundle contains the Python sandbox host"
+            exit 1
+          fi
+        working-directory: turbollm
+
   # scripts/release.mjs's guards (the publish gate, the merge and post-merge CI checks) have
   # their own tests, which no job ran: a break there showed up only during a release. They need
   # no install: each test builds a throwaway git repo and stubs gh and npm.

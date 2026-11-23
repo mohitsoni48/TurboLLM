@@ -1,0 +1,63 @@
+name: Sandbox escape suite
+
+# The Python sandbox's escape suite (GitHub #52, src/sandbox/sandbox-escape.test.ts): the real host under the real Deno,
+# started exactly as the daemon starts it, attacked from Python. Its own workflow so the main CI stays fast and needs
+# no 77 MB download: it runs when the sandbox (or the code that spawns it) changes, every night, and on demand. Every
+# Deno or Pyodide upgrade (runtime-manifest.ts) must pass it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'turbollm/src/sandbox/**'
+      - 'turbollm/src/util/tether.ts'
+      - '.github/workflows/sandbox-escape.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'turbollm/src/sandbox/**'
+      - 'turbollm/src/util/tether.ts'
+      - '.github/workflows/sandbox-escape.yml'
+  schedule:
+    - cron: '30 3 * * *' # nightly, 03:30 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  escape:
+    name: Sandbox escape suite (${{ matrix.os }})
+    # Linux only by default, to keep CI minutes down. The same suite passes on macOS and Windows (shunya0's spike repo
+    # runs it on all three); add them here to run it there on every change.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: turbollm/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: turbollm
+
+      # Keyed on the pinned versions and hashes: a manifest change downloads (and verifies) the new runtime.
+      - name: Cache the sandbox runtime
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sandbox-runtimes
+          key: sandbox-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('turbollm/src/sandbox/runtime-manifest.ts') }}
+
+      - name: Escape suite
+        run: npx tsx --test --test-timeout=120000 src/sandbox/sandbox-escape.test.ts
+        working-directory: turbollm
+        env:
+          TURBOLLM_SANDBOX_ESCAPE_RUNTIMES: ${{ runner.temp }}/sandbox-runtimes

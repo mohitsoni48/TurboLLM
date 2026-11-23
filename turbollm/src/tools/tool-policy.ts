@@ -5,6 +5,12 @@
 // previously nothing prompted except the (broken) run_code confirmation stub.
 export type ToolPolicy = 'ask' | 'allow' | 'deny'
 
+/** Tools that ask before every call whatever is set (GitHub #52): a global or chat Allow, "Always Allow" and
+ *  Auto-allow all would let later calls run unseen. Only a Deny changes them. run_python runs model-written code, and
+ *  seeing each run before it starts is v1's defence against prompt injection steering it (the sandbox protects the
+ *  machine, not the chat's own data). */
+export const ALWAYS_ASK_TOOLS: ReadonlySet<string> = new Set(['run_python'])
+
 /** Per-conversation override wins over the global default; falling through to 'ask'
  *  when neither is set (safe-by-default: a brand-new/unclassified tool always prompts).
  *  `autoAllowAll` (Settings → Tool permissions master toggle) only silences a resolved
@@ -23,6 +29,7 @@ export function resolveToolPolicy(
 ): ToolPolicy {
   const global = globalPolicies[name]
   if (global === 'deny') return 'deny'
+  if (ALWAYS_ASK_TOOLS.has(name)) return convOverrides[name] === 'deny' ? 'deny' : 'ask'
   if (convOverrides[name]) return convOverrides[name]
   if (global) return global === 'ask' && autoAllowAll ? 'allow' : global
   return autoAllowAll ? 'allow' : 'ask'

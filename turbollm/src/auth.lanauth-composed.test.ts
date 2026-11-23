@@ -1693,6 +1693,61 @@ test("approving a Code session's pending call needs what Code needs: a keyless S
   }
 })
 
+// ── A chat's pending run_python call ────────────────────────────────────────────────────────
+// run_python runs the model's code on the host (in the sandbox), so allowing one is a host-side
+// action like an MCP call: a keyless Serve identity, Access JWT, open-LAN peer or remote token may
+// only deny the host's pending call; the host and a LAN caller with a real key may allow it.
+
+test("approving a chat's pending run_python call needs isLocalOrAuthenticated: a keyless Serve identity, Access JWT, open-LAN peer or remote token may only deny it", async () => {
+  for (const caller of keylessCallers()) {
+    const h = toolChat(caller.mutate)
+    const restoreJwks = stubJwksEndpoint(SKILL_TEAM)
+    const ac = new AbortController()
+    try {
+      const headers = caller.headers(h.d)
+      const conv = h.db.createConversation()
+      const pending = waitForToolApproval(`${conv.id}:tc-py`, ac.signal, 'run_python')
+      for (const body of [
+        { toolName: 'run_python', decision: 'allow' },
+        // The body's toolName is the caller's word: the pending call's own name decides.
+        { toolName: 'web_search', decision: 'allow' },
+      ]) {
+        const res = await approveCall(h, caller.request, headers, conv.id, 'tc-py', body)
+        assert.equal(res.status, 403, `${caller.name}: ${JSON.stringify(body)}`)
+        assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'api_key_required')
+      }
+      // Still pending: the host allows it.
+      assert.equal((await approveCall(h, loopbackRequest, {}, conv.id, 'tc-py', { toolName: 'run_python', decision: 'allow' })).status, 200)
+      assert.equal(await pending, 'allow', `${caller.name}: the call stayed pending for the host`)
+      // A deny, which runs nothing, stays open to the caller.
+      const denied = waitForToolApproval(`${conv.id}:tc-py2`, ac.signal, 'run_python')
+      assert.equal((await approveCall(h, caller.request, headers, conv.id, 'tc-py2', { toolName: 'run_python', decision: 'deny' })).status, 200)
+      assert.equal(await denied, 'deny')
+    } finally {
+      ac.abort()
+      restoreJwks()
+      h.cleanup()
+    }
+  }
+  // A LAN caller with a real API key may allow it, on an open LAN too.
+  const raw = 'tllm-pykeyedpykeyedpykeyedpykeyedpykeye1'
+  const h = toolChat((cfg) => {
+    cfg.daemon.lanBind = true
+    cfg.daemon.requireApiKey = false
+    cfg.apiKeys.push({ id: 'k1', name: 'mine', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null } as never)
+  })
+  const ac = new AbortController()
+  try {
+    const conv = h.db.createConversation()
+    const keyed = waitForToolApproval(`${conv.id}:tc-keyed`, ac.signal, 'run_python')
+    assert.equal((await approveCall(h, lanRequest, { 'X-TurboLLM-Auth': raw }, conv.id, 'tc-keyed', { toolName: 'run_python', decision: 'allow' })).status, 200)
+    assert.equal(await keyed, 'allow')
+  } finally {
+    ac.abort()
+    h.cleanup()
+  }
+})
+
 // ── An agent that lists the owner's MCP tool, and a chat routine on one ─────────────────────
 // A chat routine runs every tool its agent lists with no approval (chat-runner.ts), so an agent
 // naming the owner's MCP tool, and a chat routine on it, ran that tool for a caller the chat above
