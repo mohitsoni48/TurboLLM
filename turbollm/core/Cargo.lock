@@ -509,6 +509,16 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
+name = "libloading"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1832accd5a4ca2795ace4d05d15c4039be15b62d3b950eff99746a990e3cc10"
@@ -602,7 +612,7 @@ version = "3.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d153beb7d5c973f4b9395be8a83054a28968b61188f1dd1a2cc2321af22daea2"
 dependencies = [
- "libloading",
+ "libloading 0.9.1",
 ]
 
 [[package]]
@@ -1076,6 +1086,14 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "turbollm-core",
+]
+
+[[package]]
+name = "turbollm-platform"
+version = "1.15.2"
+dependencies = [
+ "libloading 0.8.9",
+ "tempfile",
 ]
 
 [[package]]
