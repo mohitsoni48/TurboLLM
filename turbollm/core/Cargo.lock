@@ -1103,6 +1103,7 @@ version = "1.15.2"
 dependencies = [
  "thiserror",
  "turbollm-core",
+ "turbollm-engine",
  "uniffi",
 ]
 
