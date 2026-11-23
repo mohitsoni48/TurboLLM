@@ -7,6 +7,9 @@ pub mod gguf {
 #[cfg(feature = "engines")]
 pub mod engines;
 
+#[cfg(feature = "llama")]
+mod platform_log;
+
 const VERSION_MARKER_PREFIX: &str = "TURBOLLM_CORE_VERSION=";
 
 /// The release version as searchable bytes, so the publish job can check every target's binary

@@ -32,7 +32,8 @@ pub const ENGINE_THREAD_NAME: &str = "turbollm-llama";
 pub type SharedCalls = Arc<dyn LlamaCalls + Send + Sync>;
 
 /// Where the backend reports what a host log should keep: the library it loaded, and a GGUF
-/// header the library disagreed with.
+/// header the library disagreed with. The Android core sends it to logcat; desktop cores write it
+/// nowhere (they list no llama row).
 pub type LlamaLog = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A session library that opened, and the file it came from.

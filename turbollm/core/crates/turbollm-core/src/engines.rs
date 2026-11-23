@@ -174,7 +174,8 @@ fn native_entries(library_dir: Option<PathBuf>) -> Vec<CatalogEntry> {
     [
         #[cfg(feature = "llama")]
         CatalogEntry::llama_cpp_cpu(Arc::new(InProcess::new(
-            turbollm_engine_llama::LlamaBackend::new(library_dir),
+            turbollm_engine_llama::LlamaBackend::new(library_dir)
+                .with_log(crate::platform_log::platform_log()),
         ))),
     ]
     .into_iter()
