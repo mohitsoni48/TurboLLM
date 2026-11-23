@@ -664,7 +664,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
                     </div>
                   ) : entry.id === 'keenable' ? (
                     <>
-                      <p className="text-[11px] leading-relaxed text-muted">Keyless requests are logged with the query and IP.</p>
+                      <p className="text-[11px] leading-relaxed text-muted">Keenable logs the query, results and IP of every request, with or without a key.</p>
                       <div className="flex flex-col gap-1">
                         <label className="text-[12px] text-muted">Keenable API Key (optional)</label>
                         <input type="password" value={searchSecret} onChange={(e) => setSearchSecret(e.target.value)}

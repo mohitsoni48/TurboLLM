@@ -60,7 +60,7 @@ export const BUILTIN_SEARCH: BuiltinSearchEntry[] = [
   { id: 'tavily', name: 'Tavily', desc: 'AI-search API tuned for LLMs.' },
   { id: 'kagi', name: 'Kagi', desc: 'Premium search with no ads or tracking.', iconSlug: 'kagi' },
   { id: 'searxng', name: 'SearXNG', desc: 'Self-hosted meta-search, fully local — no API key required.', iconSlug: 'searxng' },
-  { id: 'keenable', name: 'Keenable', desc: 'Web search that works without a key. Keyless requests are logged with the query and IP.' },
+  { id: 'keenable', name: 'Keenable', desc: 'Web search that works without a key. Keenable logs the query, results and IP of every request, with or without a key.' },
 ]
 
 // Only entries where a static API key / Bearer token is confirmed to work against the
