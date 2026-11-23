@@ -155,12 +155,12 @@ mod tests {
     use crate::error::REPLY_CANCELLED;
     use crate::event::{EngineEvent, FinishReason};
     use crate::inprocess::sink::tests::next_event;
+    use crate::manager::GenerationGate;
     use crate::request::{ChatMessage, GenerationParams, MessageContent, Role};
     use crate::testing::{SCRIPTED_THREAD_NAME, ScriptRecord, ScriptedBackend, Step};
     use crate::{Backend, EngineId};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
-    use tokio::sync::Semaphore;
 
     const WAIT_LIMIT: Duration = Duration::from_secs(1);
 
@@ -212,10 +212,10 @@ mod tests {
         }
     }
 
-    fn one_slot_gate() -> (Arc<Semaphore>, GatePermit) {
-        let gate = Arc::new(Semaphore::new(1));
-        let slot = Arc::clone(&gate).try_acquire_owned().unwrap();
-        (gate, GatePermit::new(slot))
+    async fn one_slot_gate() -> (GenerationGate, GatePermit) {
+        let gate = GenerationGate::new(1, 8, Box::new(|| {}));
+        let permit = gate.acquire().await.unwrap();
+        (gate, permit)
     }
 
     async fn load(backend: ScriptedBackend) -> (Box<dyn LoadedModel>, Arc<ScriptRecord>) {
@@ -299,7 +299,7 @@ mod tests {
             Step::Emit(done()),
         ];
         let (model, _record) = load(ScriptedBackend::new(script)).await;
-        let (_gate, permit) = one_slot_gate();
+        let (_gate, permit) = one_slot_gate().await;
         let mut stream = model
             .generate(request(), permit, AbortSignal::new())
             .unwrap();
@@ -315,16 +315,16 @@ mod tests {
             Step::Emit(done()),
         ];
         let (model, record) = load(ScriptedBackend::new(script)).await;
-        let (gate, permit) = one_slot_gate();
+        let (gate, permit) = one_slot_gate().await;
         let mut stream = model
             .generate(request(), permit, AbortSignal::new())
             .unwrap();
         assert_eq!(next_event(&mut stream).await, Some(Ok(prefilled())));
-        assert_eq!(gate.available_permits(), 0);
+        assert!(gate.busy());
         assert!(!has(&record, "generate returned"));
         drain(&mut stream).await;
         assert!(has(&record, "generate returned"));
-        assert_eq!(gate.available_permits(), 1);
+        assert!(!gate.busy());
     }
 
     #[tokio::test]
@@ -334,13 +334,13 @@ mod tests {
             Step::Emit(text("lost")),
         ];
         let (model, record) = load(ScriptedBackend::new(script)).await;
-        let (gate, permit) = one_slot_gate();
+        let (gate, permit) = one_slot_gate().await;
         let stream = model
             .generate(request(), permit, AbortSignal::new())
             .unwrap();
         drop(stream);
         assert!(wait_until(|| has(&record, "aborted")).await);
-        assert!(wait_until(|| gate.available_permits() == 1).await);
+        assert!(wait_until(|| !gate.busy()).await);
     }
 
     #[tokio::test]
@@ -348,7 +348,7 @@ mod tests {
         let failure = EngineError::EngineFailure("decode failed".to_owned());
         let script = vec![Step::Emit(prefilled()), Step::Fail(failure.clone())];
         let (model, _record) = load(ScriptedBackend::new(script)).await;
-        let (_gate, permit) = one_slot_gate();
+        let (_gate, permit) = one_slot_gate().await;
         let mut stream = model
             .generate(request(), permit, AbortSignal::new())
             .unwrap();
@@ -362,7 +362,7 @@ mod tests {
             Step::Pause(Duration::from_secs(30)),
         ];
         let (model, record) = load(ScriptedBackend::new(script)).await;
-        let (_gate, permit) = one_slot_gate();
+        let (_gate, permit) = one_slot_gate().await;
         let abort = AbortSignal::new();
         let mut stream = model.generate(request(), permit, abort.clone()).unwrap();
         assert_eq!(next_event(&mut stream).await, Some(Ok(prefilled())));

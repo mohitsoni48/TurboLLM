@@ -25,7 +25,7 @@ pub use error::{EngineError, InvalidReason, MODEL_UNLOADED, REPLY_CANCELLED};
 pub use event::{EngineEvent, FinishReason};
 pub use ids::{EngineId, EngineKind, ModelFormat, ModelRef};
 pub use inprocess::{EventSink, InProcess, NativeBackend, NativeModel, SinkClosed};
-pub use manager::GatePermit;
+pub use manager::{GatePermit, GenerationGate, OccupancyListener};
 pub use request::{
     ChatMessage, GenerateRequest, GenerationParams, LoadSpec, LoadTarget, MessageContent, Role,
 };

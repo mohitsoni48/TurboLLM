@@ -1,3 +1,3 @@
 mod gate;
 
-pub use gate::GatePermit;
+pub use gate::{GatePermit, GenerationGate, OccupancyListener};
