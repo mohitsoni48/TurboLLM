@@ -36,6 +36,7 @@ import { ToolApprovalBar } from './chat/ToolApprovalBar'
 import { VoiceBar } from './chat/VoiceBar'
 import { useVoiceInput, type ComposerClip } from './chat/useVoiceInput'
 import { useConversationMode, type ConversationMode } from './chat/useConversationMode'
+import { sendForConversation, type ConversationSendResult } from './chat/sendForConversation'
 import { formatClock } from '../lib/voice/pcm'
 import { speaker, ttsAvailable, type SpeechStream } from '../lib/voice/tts'
 import { readAloudOptions } from '../lib/voice/use-tts'
@@ -149,8 +150,6 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // Voice (useVoiceInput, further down): whether what is in the composer was spoken, and the chat whose next reply
   // is to be read aloud as it streams.
   const voiceUsed = useRef(false)
-  /** Whether the latest send() reached the daemon (read by the voice loop, which sends before the reply is over). */
-  const lastSendStarted = useRef(false)
   const speakNextReplyIn = useRef<string | null>(null)
   // `durationMs`: a voice clip's length, for its chip. Clips have file.type audio/wav and go out as `audio`.
   const [attachments, setAttachments] = useState<{ file: File; dataUrl: string; durationMs?: number }[]>([])
@@ -848,12 +847,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
 
   // `overrideAttachments`: what a voice message sends when it goes out the moment it is recorded, before the
   // attachment state it was added to has rendered.
-  const send = async (overrideInput?: string, overrideAttachments?: typeof attachments) => {
-    lastSendStarted.current = false
+  const send = async (overrideInput?: string, overrideAttachments?: typeof attachments): Promise<ConversationSendResult> => {
     const rawText = (overrideInput ?? input).trim()
     const outgoing = overrideAttachments ?? attachments
-    if ((!rawText && outgoing.length === 0) || live) return
-    if (!ready) { toast.error('Load a model first.'); return }
+    if ((!rawText && outgoing.length === 0) || live) return { started: false, aborted: false }
+    if (!ready) { toast.error('Load a model first.'); return { started: false, aborted: false } }
 
     // `/compact` — a composer command, not a real turn: it never reaches the engine as a
     // message, it just runs the same manual-compaction call as the header button (mirrors
@@ -863,7 +861,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       setInput('')
       setTimeout(autoResize, 0)
       runCompact()
-      return
+      return { started: false, aborted: false }
     }
 
     // A message that starts with '/skill-id' enables that skill for this send — no matter
@@ -982,11 +980,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       const textAttachmentNames = textAttachments.map((a) => a.file.name)
       speakNextReplyIn.current = speakReply ? convId : null
       const { started, aborted } = await session.send(convId, { text, images, audio, docContext, textAttachmentNames }, turnSettings)
-      lastSendStarted.current = started
       // The session toasts the error itself and never rethrows. An abort is the user (or Eject)
       // stopping it, not a refusal.
       if (!started && !aborted) restoreComposer()
       if (!started) speakNextReplyIn.current = null
+      return { started, aborted }
     } catch (e) {
       // A failure here came before this send streamed (the session never throws): creating the
       // chat, or turning on the '/skill' it named. So the chat's live view, if any, is another
@@ -997,6 +995,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         restoreComposer()
       }
       if (convId) void qc.invalidateQueries({ queryKey: ['conversation', convId] })
+      return { started: false, aborted: (e as Error)?.name === 'AbortError' }
     }
   }
 
@@ -1187,12 +1186,6 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // Full voice mode (useConversationMode, below useVoiceInput): when it is on, a spoken message
   // always goes straight out - hands-free means no look at the chat box - and the loop is told so.
   const conversationRef = useRef<ConversationMode | null>(null)
-  // The spoken message counts as handed over at once (the loop then waits for the reply). A send the chat refused, or that
-  // failed before streaming, tells the loop when send() returns, so it does not wait for a reply that is not coming.
-  const sendForConversation = (conv: ConversationMode, go: () => Promise<void>) => {
-    conv.emit({ type: 'message-sent' })
-    void go().then(() => { if (!lastSendStarted.current) conv.emit({ type: 'send-failed' }) })
-  }
   const voice = useVoiceInput({
     modelHears,
     handsFree: () => !!conversationRef.current?.active,
@@ -1201,7 +1194,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       const combined = input.trim() ? `${input.trimEnd()} ${text}` : text
       const conv = conversationRef.current
       if (conv?.active) {
-        sendForConversation(conv, () => send(combined))
+        void sendForConversation(conv, () => send(combined))
         return
       }
       if (autoSendNow()) {
@@ -1215,7 +1208,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       voiceUsed.current = true
       const conv = conversationRef.current
       if (conv?.active) {
-        sendForConversation(conv, () => send(undefined, [...attachments, clip]))
+        void sendForConversation(conv, () => send(undefined, [...attachments, clip]))
         return
       }
       if (autoSendNow()) {
