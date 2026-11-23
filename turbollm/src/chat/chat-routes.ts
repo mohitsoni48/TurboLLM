@@ -52,6 +52,7 @@ export function chatCodeAuthorization(c: Context, d: Deps): boolean {
 /** The approve route's refusal of a Code session's pending tool call to a caller codeAuth would
  *  not let into Code. */
 const CODE_APPROVAL_REFUSED_MESSAGE = 'Allowing a Code tool call requires a valid API key from a non-host device.'
+const RUN_PYTHON_APPROVAL_REFUSED_MESSAGE = 'Allowing a Python run requires a valid API key from a non-host device.'
 
 const COMPACTING_MESSAGE = 'This chat is being compacted. Try again when it finishes.'
 
@@ -529,11 +530,14 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // below). The name the pending call was registered with decides as well as the body's
     // toolName, which the caller picks (execute-with-approval.ts and code-session.ts record it).
     // A deny runs nothing and stays open. api_key_required: the web client opens its key prompt
-    // on it, as for "Always Allow" below.
+    // on it, as for "Always Allow" below. run_python (ALWAYS_ASK_TOOLS) runs the model's code on
+    // this machine, so allowing one is held to the same bar.
     if (decision !== 'deny' && !isLocalOrAuthenticated(c, d)) {
       const pendingName = pendingToolApprovalName(`${convId}:${toolCallId}`)
       if (isMcpToolName(toolName) || (pendingName !== undefined && isMcpToolName(pendingName)))
         return err(c, 403, 'api_key_required', MCP_APPROVAL_REFUSED_MESSAGE)
+      if (ALWAYS_ASK_TOOLS.has(toolName) || (pendingName !== undefined && ALWAYS_ASK_TOOLS.has(pendingName)))
+        return err(c, 403, 'api_key_required', RUN_PYTHON_APPROVAL_REFUSED_MESSAGE)
     }
 
     let decisionToApply: 'allow' | 'deny'
