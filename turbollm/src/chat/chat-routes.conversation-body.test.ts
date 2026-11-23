@@ -205,23 +205,35 @@ test('PATCH /conversations/:id reads a null in a field that cannot be cleared as
   }
 })
 
-test('the conversation routes refuse a sampling setting that is not a number, flag, name or list of strings', async () => {
+test('the conversation routes check each sampler setting by key: numbers where the engine wants numbers, a list of strings for stop', async () => {
   const h = harness()
   try {
     const conv = h.store.createConversation({ sampling: { temp: 0.5 } })
-    for (const bad of ['x', { a: 1 }, null, [1], Number.NaN]) {
-      for (const [method, url] of [['POST', '/api/v1/conversations'], ['PATCH', `/api/v1/conversations/${conv.id}`]] as const) {
-        const value = bad === null ? null : bad
-        const res = await h.send(method, url, { sampling: { temp: value, ...(typeof bad === 'string' ? { temp: 0.7 } : {}), topK: bad } })
-        if (typeof bad === 'string') { assert.equal(res.status, method === 'POST' ? 201 : 200, `a string setting is a setting: ${bad}`); continue }
-        assert.equal(res.status, 400, `${method} sampling.topK=${JSON.stringify(bad)}: ${await res.clone().text()}`)
-        assert.match(((await res.json()) as { error: { message: string } }).error.message, /^sampling\.(temp|topK) must be a number, boolean, string or array of strings\.$/)
+    const url = `/api/v1/conversations/${conv.id}`
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ temp: 'hot' }, 'sampling.temp must be a number.'],
+      [{ topK: 'x' }, 'sampling.topK must be a number.'],
+      [{ topP: true }, 'sampling.topP must be a number.'],
+      [{ minP: null }, 'sampling.minP must be a number.'],
+      [{ repeatPenalty: Number.NaN }, 'sampling.repeatPenalty must be a number.'],
+      [{ presencePenalty: [1] }, 'sampling.presencePenalty must be a number.'],
+      [{ stop: 'END' }, 'sampling.stop must be an array of strings.'],
+      [{ stop: [1] }, 'sampling.stop must be an array of strings.'],
+      [{ mirostat: { a: 1 } }, 'sampling.mirostat must be a number, boolean, string or array of strings.'],
+      [{ mirostat: null }, 'sampling.mirostat must be a number, boolean, string or array of strings.'],
+    ]
+    for (const [sampling, message] of cases) {
+      for (const [method, path] of [['POST', '/api/v1/conversations'], ['PATCH', url]] as const) {
+        const res = await h.send(method, path, { sampling })
+        assert.equal(res.status, 400, `${method} ${JSON.stringify(sampling)}: ${await res.clone().text()}`)
+        assert.equal(((await res.json()) as { error: { message: string } }).error.message, message, JSON.stringify(sampling))
       }
     }
-    // The kinds the engine mapping reads (numbers, `stop`, flags) are fine.
-    const ok = await h.send('PATCH', `/api/v1/conversations/${conv.id}`, { sampling: { temp: 0.2, topK: 40, stop: ['</s>'], mirostat: true } })
+    assert.deepEqual(h.store.getConversation(conv.id)!.sampling, { temp: 0.5 }, 'refused bodies changed nothing')
+    // The kinds the engine mapping reads are fine, and a setting it passes through unmapped may be a flag or a name.
+    const ok = await h.send('PATCH', url, { sampling: { temp: 0.2, topK: 40, stop: ['</s>'], mirostat: true, grammar: 'root ::= x' } })
     assert.equal(ok.status, 200)
-    assert.deepEqual(h.store.getConversation(conv.id)!.sampling, { temp: 0.2, topK: 40, stop: ['</s>'], mirostat: true })
+    assert.deepEqual(h.store.getConversation(conv.id)!.sampling, { temp: 0.2, topK: 40, stop: ['</s>'], mirostat: true, grammar: 'root ::= x' })
   } finally {
     h.cleanup()
   }
