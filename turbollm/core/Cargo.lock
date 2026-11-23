@@ -1362,6 +1362,10 @@ name = "turbollm-engine-llama"
 version = "1.15.2"
 dependencies = [
  "libloading 0.8.9",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "turbollm-engine",
  "turbollm-platform",
 ]
 
