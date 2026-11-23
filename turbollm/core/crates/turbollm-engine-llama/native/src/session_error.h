@@ -5,7 +5,7 @@
 
 namespace turbollm {
 
-// The values are the sentinels the JNI layer returns, so Kotlin can tell the failures apart.
+// The values are the TL_* codes the C ABI returns (tl_llama.h), so the caller can tell the failures apart.
 enum class session_failure : int {
     failed                  = -1,
     context_length_exceeded = -2,

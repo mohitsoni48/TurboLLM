@@ -86,13 +86,6 @@ rendered_chat render_chat(const common_chat_templates * templates, const chat_re
     }
 }
 
-std::string to_json(const reply_delta & delta) {
-    return common_json::object({
-        { "content", delta.content },
-        { "reasoning", delta.reasoning },
-    }).dump_safe();
-}
-
 reply_parser::reply_parser(common_chat_parser_params syntax) : syntax_(std::move(syntax)) {}
 
 void reply_parser::append(const std::string & piece) {

@@ -1,7 +1,7 @@
 #pragma once
 
-// Debug builds only (TURBOLLM_TEST_PROBES): native state a device test can observe through the
-// androidTest-only LlamaTestProbe, and nothing a release build contains.
+// Test builds only (TURBOLLM_TEST_PROBES): native state a test can observe through
+// tl_llama_live_sessions, and nothing a release build contains.
 
 namespace turbollm {
 

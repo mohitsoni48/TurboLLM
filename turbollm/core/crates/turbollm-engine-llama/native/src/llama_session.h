@@ -8,7 +8,6 @@
 #    include "test_probes.h"
 #endif
 
-#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -36,29 +35,38 @@ struct generation_stats {
     bool   context_full     = false;
 };
 
-// One loaded model, its context and its chat templates. Not thread-safe: every call except
-// request_abort comes from the engine thread. Failures are thrown as session_error.
+// The caller's hooks into a load and into every decode afterwards. The abort flag lives with the caller,
+// which raises and lowers it; llama.cpp polls the abort hook from its compute threads.
+struct session_hooks {
+    llama_progress_callback progress      = nullptr;  // false stops the load
+    void *                  progress_data = nullptr;
+    ggml_abort_callback     abort         = nullptr;  // true stops the decode in flight
+    void *                  abort_data    = nullptr;
+};
+
+// One loaded model, its context and its chat templates. Not thread-safe: every call comes from the engine
+// thread. Failures are thrown as session_error.
 class llama_session {
 public:
-    static std::unique_ptr<llama_session> load(const std::string & model_path, int32_t context_size, int32_t threads);
+    static std::unique_ptr<llama_session> load(const std::string & model_path, int32_t context_size, int32_t threads,
+                                               const session_hooks & hooks);
 
-    std::string model_info_json() const;
-    size_t      prepare(const std::string & request_json);
-    void        start_sampling(const sampling_settings & settings);
+    uint32_t context_length() const noexcept;
+    int32_t  trained_context_length() const noexcept;
+    size_t   prepare(const std::string & request_json);
+    void     start_sampling(const sampling_settings & settings);
 
     // nullopt once the reply has ended: an end-of-generation token, or a full context.
     // An empty piece is a control token.
     std::optional<std::string> next_token();
 
-    std::string parse_delta_json(bool is_partial);
-    std::string stats_json() const;
-    void        request_abort() noexcept;
-    void        clear_abort() noexcept;
+    reply_delta      parse_delta(bool is_partial);
+    prompt_stats     last_prompt_stats() const noexcept;
+    generation_stats last_generation_stats() const noexcept;
 
 private:
-    llama_session(llama_model_ptr model, llama_context_ptr context, common_chat_templates_ptr templates);
-
-    static bool should_abort(void * session);
+    llama_session(llama_model_ptr model, llama_context_ptr context, common_chat_templates_ptr templates,
+                  const session_hooks & hooks);
 
     llama_tokens tokenize(const std::string & prompt) const;
     void         refuse_unfit_prompt(const llama_tokens & prompt) const;
@@ -91,7 +99,6 @@ private:
     generation_stats                generation_stats_;
     bool                            prompt_ready_ = false;
     bool                            reply_open_   = false;
-    std::atomic<bool>               abort_requested_{ false };
 };
 
 }  // namespace turbollm

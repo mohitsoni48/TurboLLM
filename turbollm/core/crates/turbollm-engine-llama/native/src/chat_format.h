@@ -9,7 +9,7 @@
 
 namespace turbollm {
 
-// What LlamaNative.prepare receives:
+// What tl_llama_prepare receives:
 // {"messages":[...],"enable_thinking":<bool>,"chat_template_kwargs":{"<k>":"<json-encoded value>"}}
 struct chat_request {
     std::vector<common_chat_msg>       messages;
@@ -32,8 +32,6 @@ struct reply_delta {
     std::string content;
     std::string reasoning;
 };
-
-std::string to_json(const reply_delta & delta);
 
 // Splits the reply generated so far into reasoning and content, and hands out only what is new each time.
 // If the reply cannot be parsed, the rest of it is handed out as content: output degrades, it is never lost.

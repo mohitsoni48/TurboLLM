@@ -1,7 +1,5 @@
 #include "test_probes.h"
 
-#include <jni.h>
-
 #include <atomic>
 
 namespace turbollm {
@@ -25,7 +23,3 @@ int live_session_count::current() noexcept {
 }
 
 }  // namespace turbollm
-
-extern "C" JNIEXPORT jint JNICALL Java_dev_turbollm_sdk_engine_llama_LlamaTestProbe_liveSessions(JNIEnv *, jobject) {
-    return turbollm::live_session_count::current();
-}

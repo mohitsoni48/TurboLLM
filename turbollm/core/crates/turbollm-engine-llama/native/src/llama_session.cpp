@@ -1,7 +1,6 @@
 #include "llama_session.h"
 
 #include "common.h"
-#include "json.h"
 #include "llama.h"
 #include "session_error.h"
 
@@ -22,10 +21,12 @@ double milliseconds_since(steady_clock::time_point start) {
     return std::chrono::duration<double, std::milli>(steady_clock::now() - start).count();
 }
 
-llama_model_ptr load_model(const std::string & model_path) {
-    llama_model_params params = llama_model_default_params();
-    params.load_mode          = LLAMA_LOAD_MODE_MMAP;
-    params.n_gpu_layers       = 0;
+llama_model_ptr load_model(const std::string & model_path, const session_hooks & hooks) {
+    llama_model_params params          = llama_model_default_params();
+    params.load_mode                   = LLAMA_LOAD_MODE_MMAP;
+    params.n_gpu_layers                = 0;
+    params.progress_callback           = hooks.progress;
+    params.progress_callback_user_data = hooks.progress_data;
     llama_model_ptr model(llama_model_load_from_file(model_path.c_str(), params));
     if (!model) {
         throw session_error(session_failure::failed, "The model could not be loaded from " + model_path + ".");
@@ -77,41 +78,32 @@ session_error decode_failure(int32_t status) {
     return session_error(session_failure::failed, "llama_decode failed with status " + std::to_string(status) + ".");
 }
 
-std::string model_description(const llama_model * model) {
-    char description[256];
-    llama_model_desc(model, description, sizeof(description));
-    return description;
-}
-
 }  // namespace
 
 std::unique_ptr<llama_session> llama_session::load(const std::string & model_path, int32_t context_size,
-                                                   int32_t threads) {
-    llama_model_ptr           model     = load_model(model_path);
+                                                   int32_t threads, const session_hooks & hooks) {
+    llama_model_ptr           model     = load_model(model_path, hooks);
     llama_context_ptr         context   = create_context(model.get(), context_size, std::max(threads, 1));
     common_chat_templates_ptr templates = common_chat_templates_init(model.get(), "");
     return std::unique_ptr<llama_session>(
-        new llama_session(std::move(model), std::move(context), std::move(templates)));
+        new llama_session(std::move(model), std::move(context), std::move(templates), hooks));
 }
 
-llama_session::llama_session(llama_model_ptr model, llama_context_ptr context, common_chat_templates_ptr templates) :
+llama_session::llama_session(llama_model_ptr model, llama_context_ptr context, common_chat_templates_ptr templates,
+                             const session_hooks & hooks) :
     model_(std::move(model)),
     context_(std::move(context)),
     templates_(std::move(templates)),
     vocab_(llama_model_get_vocab(model_.get())) {
-    llama_set_abort_callback(context_.get(), &llama_session::should_abort, this);
+    llama_set_abort_callback(context_.get(), hooks.abort, hooks.abort_data);
 }
 
-bool llama_session::should_abort(void * session) {
-    return static_cast<llama_session *>(session)->abort_requested_.load();
+uint32_t llama_session::context_length() const noexcept {
+    return llama_n_ctx(context_.get());
 }
 
-std::string llama_session::model_info_json() const {
-    return common_json::object({
-        { "n_ctx", llama_n_ctx(context_.get()) },
-        { "n_ctx_train", llama_model_n_ctx_train(model_.get()) },
-        { "desc", model_description(model_.get()) },
-    }).dump_safe();
+int32_t llama_session::trained_context_length() const noexcept {
+    return llama_model_n_ctx_train(model_.get());
 }
 
 size_t llama_session::prepare(const std::string & request_json) {
@@ -252,27 +244,16 @@ void llama_session::end_reply(bool context_full) {
     generation_stats_.context_full = context_full;
 }
 
-std::string llama_session::parse_delta_json(bool is_partial) {
-    return to_json(reply_.next_delta(is_partial));
+reply_delta llama_session::parse_delta(bool is_partial) {
+    return reply_.next_delta(is_partial);
 }
 
-std::string llama_session::stats_json() const {
-    return common_json::object({
-        { "prompt_n", prompt_stats_.prompt_tokens },
-        { "prompt_decoded", prompt_stats_.decoded_tokens },
-        { "prompt_ms", prompt_stats_.prompt_ms },
-        { "predicted_n", generation_stats_.generated_tokens },
-        { "predicted_ms", generation_stats_.generation_ms },
-        { "context_full", generation_stats_.context_full },
-    }).dump_safe();
+prompt_stats llama_session::last_prompt_stats() const noexcept {
+    return prompt_stats_;
 }
 
-void llama_session::request_abort() noexcept {
-    abort_requested_.store(true);
-}
-
-void llama_session::clear_abort() noexcept {
-    abort_requested_.store(false);
+generation_stats llama_session::last_generation_stats() const noexcept {
+    return generation_stats_;
 }
 
 }  // namespace turbollm
