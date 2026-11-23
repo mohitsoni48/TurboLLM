@@ -5,9 +5,10 @@ mod uniffi;
 mod version;
 
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 const USAGE: &str = "usage: cargo xtask <command>\n\n\
 commands:\n  \
@@ -17,7 +18,8 @@ goldens-check  fail if the GGUF fixture folder is incomplete or breaks its rules
 uniffi-kotlin --lib <library> --out <dir>  generate Kotlin bindings from a built turbollm-ffi library\n  \
 check-android-elf <file> [--needs <library>]  fail unless every PT_LOAD is 16 KB aligned (and <library> is DT_NEEDED)\n  \
 check-glibc --max <x.y> <file>  fail if the file needs a GLIBC_ symbol version above <x.y>\n  \
-fetch-llama --out <dir>  put the pinned, sha256-checked llama.cpp source at <dir>/llama.cpp";
+fetch-llama --out <dir>  put the pinned, sha256-checked llama.cpp source at <dir>/llama.cpp\n  \
+build-llama --host [--variant base]  CMake-build turbollm_core_llama_<variant> into target/llama/<host-triple>";
 const FAILURE_EXIT: u8 = 1;
 const UNKNOWN_COMMAND_EXIT: u8 = 2;
 
@@ -31,6 +33,7 @@ fn main() -> ExitCode {
         "check-android-elf" => check_android_elf(),
         "check-glibc" => check_glibc(),
         "fetch-llama" => fetch_llama(),
+        "build-llama" => build_llama(),
         _ => {
             eprintln!("unknown command {command:?}\n{USAGE}");
             return ExitCode::from(UNKNOWN_COMMAND_EXIT);
@@ -122,26 +125,90 @@ fn check_glibc() -> Result<(), String> {
 
 fn fetch_llama() -> Result<(), String> {
     let out_dir = llama::out_dir_arg(&command_args())?;
+    fetched_llama_tree(out_dir).map(|_| ())
+}
+
+fn build_llama() -> Result<(), String> {
+    let variant = llama::build_variant_arg(&command_args())?;
+    let native_dir = llama_crate_dir().join("native");
+    require_file(&native_dir.join("CMakeLists.txt"))?;
+    let target_dir = core_dir().join("target");
+    let llama_dir = fetched_llama_tree(target_dir.join("llama").join("src"))?;
+    let library_dir = llama::host_library_dir(&target_dir, &rustc_host_triple()?);
+    let build = llama::HostBuild {
+        generator: llama::host_generator(env::consts::OS, ninja_on_path()),
+        native_dir,
+        llama_dir,
+        build_dir: library_dir.join("build"),
+        library_dir,
+        variant,
+    };
+    run_cmake(&build.configure_args())?;
+    run_cmake(&build.build_args())?;
+    require_file(&build.library())?;
+    println!("build-llama: built {}", build.library().display());
+    Ok(())
+}
+
+fn fetched_llama_tree(out_dir: PathBuf) -> Result<PathBuf, String> {
     let source = llama::parse_source(&read(&llama_source_pin())?)?;
     let places = llama::SourcePlaces {
         cache_dir: core_dir().join("target").join("cache").join("llama"),
         out_dir,
     };
     match llama::fetch_llama(&source, &places, &llama::HttpsFetcher)? {
-        llama::FetchOutcome::AlreadyExtracted { tree } => println!(
-            "fetch-llama: {} already holds {}, nothing to do",
-            tree.display(),
-            source.commit
-        ),
+        llama::FetchOutcome::AlreadyExtracted { tree } => {
+            println!(
+                "fetch-llama: {} already holds {}, nothing to do",
+                tree.display(),
+                source.commit
+            );
+            Ok(tree)
+        }
         llama::FetchOutcome::Extracted {
             tree,
             origin,
             sha256,
-        } => println!(
-            "fetch-llama: {origin} {}, sha256 {sha256}, extracted to {}",
-            source.archive_url(),
-            tree.display()
-        ),
+        } => {
+            println!(
+                "fetch-llama: {origin} {}, sha256 {sha256}, extracted to {}",
+                source.archive_url(),
+                tree.display()
+            );
+            Ok(tree)
+        }
+    }
+}
+
+fn rustc_host_triple() -> Result<String, String> {
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = Command::new(&rustc)
+        .arg("-vV")
+        .output()
+        .map_err(|e| format!("{}: {e}", rustc.to_string_lossy()))?;
+    llama::host_triple(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn ninja_on_path() -> bool {
+    env::var_os("PATH").is_some_and(|path_var| llama::on_path(&path_var, "ninja"))
+}
+
+/// `TURBOLLM_CMAKE` first, so a box whose PATH holds an unsuitable `cmake` can name the right one (plan P-8).
+fn run_cmake(args: &[OsString]) -> Result<(), String> {
+    let cmake = env::var_os("TURBOLLM_CMAKE").unwrap_or_else(|| "cmake".into());
+    let status = Command::new(&cmake)
+        .args(args)
+        .status()
+        .map_err(|e| format!("{}: {e}", cmake.to_string_lossy()))?;
+    if !status.success() {
+        return Err(format!("{} {args:?}: {status}", cmake.to_string_lossy()));
+    }
+    Ok(())
+}
+
+fn require_file(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err(format!("{}: no such file", path.display()));
     }
     Ok(())
 }
@@ -162,10 +229,11 @@ fn core_dir() -> PathBuf {
 }
 
 fn llama_source_pin() -> PathBuf {
-    core_dir()
-        .join("crates")
-        .join("turbollm-engine-llama")
-        .join("llama-source.json")
+    llama_crate_dir().join("llama-source.json")
+}
+
+fn llama_crate_dir() -> PathBuf {
+    core_dir().join("crates").join("turbollm-engine-llama")
 }
 
 fn workspace_manifest() -> PathBuf {

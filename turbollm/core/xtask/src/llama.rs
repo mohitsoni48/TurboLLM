@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -11,6 +12,9 @@ const TREE_DIR: &str = "llama.cpp";
 const COMMIT_MARKER: &str = ".turbollm-commit";
 const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const USAGE: &str = "usage: cargo xtask fetch-llama --out <dir>";
+const BUILD_USAGE: &str = "usage: cargo xtask build-llama --host [--variant base]";
+const DEFAULT_VARIANT: &str = "base";
+const RELEASE: &str = "Release";
 
 /// The llama.cpp fork commit the engine builds from, as pinned in `llama-source.json`.
 #[derive(Debug)]
@@ -229,6 +233,118 @@ fn remove_if_present(dir: &Path) -> Result<(), String> {
         fs::remove_dir_all(dir).map_err(io_error(dir))?;
     }
     Ok(())
+}
+
+/// What `build-llama --host [--variant <name>]` builds; only the host build exists (Android builds run in Gradle).
+pub fn build_variant_arg(args: &[String]) -> Result<String, String> {
+    match args {
+        [host] if host == "--host" => Ok(DEFAULT_VARIANT.to_string()),
+        [host, flag, variant] if host == "--host" && flag == "--variant" => Ok(variant.clone()),
+        _ => Err(BUILD_USAGE.to_string()),
+    }
+}
+
+/// The CMake generator for a host OS (`std::env::consts::OS`); `None` leaves CMake's default.
+/// Visual Studio finds MSVC without a developer prompt, which a `cl`-less PATH needs (plan P-8).
+pub fn host_generator(os: &str, ninja_on_path: bool) -> Option<&'static str> {
+    if os == "windows" {
+        return Some("Visual Studio 17 2022");
+    }
+    ninja_on_path.then_some("Ninja")
+}
+
+/// Whether `program` (without its OS suffix) is a file in one of the folders of a `PATH` value.
+pub fn on_path(path_var: &OsStr, program: &str) -> bool {
+    let file_name = format!("{program}{}", std::env::consts::EXE_SUFFIX);
+    std::env::split_paths(path_var).any(|folder| folder.join(&file_name).is_file())
+}
+
+/// The host target triple from `rustc -vV`'s `host:` line.
+pub fn host_triple(rustc_verbose: &str) -> Result<String, String> {
+    rustc_verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("host:"))
+        .map(|triple| triple.trim().to_string())
+        .ok_or_else(|| format!("rustc -vV printed no \"host:\" line:\n{rustc_verbose}"))
+}
+
+/// Where the host library of a target triple lands: `<target dir>/llama/<host-triple>`.
+pub fn host_library_dir(target_dir: &Path, triple: &str) -> PathBuf {
+    target_dir.join("llama").join(triple)
+}
+
+/// One CMake host build of `turbollm_core_llama_<variant>` from the fetched llama.cpp tree.
+pub struct HostBuild {
+    pub generator: Option<&'static str>,
+    pub native_dir: PathBuf,
+    pub llama_dir: PathBuf,
+    pub build_dir: PathBuf,
+    pub library_dir: PathBuf,
+    pub variant: String,
+}
+
+impl HostBuild {
+    pub fn configure_args(&self) -> Vec<OsString> {
+        let mut args = vec![
+            OsString::from("-S"),
+            self.native_dir.clone().into_os_string(),
+            OsString::from("-B"),
+            self.build_dir.clone().into_os_string(),
+        ];
+        if let Some(generator) = self.generator {
+            args.extend([OsString::from("-G"), OsString::from(generator)]);
+        }
+        args.push(path_define("TURBOLLM_LLAMA_DIR", &self.llama_dir));
+        args.extend([
+            format!("-DTURBOLLM_VARIANTS={}", self.variant).into(),
+            "-DTURBOLLM_TEST_PROBES=ON".into(),
+            format!("-DCMAKE_BUILD_TYPE={RELEASE}").into(),
+        ]);
+        args.extend(self.library_dir_defines());
+        args
+    }
+
+    pub fn build_args(&self) -> Vec<OsString> {
+        vec![
+            OsString::from("--build"),
+            self.build_dir.clone().into_os_string(),
+            OsString::from("--config"),
+            OsString::from(RELEASE),
+            OsString::from("--target"),
+            OsString::from(self.library_stem()),
+            OsString::from("--parallel"),
+        ]
+    }
+
+    pub fn library(&self) -> PathBuf {
+        self.library_dir
+            .join(turbollm_platform::library_file_name(&self.library_stem()))
+    }
+
+    fn library_stem(&self) -> String {
+        format!("turbollm_core_llama_{}", self.variant)
+    }
+
+    /// Shared libraries are LIBRARY outputs on ELF/Mach-O and RUNTIME outputs (DLLs) on Windows; the
+    /// `_RELEASE` forms stop multi-config generators (Visual Studio) from adding a `Release/` folder.
+    fn library_dir_defines(&self) -> Vec<OsString> {
+        [
+            "CMAKE_LIBRARY_OUTPUT_DIRECTORY",
+            "CMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE",
+            "CMAKE_RUNTIME_OUTPUT_DIRECTORY",
+            "CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE",
+        ]
+        .into_iter()
+        .map(|name| path_define(name, &self.library_dir))
+        .collect()
+    }
+}
+
+/// A `PATH`-typed cache entry: CMake normalises its value, so Windows backslashes never reach CMake strings.
+fn path_define(name: &str, path: &Path) -> OsString {
+    let mut define = OsString::from(format!("-D{name}:PATH="));
+    define.push(path);
+    define
 }
 
 fn io_error(path: &Path) -> impl Fn(std::io::Error) -> String + '_ {
@@ -526,6 +642,179 @@ mod tests {
         assert!(error.contains("leaves the source tree"), "{error}");
         assert!(!places.out_dir.join("escaped.txt").exists());
         assert!(!tree(&places).exists());
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn build_variant_defaults_to_base() {
+        assert_eq!(build_variant_arg(&strings(&["--host"])).unwrap(), "base");
+    }
+
+    #[test]
+    fn build_variant_reads_the_variant_flag() {
+        let args = strings(&["--host", "--variant", "dotprod"]);
+        assert_eq!(build_variant_arg(&args).unwrap(), "dotprod");
+    }
+
+    #[test]
+    fn build_variant_requires_the_host_flag() {
+        let error = build_variant_arg(&strings(&["--variant", "base"])).unwrap_err();
+        assert!(error.contains("build-llama --host"), "{error}");
+    }
+
+    #[test]
+    fn windows_builds_with_visual_studio_2022_even_with_ninja_on_path() {
+        assert_eq!(
+            host_generator("windows", true),
+            Some("Visual Studio 17 2022")
+        );
+    }
+
+    #[test]
+    fn linux_and_macos_build_with_ninja_when_it_is_on_path() {
+        assert_eq!(host_generator("linux", true), Some("Ninja"));
+        assert_eq!(host_generator("macos", true), Some("Ninja"));
+    }
+
+    #[test]
+    fn without_ninja_cmake_keeps_its_default_generator() {
+        assert_eq!(host_generator("linux", false), None);
+    }
+
+    #[test]
+    fn a_program_in_a_path_folder_is_on_path() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(
+            bin.join(format!("ninja{}", std::env::consts::EXE_SUFFIX)),
+            "",
+        )
+        .unwrap();
+        let path_var = std::env::join_paths([root.path().join("empty"), bin]).unwrap();
+
+        assert!(on_path(&path_var, "ninja"));
+        assert!(!on_path(&path_var, "cmake"));
+    }
+
+    #[test]
+    fn host_triple_is_read_from_rustc_verbose_version() {
+        let verbose = "rustc 1.95.0 (abc 2026-01-01)\nbinary: rustc\nhost: x86_64-pc-windows-msvc\nrelease: 1.95.0\n";
+        assert_eq!(host_triple(verbose).unwrap(), "x86_64-pc-windows-msvc");
+    }
+
+    #[test]
+    fn host_triple_without_a_host_line_is_an_error() {
+        let error = host_triple("rustc 1.95.0\n").unwrap_err();
+        assert!(error.contains("host:"), "{error}");
+    }
+
+    #[test]
+    fn the_host_library_dir_is_keyed_by_triple_under_target_llama() {
+        let target = Path::new("core").join("target");
+        assert_eq!(
+            host_library_dir(&target, "x86_64-unknown-linux-gnu"),
+            target.join("llama").join("x86_64-unknown-linux-gnu")
+        );
+    }
+
+    fn host_build(generator: Option<&'static str>) -> HostBuild {
+        HostBuild {
+            generator,
+            native_dir: Path::new("crate").join("native"),
+            llama_dir: Path::new("src").join("llama.cpp"),
+            build_dir: Path::new("lib").join("build"),
+            library_dir: PathBuf::from("lib"),
+            variant: "base".to_string(),
+        }
+    }
+
+    fn path_define(name: &str, path: &Path) -> String {
+        format!("-D{name}:PATH={}", path.display())
+    }
+
+    fn as_strings(args: Vec<OsString>) -> Vec<String> {
+        args.into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn configure_args_name_the_generator_sources_and_release_flags() {
+        let build = host_build(Some("Visual Studio 17 2022"));
+        let lib = Path::new("lib");
+        let expected = vec![
+            "-S".to_string(),
+            build.native_dir.display().to_string(),
+            "-B".to_string(),
+            build.build_dir.display().to_string(),
+            "-G".to_string(),
+            "Visual Studio 17 2022".to_string(),
+            path_define("TURBOLLM_LLAMA_DIR", &build.llama_dir),
+            "-DTURBOLLM_VARIANTS=base".to_string(),
+            "-DTURBOLLM_TEST_PROBES=ON".to_string(),
+            "-DCMAKE_BUILD_TYPE=Release".to_string(),
+            path_define("CMAKE_LIBRARY_OUTPUT_DIRECTORY", lib),
+            path_define("CMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE", lib),
+            path_define("CMAKE_RUNTIME_OUTPUT_DIRECTORY", lib),
+            path_define("CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE", lib),
+        ];
+        assert_eq!(as_strings(build.configure_args()), expected);
+    }
+
+    #[test]
+    fn configure_args_leave_out_the_generator_when_cmake_picks_it() {
+        let args = as_strings(host_build(None).configure_args());
+        assert!(!args.contains(&"-G".to_string()), "{args:?}");
+        assert!(args.contains(&"-DTURBOLLM_VARIANTS=base".to_string()));
+    }
+
+    #[test]
+    fn build_args_build_only_the_variant_library_in_release() {
+        let build = host_build(None);
+        let expected = vec![
+            "--build".to_string(),
+            build.build_dir.display().to_string(),
+            "--config".to_string(),
+            "Release".to_string(),
+            "--target".to_string(),
+            "turbollm_core_llama_base".to_string(),
+            "--parallel".to_string(),
+        ];
+        assert_eq!(as_strings(build.build_args()), expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_built_library_is_a_dll_without_prefix() {
+        let build = host_build(None);
+        assert_eq!(
+            build.library(),
+            Path::new("lib").join("turbollm_core_llama_base.dll")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_the_built_library_is_a_lib_prefixed_so() {
+        let build = host_build(None);
+        assert_eq!(
+            build.library(),
+            Path::new("lib").join("libturbollm_core_llama_base.so")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_the_built_library_is_a_lib_prefixed_dylib() {
+        let build = host_build(None);
+        assert_eq!(
+            build.library(),
+            Path::new("lib").join("libturbollm_core_llama_base.dylib")
+        );
     }
 
     fn archive_with_raw_path(path: &str) -> Vec<u8> {
