@@ -18,3 +18,10 @@ turbollm-engine = { path = "../../crates/turbollm-engine" }
 # Same exact version as xtask's uniffi (bindgen): generated Kotlin must match the scaffolding.
 uniffi = { version = "=0.32.2", default-features = false }
 thiserror = "=2.0.21"
+# The platform's default thread count (default_thread_count export).
+turbollm-platform = { path = "../../crates/turbollm-platform" }
+# The generation lock its async next() awaits, and the join error of work on the core runtime.
+tokio = { version = "=1.54.1", features = ["rt", "sync"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"

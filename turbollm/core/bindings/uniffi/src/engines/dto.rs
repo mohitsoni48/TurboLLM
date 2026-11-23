@@ -646,7 +646,7 @@ where
 }
 
 /// A signed Kotlin count as the domain's unsigned one; a negative value is the caller's mistake.
-fn count<Signed, Unsigned>(value: Signed, field: &str) -> Result<Unsigned, EngineError>
+pub(crate) fn count<Signed, Unsigned>(value: Signed, field: &str) -> Result<Unsigned, EngineError>
 where
     Signed: Copy + Display,
     Unsigned: TryFrom<Signed>,

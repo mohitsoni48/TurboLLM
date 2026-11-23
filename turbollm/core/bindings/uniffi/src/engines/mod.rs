@@ -1,5 +1,5 @@
 //! The engine layer's UniFFI surface (arch 2.7, 3.3): the records Kotlin sees, their conversions to and from the
-//! domain, and the failure mapping.
+//! domain, the failure mapping, the core and its claims and generations, and the engines Kotlin implements.
 
 /// `From` both ways between a binding enum and the domain enum whose variants carry the same names.
 macro_rules! same_variants {
@@ -22,5 +22,15 @@ macro_rules! same_variants {
     };
 }
 
+pub mod claim;
 pub mod dto;
+#[expect(
+    clippy::module_inception,
+    reason = "plan T10 names the file engines.rs"
+)]
+pub mod engines;
 pub mod failure;
+pub mod foreign;
+pub mod generation;
+#[cfg(test)]
+mod test_support;

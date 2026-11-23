@@ -791,6 +791,28 @@ async fn cancelling_a_generation_mid_stream_aborts_the_backend() {
 }
 
 #[tokio::test]
+async fn the_cancel_signal_stops_a_generation_whose_next_is_pending_elsewhere() {
+    let script = vec![
+        Step::Emit(EngineEvent::Text("a".to_owned())),
+        Step::Pause(LONG),
+        Step::Emit(done()),
+    ];
+    let f = fixture(ScriptedBackend::new(script));
+    f.load("org/repo/a").await;
+    let mut generation = f.manager.generate(request()).await.unwrap();
+    generation.next().await.expect("first event");
+    let cancel = generation.cancel_signal();
+    let pending = tokio::spawn(async move { generation.next().await });
+
+    cancel.abort();
+
+    let cancelled = EngineError::Cancelled(REPLY_CANCELLED.to_owned());
+    let ended = tokio::time::timeout(WAIT_LIMIT, pending).await;
+    assert_eq!(ended.unwrap().unwrap(), Err(cancelled));
+    assert!(has(f.record(), "aborted"));
+}
+
+#[tokio::test]
 async fn dropping_a_generation_early_aborts_the_backend() {
     let script = vec![
         Step::Emit(EngineEvent::Text("a".to_owned())),

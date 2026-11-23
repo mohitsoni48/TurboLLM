@@ -47,6 +47,11 @@ impl Generation {
         self.registration.signal.abort();
     }
 
+    /// The signal `cancel` raises, for a caller that cancels while another task awaits `next`.
+    pub fn cancel_signal(&self) -> AbortSignal {
+        self.registration.abort_signal()
+    }
+
     fn end(
         &mut self,
         outcome: Result<Option<EngineEvent>, EngineError>,

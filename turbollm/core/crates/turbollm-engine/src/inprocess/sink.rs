@@ -18,7 +18,10 @@ type ReplyItem = Result<EngineEvent, EngineError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SinkClosed;
 
-/// Where a native model's generate writes its events, on the engine thread.
+/// Where a native model's generate writes its events, on the engine thread. A clone writes into the
+/// same reply, which ends only once every clone is gone; a backend that lends one out (a foreign
+/// engine's sink object) drops its loan before its generate returns.
+#[derive(Clone)]
 pub struct EventSink {
     consumer: mpsc::Sender<ReplyItem>,
 }
@@ -98,6 +101,20 @@ pub(crate) mod tests {
         let (mut sink, stream) = reply_channel();
         drop(stream);
         assert_eq!(sink.emit(text("a")), Err(SinkClosed));
+    }
+
+    #[tokio::test]
+    async fn a_cloned_sink_writes_into_the_same_reply_which_ends_when_every_clone_is_gone() {
+        let (mut sink, mut stream) = reply_channel();
+        let mut lent = sink.clone();
+        std::thread::spawn(move || {
+            lent.emit(text("lent")).unwrap();
+            drop(lent);
+            sink.emit(text("own")).unwrap();
+        });
+        assert_eq!(next_event(&mut stream).await, Some(Ok(text("lent"))));
+        assert_eq!(next_event(&mut stream).await, Some(Ok(text("own"))));
+        assert_eq!(next_event(&mut stream).await, None);
     }
 
     #[tokio::test]

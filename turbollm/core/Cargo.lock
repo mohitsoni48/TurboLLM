@@ -1101,9 +1101,12 @@ dependencies = [
 name = "turbollm-ffi"
 version = "1.15.2"
 dependencies = [
+ "tempfile",
  "thiserror",
+ "tokio",
  "turbollm-core",
  "turbollm-engine",
+ "turbollm-platform",
  "uniffi",
 ]
 
