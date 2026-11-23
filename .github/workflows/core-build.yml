@@ -40,6 +40,10 @@ env:
   # nodejs-mobile's public Android release (arch 4): bin/<abi>/libnode.so, the library the app's addon links against.
   NODEJS_MOBILE_VERSION: v18.20.4
   NODEJS_MOBILE_SHA256: bd7321eaa1a7602fbe0bb87302df2d79d87835cf4363fbdd17c350dbb485c2af
+  # The real-native engine tests' model, at the commit and sha256 of turbollm/core/fixtures/engines/README.md (the
+  # model caches are keyed on that file, so a new pin there is a new cache).
+  TEST_GGUF_URL: https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-Q4_K_M.gguf
+  TEST_GGUF_SHA256: ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a
 
 jobs:
   rust-checks:
@@ -55,6 +59,12 @@ jobs:
       - name: Record the commit being built
         shell: bash
         run: echo "TURBOLLM_GIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      # xtask downloads through ureq with native-tls (plan T12), so building it on Linux needs the OpenSSL headers and
+      # pkg-config. The ubuntu images ship both; this installs them only on an image that lacks them.
+      - name: OpenSSL headers for xtask
+        shell: bash
+        run: pkg-config --exists openssl || { sudo apt-get update -q && sudo apt-get install -y -q libssl-dev pkg-config; }
 
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install
@@ -110,9 +120,49 @@ jobs:
         run: cargo xtask goldens-check
         working-directory: turbollm/core
 
+      # The real-native llama tests (rust-core Phase 2a T14/T17) need the host library and the test model. Each step is
+      # named so the run shows its time against this job's 45-minute budget (plan P-21: a cold run over 35 min moves
+      # them into a job of their own, T20b).
+      - name: Restore the llama.cpp source archive
+        uses: actions/cache@v6
+        with:
+          path: turbollm/core/target/cache/llama
+          key: llama-source-${{ hashFiles('turbollm/core/crates/turbollm-engine-llama/llama-source.json') }}
+
+      - name: Fetch the pinned llama.cpp source
+        run: cargo xtask fetch-llama --out target/llama/src
+        working-directory: turbollm/core
+
+      - name: Build the host llama library
+        run: cargo xtask build-llama --host
+        working-directory: turbollm/core
+
+      - name: Restore the test GGUF
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/turbollm-test-models
+          key: engine-test-models-${{ hashFiles('turbollm/core/fixtures/engines/README.md') }}
+
+      # A cached file is checked like a download; a miss or a bad file is fetched again from the pinned commit.
+      - name: Download the test GGUF on a cache miss
+        shell: bash
+        env:
+          TURBOLLM_TEST_GGUF: ${{ runner.temp }}/turbollm-test-models/Qwen3-0.6B-Q4_K_M.gguf
+        run: |
+          if ! echo "$TEST_GGUF_SHA256  $TURBOLLM_TEST_GGUF" | sha256sum -c --status 2>/dev/null; then
+            mkdir -p "$(dirname "$TURBOLLM_TEST_GGUF")"
+            curl -fsSL --retry 3 -o "$TURBOLLM_TEST_GGUF" "$TEST_GGUF_URL"
+            echo "$TEST_GGUF_SHA256  $TURBOLLM_TEST_GGUF" | sha256sum -c -
+          fi
+
+      # CI=true turns a missing library or model into a failure instead of a skip.
       - name: Rust tests
         run: cargo test --workspace
         working-directory: turbollm/core
+        env:
+          CI: 'true'
+          TURBOLLM_LLAMA_LIB_DIR: target/llama/x86_64-unknown-linux-gnu
+          TURBOLLM_TEST_GGUF: ${{ runner.temp }}/turbollm-test-models/Qwen3-0.6B-Q4_K_M.gguf
 
       # The core's scripts (corpus fetch, staging, publish, this workflow's structure) sit outside npm test's src/** glob.
       - name: Core script tests
@@ -194,6 +244,12 @@ jobs:
       - name: Record the commit being built
         shell: bash
         run: echo "TURBOLLM_GIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      # xtask needs the OpenSSL headers on Linux (see rust-checks).
+      - name: OpenSSL headers for xtask
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: pkg-config --exists openssl || { sudo apt-get update -q && sudo apt-get install -y -q libssl-dev pkg-config; }
 
       # The Windows on Arm image is not guaranteed to ship rustup; the toolchain itself comes from rust-toolchain.toml.
       - name: Install rustup if the image has none
@@ -322,6 +378,10 @@ jobs:
           workspaces: turbollm/core
           key: nodejs-mobile
 
+      - name: OpenSSL headers for xtask
+        shell: bash
+        run: pkg-config --exists openssl || { sudo apt-get update -q && sudo apt-get install -y -q libssl-dev pkg-config; }
+
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-ndk@${{ env.CARGO_NDK_VERSION }}
@@ -384,6 +444,10 @@ jobs:
         with:
           workspaces: turbollm/core
           key: android-library
+
+      - name: OpenSSL headers for xtask
+        shell: bash
+        run: pkg-config --exists openssl || { sudo apt-get update -q && sudo apt-get install -y -q libssl-dev pkg-config; }
 
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
@@ -460,6 +524,10 @@ jobs:
           workspaces: turbollm/core
           key: android-emulator
 
+      - name: OpenSSL headers for xtask
+        shell: bash
+        run: pkg-config --exists openssl || { sudo apt-get update -q && sudo apt-get install -y -q libssl-dev pkg-config; }
+
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-ndk@${{ env.CARGO_NDK_VERSION }}
@@ -491,19 +559,45 @@ jobs:
         run: node core/scripts/fetch-gguf-corpus.mjs
         working-directory: turbollm
 
+      # EnginesInstrumentedTest runs llama.cpp on this model (rust-core Phase 2a T19); same cache as rust-checks.
+      - name: Restore the test GGUF
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/turbollm-test-models
+          key: engine-test-models-${{ hashFiles('turbollm/core/fixtures/engines/README.md') }}
+
+      # A cached file is checked like a download; a miss or a bad file is fetched again from the pinned commit.
+      - name: Download the test GGUF on a cache miss
+        shell: bash
+        env:
+          TURBOLLM_TEST_GGUF: ${{ runner.temp }}/turbollm-test-models/Qwen3-0.6B-Q4_K_M.gguf
+        run: |
+          if ! echo "$TEST_GGUF_SHA256  $TURBOLLM_TEST_GGUF" | sha256sum -c --status 2>/dev/null; then
+            mkdir -p "$(dirname "$TURBOLLM_TEST_GGUF")"
+            curl -fsSL --retry 3 -o "$TURBOLLM_TEST_GGUF" "$TEST_GGUF_URL"
+            echo "$TEST_GGUF_SHA256  $TURBOLLM_TEST_GGUF" | sha256sum -c -
+          fi
+
       # Built before the emulator boots, so its timeout covers only the device runs. The build's CI=true reaches the
-      # device as the instrumentation argument turbollmCi, so a missing corpus slice fails there too.
+      # device as the instrumentation argument turbollmCi, so a missing corpus slice or test model fails there too.
       - name: Build the instrumented test APKs
         run: |
           chmod +x gradlew
           ./gradlew -Pturbollm.ndkVersion="$NDK_VERSION" :turbollm-core:assembleDebugAndroidTest :r8-consumer:assembleReleaseAndroidTest
         working-directory: turbollm/core/bindings/android
 
-      - uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+      # The model goes to the device, readable by the test app, and its device path reaches the tests as turbollmTestGguf.
+      - name: Instrumented tests on the emulator
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        env:
+          TURBOLLM_TEST_GGUF: ${{ runner.temp }}/turbollm-test-models/Qwen3-0.6B-Q4_K_M.gguf
         with:
           api-level: 34
           arch: x86_64
           target: google_apis
           disable-animations: true
           working-directory: turbollm/core/bindings/android
-          script: ./gradlew -Pturbollm.ndkVersion="$NDK_VERSION" :turbollm-core:connectedDebugAndroidTest :r8-consumer:connectedReleaseAndroidTest
+          script: |
+            adb push "$TURBOLLM_TEST_GGUF" /data/local/tmp/turbollm/Qwen3-0.6B-Q4_K_M.gguf
+            adb shell chmod -R a+rX /data/local/tmp/turbollm
+            ./gradlew -Pturbollm.ndkVersion="$NDK_VERSION" -Pandroid.testInstrumentationRunnerArguments.turbollmTestGguf=/data/local/tmp/turbollm/Qwen3-0.6B-Q4_K_M.gguf :turbollm-core:connectedDebugAndroidTest :r8-consumer:connectedReleaseAndroidTest
