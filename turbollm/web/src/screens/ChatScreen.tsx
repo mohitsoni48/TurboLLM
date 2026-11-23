@@ -27,7 +27,7 @@ import {
 } from '../components/ui/alert-dialog'
 import { focusManager, useQuery, useQueryClient } from '@tanstack/react-query'
 import { skillKeys, fetchSkills } from '../lib/agent-api'
-import { CHAT_UNSUPPORTED_SKILLS, skillIdsForNewConversation } from '../lib/chat-skills'
+import { CHAT_UNSUPPORTED_SKILLS, enabledSkillsOf, pendingSkillsFor, skillIdsForNewConversation } from '../lib/chat-skills'
 import { completeMention, dismissMention, findMentionedSkillIds, trailingMentionQuery } from '../lib/skill-mentions'
 import { cn, readLastChatConvId, writeLastChatConvId } from '../lib/utils'
 import { useChatInAddress } from '../lib/chat-address'
@@ -308,13 +308,20 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const [pendingSkillSelection, setPendingSkillSelection] = useState<string[] | null>(null)
   const savedDefaultSkillIds = settingsQ.data?.defaultSkillIds
   const defaultSkillIds = useMemo(() => (savedDefaultSkillIds ?? []).filter((id) => !CHAT_UNSUPPORTED_SKILLS.has(id)), [savedDefaultSkillIds])
-  const pendingSkillIds = pendingSkillSelection ?? defaultSkillIds
+  // What an untouched empty chat shows is what a chat on the SELECTED agent would start with: the defaults for a plain chat, none for
+  // Blank or an agent with a skill list of its own. A boolean dep keeps this array stable while the agents list is rebuilt per render.
+  const selectedAgentHasSkillList = allAgents.find((a) => a.id === selectedPersonaId)?.skillIds !== undefined
+  const untouchedPendingSkillIds = useMemo(
+    () => pendingSkillsFor({ selection: null, defaults: defaultSkillIds, agentSkillIds: selectedAgentHasSkillList ? [] : undefined, isBlankAgent: selectedPersonaId === 'blank' }),
+    [defaultSkillIds, selectedAgentHasSkillList, selectedPersonaId],
+  )
+  const pendingSkillIds = pendingSkillSelection ?? untouchedPendingSkillIds
   const setPendingSkillIds = useCallback(
     (next: string[] | ((prev: string[]) => string[])) =>
-      setPendingSkillSelection((prev) => (typeof next === 'function' ? next(prev ?? defaultSkillIds) : next)),
-    [defaultSkillIds],
+      setPendingSkillSelection((prev) => (typeof next === 'function' ? next(prev ?? untouchedPendingSkillIds) : next)),
+    [untouchedPendingSkillIds],
   )
-  const enabledSkillIds = conv?.skillIds ?? pendingSkillIds
+  const enabledSkillIds = enabledSkillsOf({ chatOpen: !!activeId, convSkillIds: conv?.skillIds, pending: pendingSkillIds })
   // The agent this chat runs under: the one the daemon stored with it, else this browser's memory of it (chats from before the
   // daemon kept it), else the default. Not `selectedPersonaId`, which is the empty chat's picker and is not re-seeded for every
   // way a chat can open (a routine run shown inside this screen, another device's chat).
