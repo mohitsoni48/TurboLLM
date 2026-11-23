@@ -1,13 +1,13 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { ArrowDown, AudioLines, Copy, Download, Loader2, Mic, PanelLeft, Paperclip, Search, SendHorizontal, Share2, Shrink, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
+import { ArrowDown, AudioLines, Copy, Download, Loader2, Mic, PanelLeft, Paperclip, Search, SendHorizontal, Share2, Shrink, SlidersHorizontal, Square, X } from 'lucide-react'
 import { fetchSysInfo, forkConversation, getConversation, listMemoryFacts } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { chatKeys, useConversation, useConversationMutations } from '../lib/chat-queries'
 import { queryKeys, useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useShowAllEngineModels, useStatus, useSysInfo } from '../lib/queries'
 import { isAndroidOs } from '../lib/platform'
 import { copyToClipboard } from '../lib/clipboard'
-import type { Message } from '../lib/chat-types'
+import type { Conversation, Message } from '../lib/chat-types'
 import { useChatSession } from '../lib/use-chat-session'
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat, track } from '../lib/api'
 import { classifyStatusError } from '../lib/connection-state'
@@ -22,6 +22,9 @@ import {
   DropdownMenuTrigger,
 } from '../components/ui/dropdown-menu'
 import { toast } from '../components/ui/sonner'
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from '../components/ui/alert-dialog'
 import { focusManager, useQuery, useQueryClient } from '@tanstack/react-query'
 import { skillKeys, fetchSkills } from '../lib/agent-api'
 import { cn, readLastChatConvId, writeLastChatConvId } from '../lib/utils'
@@ -38,6 +41,8 @@ import { speaker, ttsAvailable, type SpeechStream } from '../lib/voice/tts'
 import { readAloudOptions } from '../lib/voice/use-tts'
 import { useVoiceStore } from '../stores/voice'
 import { ContextMeter } from './chat/ContextMeter'
+import { AgentSwitcher } from './chat/AgentSwitcher'
+import { agentSwitchPatch, buildAgentConfig, conversationAfterSwitch, hardwareSection, promptLooksCustomised, skillIdsAfterSwitch } from '../lib/agent-conversation'
 import { CompactionDivider } from './chat/CompactionDivider'
 import { ChatFindBar } from './chat/ChatFindBar'
 import { ConversationSidebar } from './chat/ConversationSidebar'
@@ -51,7 +56,7 @@ import { ConversationSettingsDialog, type ConversationSettingsDraft } from './ch
 import { useUiStore } from '../stores/ui'
 import { useIsDesktop } from '../lib/useIsDesktop'
 import {
-  buildSystemPrompt, getConvAgentId, getDefaultAgentId, hasExplicitDefaultAgent,
+  getConvAgentId, getDefaultAgentId, hasExplicitDefaultAgent,
   getPersonalization, resolveAgents, setConvAgentId,
 } from '../lib/personas'
 
@@ -207,7 +212,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // Android when nothing's been explicitly set — see isAndroid comment above). A plain
   // string: besides the fixed built-in ids, a custom agent's id is an arbitrary
   // server-issued one, resolved against `allAgents` below.
-  const [selectedPersonaId, setSelectedPersonaId] = useState<string>(() => getDefaultAgentId(isAndroid))
+  // A chat opened straight from its URL (reload, shared link) starts on its own agent, as handleSelect gives one picked in the
+  // sidebar: the default would label it with an agent it never had.
+  const [selectedPersonaId, setSelectedPersonaId] = useState<string>(() => (activeId ? getConvAgentId(activeId, isAndroid) : getDefaultAgentId(isAndroid)))
   const userTouchedPersonaRef = useRef(false)
   const handlePersonaChange = (id: string) => {
     userTouchedPersonaRef.current = true
@@ -223,7 +230,6 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const customAgentsQ = useChatAgents()
   const builtinOverridesQ = useBuiltinAgentOverrides()
   const allAgents = resolveAgents(customAgentsQ.data ?? [], builtinOverridesQ.data ?? {})
-  const selectedAgent = allAgents.find((a) => a.id === selectedPersonaId)
   const scrollerRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -298,6 +304,15 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // Once activeId exists, conv.skillIds is the source of truth instead.
   const [pendingSkillIds, setPendingSkillIds] = useState<string[]>([])
   const enabledSkillIds = conv?.skillIds ?? pendingSkillIds
+  // The agent this chat runs under: the one the daemon stored with it, else this browser's memory of it (chats from before the
+  // daemon kept it), else the default. Not `selectedPersonaId`, which is the empty chat's picker and is not re-seeded for every
+  // way a chat can open (a routine run shown inside this screen, another device's chat).
+  const chatAgentId = activeId ? (conv?.chatAgentId || getConvAgentId(activeId, isAndroid)) : selectedPersonaId
+  const [switchingAgent, setSwitchingAgent] = useState(false)
+  const [confirmSwitchTo, setConfirmSwitchTo] = useState<string | null>(null)
+  // The latest of what a switch reads after its awaits: the handler closed over the render that started it.
+  const switchRef = useRef({ activeId, live, enabledSkillIds, chatAgentId })
+  switchRef.current = { activeId, live, enabledSkillIds, chatAgentId }
 
   // Same pattern, extended to the other Thread-settings fields (GitHub #52 follow-up):
   // lets the settings dialog be used on a blank chat screen, before a conversation
@@ -670,6 +685,65 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     session.acknowledgeCompleted(id)
   }
 
+  // Switch the agent of the open conversation (GitHub #52: "change the agent once the first message has been sent").
+  // An agent is baked into a chat when it is created — system prompt, tool allow-list, Research's forced web search, the
+  // skills it brings — so switching rewrites those through the same buildAgentConfig that creation uses. Earlier
+  // messages are untouched. Not while a reply is running: its system prompt and tools must not change under it.
+  const switchAgentBlocked = readonly
+    ? 'this chat is read-only'
+    : embedded || convIdOverride || conv?.agentId
+      ? 'a routine run keeps the agent it was set up with'
+      : conv?.expertMode
+        ? 'this is the built-in TurboLLM Expert thread'
+        : switchingAgent
+          ? 'switching…'
+          : live ? 'wait for the reply to finish' : undefined
+
+  // A chat whose system prompt was written in Thread settings (or whose agent was edited since) loses it on a switch: ask.
+  const requestSwitchAgent = (agentId: string) => {
+    if (switchAgentBlocked || !activeId) return
+    const current = allAgents.find((a) => a.id === chatAgentId)
+    if (promptLooksCustomised(conv?.systemPrompt ?? '', chatAgentId, current, getPersonalization())) setConfirmSwitchTo(agentId)
+    else void handleSwitchAgent(agentId)
+  }
+
+  const handleSwitchAgent = async (agentId: string) => {
+    if (!activeId || switchAgentBlocked) return
+    const next = allAgents.find((a) => a.id === agentId)
+    if (!next) return
+    const convId = activeId
+    const choicesAtStart = chatChoices.current
+    setSwitchingAgent(true)
+    try {
+      let memoryFacts: string[] = []
+      if (settingsQ.data?.autoMemoryEnabled) {
+        try { memoryFacts = (await listMemoryFacts()).facts.map((f) => f.factText) } catch { /* non-fatal — proceed without memory */ }
+      }
+      let hardware: string | undefined
+      if (agentId === 'expert') {
+        try { hardware = hardwareSection(await fetchSysInfo()) } catch { /* non-fatal — proceed without hardware info */ }
+      }
+      // Read what may have changed during those awaits: a reply sent meanwhile, the user opening another chat, a skill picked.
+      const fresh = switchRef.current
+      if (fresh.activeId !== convId) return
+      if (fresh.live) { toast.error('A reply started while switching. Switch the agent once it finishes.'); return }
+      const previous = allAgents.find((a) => a.id === fresh.chatAgentId)
+      const config = buildAgentConfig(agentId, next, getPersonalization(), { memoryFacts, hardware })
+      const updated = await mut.update.mutateAsync({ id: convId, ...agentSwitchPatch(agentId, config, skillIdsAfterSwitch(fresh.enabledSkillIds, previous, config)) })
+      track('chat', 'switch_agent')
+      setConvAgentId(convId, agentId)
+      // Show it at once: the PATCH answers with the stored chat (no messages), the refetch that follows is not needed to name the agent.
+      qc.setQueryData(chatKeys.detail(convId), (old: Conversation | undefined) => (old ? conversationAfterSwitch(old, updated) : old))
+      // Only follow the switch on screen if this chat is still the open one (the PATCH was awaited).
+      if (chatChoices.current === choicesAtStart) setSelectedPersonaId(agentId)
+      toast.success(`Agent switched to ${next.name}`)
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : 'Could not switch agent.')
+    } finally {
+      setSwitchingAgent(false)
+    }
+  }
+
   // The currently-open conversation was deleted — stop following its live generation (the
   // DELETE stopped it in the daemon) and close it (clear activeId) so we don't hold a
   // dangling reference.
@@ -857,36 +931,31 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
             memoryFacts = facts.map((f) => f.factText)
           } catch { /* non-fatal — proceed without memory */ }
         }
-        let sp = buildSystemPrompt(selectedPersonaId, resolved?.systemPrompt ?? '', getPersonalization(), memoryFacts)
+        let hardware: string | undefined
         if (selectedPersonaId === 'expert') {
-          try {
-            const sys = await fetchSysInfo()
-            const gpuLine = sys.gpus.length > 0
-              ? sys.gpus.map(g => `${g.name} (${Math.round(g.vramMb / 1024)} GB VRAM)`).join(', ')
-              : 'No GPU detected (CPU inference)'
-            const hwSection = `## User's hardware\nGPU: ${gpuLine}\nRAM: ${Math.round(sys.ramMB / 1024)} GB\nOS: ${sys.os}`
-            sp = sp ? `${sp}\n\n${hwSection}` : hwSection
-          } catch { /* non-fatal — proceed without hardware info */ }
+          try { hardware = hardwareSection(await fetchSysInfo()) } catch { /* non-fatal — proceed without hardware info */ }
         }
+        const agentConfig = buildAgentConfig(selectedPersonaId, resolved, getPersonalization(), { memoryFacts, hardware })
         const initialSkillIds = Array.from(new Set([
           ...pendingSkillIds,
-          ...(resolved?.skillIds ?? []),
+          ...agentConfig.agentSkillIds,
           ...(matchedSkill ? [matchedSkill.id] : []),
         ]))
         // A system prompt set via Thread settings before the first message is an
         // explicit override — it wins over the agent's own default system prompt.
-        const finalSystemPrompt = pendingSystemPrompt.trim() || sp
+        const finalSystemPrompt = pendingSystemPrompt.trim() || agentConfig.systemPrompt
         const newConv = await mut.create.mutateAsync({
           // The model this conversation was STARTED with, for the sidebar label. A remote
           // machine's qualified id is the honest value there — it is what answered.
           modelKey: activeRemoteId ?? loadedChatModel?.key ?? '',
           systemPrompt: finalSystemPrompt || undefined,
-          toolPolicy: selectedPersonaId === 'research' ? 'force_web_search' : undefined,
+          toolPolicy: agentConfig.toolPolicy,
+          chatAgentId: selectedPersonaId,
           skillIds: initialSkillIds.length ? initialSkillIds : undefined,
           // Pass an explicit empty array through as-is (e.g. Blank's fixed []) — collapsing it
           // to undefined here would silently turn "zero tools" back into "unrestricted" before
           // the request ever reaches the backend (GitHub #52).
-          allowedTools: resolved?.tools,
+          allowedTools: agentConfig.allowedTools,
           sampling: Object.keys(pendingSampling).length ? pendingSampling : undefined,
           preserveThinking: pendingPreserveThinking,
         })
@@ -1350,14 +1419,13 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           ) : (
             <ThinkingBudgetSlider value={thinkingBudget} onChange={setThinkingBudget} automatic={loadedOnLitertLm} />
           )}
-          {activeId && selectedAgent && (
-            <span
-              title={selectedAgent.description}
-              className="hidden items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted select-none sm:inline-flex"
-            >
-              <UserRound size={11} />
-              {selectedAgent.name}
-            </span>
+          {activeId && (
+            <AgentSwitcher
+              agents={allAgents}
+              selectedId={chatAgentId}
+              onSwitch={requestSwitchAgent}
+              disabledReason={switchAgentBlocked}
+            />
           )}
           {engineState === 'starting' && (
             <span className="text-[12px] text-muted">
@@ -1451,6 +1519,25 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
             onReveal={() => { userScrolledUp.current = true }}
           />
         )}
+
+        <AlertDialog open={confirmSwitchTo !== null} onOpenChange={(open) => { if (!open) setConfirmSwitchTo(null) }}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Replace this chat’s system prompt?</AlertDialogTitle>
+              <AlertDialogDescription>
+                This chat has a system prompt that is not {allAgents.find((a) => a.id === chatAgentId)?.name ?? 'its agent'}’s own, for example one
+                written in Thread settings. Switching to {allAgents.find((a) => a.id === confirmSwitchTo)?.name ?? 'the new agent'} replaces it with that agent’s prompt.
+                Earlier messages are not changed.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Keep it</AlertDialogCancel>
+              <AlertDialogAction onClick={() => { const id = confirmSwitchTo; setConfirmSwitchTo(null); if (id) void handleSwitchAgent(id) }}>
+                Switch agent
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
 
         {/* Message list — always visible; empty state shown only when no messages */}
         <div ref={scrollerRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">

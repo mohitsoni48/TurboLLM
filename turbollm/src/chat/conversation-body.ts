@@ -19,7 +19,7 @@ function samplingValueError(key: string, v: unknown): string | undefined {
 
 /** Fields a PATCH may set to null to clear them. Every other field's column is NOT NULL (or has no "cleared" state), so
  *  a null there reads as "absent", exactly as it does on create. */
-export const CLEARABLE_ON_PATCH: readonly string[] = []
+export const CLEARABLE_ON_PATCH: readonly string[] = ['toolPolicy', 'allowedTools', 'chatAgentId']
 
 /** The body of a PATCH as the store should apply it: only the fields the route reads, with a null for a field that cannot
  *  be cleared dropped. `null.filter`, a NOT NULL constraint failure (500) and `preserveThinking: null` silently writing
@@ -34,17 +34,19 @@ export function patchFields(b: Record<string, unknown>, clearable: readonly stri
   return out
 }
 
-/** The fields each route reads. PATCH has no `toolPolicy` or `allowedTools`: they are chosen when a chat is created. */
-export const CREATE_FIELDS = ['title', 'systemPrompt', 'modelKey', 'toolPolicy', 'skillIds', 'allowedTools', 'sampling', 'preserveThinking'] as const
-export const PATCH_FIELDS = ['title', 'systemPrompt', 'modelKey', 'skillIds', 'sampling', 'preserveThinking'] as const
+/** The fields each route reads. PATCH's `toolPolicy`, `allowedTools` and `chatAgentId` take null to clear them. */
+export const CREATE_FIELDS = ['title', 'systemPrompt', 'modelKey', 'toolPolicy', 'chatAgentId', 'skillIds', 'allowedTools', 'sampling', 'preserveThinking'] as const
+export const PATCH_FIELDS = ['title', 'systemPrompt', 'modelKey', 'toolPolicy', 'chatAgentId', 'skillIds', 'allowedTools', 'sampling', 'preserveThinking'] as const
 
 /** The 400 message for a body the route must refuse, or undefined when every field it reads is well-formed. Absent and
  *  null fields are fine (the route leaves them unset), as they are everywhere else in the API. */
 export function conversationBodyError(b: unknown, fields: readonly string[]): string | undefined {
   if (typeof b !== 'object' || b === null || Array.isArray(b)) return 'The body must be a JSON object.'
   const body = b as Record<string, unknown>
-  const text = nonStringField(body, fields.filter((f) => ['title', 'systemPrompt', 'modelKey', 'toolPolicy'].includes(f)))
+  const text = nonStringField(body, fields.filter((f) => ['title', 'systemPrompt', 'modelKey', 'toolPolicy', 'chatAgentId'].includes(f)))
   if (text) return `${text} must be a string.`
+  // An empty id would be stored, and `??` would then show it as an agent called "" instead of falling back (the header said "Choose agent").
+  if (fields.includes('chatAgentId') && typeof body.chatAgentId === 'string' && body.chatAgentId.trim() === '') return 'chatAgentId must not be empty.'
   for (const f of fields.filter((x) => x === 'skillIds' || x === 'allowedTools')) {
     if (body[f] != null && !isStringArray(body[f])) return `${f} must be an array of strings.`
   }

@@ -559,6 +559,7 @@ export const UI_ACTIONS = [
   'open_model_settings', 'copy_chat_link', 'copy_chat_debug_info', 'export_chat',
   'dismiss_import_banner', 'use_suggested_prompt', 'scroll_to_latest', 'dismiss_clipboard_modal',
   'select_skill_from_picker', 'remove_attachment', 'attach_file', 'stop_generation', 'send_message',
+  'switch_agent',
 
   'export_code_session', 'open_code_git_dialog', 'back_to_code', 'resume_code_session',
   'send_code_message', 'add_code_context_file', 'revert_code_chat', 'revert_code_chat_and_files',

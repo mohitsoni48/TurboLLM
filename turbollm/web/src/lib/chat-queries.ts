@@ -5,7 +5,7 @@ import {
   getConversation, listConversations, listFolders, listMemoryFacts, moveConversationToFolder, regenerate, undoCompaction,
   renameFolder, stopGeneration, updateConversation,
 } from './chat-api'
-import type { ConversationPage } from './chat-api'
+import type { ConversationPage, ConversationPatch } from './chat-api'
 import type { Conversation, MemoryFact } from './chat-types'
 import { FIRST_PAGE, flattenPages, nextCursorOf } from './paging'
 import { pollWhileLive } from './live-events'
@@ -136,11 +136,11 @@ export function useConversationMutations() {
 
   return {
     create: useMutation({
-      mutationFn: (p?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy' | 'skillIds' | 'allowedTools' | 'sampling' | 'preserveThinking'>>) => createConversation(p),
+      mutationFn: (p?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy' | 'chatAgentId' | 'skillIds' | 'allowedTools' | 'sampling' | 'preserveThinking'>>) => createConversation(p),
       onSuccess: invalidateList,
     }),
 update: useMutation({
-      mutationFn: (v: { id: string } & Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'skillIds' | 'preserveThinking'>>) => updateConversation(v.id, v),
+      mutationFn: (v: { id: string } & ConversationPatch) => updateConversation(v.id, v),
       onSuccess: (_d, v) => { invalidateList(); invalidateDetail(v.id) },
     }),
     remove: useMutation({

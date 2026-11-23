@@ -33,7 +33,7 @@ export function listConversations(q?: string, cursor?: string | null): Promise<C
   return req(`/api/v1/conversations${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`)
 }
 
-export function createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy' | 'skillIds' | 'allowedTools' | 'sampling' | 'preserveThinking'>>): Promise<Conversation> {
+export function createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy' | 'chatAgentId' | 'skillIds' | 'allowedTools' | 'sampling' | 'preserveThinking'>>): Promise<Conversation> {
   return req('/api/v1/conversations', { method: 'POST', json: partial ?? {} })
 }
 
@@ -41,7 +41,14 @@ export function getConversation(id: string): Promise<Conversation> {
   return req(`/api/v1/conversations/${encodeURIComponent(id)}`)
 }
 
-export function updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'skillIds' | 'preserveThinking'>>): Promise<Conversation> {
+/** What PATCH /conversations/:id takes. `allowedTools`, `toolPolicy` and `chatAgentId` accept `null` to clear them (every tool allowed
+ *  again, no policy): undefined is dropped by JSON, so only null can say it. */
+export type ConversationPatch = Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'skillIds' | 'preserveThinking'>> & {
+  allowedTools?: string[] | null
+  toolPolicy?: string | null
+  chatAgentId?: string | null
+}
+export function updateConversation(id: string, patch: ConversationPatch): Promise<Conversation> {
   return req(`/api/v1/conversations/${encodeURIComponent(id)}`, { method: 'PATCH', json: patch })
 }
 
