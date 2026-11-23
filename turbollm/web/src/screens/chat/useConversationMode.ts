@@ -46,6 +46,8 @@ export interface ConversationModeOptions {
   /** The Settings → Voice opt-in for the beta. The master switch: the mode cannot be turned on without it, and turning it off
    *  while the mode is on ends the mode (so a composer that no longer offers it cannot keep a live loop running). */
   enabled: boolean
+  /** Drop any queued read-aloud when the mode stops, even before speech starts. */
+  onStop?: () => void
 }
 
 export interface ConversationMode {
@@ -115,6 +117,7 @@ export function useConversationMode(options: ConversationModeOptions): Conversat
   }, [tryStartMic])
 
   const dispatch = useCallback((event: ConversationEvent) => {
+    if (event.type === 'stop' && stateRef.current.on) latest.current.onStop?.()
     const t = reduceConversation(stateRef.current, event)
     stateRef.current = t.state
     setState(t.state)
