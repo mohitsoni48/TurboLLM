@@ -1,5 +1,6 @@
 mod elf;
 mod goldens;
+mod llama;
 mod uniffi;
 mod version;
 
@@ -15,7 +16,8 @@ check-version  fail if core/Cargo.toml and turbollm/package.json versions differ
 goldens-check  fail if the GGUF fixture folder is incomplete or breaks its rules\n  \
 uniffi-kotlin --lib <library> --out <dir>  generate Kotlin bindings from a built turbollm-ffi library\n  \
 check-android-elf <file> [--needs <library>]  fail unless every PT_LOAD is 16 KB aligned (and <library> is DT_NEEDED)\n  \
-check-glibc --max <x.y> <file>  fail if the file needs a GLIBC_ symbol version above <x.y>";
+check-glibc --max <x.y> <file>  fail if the file needs a GLIBC_ symbol version above <x.y>\n  \
+fetch-llama --out <dir>  put the pinned, sha256-checked llama.cpp source at <dir>/llama.cpp";
 const FAILURE_EXIT: u8 = 1;
 const UNKNOWN_COMMAND_EXIT: u8 = 2;
 
@@ -28,6 +30,7 @@ fn main() -> ExitCode {
         "uniffi-kotlin" => uniffi_kotlin(),
         "check-android-elf" => check_android_elf(),
         "check-glibc" => check_glibc(),
+        "fetch-llama" => fetch_llama(),
         _ => {
             eprintln!("unknown command {command:?}\n{USAGE}");
             return ExitCode::from(UNKNOWN_COMMAND_EXIT);
@@ -117,6 +120,32 @@ fn check_glibc() -> Result<(), String> {
     Ok(())
 }
 
+fn fetch_llama() -> Result<(), String> {
+    let out_dir = llama::out_dir_arg(&command_args())?;
+    let source = llama::parse_source(&read(&llama_source_pin())?)?;
+    let places = llama::SourcePlaces {
+        cache_dir: core_dir().join("target").join("cache").join("llama"),
+        out_dir,
+    };
+    match llama::fetch_llama(&source, &places, &llama::HttpsFetcher)? {
+        llama::FetchOutcome::AlreadyExtracted { tree } => println!(
+            "fetch-llama: {} already holds {}, nothing to do",
+            tree.display(),
+            source.commit
+        ),
+        llama::FetchOutcome::Extracted {
+            tree,
+            origin,
+            sha256,
+        } => println!(
+            "fetch-llama: {origin} {}, sha256 {sha256}, extracted to {}",
+            source.archive_url(),
+            tree.display()
+        ),
+    }
+    Ok(())
+}
+
 fn command_args() -> Vec<String> {
     env::args().skip(2).collect()
 }
@@ -130,6 +159,13 @@ fn core_dir() -> PathBuf {
         .parent()
         .expect("xtask lives inside turbollm/core")
         .to_path_buf()
+}
+
+fn llama_source_pin() -> PathBuf {
+    core_dir()
+        .join("crates")
+        .join("turbollm-engine-llama")
+        .join("llama-source.json")
 }
 
 fn workspace_manifest() -> PathBuf {
