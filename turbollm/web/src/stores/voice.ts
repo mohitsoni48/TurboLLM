@@ -142,8 +142,16 @@ export const useVoiceStore = create<VoiceState>((set) => ({
 
 // The opt-in is per browser, so another tab turning it off tells this one by a `storage` event: without it a loop already running here
 // would go on after the user switched the beta off elsewhere. (`key` is null when the whole storage was cleared.)
+// Keep a single handler across HMR and module reloads. Replace it so it always
+// points at the current store, rather than retaining old store instances.
+const listenerKey = Symbol.for('tllm.voice.storageListener')
 if (typeof window !== 'undefined') {
-  window.addEventListener('storage', (e) => {
+  const host = window as Window & { [listenerKey]?: (event: StorageEvent) => void }
+  const previous = host[listenerKey]
+  if (previous) window.removeEventListener('storage', previous)
+  const listener = (e: StorageEvent) => {
     if (e.key === KEYS.conversation || e.key === null) useVoiceStore.setState({ conversation: read(KEYS.conversation) === 'true' })
-  })
+  }
+  host[listenerKey] = listener
+  window.addEventListener('storage', listener)
 }
