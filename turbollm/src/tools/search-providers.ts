@@ -189,7 +189,7 @@ class KeenableClient implements SearchClient {
   readonly provider = 'keenable' as const
   constructor(private key: string | undefined, private fetchImpl: FetchImpl) {}
 
-  async search(query: string, maxResults: number): Promise<SearchResult[]> {
+  async search(query: string, maxResults: number, opts?: SearchOptions): Promise<SearchResult[]> {
     const keyed = typeof this.key === 'string' && this.key.length > 0
     const url = keyed ? 'https://api.keenable.ai/v1/search' : 'https://api.keenable.ai/v1/search/public'
     const headers: Record<string, string> = {
@@ -201,20 +201,21 @@ class KeenableClient implements SearchClient {
     const resp = await this.fetchImpl(url, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ query, max_results: maxResults }),
+      body: JSON.stringify({ query, max_results: maxResults, ...(opts?.recent ? { published_after: '30d' } : {}) }),
       signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
       // A keyed request must not let fetch follow a redirect with X-API-Key still attached.
-      ...(keyed ? { redirect: 'error' as RequestRedirect } : {}),
+      ...(keyed ? { redirect: 'error' as const } : {}),
     })
     if (!resp.ok) throw new Error(await httpError('Keenable', resp))
     const data = (await resp.json()) as {
-      results?: Array<{ title?: string; url?: string; snippet?: string; description?: string }>
+      results?: Array<{ title?: string; url?: string; snippet?: string; description?: string; published_at?: string }>
     }
     return (data.results ?? []).map((r) => {
       const content = (typeof r.snippet === 'string' && r.snippet)
         || (typeof r.description === 'string' && r.description)
         || ''
-      return { title: r.title ?? '', url: r.url ?? '', content }
+      const publishedDate = normalizePublishedDate(r.published_at)
+      return { title: r.title ?? '', url: r.url ?? '', content, ...(publishedDate ? { publishedDate } : {}) }
     })
   }
 }

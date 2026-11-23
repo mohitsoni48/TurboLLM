@@ -663,15 +663,12 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
                         className="rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-ink outline-none" />
                     </div>
                   ) : entry.id === 'keenable' ? (
-                    <>
-                      <p className="text-[11px] leading-relaxed text-muted">Keenable logs the query, results and IP of every request, with or without a key.</p>
-                      <div className="flex flex-col gap-1">
-                        <label className="text-[12px] text-muted">Keenable API Key (optional)</label>
-                        <input type="password" value={searchSecret} onChange={(e) => setSearchSecret(e.target.value)}
-                          placeholder="optional — works without a key" autoComplete="off"
-                          className="rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-ink outline-none" />
-                      </div>
-                    </>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[12px] text-muted">Keenable API Key (optional)</label>
+                      <input type="password" value={searchSecret} onChange={(e) => setSearchSecret(e.target.value)}
+                        placeholder="optional — works without a key" autoComplete="off"
+                        className="rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-ink outline-none" />
+                    </div>
                   ) : (
                     <div className="flex flex-col gap-1">
                       <label className="text-[12px] text-muted">{entry.name} API Key</label>

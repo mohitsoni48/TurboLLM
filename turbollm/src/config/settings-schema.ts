@@ -365,9 +365,11 @@ export const SETTINGS = [
     keenableKeySet: !!c.tools.search?.keenableApiKey,
     searxngUrl: c.tools.search?.searxngUrl ?? '',
   }), [
-    // An unknown provider is ignored, not refused.
+    // An unknown provider is ignored, not refused. Keenable works keyless, so switching to (or from) it is host-only:
+    // otherwise a caller could send the owner's searches to a third party without touching any key.
     field<unknown>('search.provider', {
       set: (c, v) => { if (v === 'tavily' || v === 'kagi' || v === 'searxng' || v === 'keenable') searchBlock(c).provider = v },
+      hostOnly: { label: 'the search provider (Keenable)', get: (c) => c.tools.search?.provider === 'keenable' },
     }),
     searchSecret('tavilyApiKey', 'the Tavily API key', (c) => [c.tools.search?.tavilyApiKey, c.tools.tavily?.apiKey]),
     searchSecret('kagiApiKey', 'the Kagi API key', (c) => c.tools.search?.kagiApiKey),

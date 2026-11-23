@@ -168,3 +168,24 @@ test('keenable keyed adapter posts to /v1/search with X-API-Key and does not fol
   assert.equal(headers['X-Keenable-Title'], 'TurboLLM')
   assert.equal(calls[0].init?.redirect, 'error')
 })
+
+test('keenable adapter maps recent to published_after 30d and returns published_at as publishedDate', async () => {
+  const { calls, fn } = stubFetch({
+    results: [
+      { title: 'A', url: 'https://a.com', snippet: 'alpha', published_at: '2026-11-18T09:30:00Z' },
+      { title: 'B', url: 'https://b.com', snippet: 'beta', published_at: 'not a date' },
+    ],
+  })
+  const client = searchProviderClient({ provider: 'keenable' }, fn)!
+  const out = await client.search('q', 5, { recent: true })
+  assert.deepEqual(JSON.parse(String(calls[0].init?.body)), { query: 'q', max_results: 5, published_after: '30d' })
+  assert.equal(out[0].publishedDate, '2026-11-18')
+  assert.equal('publishedDate' in out[1], false)
+})
+
+test('keenable adapter leaves the body unchanged when recent is false', async () => {
+  const { calls, fn } = stubFetch({ results: [] })
+  const client = searchProviderClient({ provider: 'keenable' }, fn)!
+  await client.search('q', 5, { recent: false })
+  assert.deepEqual(JSON.parse(String(calls[0].init?.body)), { query: 'q', max_results: 5 })
+})
