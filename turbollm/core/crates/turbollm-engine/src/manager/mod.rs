@@ -61,7 +61,9 @@ struct Shared {
     resident: StdMutex<Option<Resident>>,
     snapshots: Arc<Snapshots>,
     journal: Option<LoadJournal>,
-    predecessor: Option<EngineManager>,
+    /// Only the predecessor's published states: holding its manager would keep its catalogue (and
+    /// any Kotlin engine handles in it) and its own predecessor alive for this manager's life.
+    predecessor_states: Option<Arc<Snapshots>>,
     stall: Duration,
     max_queued: usize,
     cache_dir: PathBuf,
@@ -86,7 +88,9 @@ impl EngineManager {
                 resident: StdMutex::new(None),
                 snapshots: Arc::new(Snapshots::new()),
                 journal: config.journal,
-                predecessor: config.predecessor,
+                predecessor_states: config
+                    .predecessor
+                    .map(|predecessor| Arc::clone(&predecessor.shared.snapshots)),
                 stall: config.stall,
                 max_queued: config.max_queued,
                 cache_dir: config.cache_dir,
@@ -206,8 +210,8 @@ impl EngineManager {
     }
 
     async fn await_predecessor_closed(&self) {
-        if let Some(predecessor) = &self.shared.predecessor {
-            predecessor.shared.snapshots.reached_closed().await;
+        if let Some(states) = &self.shared.predecessor_states {
+            states.reached_closed().await;
         }
     }
 

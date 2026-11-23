@@ -1132,6 +1132,24 @@ async fn a_successors_run_waits_for_the_predecessor_to_close() {
 }
 
 #[tokio::test]
+async fn a_successor_lets_go_of_its_predecessor_once_it_closed() {
+    let first = fixture(ScriptedBackend::new(vec![]));
+    let predecessors_engine = Arc::downgrade(&first.records[0]);
+    let second = Setup::of(ScriptedBackend::new(vec![]))
+        .after(&first.manager)
+        .build();
+
+    first.manager.shutdown().await;
+    second.load("org/repo/b").await;
+    drop(first);
+
+    assert!(
+        predecessors_engine.upgrade().is_none(),
+        "the successor keeps its predecessor's engines alive"
+    );
+}
+
+#[tokio::test]
 async fn a_stalled_open_ends_failed_with_the_stall_text_and_releases_everything() {
     let clock = FakeClock::paused();
     let f = fixture(ScriptedBackend::new(vec![]).with_open_pause(LONG));
