@@ -116,7 +116,7 @@ export function agentSwitchPatch(agentId: string, next: AgentConversationConfig,
 export function conversationAfterSwitch<C extends { messages?: unknown }>(
   old: C,
   updated: { chatAgentId?: string; systemPrompt?: string; allowedTools?: string[]; toolPolicy?: string; skillIds?: string[] },
-): C {
+): Omit<C, keyof typeof updated> & typeof updated {
   return {
     ...old,
     ...updated,
@@ -126,5 +126,5 @@ export function conversationAfterSwitch<C extends { messages?: unknown }>(
     toolPolicy: updated.toolPolicy,
     skillIds: updated.skillIds,
     messages: old.messages,
-  } as C
+  }
 }
