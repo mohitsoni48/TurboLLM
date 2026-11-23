@@ -95,13 +95,12 @@ pub fn fetch_llama(
     if extracted_commit(&tree).as_deref() == Some(source.commit.as_str()) {
         return Ok(FetchOutcome::AlreadyExtracted { tree });
     }
-    let (archive, origin) = cached_or_downloaded(source, &places.cache_dir, fetcher)?;
-    let sha256 = verified_sha256(source, &archive)?;
+    let (archive, origin) = verified_archive(source, &places.cache_dir, fetcher)?;
     replace_tree(&tree, &archive, &source.commit)?;
     Ok(FetchOutcome::Extracted {
         tree,
         origin,
-        sha256,
+        sha256: source.sha256.clone(),
     })
 }
 
@@ -138,22 +137,36 @@ fn extracted_commit(tree: &Path) -> Option<String> {
         .map(|commit| commit.trim().to_string())
 }
 
-/// The cache keeps the archive as downloaded; its hash is checked on every use, not only after a download.
-fn cached_or_downloaded(
+/// The hash is checked on every use: a download is cached only once it matches the pin, and a
+/// cached archive that no longer matches is removed, so one bad response cannot break later runs.
+fn verified_archive(
     source: &LlamaSource,
     cache_dir: &Path,
     fetcher: &dyn ArchiveFetcher,
 ) -> Result<(Vec<u8>, ArchiveOrigin), String> {
     let cached = cache_dir.join(format!("{}.tar.gz", source.commit));
     if cached.is_file() {
-        return Ok((
-            fs::read(&cached).map_err(io_error(&cached))?,
-            ArchiveOrigin::CacheHit,
-        ));
+        let archive = fs::read(&cached).map_err(io_error(&cached))?;
+        verify_sha256(source, &archive).map_err(|mismatch| forget_cached(&cached, &mismatch))?;
+        return Ok((archive, ArchiveOrigin::CacheHit));
     }
     let archive = fetcher.fetch(&source.archive_url())?;
+    verify_sha256(source, &archive)?;
     keep_in_cache(&cached, &archive)?;
     Ok((archive, ArchiveOrigin::Downloaded))
+}
+
+fn forget_cached(cached: &Path, mismatch: &str) -> String {
+    match fs::remove_file(cached) {
+        Ok(()) => format!(
+            "{mismatch}; removed the cached archive {}, the next run downloads it again",
+            cached.display()
+        ),
+        Err(e) => format!(
+            "{mismatch}; could not remove the cached archive {}: {e}",
+            cached.display()
+        ),
+    }
 }
 
 fn keep_in_cache(cached: &Path, archive: &[u8]) -> Result<(), String> {
@@ -166,7 +179,7 @@ fn keep_in_cache(cached: &Path, archive: &[u8]) -> Result<(), String> {
     fs::rename(&partial, cached).map_err(io_error(cached))
 }
 
-fn verified_sha256(source: &LlamaSource, archive: &[u8]) -> Result<String, String> {
+fn verify_sha256(source: &LlamaSource, archive: &[u8]) -> Result<(), String> {
     let actual: String = Sha256::digest(archive)
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -177,7 +190,7 @@ fn verified_sha256(source: &LlamaSource, archive: &[u8]) -> Result<String, Strin
             source.commit, source.sha256
         ));
     }
-    Ok(actual)
+    Ok(())
 }
 
 /// Unpacks next to the tree and swaps it in last, so a failed run never leaves a marked, half-written tree.
@@ -203,6 +216,7 @@ fn unpack_below_top_folder(archive: &[u8], destination: &Path) -> Result<(), Str
         let Some(inside) = path_below_top_folder(&entry_path)? else {
             continue;
         };
+        refuse_special_entry(entry.header().entry_type(), &entry_path)?;
         let target = destination.join(inside);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(io_error(parent))?;
@@ -226,6 +240,22 @@ fn path_below_top_folder(entry_path: &Path) -> Result<Option<PathBuf>, String> {
     }
     let inside: PathBuf = entry_path.components().skip(1).collect();
     Ok((!inside.as_os_str().is_empty()).then_some(inside))
+}
+
+/// Only files and folders are unpacked: a link could carry a later entry outside the tree.
+fn refuse_special_entry(kind: tar::EntryType, entry_path: &Path) -> Result<(), String> {
+    if kind.is_file() || kind.is_dir() {
+        return Ok(());
+    }
+    let what = if kind.is_symlink() || kind.is_hard_link() {
+        "a link".to_string()
+    } else {
+        format!("a {kind:?} entry")
+    };
+    Err(format!(
+        "llama.cpp archive entry {} is {what}",
+        entry_path.display()
+    ))
 }
 
 fn remove_if_present(dir: &Path) -> Result<(), String> {
@@ -644,6 +674,83 @@ mod tests {
         assert!(!tree(&places).exists());
     }
 
+    #[test]
+    fn a_download_with_the_wrong_sha256_is_not_kept_in_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let places = places_in(root.path());
+        let archive = llama_archive();
+        let source = pinned_to(&archive);
+
+        let error = fetch_llama(
+            &source,
+            &places,
+            &RecordingFetcher::serving(b"a captive portal page"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("sha256 mismatch"), "{error}");
+        assert!(!cached_archive(&places).exists());
+        let fetcher = RecordingFetcher::serving(&archive);
+        fetch_llama(&source, &places, &fetcher).unwrap();
+        assert_eq!(fetcher.requests(), vec![source.archive_url()]);
+    }
+
+    #[test]
+    fn a_cached_archive_with_the_wrong_sha256_is_removed_and_named() {
+        let root = tempfile::tempdir().unwrap();
+        let places = places_in(root.path());
+        fs::create_dir_all(&places.cache_dir).unwrap();
+        fs::write(cached_archive(&places), b"a poisoned cache entry").unwrap();
+
+        let error = fetch_llama(
+            &pinned_to(&llama_archive()),
+            &places,
+            &RecordingFetcher::serving(b""),
+        )
+        .unwrap_err();
+
+        let named = format!(
+            "removed the cached archive {}",
+            cached_archive(&places).display()
+        );
+        assert!(error.contains(&named), "{error}");
+        assert!(!cached_archive(&places).exists());
+    }
+
+    #[test]
+    fn a_symlink_entry_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let places = places_in(root.path());
+        let archive = archive_with_link(tar::EntryType::Symlink, "/etc");
+
+        let error = fetch_llama(
+            &pinned_to(&archive),
+            &places,
+            &RecordingFetcher::serving(&archive),
+        )
+        .unwrap_err();
+
+        assert!(error.contains(&format!("{TOP}/link is a link")), "{error}");
+        assert!(!tree(&places).exists());
+    }
+
+    #[test]
+    fn a_hardlink_entry_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let places = places_in(root.path());
+        let archive = archive_with_link(tar::EntryType::Link, &format!("{TOP}/CMakeLists.txt"));
+
+        let error = fetch_llama(
+            &pinned_to(&archive),
+            &places,
+            &RecordingFetcher::serving(&archive),
+        )
+        .unwrap_err();
+
+        assert!(error.contains(&format!("{TOP}/link is a link")), "{error}");
+        assert!(!tree(&places).exists());
+    }
+
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
     }
@@ -825,6 +932,24 @@ mod tests {
         header.set_cksum();
         let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
         builder.append(&header, &b"x"[..]).unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn archive_with_link(kind: tar::EntryType, target: &str) -> Vec<u8> {
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        let mut file = tar::Header::new_gnu();
+        file.set_size(5);
+        file.set_mode(0o644);
+        builder
+            .append_data(&mut file, format!("{TOP}/CMakeLists.txt"), &b"llama"[..])
+            .unwrap();
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(kind);
+        link.set_size(0);
+        link.set_mode(0o777);
+        builder
+            .append_link(&mut link, format!("{TOP}/link"), target)
+            .unwrap();
         builder.into_inner().unwrap().finish().unwrap()
     }
 }
