@@ -48,6 +48,10 @@ export interface VoiceInputOptions {
   onClip: (clip: ComposerClip) => void
   /** Something to tell the user: a refusal, a failure, or why a recording was dropped. */
   notify: (message: string, kind: 'error' | 'info') => void
+  /** True while hands-free voice mode is on. A clip then never waits for the "audio or text?" choice (it goes as text), and the
+   *  recording ends on silence whatever the auto-stop setting says: nobody is there to tap. The saved settings are not
+   *  changed; they apply again the moment the mode is off. */
+  handsFree?: () => boolean
 }
 
 /** A recording shorter than this holds no word: a tap on the button, not a message. */
@@ -135,7 +139,8 @@ export function useVoiceInput(opts: VoiceInputOptions) {
     }
     const { modelHears, sttAvailable: stt } = latest.current
     if (modelHears && stt) {
-      const mode = useVoiceStore.getState().audioMode
+      const stored = useVoiceStore.getState().audioMode
+      const mode = stored === 'ask' && latest.current.handsFree?.() ? 'text' : stored
       if (mode === 'ask') {
         pending.current = clip
         setPendingMs(clip.durationMs)
@@ -196,7 +201,10 @@ export function useVoiceInput(opts: VoiceInputOptions) {
     const mine = ++run.current
     setPhase('starting')
     const { modelHears, sttAvailable: stt } = latest.current
-    const { audioMode, autoStop } = useVoiceStore.getState()
+    const store = useVoiceStore.getState()
+    const handsFree = latest.current.handsFree?.() === true
+    const audioMode = store.audioMode === 'ask' && handsFree ? 'text' : store.audioMode
+    const autoStop = handsFree ? true : store.autoStop
     // whisper loads its model while the user is still talking, unless the clip is certain to go as audio.
     if (stt && !(modelHears && audioMode === 'audio')) warmVoice()
     try {

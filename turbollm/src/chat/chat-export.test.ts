@@ -179,3 +179,10 @@ test('buildSnapshot: omits compaction field entirely when the conversation was n
   const snap = buildSnapshot(conv, makeCfg(), VERSION, EXPORTED_AT, 'export')
   assert.equal(snap.compaction, undefined)
 })
+
+test('buildSnapshot: persona is the chat’s own agent when the daemon kept it, whatever its toolPolicy says', () => {
+  const snap = (over: Parameters<typeof makeConv>[0]) => buildSnapshot(makeConv(over), makeCfg(), VERSION, EXPORTED_AT, 'debug')
+  assert.equal(snap({ chatAgentId: 'writer', toolPolicy: 'force_web_search' }).persona, 'writer')
+  assert.equal(snap({ chatAgentId: 'blank' }).persona, 'blank')
+  assert.equal(snap({ chatAgentId: '', toolPolicy: 'force_web_search' }).persona, 'research', 'an empty id falls back to the guess')
+})

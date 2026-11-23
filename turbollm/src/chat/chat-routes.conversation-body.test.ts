@@ -92,9 +92,7 @@ test('the conversation routes refuse a sampling that is not an object, a list th
       ['preserveThinking', 'no', 'preserveThinking must be a boolean.'],
     ]
     for (const [field, bad, message] of cases) {
-      // allowedTools is chosen when a chat is created; PATCH does not read it.
-      const routes = [['POST', '/api/v1/conversations'], ['PATCH', `/api/v1/conversations/${conv.id}`]] as const
-      for (const [method, url] of field === 'allowedTools' ? routes.slice(0, 1) : routes) {
+      for (const [method, url] of [['POST', '/api/v1/conversations'], ['PATCH', `/api/v1/conversations/${conv.id}`]] as const) {
         const what = `${method} ${field}=${JSON.stringify(bad)}`
         const res = await h.send(method, url, { [field]: bad })
         assert.equal(res.status, 400, `${what}: ${await res.clone().text()}`)
@@ -205,23 +203,128 @@ test('PATCH /conversations/:id reads a null in a field that cannot be cleared as
   }
 })
 
-test('the conversation routes refuse a sampling setting that is not a number, flag, name or list of strings', async () => {
+test('the conversation routes check each sampler setting by key: numbers where the engine wants numbers, a list of strings for stop', async () => {
   const h = harness()
   try {
     const conv = h.store.createConversation({ sampling: { temp: 0.5 } })
-    for (const bad of ['x', { a: 1 }, null, [1], Number.NaN]) {
-      for (const [method, url] of [['POST', '/api/v1/conversations'], ['PATCH', `/api/v1/conversations/${conv.id}`]] as const) {
-        const value = bad === null ? null : bad
-        const res = await h.send(method, url, { sampling: { temp: value, ...(typeof bad === 'string' ? { temp: 0.7 } : {}), topK: bad } })
-        if (typeof bad === 'string') { assert.equal(res.status, method === 'POST' ? 201 : 200, `a string setting is a setting: ${bad}`); continue }
-        assert.equal(res.status, 400, `${method} sampling.topK=${JSON.stringify(bad)}: ${await res.clone().text()}`)
-        assert.match(((await res.json()) as { error: { message: string } }).error.message, /^sampling\.(temp|topK) must be a number, boolean, string or array of strings\.$/)
+    const url = `/api/v1/conversations/${conv.id}`
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ temp: 'hot' }, 'sampling.temp must be a number.'],
+      [{ topK: 'x' }, 'sampling.topK must be a number.'],
+      [{ topP: true }, 'sampling.topP must be a number.'],
+      [{ minP: null }, 'sampling.minP must be a number.'],
+      [{ repeatPenalty: Number.NaN }, 'sampling.repeatPenalty must be a number.'],
+      [{ presencePenalty: [1] }, 'sampling.presencePenalty must be a number.'],
+      [{ stop: 'END' }, 'sampling.stop must be an array of strings.'],
+      [{ stop: [1] }, 'sampling.stop must be an array of strings.'],
+      [{ mirostat: { a: 1 } }, 'sampling.mirostat must be a number, boolean, string or array of strings.'],
+      [{ mirostat: null }, 'sampling.mirostat must be a number, boolean, string or array of strings.'],
+    ]
+    for (const [sampling, message] of cases) {
+      for (const [method, path] of [['POST', '/api/v1/conversations'], ['PATCH', url]] as const) {
+        const res = await h.send(method, path, { sampling })
+        assert.equal(res.status, 400, `${method} ${JSON.stringify(sampling)}: ${await res.clone().text()}`)
+        assert.equal(((await res.json()) as { error: { message: string } }).error.message, message, JSON.stringify(sampling))
       }
     }
-    // The kinds the engine mapping reads (numbers, `stop`, flags) are fine.
-    const ok = await h.send('PATCH', `/api/v1/conversations/${conv.id}`, { sampling: { temp: 0.2, topK: 40, stop: ['</s>'], mirostat: true } })
+    assert.deepEqual(h.store.getConversation(conv.id)!.sampling, { temp: 0.5 }, 'refused bodies changed nothing')
+    // The kinds the engine mapping reads are fine, and a setting it passes through unmapped may be a flag or a name.
+    const ok = await h.send('PATCH', url, { sampling: { temp: 0.2, topK: 40, stop: ['</s>'], mirostat: true, grammar: 'root ::= x' } })
     assert.equal(ok.status, 200)
-    assert.deepEqual(h.store.getConversation(conv.id)!.sampling, { temp: 0.2, topK: 40, stop: ['</s>'], mirostat: true })
+    assert.deepEqual(h.store.getConversation(conv.id)!.sampling, { temp: 0.2, topK: 40, stop: ['</s>'], mirostat: true, grammar: 'root ::= x' })
+  } finally {
+    h.cleanup()
+  }
+})
+
+// Switching the agent of a running chat (the header's agent menu) rewrites what the agent decided at creation: the system
+// prompt, the skills, and the tool allow-list and policy. `null` clears the last two, which a missing key cannot say.
+test('PATCH /conversations/:id sets and clears the tool allow-list and tool policy, and leaves them alone when absent', async () => {
+  const h = harness()
+  try {
+    const conv = h.store.createConversation({ allowedTools: ['web_search'], toolPolicy: 'force_web_search', skillIds: ['s1'] })
+    const url = `/api/v1/conversations/${conv.id}`
+    const read = () => { const c = h.store.getConversation(conv.id)!; return [c.allowedTools, c.toolPolicy, c.skillIds] }
+    assert.equal((await h.send('PATCH', url, { title: 'Renamed' })).status, 200)
+    assert.deepEqual(read(), [['web_search'], 'force_web_search', ['s1']], 'a PATCH that does not mention them leaves them alone')
+    assert.equal((await h.send('PATCH', url, { allowedTools: [], toolPolicy: null })).status, 200)
+    assert.deepEqual(read(), [[], undefined, ['s1']], 'an empty list is "no tools"; null clears the policy')
+    assert.equal((await h.send('PATCH', url, { allowedTools: ['run_code', 'web_search'], toolPolicy: 'force_web_search', skillIds: [] })).status, 200)
+    assert.deepEqual(read(), [['run_code', 'web_search'], 'force_web_search', []])
+    assert.equal((await h.send('PATCH', url, { allowedTools: null })).status, 200)
+    assert.deepEqual(read(), [undefined, 'force_web_search', []], 'null clears the list: every tool is allowed again')
+    // The response carries what was stored.
+    const res = await h.send('PATCH', url, { allowedTools: ['read'], toolPolicy: null })
+    const body = (await res.json()) as { allowedTools?: string[]; toolPolicy?: string }
+    assert.deepEqual([body.allowedTools, body.toolPolicy], [['read'], undefined])
+    for (const bad of ['web_search', [1], {}, true]) {
+      const refused = await h.send('PATCH', url, { allowedTools: bad })
+      assert.equal(refused.status, 400, `allowedTools=${JSON.stringify(bad)}`)
+    }
+    for (const bad of [7, ['x'], {}, true]) {
+      const refused = await h.send('PATCH', url, { toolPolicy: bad })
+      assert.equal(refused.status, 400, `toolPolicy=${JSON.stringify(bad)}`)
+    }
+    assert.deepEqual(read(), [['read'], undefined, []], 'refused bodies changed nothing')
+  } finally {
+    h.cleanup()
+  }
+})
+
+// The chat's agent id is kept on the conversation (not only in the browser), so a switch and any other device agree on it.
+test('a chat keeps its agent id: set on create, changed and cleared by PATCH, refused when not a string, and returned on read', async () => {
+  const h = harness()
+  try {
+    const made = await h.send('POST', '/api/v1/conversations', { chatAgentId: 'research' })
+    assert.equal(made.status, 201)
+    const conv = (await made.json()) as { id: string; chatAgentId?: string }
+    assert.equal(conv.chatAgentId, 'research')
+    assert.equal(h.store.getConversation(conv.id)!.chatAgentId, 'research')
+    const url = `/api/v1/conversations/${conv.id}`
+    assert.equal((await h.send('PATCH', url, { title: 'Renamed' })).status, 200)
+    assert.equal(h.store.getConversation(conv.id)!.chatAgentId, 'research', 'a PATCH that does not mention it leaves it alone')
+    assert.equal((await h.send('PATCH', url, { chatAgentId: 'blank' })).status, 200)
+    assert.equal(((await (await h.app.request(url)).json()) as { chatAgentId?: string }).chatAgentId, 'blank', 'GET returns it')
+    for (const bad of [7, ['x'], {}, true]) {
+      assert.equal((await h.send('PATCH', url, { chatAgentId: bad })).status, 400, `PATCH chatAgentId=${JSON.stringify(bad)}`)
+      assert.equal((await h.send('POST', '/api/v1/conversations', { chatAgentId: bad })).status, 400, `POST chatAgentId=${JSON.stringify(bad)}`)
+    }
+    assert.equal(h.store.getConversation(conv.id)!.chatAgentId, 'blank', 'refused bodies changed nothing')
+    assert.equal((await h.send('PATCH', url, { chatAgentId: null })).status, 200)
+    assert.equal(h.store.getConversation(conv.id)!.chatAgentId, undefined, 'null clears it')
+    const plain = (await (await h.send('POST', '/api/v1/conversations', {})).json()) as { id: string }
+    assert.equal(h.store.getConversation(plain.id)!.chatAgentId, undefined, 'a chat made without one has none (older chats look the same)')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('an empty chatAgentId is refused on create and update, and a routine run’s conversation cannot change its agent', async () => {
+  const h = harness()
+  try {
+    const conv = h.store.createConversation({ chatAgentId: 'blank' })
+    for (const empty of ['', '   ']) {
+      assert.equal((await h.send('POST', '/api/v1/conversations', { chatAgentId: empty })).status, 400, `POST chatAgentId=${JSON.stringify(empty)}`)
+      const res = await h.send('PATCH', `/api/v1/conversations/${conv.id}`, { chatAgentId: empty })
+      assert.equal(res.status, 400, `PATCH chatAgentId=${JSON.stringify(empty)}`)
+      assert.deepEqual(await res.json(), { error: { code: 'invalid_input', message: 'chatAgentId must not be empty.' } })
+    }
+    assert.equal(h.store.getConversation(conv.id)!.chatAgentId, 'blank', 'nothing changed')
+    // null still clears it: that is "no agent", not an empty one.
+    assert.equal((await h.send('PATCH', `/api/v1/conversations/${conv.id}`, { chatAgentId: null })).status, 200)
+    assert.equal(h.store.getConversation(conv.id)!.chatAgentId, undefined)
+
+    // A conversation a routine run made carries that routine's agent id; its tools come from that agent.
+    const run = h.store.createConversation({ agentId: 'agent-1', allowedTools: ['web_search'], toolPolicy: 'force_web_search' })
+    const url = `/api/v1/conversations/${run.id}`
+    for (const body of [{ chatAgentId: 'blank' }, { allowedTools: [] }, { allowedTools: null }, { toolPolicy: null }]) {
+      const res = await h.send('PATCH', url, body)
+      assert.equal(res.status, 409, JSON.stringify(body))
+      assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'routine_conversation')
+    }
+    const after = h.store.getConversation(run.id)!
+    assert.deepEqual([after.allowedTools, after.toolPolicy, after.chatAgentId], [['web_search'], 'force_web_search', undefined], 'refused bodies changed nothing')
+    assert.equal((await h.send('PATCH', url, { title: 'Renamed run' })).status, 200, 'everything else about it can still be edited')
   } finally {
     h.cleanup()
   }

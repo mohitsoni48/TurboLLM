@@ -70,8 +70,8 @@ export function buildSnapshot(
     return entry
   })
 
-  // Derive persona from toolPolicy: force_web_search → 'research', else 'default'.
-  const persona = conv.toolPolicy === 'force_web_search' ? 'research' : 'default'
+  // The chat's own agent when the daemon kept it; for a chat from before that, guess from toolPolicy: force_web_search → 'research', else 'default'.
+  const persona = conv.chatAgentId || (conv.toolPolicy === 'force_web_search' ? 'research' : 'default')
 
   return {
     turbollm_version: version,

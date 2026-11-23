@@ -50,6 +50,7 @@ export default defineConfig({
       // which spins up a vite dev server on 5173) never also collects it: this
       // suite assumes the real daemon on 6996, not a dev-server proxy.
       '**/e2e-onboarding/**',
+      'src/lib/agent-conversation.test.ts',
       'src/lib/argv.test.ts',
       'src/lib/download-subdir.test.ts',
       'src/lib/engine-groups.test.ts',

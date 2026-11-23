@@ -71,7 +71,7 @@ beforeEach(() => {
   tts.voices = []
   tts.speaking = null
   installer.fn = null
-  useVoiceStore.setState({ audioMode: 'ask', autoSend: false, autoStop: true, readAloud: 'off', ttsVoice: '', ttsRate: 1, onlineVoices: false })
+  useVoiceStore.setState({ audioMode: 'ask', autoSend: false, autoStop: true, conversation: false, readAloud: 'off', ttsVoice: '', ttsRate: 1, onlineVoices: false })
 })
 
 describe('formatSize', () => {
@@ -288,6 +288,20 @@ describe('VoiceSection voice messages', () => {
     expect(useVoiceStore.getState().autoStop).toBe(false)
     await userEvent.click(screen.getByRole('checkbox', { name: /Send as soon as I finish/ }))
     expect(useVoiceStore.getState().autoSend).toBe(true)
+  })
+})
+
+describe('VoiceSection voice conversation', () => {
+  it('is off by default, labelled Beta, and writes the store from its checkbox', async () => {
+    render(<VoiceSection />)
+    expect(screen.getByText('Beta')).toBeTruthy()
+    const toggle = screen.getByRole('checkbox', { name: /Hands-free voice conversation/ }) as HTMLInputElement
+    expect(toggle.checked).toBe(false)
+    expect(useVoiceStore.getState().conversation).toBe(false)
+    await userEvent.click(toggle)
+    expect(useVoiceStore.getState().conversation).toBe(true)
+    await userEvent.click(toggle)
+    expect(useVoiceStore.getState().conversation).toBe(false)
   })
 })
 

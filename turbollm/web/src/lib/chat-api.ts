@@ -33,7 +33,7 @@ export function listConversations(q?: string, cursor?: string | null): Promise<C
   return req(`/api/v1/conversations${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`)
 }
 
-export function createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy' | 'skillIds' | 'allowedTools' | 'sampling' | 'preserveThinking'>>): Promise<Conversation> {
+export function createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy' | 'chatAgentId' | 'skillIds' | 'allowedTools' | 'sampling' | 'preserveThinking'>>): Promise<Conversation> {
   return req('/api/v1/conversations', { method: 'POST', json: partial ?? {} })
 }
 
@@ -41,7 +41,14 @@ export function getConversation(id: string): Promise<Conversation> {
   return req(`/api/v1/conversations/${encodeURIComponent(id)}`)
 }
 
-export function updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'skillIds' | 'preserveThinking'>>): Promise<Conversation> {
+/** What PATCH /conversations/:id takes. `allowedTools`, `toolPolicy` and `chatAgentId` accept `null` to clear them (every tool allowed
+ *  again, no policy): undefined is dropped by JSON, so only null can say it. */
+export type ConversationPatch = Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'skillIds' | 'preserveThinking'>> & {
+  allowedTools?: string[] | null
+  toolPolicy?: string | null
+  chatAgentId?: string | null
+}
+export function updateConversation(id: string, patch: ConversationPatch): Promise<Conversation> {
   return req(`/api/v1/conversations/${encodeURIComponent(id)}`, { method: 'PATCH', json: patch })
 }
 
@@ -89,6 +96,11 @@ export function deleteMessage(convId: string, msgId: string): Promise<{ ok: true
 
 export function regenerate(convId: string): Promise<{ ok: true }> {
   return req(`/api/v1/conversations/${encodeURIComponent(convId)}/regenerate`, { method: 'POST', json: {} })
+}
+
+/** A new chat with this one's settings and its history up to and including `messageId` (GitHub issue 323). */
+export function forkConversation(convId: string, messageId: string): Promise<Conversation> {
+  return req(`/api/v1/conversations/${encodeURIComponent(convId)}/fork`, { method: 'POST', json: { messageId } })
 }
 
 // ── Compaction (ADR-420) ─────────────────────────────────────────────────────

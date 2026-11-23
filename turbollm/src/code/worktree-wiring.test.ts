@@ -39,7 +39,10 @@ const OPERATIONAL_CALLS = [
  *   - `if (!run.repoRoot)` guards (does this session have a repo at all?)
  *   - `removeSessionWorktree(run.repoRoot, …)` — `git worktree remove` MUST run from the base repo (called
  *     as `removeWorktree(…)`, the delete route's seam for its tests)
- *   - the `run.worktreePath && run.repoRoot` guard that precedes it */
+ *   - the `run.worktreePath && run.repoRoot` guard that precedes it
+ *   - the fork route (GitHub #323): its new session's project (`repoRoot: run.repoRoot,` in createAgentRun), the
+ *     fork's own worktree made from the base repo (`createSessionWorktree({ repoRoot: run.repoRoot`), and the cleanup
+ *     of a fork that failed (`git branch -D` of its new branch, from the base repo), with the guards before them */
 function isLegitimateRepoRootUse(line: string): boolean {
   const t = line.trim()
   return (
@@ -48,7 +51,12 @@ function isLegitimateRepoRootUse(line: string): boolean {
     t.startsWith('hasAgentsMd: run.repoRoot') ||
     t.includes('removeSessionWorktree(run.repoRoot') ||
     t.includes('removeWorktree(run.repoRoot') ||
-    t.startsWith('if (run.worktreePath && run.repoRoot)')
+    t.startsWith('if (run.worktreePath && run.repoRoot)') ||
+    t.startsWith('if (run.worktreePath && run.worktreeBranch && run.repoRoot)') ||
+    t.startsWith('if (worktreePath && run.repoRoot)') ||
+    t.includes('createSessionWorktree({ repoRoot: run.repoRoot') ||
+    t === 'repoRoot: run.repoRoot,' ||
+    t.includes("runGit(run.repoRoot, ['branch', '-D'")
   )
 }
 

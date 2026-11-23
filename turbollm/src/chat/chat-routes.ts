@@ -370,7 +370,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/conversations', async (c) => {
-    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; skillIds?: string[]; allowedTools?: string[]; sampling?: Record<string, number>; preserveThinking?: boolean }>(c)
+    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; chatAgentId?: string; skillIds?: string[]; allowedTools?: string[]; sampling?: Record<string, number>; preserveThinking?: boolean }>(c)
     const bad = conversationBodyError(b, CREATE_FIELDS)
     if (bad) return err(c, 400, 'invalid_input', bad)
     // Only keep ids that exist in the shared skill library; silently drop unknown ones.
@@ -383,7 +383,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const allowedTools = Array.isArray(b.allowedTools) ? b.allowedTools.filter((t) => typeof t === 'string') : undefined
     const sampling = (b.sampling && typeof b.sampling === 'object') ? b.sampling : undefined
     const preserveThinking = typeof b.preserveThinking === 'boolean' ? b.preserveThinking : undefined
-    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy, skillIds, allowedTools, sampling, preserveThinking })
+    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy, chatAgentId: b.chatAgentId, skillIds, allowedTools, sampling, preserveThinking })
     return c.json(conv, 201)
   })
 
@@ -434,9 +434,14 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.patch('/api/v1/conversations/:id', async (c) => {
-    const b = await body<{ title?: string; systemPrompt?: string; sampling?: Record<string, unknown>; skillIds?: string[]; preserveThinking?: boolean }>(c)
+    const b = await body<{ title?: string; systemPrompt?: string; toolPolicy?: string | null; allowedTools?: string[] | null; chatAgentId?: string | null; sampling?: Record<string, unknown>; skillIds?: string[]; preserveThinking?: boolean }>(c)
     const bad = conversationBodyError(b, PATCH_FIELDS)
     if (bad) return err(c, 400, 'invalid_input', bad)
+    // A routine run's chat takes its tools from the routine's agent (routines/chat-runner.ts), so changing its agent, tool list or
+    // tool policy here would change only what the page shows: refuse it rather than pretend.
+    if (['chatAgentId', 'allowedTools', 'toolPolicy'].some((f) => (b as Record<string, unknown>)[f] !== undefined) && db.getConversation(c.req.param('id'))?.agentId) {
+      return err(c, 409, 'routine_conversation', 'This conversation belongs to a routine run. Its tools come from the routine\u2019s agent, so its agent cannot be switched here.')
+    }
     const patch = patchFields(b)
     if (Array.isArray(patch.skillIds)) {
       const validIds = new Set(new SkillStore(d.store.dir()).list().map((s) => s.id))
@@ -979,6 +984,25 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // it sends /continue { regenerate: true }, which deactivates only once the turn can run.
     if (last?.role === 'assistant') db.deactivateMessage(last.id)
     return c.json({ ok: true })
+  })
+
+  // Fork (GitHub #323): a new chat with this one's settings and its shown history up to and including `messageId`
+  // (ConversationStore.forkConversation). Not from the reply being written: its text is not saved yet, so the copy
+  // would hold a placeholder. A Code session forks through its own route (code-routes.ts), which also makes it a
+  // session; a bare copy of its conversation here would be a Code chat no session points at.
+  app.post('/api/v1/conversations/:id/fork', async (c) => {
+    const convId = c.req.param('id')
+    const b = await body<{ messageId?: unknown }>(c)
+    if (typeof b.messageId !== 'string' || !b.messageId) return err(c, 400, 'invalid_input', 'messageId is required.')
+    const conv = db.getConversation(convId)
+    if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
+    if (conv.kind === 'code') return err(c, 400, 'invalid_input', 'Fork a Code session from the Code screen.')
+    if (d.chatTurns.slotState(convId).runningReplyId === b.messageId) {
+      return err(c, 409, 'generation_in_flight', 'This reply is still being written. Wait for it to finish, or fork from an earlier message.')
+    }
+    const r = db.forkConversation(convId, b.messageId)
+    if (!r.ok) return err(c, 404, 'not_found', r.reason === 'conversation_not_found' ? 'Conversation not found.' : 'That message is not in this chat.')
+    return c.json(r.conversation, 201)
   })
 
   // Chat branching: list all siblings (active + inactive) for the ‹ 1/2 › switcher UI.
