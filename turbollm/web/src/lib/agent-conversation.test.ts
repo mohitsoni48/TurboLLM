@@ -122,3 +122,24 @@ test('conversationAfterSwitch: a field the switch cleared is cleared in the open
   const toBlank = conversationAfterSwitch(old, { chatAgentId: 'blank', systemPrompt: '', allowedTools: [], skillIds: [] })
   assert.deepEqual([toBlank.allowedTools, toBlank.toolPolicy], [[], undefined])
 })
+
+test('promptLooksCustomised: multiline custom instructions remain one generated block', () => {
+  const personalization = { assistantName: 'Ada', userName: 'Sam', customInstructions: 'Be brief.\n\nUse examples.\n\nAvoid jargon.' }
+  for (const id of ['concise', 'expert']) {
+    const generated = buildAgentConfig(id, byId(id), personalization, {
+      memoryFacts: ['likes tea'],
+      hardware: hardwareSection({ gpus: [], ramMB: 8192, os: 'linux' }),
+    }).systemPrompt
+    assert.equal(promptLooksCustomised(generated, id, byId(id), personalization), false)
+    assert.equal(promptLooksCustomised(`${generated}\n\nAnswer in French.`, id, byId(id), personalization), true)
+    assert.equal(promptLooksCustomised(generated.replace('Use examples.', 'Use diagrams.'), id, byId(id), personalization), true)
+  }
+})
+
+test('promptLooksCustomised: a custom-instruction prefix never hides appended edits', () => {
+  const personalization = { assistantName: '', userName: '', customInstructions: 'Be brief.\n\nUse examples.' }
+  const generated = buildAgentConfig('concise', byId('concise'), personalization).systemPrompt
+  assert.equal(promptLooksCustomised(generated, 'concise', byId('concise'), personalization), false)
+  assert.equal(promptLooksCustomised(`${generated} Answer in French.`, 'concise', byId('concise'), personalization), true)
+  assert.equal(promptLooksCustomised(`${generated}\nAnswer in French.`, 'concise', byId('concise'), personalization), true)
+})
