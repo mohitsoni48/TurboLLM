@@ -9,6 +9,20 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../lib/api'
 import { toast } from '../components/ui/sonner'
 import type { ChatSseEvent } from '../lib/chat-types'
+import type { VoiceInputOptions } from './chat/useVoiceInput'
+import { useVoiceStore } from '../stores/voice'
+
+let voiceOptions: VoiceInputOptions
+vi.mock('./chat/useVoiceInput', () => ({
+  useVoiceInput: (options: VoiceInputOptions) => {
+    voiceOptions = options
+    return {
+      phase: 'idle', block: null, startedAt: null, pendingMs: 0,
+      meter: { subscribe: () => () => {}, level: () => 0 },
+      start: vi.fn(), stop: vi.fn(), cancel: vi.fn(), choose: vi.fn(),
+    }
+  },
+}))
 
 beforeEach(() => {
   const store = new Map<string, string>()
@@ -717,4 +731,26 @@ describe('ChatScreen — streaming a reply', () => {
     // row alone would add one call per token).
     expect(mutationHookCalls / TOKENS).toBeLessThan(5)
   })
+})
+
+
+it('keeps hands-free speech and reports a refusal when a reply is already live', async () => {
+  nextGen = hangingStream()
+  const toastError = vi.spyOn(toast, 'error')
+  useVoiceStore.setState({ conversation: true })
+  try {
+    await renderScreen('/chat/c1')
+    act(() => {
+      const button = screen.getAllByRole('button', { name: /Start a voice conversation/ })[0]
+      fireEvent.click(button)
+    })
+    await sendText('start a reply')
+    await screen.findByTitle('Stop generation (Esc)')
+    act(() => voiceOptions.onText('keep this spoken text'))
+    expect(await composer()).toHaveValue('keep this spoken text')
+    expect(toastError).toHaveBeenCalledWith('Wait for the current reply to finish, or stop it before sending.')
+  } finally {
+    useVoiceStore.setState({ conversation: false })
+    toastError.mockRestore()
+  }
 })

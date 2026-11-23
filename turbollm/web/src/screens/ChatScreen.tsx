@@ -852,7 +852,15 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     lastSendStarted.current = false
     const rawText = (overrideInput ?? input).trim()
     const outgoing = overrideAttachments ?? attachments
-    if ((!rawText && outgoing.length === 0) || live) return
+    if (!rawText && outgoing.length === 0) return
+    if (live) {
+      // Voice input may arrive after a reply became live. Keep the spoken text or
+      // clip in the composer instead of dropping it without an explanation.
+      setInput(rawText)
+      setAttachments(outgoing)
+      toast.error('Wait for the current reply to finish, or stop it before sending.')
+      return
+    }
     if (!ready) { toast.error('Load a model first.'); return }
 
     // `/compact` — a composer command, not a real turn: it never reaches the engine as a
