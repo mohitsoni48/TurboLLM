@@ -1058,6 +1058,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "turbollm-engine"
+version = "1.15.2"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "turbollm-ffi"
 version = "1.15.2"
 dependencies = [
