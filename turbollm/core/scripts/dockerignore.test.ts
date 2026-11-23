@@ -12,6 +12,7 @@ const RUST_BUILD_TREE = [
   'turbollm/core/target',
   'turbollm/core/fixtures/gguf/.corpus-cache',
   'turbollm/core/bindings/android/**/build',
+  'turbollm/core/bindings/android/**/.cxx',
   'turbollm/core/bindings/android/.gradle',
   'turbollm/core/bindings/node/*.node',
 ]
