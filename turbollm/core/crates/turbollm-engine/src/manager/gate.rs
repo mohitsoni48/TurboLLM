@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
-use crate::error::{EngineError, MODEL_UNLOADED};
+use crate::error::EngineError;
 
 /// Called whenever `busy` or `queued` may have changed; it feeds the manager's snapshot.
 pub type OccupancyListener = Box<dyn Fn() + Send + Sync>;
@@ -58,7 +58,7 @@ impl GenerationGate {
     pub async fn acquire(&self) -> Result<GatePermit, EngineError> {
         let slot = match Arc::clone(&self.permits).try_acquire_owned() {
             Ok(slot) => slot,
-            Err(TryAcquireError::Closed) => return Err(unloaded()),
+            Err(TryAcquireError::Closed) => return Err(EngineError::queued_request_unloaded()),
             Err(TryAcquireError::NoPermits) => self.wait_in_queue().await?,
         };
         self.occupancy.changed();
@@ -99,7 +99,7 @@ impl GenerationGate {
         Arc::clone(&self.permits)
             .acquire_owned()
             .await
-            .map_err(|_closed| unloaded())
+            .map_err(|_closed| EngineError::queued_request_unloaded())
     }
 
     fn join_queue(&self) -> Result<QueuedRequest<'_>, EngineError> {
@@ -145,13 +145,10 @@ impl Occupancy {
     }
 }
 
-fn unloaded() -> EngineError {
-    EngineError::ModelNotLoaded(MODEL_UNLOADED.to_owned())
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::error::MODEL_UNLOADED;
     use std::sync::Mutex;
     use tokio::task::JoinHandle;
 

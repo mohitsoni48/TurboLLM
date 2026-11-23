@@ -43,6 +43,25 @@ pub enum EngineError {
     Closed,
 }
 
+/// The contract errors built in more than one place, one constructor each (PG-10: a queued request
+/// and a running generation read the same text through different variants).
+impl EngineError {
+    /// A request that waited at the gate of a model an unload removed (`EngineHost.kt:165`, E-6).
+    pub fn queued_request_unloaded() -> EngineError {
+        EngineError::ModelNotLoaded(MODEL_UNLOADED.to_owned())
+    }
+
+    /// A generation that was running when its model was unloaded (E-9).
+    pub fn generation_cancelled_by_unload() -> EngineError {
+        EngineError::Cancelled(MODEL_UNLOADED.to_owned())
+    }
+
+    /// A reply stopped because its caller cancelled it or went away.
+    pub fn reply_cancelled() -> EngineError {
+        EngineError::Cancelled(REPLY_CANCELLED.to_owned())
+    }
+}
+
 /// Why a request is invalid, where a client branches on it (ADR-462).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidReason {
@@ -58,19 +77,25 @@ mod tests {
 
     #[test]
     fn a_cancelled_reply_reads_as_the_kotlin_text() {
-        let error = EngineError::Cancelled(REPLY_CANCELLED.to_owned());
+        let error = EngineError::reply_cancelled();
+        assert_eq!(error, EngineError::Cancelled(REPLY_CANCELLED.to_owned()));
         assert_eq!(error.to_string(), "The reply was cancelled.");
     }
 
     #[test]
     fn a_waiter_on_an_unloaded_model_reads_as_the_kotlin_text() {
-        let error = EngineError::ModelNotLoaded(MODEL_UNLOADED.to_owned());
+        let error = EngineError::queued_request_unloaded();
+        assert_eq!(
+            error,
+            EngineError::ModelNotLoaded(MODEL_UNLOADED.to_owned())
+        );
         assert_eq!(error.to_string(), "The model was unloaded.");
     }
 
     #[test]
     fn a_generation_cancelled_by_an_unload_reads_as_the_kotlin_text() {
-        let error = EngineError::Cancelled(MODEL_UNLOADED.to_owned());
+        let error = EngineError::generation_cancelled_by_unload();
+        assert_eq!(error, EngineError::Cancelled(MODEL_UNLOADED.to_owned()));
         assert_eq!(error.to_string(), "The model was unloaded.");
     }
 

@@ -15,7 +15,7 @@ use crate::descriptor::{EngineDescriptor, ModelInfo};
 use crate::engine::{
     AbortHook, AbortSignal, BoxFuture, Engine, EventStream, LoadControl, LoadedModel, StallPolicy,
 };
-use crate::error::{EngineError, MODEL_UNLOADED};
+use crate::error::EngineError;
 use crate::manager::GatePermit;
 use crate::request::{GenerateRequest, LoadSpec};
 
@@ -118,7 +118,7 @@ impl LoadedModel for InProcessModel {
         };
         self.commands
             .send(generate)
-            .map_err(|_| EngineError::ModelNotLoaded(MODEL_UNLOADED.to_owned()))?;
+            .map_err(|_| EngineError::queued_request_unloaded())?;
         Ok(stream)
     }
 

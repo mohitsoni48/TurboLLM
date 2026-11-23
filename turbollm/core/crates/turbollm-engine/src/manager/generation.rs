@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::engine::{AbortSignal, EventStream};
-use crate::error::{EngineError, MODEL_UNLOADED, REPLY_CANCELLED};
+use crate::error::EngineError;
 use crate::event::EngineEvent;
 
 /// No Kotlin text exists for this: the stream ended without `Done` and nobody cancelled it (the
@@ -34,11 +34,11 @@ impl Generation {
             return Ok(None);
         }
         if self.registration.cancelled_by_unload() {
-            return self.end(Err(unloaded()));
+            return self.end(Err(EngineError::generation_cancelled_by_unload()));
         }
         let item = std::future::poll_fn(|cx| self.events.as_mut().poll_next(cx)).await;
         if self.registration.cancelled_by_unload() {
-            return self.end(Err(unloaded()));
+            return self.end(Err(EngineError::generation_cancelled_by_unload()));
         }
         match item {
             Some(Ok(done @ EngineEvent::Done { .. })) => self.end(Ok(Some(done))),
@@ -66,7 +66,7 @@ impl Generation {
     /// A cancelled reply may lose the engine's own `Cancelled` once its stream is closed.
     fn stopped_before_done(&self) -> EngineError {
         if self.registration.active.abort.is_aborted() {
-            EngineError::Cancelled(REPLY_CANCELLED.to_owned())
+            EngineError::reply_cancelled()
         } else {
             EngineError::EngineFailure(ENGINE_STOPPED_MID_REPLY.to_owned())
         }
@@ -100,10 +100,6 @@ impl GenerationCanceller {
             self.active.abort.abort();
         }
     }
-}
-
-fn unloaded() -> EngineError {
-    EngineError::Cancelled(MODEL_UNLOADED.to_owned())
 }
 
 /// The generations running on one resident model.

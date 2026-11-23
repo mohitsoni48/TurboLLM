@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use crate::catalog::Catalog;
 use crate::descriptor::LoadedModelInfo;
 use crate::engine::LoadedModel;
-use crate::error::{EngineError, MODEL_UNLOADED};
+use crate::error::EngineError;
 use crate::ids::EngineKind;
 use crate::request::{GenerateRequest, LoadTarget};
 
@@ -207,7 +207,7 @@ impl EngineManager {
         else {
             drop(resident);
             drop(permit);
-            return Err(EngineError::ModelNotLoaded(MODEL_UNLOADED.to_owned()));
+            return Err(EngineError::queued_request_unloaded());
         };
         let registration = serving.generations.register();
         let events = serving

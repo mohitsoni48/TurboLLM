@@ -10,7 +10,7 @@ use turbollm_platform::HostFacts;
 
 use crate::descriptor::{Backend, EngineDescriptor, ModelInfo};
 use crate::engine::{AbortHook, AbortSignal, LoadControl, StallPolicy};
-use crate::error::{EngineError, REPLY_CANCELLED};
+use crate::error::EngineError;
 use crate::event::EngineEvent;
 use crate::ids::{EngineId, EngineKind, ModelFormat};
 use crate::inprocess::{EventSink, NativeBackend, NativeModel};
@@ -276,7 +276,7 @@ impl ScriptedModel {
 
     fn aborted(&self) -> EngineError {
         self.record.note("aborted");
-        EngineError::Cancelled(REPLY_CANCELLED.to_owned())
+        EngineError::reply_cancelled()
     }
 }
 
