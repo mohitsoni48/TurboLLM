@@ -1085,6 +1085,7 @@ dependencies = [
  "futures-core",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "turbollm-platform",

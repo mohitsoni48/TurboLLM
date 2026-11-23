@@ -265,3 +265,32 @@ fn scripted_model_info() -> ModelInfo {
         notes: Vec::new(),
     }
 }
+
+/// Test time for the core runtime: tokio's clock, paused, moved forward only by `advance`.
+/// Needs a current-thread runtime (`#[tokio::test]`).
+pub struct FakeClock {
+    _paused: (),
+}
+
+/// Yields enough times for a task woken by the last step to run and park again.
+const SETTLE_YIELDS: usize = 8;
+
+impl FakeClock {
+    pub fn paused() -> FakeClock {
+        tokio::time::pause();
+        FakeClock { _paused: () }
+    }
+
+    /// Moves the clock forward and lets every task woken by it run.
+    pub async fn advance(&self, by: Duration) {
+        tokio::time::advance(by).await;
+        self.settle().await;
+    }
+
+    /// Lets every task that is ready run before the test looks at what they did.
+    pub async fn settle(&self) {
+        for _ in 0..SETTLE_YIELDS {
+            tokio::task::yield_now().await;
+        }
+    }
+}
