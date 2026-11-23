@@ -2,7 +2,11 @@
 //! its caller stops waiting (arch 2.3.5 "`run` future dropped": the open is aborted or finishes, any
 //! model it got is closed, the journal is cleared, and only then is the lifecycle released).
 
+use std::future::{Future, poll_fn};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
+use std::pin::pin;
+use std::task::Poll;
 
 use tokio::sync::OwnedMutexGuard;
 use turbollm_platform::default_thread_count;
@@ -11,11 +15,15 @@ use crate::descriptor::LoadedModelInfo;
 use crate::engine::{AbortSignal, Engine, LoadControl, LoadedModel};
 use crate::error::EngineError;
 use crate::ids::EngineKind;
+use crate::inprocess::panic_message;
 use crate::manager::{EngineManager, EngineState, LoadJournal, StallWatch, under_lifecycle};
 use crate::request::{LoadSpec, LoadTarget};
 
 /// What an abandoned load ends with; its caller is gone, so nobody reads it.
 const LOAD_ABANDONED: &str = "The load was abandoned: its caller stopped waiting.";
+
+/// What a load that panicked without a message fails with.
+const LOAD_PANICKED: &str = "The engine panicked while loading the model.";
 
 impl EngineManager {
     /// Loads `target` in a task that keeps `lifecycle` until the load fully ended. `abandoned` is
@@ -39,7 +47,9 @@ impl EngineManager {
         target: &LoadTarget,
         abandoned: &AbortSignal,
     ) -> Result<LoadedModelInfo, EngineError> {
-        let loaded = self.load(target, abandoned).await;
+        let loaded = catching_panics(self.load(target, abandoned))
+            .await
+            .unwrap_or_else(|message| Err(EngineError::ModelLoadFailed(message)));
         match &loaded {
             _ if abandoned.is_aborted() => self.show_resident_or_idle(),
             Err(failure) => self.publish_failed(target, failure),
@@ -133,6 +143,21 @@ impl EngineManager {
             reason,
         }
     }
+}
+
+/// Runs `work` to its end, or to a panic inside it, answered with the panic's text. Whatever the
+/// work held is dropped before this returns, so a panicked load still clears its journal record
+/// before the lifecycle is released (PG-4).
+async fn catching_panics<T>(work: impl Future<Output = T>) -> Result<T, String> {
+    let mut work = pin!(work);
+    poll_fn(
+        |cx| match panic::catch_unwind(AssertUnwindSafe(|| work.as_mut().poll(cx))) {
+            Ok(Poll::Ready(done)) => Poll::Ready(Ok(done)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(payload) => Poll::Ready(Err(panic_message(payload, LOAD_PANICKED))),
+        },
+    )
+    .await
 }
 
 /// The crash journal record of one load, cleared however the load ends (E-34). A record that

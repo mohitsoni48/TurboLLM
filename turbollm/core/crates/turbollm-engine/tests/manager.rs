@@ -12,11 +12,12 @@ use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use turbollm_engine::testing::{FakeClock, ScriptRecord, ScriptedBackend, Step};
 use turbollm_engine::{
-    Availability, Backend, Catalog, CatalogEntry, ChatMessage, Engine, EngineDescriptor,
+    Availability, Backend, BoxFuture, Catalog, CatalogEntry, ChatMessage, Engine, EngineDescriptor,
     EngineError, EngineEvent, EngineId, EngineKind, EngineManager, EngineState, FinishReason,
-    GenerateRequest, GenerationParams, InProcess, InvalidReason, LoadClaim, LoadJournal, LoadSpec,
-    LoadTarget, LoadedModelInfo, MODEL_NOT_LOADED, MODEL_UNLOADED, ManagerConfig, MessageContent,
-    ModelFormat, ModelInfo, ModelRef, PlatformKind, PlatformKinds, REPLY_CANCELLED, Role,
+    GenerateRequest, GenerationParams, InProcess, InvalidReason, LoadClaim, LoadControl,
+    LoadJournal, LoadSpec, LoadTarget, LoadedModel, LoadedModelInfo, MODEL_NOT_LOADED,
+    MODEL_UNLOADED, ManagerConfig, MessageContent, ModelFormat, ModelInfo, ModelRef, PlatformKind,
+    PlatformKinds, REPLY_CANCELLED, Role, StallPolicy,
 };
 use turbollm_platform::HostFacts;
 
@@ -619,6 +620,81 @@ async fn a_load_whose_open_panics_ends_failed_with_the_panic_message() {
         f.state(),
         EngineState::Failed(installed("org/repo/a"), failure)
     );
+}
+
+/// An engine whose load panics in the manager's load task itself, not on an engine thread.
+struct PanickingLoader {
+    descriptor: EngineDescriptor,
+}
+
+const LOADER_PANIC: &str = "the loader crashed";
+
+impl Engine for PanickingLoader {
+    fn descriptor(&self) -> &EngineDescriptor {
+        &self.descriptor
+    }
+
+    fn probe(&self, _host: &HostFacts) -> Option<String> {
+        None
+    }
+
+    fn stall_policy(&self) -> StallPolicy {
+        StallPolicy::Watch
+    }
+
+    fn load(
+        &self,
+        _spec: LoadSpec,
+        _ctl: LoadControl,
+    ) -> BoxFuture<Result<Box<dyn LoadedModel>, EngineError>> {
+        Box::pin(async { panic!("{LOADER_PANIC}") })
+    }
+}
+
+fn panicking_loader_fixture() -> Fixture {
+    let mut f = Setup::of_all(Vec::new()).build();
+    let engine: Arc<dyn Engine> = Arc::new(PanickingLoader {
+        descriptor: descriptor(
+            EngineId::LLAMA_CPP_CPU,
+            EngineKind::LlamaCpp,
+            ModelFormat::Gguf,
+        ),
+    });
+    let catalog = Catalog::new(HostFacts::detect()).with_entry(CatalogEntry {
+        descriptor: engine.descriptor().clone(),
+        per_platform: in_process_everywhere(),
+        engine,
+    });
+    f.manager = EngineManager::new(ManagerConfig {
+        catalog,
+        journal: Some(LoadJournal::new(f.journal_file(), "core-a")),
+        predecessor: None,
+        stall: SDK_STALL,
+        max_queued: SDK_QUEUE,
+        cache_dir: f.dir.path().join("cache"),
+    });
+    f
+}
+
+#[tokio::test]
+async fn a_load_task_that_panics_ends_failed_with_the_journal_cleared_and_the_lifecycle_free() {
+    let f = panicking_loader_fixture();
+    let claim = f.claim("org/repo/a");
+
+    let outcome = tokio::spawn(claim.run()).await;
+
+    let failure = model_load_failed(LOADER_PANIC);
+    assert_eq!(
+        outcome.ok(),
+        Some(Err(failure.clone())),
+        "run answers the panic"
+    );
+    assert_eq!(
+        f.state(),
+        EngineState::Failed(installed("org/repo/a"), failure)
+    );
+    assert!(!f.journal_file().exists(), "journal after the panic");
+    assert!(f.manager.claim_load(f.target("org/repo/b")).is_ok());
 }
 
 #[tokio::test]
