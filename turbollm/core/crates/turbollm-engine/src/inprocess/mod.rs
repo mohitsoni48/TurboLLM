@@ -366,6 +366,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_generate_that_panics_ends_its_reply_with_an_engine_failure_and_the_model_serves_on()
+    {
+        let script = vec![Step::Emit(prefilled()), Step::Panic("the sampler broke")];
+        let (model, record) = load(ScriptedBackend::new(script)).await;
+        let panicked = EngineError::EngineFailure("the sampler broke".to_owned());
+
+        for _ in 0..2 {
+            let (_gate, permit) = one_slot_gate().await;
+            let mut stream = model
+                .generate(request(), permit, AbortSignal::new())
+                .unwrap();
+            assert_eq!(
+                drain(&mut stream).await,
+                [Ok(prefilled()), Err(panicked.clone())]
+            );
+        }
+        model.close().await;
+
+        assert!(has(&record, "close"), "{:?}", record.history());
+    }
+
+    #[tokio::test]
     async fn an_abort_runs_the_models_hook_and_ends_the_stream() {
         let script = vec![
             Step::Emit(prefilled()),

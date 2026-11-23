@@ -47,6 +47,10 @@ pub struct Stats {
 #[derive(Debug)]
 pub struct Session(NonNull<c_void>);
 
+// SAFETY: a `tl_session` has no thread affinity; the library needs only that no two calls on it run
+// at once, which `&mut Session` and ownership enforce. `Session` is deliberately not `Sync`.
+unsafe impl Send for Session {}
+
 impl Session {
     /// # Safety
     /// `session` must be what the same table's `load` returned, not yet freed.

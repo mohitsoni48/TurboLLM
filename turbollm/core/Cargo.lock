@@ -1365,7 +1365,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "turbollm-engine",
+ "turbollm-gguf",
  "turbollm-platform",
 ]
 
