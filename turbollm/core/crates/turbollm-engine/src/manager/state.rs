@@ -56,6 +56,12 @@ impl Snapshots {
         self.current.borrow().state == EngineState::Closed
     }
 
+    /// How many waits on these snapshots are parked right now.
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn parked_waiters(&self) -> usize {
+        self.current.receiver_count()
+    }
+
     /// The first snapshot whose revision is above `revision`.
     pub(super) async fn after(&self, revision: u64) -> Snapshot {
         self.first_matching(|snapshot| snapshot.revision > revision)

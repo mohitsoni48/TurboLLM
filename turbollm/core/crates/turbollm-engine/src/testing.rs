@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use turbollm_platform::HostFacts;
@@ -57,6 +57,7 @@ enum OpenPause {
     None,
     HeedingAbort(Duration),
     IgnoringAbort(Duration),
+    Held(OpenGate),
 }
 
 enum OpenOutcome {
@@ -94,6 +95,12 @@ impl ScriptedBackend {
     /// Makes the open take this long whatever happens to the load meanwhile.
     pub fn with_unabortable_open_pause(mut self, pause: Duration) -> ScriptedBackend {
         self.open_pause = OpenPause::IgnoringAbort(pause);
+        self
+    }
+
+    /// Makes the open wait until the test releases `gate`.
+    pub fn with_held_open(mut self, gate: &OpenGate) -> ScriptedBackend {
+        self.open_pause = OpenPause::Held(gate.clone());
         self
     }
 
@@ -163,13 +170,17 @@ impl NativeBackend for ScriptedBackend {
 
 impl ScriptedBackend {
     fn pause_open(&self, abort: &AbortSignal) -> Result<(), EngineError> {
-        match self.open_pause {
+        match &self.open_pause {
             OpenPause::None => Ok(()),
             OpenPause::IgnoringAbort(pause) => {
-                std::thread::sleep(pause);
+                std::thread::sleep(*pause);
                 Ok(())
             }
-            OpenPause::HeedingAbort(pause) if pause_unless_aborted(pause, abort) => Ok(()),
+            OpenPause::Held(gate) => {
+                gate.wait();
+                Ok(())
+            }
+            OpenPause::HeedingAbort(pause) if pause_unless_aborted(*pause, abort) => Ok(()),
             OpenPause::HeedingAbort(_) => {
                 self.record.note("open aborted");
                 Err(EngineError::Cancelled(SCRIPTED_OPEN_ABORTED.to_owned()))
@@ -279,6 +290,32 @@ fn pause_unless_aborted(pause: Duration, abort: &AbortSignal) -> bool {
         std::thread::sleep(PAUSE_SLICE);
     }
     !abort.is_aborted()
+}
+
+/// Holds a scripted open until the test releases it, so a test decides when the open ends.
+#[derive(Clone, Default)]
+pub struct OpenGate {
+    released: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl OpenGate {
+    pub fn new() -> OpenGate {
+        OpenGate::default()
+    }
+
+    pub fn release(&self) {
+        let (released, wake) = &*self.released;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+    }
+
+    fn wait(&self) {
+        let (released, wake) = &*self.released;
+        let mut is_released = released.lock().unwrap();
+        while !*is_released {
+            is_released = wake.wait(is_released).unwrap();
+        }
+    }
 }
 
 /// What a `ScriptedBackend` saw, shared with the test that drives it.

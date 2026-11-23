@@ -182,7 +182,7 @@ mod tests {
     use std::time::Instant;
 
     use tempfile::TempDir;
-    use turbollm_engine::testing::{ScriptedBackend, Step};
+    use turbollm_engine::testing::{OpenGate, ScriptedBackend, Step};
     use turbollm_engine::{
         Availability, Backend, ChatMessage, EngineDescriptor, EngineKind, EngineState,
         GenerateRequest, GenerationParams, InProcess, LoadJournal, LoadTarget, MessageContent,
@@ -298,7 +298,10 @@ mod tests {
         .unwrap();
 
         let loading = start_load(&successor, dir.path(), "org/repo/b");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_until_async("the successor to wait on its predecessor", || {
+            predecessor.manager().parked_snapshot_waiters() == 1
+        })
+        .await;
         assert!(
             successor_record.history().is_empty(),
             "no open before the predecessor closed"
@@ -401,21 +404,32 @@ mod tests {
     async fn two_handles_on_one_journal_never_clear_each_others_record() {
         let dir = TempDir::new().unwrap();
         let journal = LoadJournal::path_in(dir.path());
-        let quick = backend().with_open_pause(Duration::from_millis(150));
-        let slow = backend().with_open_pause(Duration::from_millis(900));
-        let first = engines_of(config_in(dir.path()), vec![scripted(quick)]);
-        let second = engines_of(config_in(dir.path()), vec![scripted(slow)]);
+        let (first_open, second_open) = (OpenGate::new(), OpenGate::new());
+        let first = engines_of(
+            config_in(dir.path()),
+            vec![scripted(backend().with_held_open(&first_open))],
+        );
+        let second = engines_of(
+            config_in(dir.path()),
+            vec![scripted(backend().with_held_open(&second_open))],
+        );
 
         let first_load = start_load(&first, dir.path(), "org/repo/a");
         wait_until_async("the first load is journalled", || journal.exists()).await;
+        let first_record = std::fs::read_to_string(&journal).unwrap();
         let second_load = start_load(&second, dir.path(), "org/repo/b");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_until_async("the second core's record", || {
+            std::fs::read_to_string(&journal).is_ok_and(|record| record != first_record)
+        })
+        .await;
+        first_open.release();
         first_load.await.unwrap().expect("first load");
 
         assert!(
             journal.exists(),
             "the first core cleared the record the second core wrote"
         );
+        second_open.release();
         second_load.await.unwrap().expect("second load");
         assert!(!journal.exists());
     }

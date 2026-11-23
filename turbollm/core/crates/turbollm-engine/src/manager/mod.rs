@@ -107,6 +107,13 @@ impl EngineManager {
         self.shared.snapshots.current()
     }
 
+    /// How many waits on this manager's snapshots are parked, a successor's barrier (T-11) among
+    /// them; lets a test see a waiter in place before it asserts what that waiter has not done.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn parked_snapshot_waiters(&self) -> usize {
+        self.shared.snapshots.parked_waiters()
+    }
+
     /// The first snapshot whose revision is above `after_revision`.
     pub async fn next_snapshot(&self, after_revision: u64) -> Snapshot {
         self.shared.snapshots.after(after_revision).await

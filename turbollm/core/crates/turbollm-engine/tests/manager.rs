@@ -249,6 +249,12 @@ fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(Waker::noop()))
 }
 
+/// True once a new generation is refused without queueing: the resident model is leaving.
+fn refuses_generations_at_once(manager: &EngineManager) -> bool {
+    let asked = poll_once(pin!(manager.generate(request())));
+    matches!(asked, Poll::Ready(Err(EngineError::ModelNotLoaded(_))))
+}
+
 fn has(record: &ScriptRecord, entry: &str) -> bool {
     record.history().iter().any(|seen| seen == entry)
 }
@@ -1114,7 +1120,10 @@ async fn a_successors_run_waits_for_the_predecessor_to_close() {
         .build();
     let load = tokio::spawn(second.claim("org/repo/b").run());
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    eventually("the successor to wait on its predecessor", || {
+        first.manager.parked_snapshot_waiters() == 1
+    })
+    .await;
     assert_eq!(
         second.state(),
         EngineState::Loading(installed("org/repo/b"))
@@ -1284,7 +1293,10 @@ async fn unload_waits_for_the_running_native_call_and_reads_ready_until_the_mode
     let manager = f.manager.clone();
     let unload = tokio::spawn(async move { manager.unload().await });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    eventually("the unload to take the model out of service", || {
+        refuses_generations_at_once(&f.manager)
+    })
+    .await;
     assert!(
         is_ready(&f.state()),
         "still Ready while the native call runs"
