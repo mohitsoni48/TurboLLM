@@ -23,7 +23,7 @@ use crate::request::{GenerateRequest, LoadTarget};
 
 pub use claim::LoadClaim;
 pub use gate::{GatePermit, GenerationGate, OccupancyListener};
-pub use generation::Generation;
+pub use generation::{Generation, GenerationCanceller};
 pub use journal::LoadJournal;
 pub use stall::{ProgressListener, StallWatch};
 pub use state::{EngineState, Snapshot};

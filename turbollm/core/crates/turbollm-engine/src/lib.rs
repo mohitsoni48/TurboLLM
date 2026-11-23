@@ -26,9 +26,9 @@ pub use event::{EngineEvent, FinishReason};
 pub use ids::{EngineId, EngineKind, ModelFormat, ModelRef};
 pub use inprocess::{EventSink, InProcess, NativeBackend, NativeModel, SinkClosed};
 pub use manager::{
-    ALREADY_HOLDS_A_MODEL, EngineManager, EngineState, GatePermit, Generation, GenerationGate,
-    LoadClaim, LoadJournal, MODEL_NOT_LOADED, ManagerConfig, OccupancyListener, ProgressListener,
-    Snapshot, StallWatch,
+    ALREADY_HOLDS_A_MODEL, EngineManager, EngineState, GatePermit, Generation, GenerationCanceller,
+    GenerationGate, LoadClaim, LoadJournal, MODEL_NOT_LOADED, ManagerConfig, OccupancyListener,
+    ProgressListener, Snapshot, StallWatch,
 };
 pub use request::{
     ChatMessage, GenerateRequest, GenerationParams, LoadSpec, LoadTarget, MessageContent, Role,

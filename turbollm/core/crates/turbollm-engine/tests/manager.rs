@@ -25,6 +25,10 @@ const SDK_STALL: Duration = Duration::from_secs(120);
 const OTHER_GGUF_ENGINE: &str = "other-gguf";
 /// Long enough for a spawned unload or shutdown to be inside its model close.
 const UNDERWAY: Duration = Duration::from_millis(50);
+/// How soon a cancel must end a native call that waits on its consumer (QA E-26).
+const CANCEL_LIMIT: Duration = Duration::from_secs(1);
+/// Unread events a reply holds before the engine waits for its consumer (`sink.rs` `EVENT_BUFFER`).
+const REPLY_BUFFER: usize = 32;
 
 struct Fixture {
     manager: EngineManager,
@@ -211,7 +215,11 @@ fn unloaded_cancel() -> EngineError {
 }
 
 async fn eventually(what: &str, condition: impl Fn() -> bool) {
-    let deadline = Instant::now() + WAIT_LIMIT;
+    eventually_within(WAIT_LIMIT, what, condition).await;
+}
+
+async fn eventually_within(limit: Duration, what: &str, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + limit;
     while !condition() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         tokio::time::sleep(POLL).await;
@@ -237,6 +245,20 @@ fn has(record: &ScriptRecord, entry: &str) -> bool {
     record.history().iter().any(|seen| seen == entry)
 }
 
+fn native_calls(record: &ScriptRecord) -> usize {
+    record
+        .history()
+        .iter()
+        .filter(|seen| *seen == "generate")
+        .count()
+}
+
+fn texts(count: usize) -> Vec<Step> {
+    (0..count)
+        .map(|n| Step::Emit(EngineEvent::Text(n.to_string())))
+        .collect()
+}
+
 fn is_ready(state: &EngineState) -> bool {
     matches!(state, EngineState::Ready { .. })
 }
@@ -253,6 +275,17 @@ fn occupancy(state: &EngineState) -> (bool, usize) {
         EngineState::Ready { busy, queued, .. } => (*busy, *queued),
         other => panic!("not ready: {other:?}"),
     }
+}
+
+/// Every event up to the reply's end, or the failure it ended with.
+async fn read_to_end(
+    generation: &mut turbollm_engine::Generation,
+) -> Result<Vec<EngineEvent>, EngineError> {
+    let mut events = Vec::new();
+    while let Some(event) = generation.next().await? {
+        events.push(event);
+    }
+    Ok(events)
 }
 
 async fn collect(generation: &mut turbollm_engine::Generation) -> Vec<EngineEvent> {
@@ -804,7 +837,7 @@ async fn cancelling_a_generation_mid_stream_aborts_the_backend() {
 
     let cancelled = EngineError::Cancelled(REPLY_CANCELLED.to_owned());
     assert_eq!(generation.next().await, Err(cancelled));
-    assert!(has(f.record(), "aborted"));
+    eventually("the backend's abort", || has(f.record(), "aborted")).await;
 }
 
 #[tokio::test]
@@ -818,15 +851,15 @@ async fn the_cancel_signal_stops_a_generation_whose_next_is_pending_elsewhere() 
     f.load("org/repo/a").await;
     let mut generation = f.manager.generate(request()).await.unwrap();
     generation.next().await.expect("first event");
-    let cancel = generation.cancel_signal();
+    let canceller = generation.canceller();
     let pending = tokio::spawn(async move { generation.next().await });
 
-    cancel.abort();
+    canceller.cancel();
 
     let cancelled = EngineError::Cancelled(REPLY_CANCELLED.to_owned());
     let ended = tokio::time::timeout(WAIT_LIMIT, pending).await;
     assert_eq!(ended.unwrap().unwrap(), Err(cancelled));
-    assert!(has(f.record(), "aborted"));
+    eventually("the backend's abort", || has(f.record(), "aborted")).await;
 }
 
 #[tokio::test]
@@ -1295,4 +1328,132 @@ async fn a_watcher_sees_the_next_revision() {
     let seen = watcher.await.unwrap();
     assert_eq!(seen.revision, start + 1);
     assert_eq!(seen.state, EngineState::Loading(installed("org/repo/a")));
+}
+
+#[tokio::test]
+async fn cancel_after_done_never_runs_the_abort_hook() {
+    let f = fixture(ScriptedBackend::new(vec![Step::Emit(done())]));
+    f.load("org/repo/a").await;
+    let mut generation = f.manager.generate(request()).await.unwrap();
+    assert_eq!(generation.next().await, Ok(Some(done())));
+
+    generation.cancel();
+
+    assert!(!has(f.record(), "abort hook"), "{:?}", f.record().history());
+}
+
+#[tokio::test]
+async fn cancel_after_done_while_the_native_call_still_runs_never_runs_the_abort_hook() {
+    let script = vec![Step::Emit(done()), Step::Block(Duration::from_millis(300))];
+    let f = fixture(ScriptedBackend::new(script));
+    f.load("org/repo/a").await;
+    let mut generation = f.manager.generate(request()).await.unwrap();
+    assert_eq!(generation.next().await, Ok(Some(done())));
+    assert!(
+        !has(f.record(), "generate returned"),
+        "the native call still runs"
+    );
+
+    generation.cancel();
+
+    assert!(!has(f.record(), "abort hook"), "{:?}", f.record().history());
+}
+
+#[tokio::test]
+async fn a_cancel_after_done_never_reaches_the_queued_request_that_follows() {
+    let script = vec![Step::Pause(Duration::from_millis(300)), Step::Emit(done())];
+    let f = fixture(ScriptedBackend::new(script));
+    f.load("org/repo/a").await;
+    let mut first = f.manager.generate(request()).await.unwrap();
+    let manager = f.manager.clone();
+    let second = tokio::spawn(async move {
+        let mut queued = manager.generate(request()).await?;
+        read_to_end(&mut queued).await
+    });
+    eventually("the queued request", || occupancy(&f.state()).1 == 1).await;
+    assert_eq!(first.next().await, Ok(Some(done())));
+    eventually("the queued request's native call", || {
+        native_calls(f.record()) == 2
+    })
+    .await;
+
+    first.cancel();
+
+    assert_eq!(second.await.unwrap(), Ok(vec![done()]));
+}
+
+#[tokio::test]
+async fn cancel_wakes_an_engine_thread_blocked_on_an_unread_reply() {
+    let f = fixture(ScriptedBackend::new(texts(100)));
+    f.load("org/repo/a").await;
+    let mut generation = f.manager.generate(request()).await.unwrap();
+    generation.next().await.expect("first event");
+
+    generation.cancel();
+
+    eventually_within(CANCEL_LIMIT, "the native call to return", || {
+        has(f.record(), "generate returned")
+    })
+    .await;
+    eventually_within(CANCEL_LIMIT, "the freed slot", || !occupancy(&f.state()).0).await;
+    let unload = tokio::time::timeout(Duration::from_secs(2), f.manager.unload()).await;
+    assert_eq!(unload, Ok(Ok(())), "unload with the unread generation held");
+    drop(generation);
+}
+
+#[tokio::test]
+async fn e26_a_slow_consumer_back_pressures_the_engine_and_cancel_wakes_it() {
+    let f = fixture(ScriptedBackend::new(texts(10_000)));
+    f.load("org/repo/a").await;
+    let mut generation = f.manager.generate(request()).await.unwrap();
+    let mut pulled = 0;
+    let reading = Instant::now();
+    while reading.elapsed() < Duration::from_secs(1) {
+        generation.next().await.expect("event");
+        pulled += 1;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let emitted = f.record().emitted();
+    assert!(
+        emitted <= REPLY_BUFFER + pulled,
+        "emitted {emitted}, pulled {pulled}"
+    );
+    generation.cancel();
+
+    eventually_within(CANCEL_LIMIT, "the native call to return", || {
+        has(f.record(), "generate returned")
+    })
+    .await;
+    let ended = loop {
+        match generation.next().await {
+            Ok(Some(_buffered)) => continue,
+            other => break other,
+        }
+    };
+    assert_eq!(
+        ended,
+        Err(EngineError::Cancelled(REPLY_CANCELLED.to_owned()))
+    );
+}
+
+#[tokio::test]
+async fn a_reply_whose_engine_stops_before_done_ends_with_an_engine_failure() {
+    let script = vec![
+        Step::Emit(EngineEvent::Text("partial".to_owned())),
+        Step::Panic("the engine crashed mid-reply"),
+    ];
+    let f = fixture(ScriptedBackend::new(script));
+    f.load("org/repo/a").await;
+    let mut generation = f.manager.generate(request()).await.unwrap();
+
+    assert_eq!(
+        generation.next().await,
+        Ok(Some(EngineEvent::Text("partial".to_owned())))
+    );
+    let ended = generation.next().await;
+    assert!(
+        matches!(ended, Err(EngineError::EngineFailure(_))),
+        "{ended:?}"
+    );
 }

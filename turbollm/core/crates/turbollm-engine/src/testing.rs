@@ -2,7 +2,7 @@
 //! fixed script on every generation and records what was asked of it, like the SDK's `FakeEngine.kt`.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,10 +32,14 @@ pub enum Step {
     /// A native call that does not look at the abort until it returns.
     Block(Duration),
     Fail(EngineError),
+    /// The native call panics, as a crashing engine thread would.
+    Panic(&'static str),
 }
 
 /// A `NativeBackend` whose open and generate follow a script. History entries, in order:
 /// `open`, `open aborted`, `generate`, `aborted`, `abort hook`, `generate returned`, `close`.
+/// Its abort hook is model-wide, like llama.cpp's abort flag (T-6): it stops whichever generation
+/// runs when it fires, and each generation starts with it lowered.
 pub struct ScriptedBackend {
     descriptor: EngineDescriptor,
     script: Vec<Step>,
@@ -177,6 +181,7 @@ impl ScriptedBackend {
         ScriptedModel {
             script: self.script.clone(),
             close_pause: self.close_pause,
+            stop_requested: Arc::new(AtomicBool::new(false)),
             record: Arc::clone(&self.record),
         }
     }
@@ -186,6 +191,7 @@ impl ScriptedBackend {
 pub struct ScriptedModel {
     script: Vec<Step>,
     close_pause: Duration,
+    stop_requested: Arc<AtomicBool>,
     record: Arc<ScriptRecord>,
 }
 
@@ -196,6 +202,7 @@ impl NativeModel for ScriptedModel {
         sink: &mut EventSink,
         abort: &AbortSignal,
     ) -> Result<(), EngineError> {
+        self.stop_requested.store(false, Ordering::SeqCst);
         self.record.note("generate");
         let played = self.play_script(sink, abort);
         self.record.note("generate returned");
@@ -204,7 +211,11 @@ impl NativeModel for ScriptedModel {
 
     fn abort_hook(&self) -> AbortHook {
         let record = Arc::clone(&self.record);
-        Arc::new(move || record.note("abort hook"))
+        let stop_requested = Arc::clone(&self.stop_requested);
+        Arc::new(move || {
+            record.note("abort hook");
+            stop_requested.store(true, Ordering::SeqCst);
+        })
     }
 
     fn close(self) {
@@ -221,17 +232,35 @@ impl ScriptedModel {
                     if sink.emit(event.clone()).is_err() {
                         return Err(self.aborted());
                     }
+                    self.record.emitted.fetch_add(1, Ordering::SeqCst);
                 }
                 Step::Pause(pause) => {
-                    if !pause_unless_aborted(*pause, abort) {
+                    if !self.pause_unless_stopped(*pause, abort) {
                         return Err(self.aborted());
                     }
                 }
                 Step::Block(busy) => std::thread::sleep(*busy),
                 Step::Fail(error) => return Err(error.clone()),
+                Step::Panic(message) => panic!("{message}"),
             }
         }
         Ok(())
+    }
+
+    /// Sleeps for `pause`, waking early on this generation's abort or the model-wide stop request.
+    fn pause_unless_stopped(&self, pause: Duration, abort: &AbortSignal) -> bool {
+        let until = Instant::now() + pause;
+        while Instant::now() < until {
+            if self.stopped(abort) {
+                return false;
+            }
+            std::thread::sleep(PAUSE_SLICE);
+        }
+        !self.stopped(abort)
+    }
+
+    fn stopped(&self, abort: &AbortSignal) -> bool {
+        abort.is_aborted() || self.stop_requested.load(Ordering::SeqCst)
     }
 
     fn aborted(&self) -> EngineError {
@@ -259,6 +288,7 @@ pub struct ScriptRecord {
     opened_specs: Mutex<Vec<LoadSpec>>,
     open_thread: Mutex<Option<String>>,
     engine_thread_exited: AtomicBool,
+    emitted: AtomicUsize,
 }
 
 impl ScriptRecord {
@@ -274,6 +304,11 @@ impl ScriptRecord {
     fn note_open(&self, spec: &LoadSpec) {
         self.opened_specs.lock().unwrap().push(spec.clone());
         self.note("open");
+    }
+
+    /// How many events the consumer's reply has accepted so far, over every generation.
+    pub fn emitted(&self) -> usize {
+        self.emitted.load(Ordering::SeqCst)
     }
 
     pub fn open_thread(&self) -> Option<String> {

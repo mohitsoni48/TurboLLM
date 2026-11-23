@@ -108,7 +108,7 @@ impl LoadedModel for InProcessModel {
         permit: GatePermit,
         abort: AbortSignal,
     ) -> Result<EventStream, EngineError> {
-        let (sink, stream) = sink::reply_channel();
+        let (sink, stream) = sink::reply_channel(&abort);
         abort.add_hook(Arc::clone(&self.abort_hook));
         let generate = thread::Command::Generate {
             req,
@@ -356,7 +356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_abort_runs_the_models_hook_and_ends_the_generation_cancelled() {
+    async fn an_abort_runs_the_models_hook_and_ends_the_stream() {
         let script = vec![
             Step::Emit(prefilled()),
             Step::Pause(Duration::from_secs(30)),
@@ -368,8 +368,26 @@ mod tests {
         assert_eq!(next_event(&mut stream).await, Some(Ok(prefilled())));
         abort.abort();
         let cancelled = EngineError::Cancelled(REPLY_CANCELLED.to_owned());
-        assert_eq!(drain(&mut stream).await, [Err(cancelled)]);
+        let rest = drain(&mut stream).await;
+        assert!(
+            rest.iter().all(|item| *item == Err(cancelled.clone())),
+            "the abort closes the reply; only the engine's own cancel may come first: {rest:?}"
+        );
         assert!(has(&record, "abort hook"));
+    }
+
+    #[tokio::test]
+    async fn an_abort_raised_after_the_native_call_returned_never_reaches_the_model() {
+        let (model, record) = load(ScriptedBackend::new(vec![Step::Emit(done())])).await;
+        let (gate, permit) = one_slot_gate().await;
+        let abort = AbortSignal::new();
+        let mut stream = model.generate(request(), permit, abort.clone()).unwrap();
+        assert_eq!(drain(&mut stream).await, [Ok(done())]);
+        assert!(wait_until(|| !gate.busy()).await);
+
+        abort.abort();
+
+        assert!(!has(&record, "abort hook"), "{:?}", record.history());
     }
 
     #[tokio::test]

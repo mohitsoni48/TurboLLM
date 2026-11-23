@@ -2,7 +2,7 @@
 //! cancelled Kotlin coroutine simply drops the `next` future. `cancel` reaches the engine from any thread,
 //! even while a `next` is suspended.
 
-use turbollm_engine::{AbortSignal, Generation};
+use turbollm_engine::{Generation, GenerationCanceller};
 
 use crate::engines::dto::CoreEngineEvent;
 use crate::engines::failure::CoreEngineException;
@@ -10,7 +10,7 @@ use crate::engines::failure::CoreEngineException;
 #[derive(uniffi::Object)]
 pub struct CoreGeneration {
     generation: tokio::sync::Mutex<Generation>,
-    cancel: AbortSignal,
+    canceller: GenerationCanceller,
 }
 
 #[uniffi::export]
@@ -24,14 +24,14 @@ impl CoreGeneration {
 
     /// Asks the engine to stop the reply; idempotent, from any thread.
     pub fn cancel(&self) {
-        self.cancel.abort();
+        self.canceller.cancel();
     }
 }
 
 impl CoreGeneration {
     pub(crate) fn new(generation: Generation) -> CoreGeneration {
         CoreGeneration {
-            cancel: generation.cancel_signal(),
+            canceller: generation.canceller(),
             generation: tokio::sync::Mutex::new(generation),
         }
     }

@@ -342,6 +342,18 @@ mod tests {
     }
 
     #[test]
+    fn a_cancel_after_done_never_asks_the_foreign_model_to_abort() {
+        let c = replying(vec![done()]);
+        load(&c.core, "org/a");
+        let generation = finish(c.core.generate(request())).unwrap();
+        assert_eq!(finish(generation.next()).unwrap(), Some(done()));
+
+        generation.cancel();
+
+        assert!(!c.log.has("request_abort"), "{:?}", c.log.snapshot());
+    }
+
+    #[test]
     fn a_dropped_next_future_then_cancel_stops_the_foreign_generate() {
         let c = core_with(FakeForeign::replying(Reply::UntilAborted(
             vec![prefilled()],

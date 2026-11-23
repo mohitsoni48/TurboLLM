@@ -119,7 +119,8 @@ pub(crate) fn panic_message(payload: Box<dyn Any + Send>, without_message: &str)
 }
 
 /// Runs each generation to its end, then frees the model; a load whose caller left before the
-/// model was handed over ends here too, because its command sender is gone.
+/// model was handed over ends here too, because its command sender is gone. A generation's abort
+/// stops reaching the model before the next generation may start (E-11).
 fn serve<M: NativeModel>(mut model: M, commands: &mpsc::Receiver<Command>) {
     while let Ok(Command::Generate {
         req,
@@ -129,6 +130,7 @@ fn serve<M: NativeModel>(mut model: M, commands: &mpsc::Receiver<Command>) {
     }) = commands.recv()
     {
         let generated = model.generate(&req, &mut sink, &abort);
+        abort.retire();
         drop(permit);
         if let Err(error) = generated {
             sink.fail(error);

@@ -65,7 +65,9 @@ pub struct LoadControl {
 
 /// A stop request any thread can raise once: a flag the native loop polls, plus the hooks a backend
 /// registers to interrupt a call that does not poll (T-1). A hook registered while an abort is
-/// raised may run twice, so hooks only ever raise a stop request of their own.
+/// raised may run twice, so hooks only ever raise a stop request of their own, and never touch
+/// the signal that runs them. Hooks run under the signal's lock, so `retire` waits for a running
+/// one and no hook runs once `retire` returned.
 #[derive(Clone, Default)]
 pub struct AbortSignal {
     raised: Arc<AbortState>,
@@ -85,7 +87,7 @@ impl AbortSignal {
     /// Raises the flag, then runs every registered hook.
     pub fn abort(&self) {
         self.raised.flag.store(true, Ordering::SeqCst);
-        for hook in self.registered_hooks() {
+        for hook in self.hooks().iter() {
             hook();
         }
     }
@@ -96,14 +98,17 @@ impl AbortSignal {
 
     /// Registers a hook; one added after the abort runs at once.
     pub fn add_hook(&self, hook: AbortHook) {
-        self.hooks().push(Arc::clone(&hook));
+        let mut hooks = self.hooks();
+        hooks.push(Arc::clone(&hook));
         if self.is_aborted() {
             hook();
         }
     }
 
-    fn registered_hooks(&self) -> Vec<AbortHook> {
-        self.hooks().clone()
+    /// Drops every hook once the native call they interrupt has returned: a later abort still raises
+    /// the flag but reaches no native code, so it cannot stop the call that runs next (E-11).
+    pub fn retire(&self) {
+        self.hooks().clear();
     }
 
     fn hooks(&self) -> MutexGuard<'_, Vec<AbortHook>> {
@@ -118,6 +123,11 @@ impl AbortSignal {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// How long the racing test's hook keeps running, so a `retire` that does not wait for it returns
+    /// while it still runs.
+    const HOOK_RUNNING: Duration = Duration::from_millis(50);
 
     fn counting_hook(count: &Arc<AtomicUsize>) -> AbortHook {
         let count = Arc::clone(count);
@@ -156,6 +166,46 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         signal.add_hook(counting_hook(&count));
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_retired_signal_runs_no_hook() {
+        let signal = AbortSignal::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        signal.add_hook(counting_hook(&count));
+
+        signal.retire();
+        signal.abort();
+
+        assert!(signal.is_aborted());
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn an_abort_racing_retire_runs_no_hook_after_retire_returned() {
+        let signal = AbortSignal::new();
+        let retired = Arc::new(AtomicBool::new(false));
+        let (started, hook_started) = std::sync::mpsc::channel();
+        let ran_after_retire = Arc::new(AtomicBool::new(false));
+        let hook: AbortHook = {
+            let (retired, ran_after_retire) = (Arc::clone(&retired), Arc::clone(&ran_after_retire));
+            let started = Mutex::new(started);
+            Arc::new(move || {
+                let _ = started.lock().unwrap().send(());
+                std::thread::sleep(HOOK_RUNNING);
+                ran_after_retire.store(retired.load(Ordering::SeqCst), Ordering::SeqCst);
+            })
+        };
+        signal.add_hook(hook);
+        let raiser = signal.clone();
+        let aborting = std::thread::spawn(move || raiser.abort());
+        hook_started.recv().unwrap();
+
+        signal.retire();
+        retired.store(true, Ordering::SeqCst);
+
+        aborting.join().unwrap();
+        assert!(!ran_after_retire.load(Ordering::SeqCst));
     }
 
     #[test]
