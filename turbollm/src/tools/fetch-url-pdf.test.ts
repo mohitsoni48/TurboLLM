@@ -301,24 +301,27 @@ test('execFetchUrl: a PDF reply with no body says so, not "could not be download
 })
 
 test('execFetchUrl: a PDF body gets its own, longer budget than the 15 s headers budget', async () => {
-  // Headers budget 50 ms, PDF body budget 2 s: the body arrives after 300 ms (> the headers
-  // budget) and must still be read. A non-PDF body arriving at the same pace is cut by 50 ms.
+  // Headers budget 1 s, PDF body budget 5 s: the body arrives after 1.3 s (> the headers budget)
+  // and must still be read. The headers budget is not tiny because it also covers the host
+  // lookup that runs before the stubbed fetch, which on a loaded CI runner can outlast 50 ms.
   const slowBody = (type: string, payload: Uint8Array | string) => () => {
     const bytes = typeof payload === 'string' ? new TextEncoder().encode(payload) : payload
     const body = new ReadableStream<Uint8Array>({
-      async start(c) { c.enqueue(bytes.slice(0, 8)); await new Promise((r) => setTimeout(r, 300)); c.enqueue(bytes.slice(8)); c.close() },
+      async start(c) { c.enqueue(bytes.slice(0, 8)); await new Promise((r) => setTimeout(r, 1_300)); c.enqueue(bytes.slice(8)); c.close() },
     })
     return new Response(body, { headers: { 'content-type': type } })
   }
   const pdf = stubFetch(slowBody('application/pdf', new Uint8Array(dummyPdf)))
   try {
-    assert.match(await execFetchUrl({ url: 'http://files.invalid/slow.pdf' }, { pdfReading: true, headersTimeoutMs: 50, pdfBodyTimeoutMs: 2_000 }), /Dummy PDF file/)
+    assert.match(await execFetchUrl({ url: 'http://files.invalid/slow.pdf' }, { pdfReading: true, headersTimeoutMs: 1_000, pdfBodyTimeoutMs: 5_000 }), /Dummy PDF file/)
   } finally { pdf.restore() }
 })
 
 test('execFetchUrl: a slow PDF body over its own budget is cut', async () => {
-  // Same pace as the test above (300 ms between chunks) but only a 50 ms PDF body budget:
-  // the read fails mid-stream and the answer is the incomplete-download note, not parsed text.
+  // Only the 50 ms PDF body budget is under test, so the headers budget is generous: it also
+  // covers the host lookup before the stubbed fetch, and a loaded CI runner can spend over 50 ms
+  // there, which answers "could not fetch URL" instead of the incomplete-download note.
+  // The read fails mid-stream and the answer is that note, not parsed text.
   const body = new ReadableStream<Uint8Array>({
     async start(c) {
       try {
@@ -333,7 +336,7 @@ test('execFetchUrl: a slow PDF body over its own budget is cut', async () => {
   const stub = stubFetch(() => new Response(body, { headers: PDF_HEADERS }))
   try {
     assert.match(
-      await execFetchUrl({ url: 'http://files.invalid/slow.pdf' }, { pdfReading: true, headersTimeoutMs: 50, pdfBodyTimeoutMs: 50 }),
+      await execFetchUrl({ url: 'http://files.invalid/slow.pdf' }, { pdfReading: true, headersTimeoutMs: 5_000, pdfBodyTimeoutMs: 50 }),
       /could not be downloaded completely/,
     )
   } finally { stub.restore() }
