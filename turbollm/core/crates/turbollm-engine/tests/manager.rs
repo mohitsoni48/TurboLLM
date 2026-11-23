@@ -23,6 +23,8 @@ const LONG: Duration = Duration::from_secs(3600);
 const SDK_QUEUE: usize = 8;
 const SDK_STALL: Duration = Duration::from_secs(120);
 const OTHER_GGUF_ENGINE: &str = "other-gguf";
+/// Long enough for a spawned unload or shutdown to be inside its model close.
+const UNDERWAY: Duration = Duration::from_millis(50);
 
 struct Fixture {
     manager: EngineManager,
@@ -213,6 +215,21 @@ async fn eventually(what: &str, condition: impl Fn() -> bool) {
     while !condition() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The next claim, once the lifecycle is free again.
+async fn claim_once_free(f: &Fixture, id: &str) -> LoadClaim {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    loop {
+        match f.manager.claim_load(f.target(id)) {
+            Ok(claim) => return claim,
+            Err(EngineError::LoadInProgress) => {
+                assert!(Instant::now() < deadline, "the lifecycle stayed held");
+                tokio::time::sleep(POLL).await;
+            }
+            Err(other) => panic!("claim refused: {other:?}"),
+        }
     }
 }
 
@@ -583,10 +600,10 @@ async fn a_dropped_run_future_ends_idle_and_releases_the_lifecycle() {
     let _ = load.await;
 
     eventually("the aborted open", || has(f.record(), "open aborted")).await;
-    assert_eq!(f.state(), EngineState::Idle);
+    eventually("Idle", || f.state() == EngineState::Idle).await;
     assert!(!f.journal_file().exists(), "journal after the dropped load");
     assert_never_failed_cancelled_or_closed(&recorder.states(&f.manager).await);
-    f.claim("org/repo/b").abandon();
+    claim_once_free(&f, "org/repo/b").await.abandon();
 }
 
 #[tokio::test]
@@ -929,8 +946,104 @@ async fn a_dropped_run_future_closes_the_model_its_open_still_produced() {
     load.abort();
     let _ = load.await;
 
-    assert_eq!(f.state(), EngineState::Idle);
+    assert_eq!(
+        f.state(),
+        EngineState::Loading(installed("org/repo/a")),
+        "not Idle while the abandoned open still runs"
+    );
+    eventually("Idle", || f.state() == EngineState::Idle).await;
+    assert!(has(f.record(), "close"), "Idle only after the close");
+}
+
+#[tokio::test]
+async fn a_dropped_run_future_holds_the_lifecycle_until_its_open_ended_and_closed() {
+    let f = fixture(
+        ScriptedBackend::new(vec![]).with_unabortable_open_pause(Duration::from_millis(300)),
+    );
+    let load = tokio::spawn(f.claim("org/repo/a").run());
+    eventually("the open", || has(f.record(), "open")).await;
+
+    load.abort();
+    let _ = load.await;
+
+    assert_eq!(
+        refusal(f.manager.claim_load(f.target("org/repo/b"))),
+        EngineError::LoadInProgress
+    );
     eventually("the close", || has(f.record(), "close")).await;
+    let next = claim_once_free(&f, "org/repo/b").await;
+    next.run().await.expect("load");
+    assert_eq!(f.record().history(), ["open", "close", "open"]);
+}
+
+#[tokio::test]
+async fn a_dropped_run_future_keeps_the_journal_until_the_open_returned() {
+    let f = fixture(
+        ScriptedBackend::new(vec![]).with_unabortable_open_pause(Duration::from_millis(300)),
+    );
+    let load = tokio::spawn(f.claim("org/repo/a").run());
+    eventually("the open", || has(f.record(), "open")).await;
+
+    load.abort();
+    let _ = load.await;
+
+    assert!(
+        f.journal_file().exists(),
+        "journal while the abandoned open still runs"
+    );
+    eventually("the close", || has(f.record(), "close")).await;
+    eventually("the cleared journal", || !f.journal_file().exists()).await;
+}
+
+#[tokio::test]
+async fn shutdown_after_a_dropped_run_publishes_closed_only_after_the_open_was_closed() {
+    let f = fixture(
+        ScriptedBackend::new(vec![]).with_unabortable_open_pause(Duration::from_millis(300)),
+    );
+    let load = tokio::spawn(f.claim("org/repo/a").run());
+    eventually("the open", || has(f.record(), "open")).await;
+    load.abort();
+    let _ = load.await;
+
+    f.manager.shutdown().await;
+
+    assert_eq!(f.record().history(), ["open", "close"]);
+    assert_eq!(f.state(), EngineState::Closed);
+}
+
+#[tokio::test]
+async fn a_cancelled_unload_still_ends_idle_after_the_model_closed() {
+    let f = fixture(ScriptedBackend::new(vec![]).with_close_pause(Duration::from_millis(300)));
+    f.load("org/repo/a").await;
+    let manager = f.manager.clone();
+    let unload = tokio::spawn(async move { manager.unload().await });
+    tokio::time::sleep(UNDERWAY).await;
+
+    unload.abort();
+    let _ = unload.await;
+
+    assert_eq!(
+        refusal(f.manager.claim_load(f.target("org/repo/b"))),
+        EngineError::LoadInProgress
+    );
+    eventually("Idle", || f.state() == EngineState::Idle).await;
+    assert_eq!(f.record().history(), ["open", "close"]);
+    assert!(f.record().engine_thread_exited());
+}
+
+#[tokio::test]
+async fn a_cancelled_shutdown_still_reaches_closed() {
+    let f = fixture(ScriptedBackend::new(vec![]).with_close_pause(Duration::from_millis(300)));
+    f.load("org/repo/a").await;
+    let manager = f.manager.clone();
+    let shutdown = tokio::spawn(async move { manager.shutdown().await });
+    tokio::time::sleep(UNDERWAY).await;
+
+    shutdown.abort();
+    let _ = shutdown.await;
+
+    eventually("Closed", || f.state() == EngineState::Closed).await;
+    assert_eq!(f.record().history(), ["open", "close"]);
 }
 
 #[tokio::test]

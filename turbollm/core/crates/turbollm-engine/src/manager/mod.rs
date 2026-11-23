@@ -2,15 +2,17 @@ mod claim;
 mod gate;
 mod generation;
 mod journal;
+mod load;
 mod stall;
 mod state;
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::catalog::Catalog;
 use crate::descriptor::LoadedModelInfo;
@@ -121,13 +123,18 @@ impl EngineManager {
 
     /// Cancels the resident model's generations, waits for their native calls, closes the model.
     /// Waits for a running load first.
+    /// Once it holds the lifecycle, a dropped future no longer stops it.
     pub async fn unload(&self) -> Result<(), EngineError> {
         self.refuse_when_closed()?;
-        let _lifecycle = self.shared.lifecycle.lock().await;
+        let lifecycle = self.lifecycle().await;
         self.refuse_when_closed()?;
-        self.unload_resident().await;
-        self.shared.snapshots.publish(EngineState::Idle);
-        Ok(())
+        let manager = self.clone();
+        under_lifecycle(lifecycle, async move {
+            manager.unload_resident().await;
+            manager.shared.snapshots.publish(EngineState::Idle);
+            Ok(())
+        })
+        .await
     }
 
     /// The gate first, then the resident check (`ChatService.kt:51-60`). With nothing resident
@@ -139,14 +146,25 @@ impl EngineManager {
         self.start_generation(&gate, req, permit)
     }
 
-    /// Unloads, then refuses everything with `Closed`; a successor waiting on it continues.
+    /// Unloads, then refuses everything with `Closed`; a successor waiting on it continues. Once it
+    /// holds the lifecycle, a dropped future no longer stops it.
     pub async fn shutdown(&self) {
-        let _lifecycle = self.shared.lifecycle.lock().await;
+        let lifecycle = self.lifecycle().await;
         if self.shared.snapshots.is_closed() {
             return;
         }
-        self.unload_resident().await;
-        self.shared.snapshots.publish(EngineState::Closed);
+        let manager = self.clone();
+        let closing = under_lifecycle(lifecycle, async move {
+            manager.unload_resident().await;
+            manager.shared.snapshots.publish(EngineState::Closed);
+            Ok(())
+        });
+        // Its only failure is a runtime that dropped the task, which leaves nothing to close.
+        let _ = closing.await;
+    }
+
+    fn lifecycle(&self) -> impl Future<Output = OwnedMutexGuard<()>> + use<> {
+        Arc::clone(&self.shared.lifecycle).lock_owned()
     }
 
     fn refuse_when_closed(&self) -> Result<(), EngineError> {
@@ -284,6 +302,26 @@ impl Resident {
         self.gate.close();
         self.gate.await_idle().await;
         self.model.close().await;
+    }
+}
+
+/// Runs `work` in a task of its own that keeps `lifecycle` until the work ended: a caller that
+/// stops waiting stops only its wait (arch 2.3.5). Work the runtime dropped while shutting down
+/// reads `Closed`.
+async fn under_lifecycle<T, W>(lifecycle: OwnedMutexGuard<()>, work: W) -> Result<T, EngineError>
+where
+    W: Future<Output = Result<T, EngineError>> + Send + 'static,
+    T: Send + 'static,
+{
+    let task = tokio::spawn(async move {
+        let ended = work.await;
+        drop(lifecycle);
+        ended
+    });
+    match task.await {
+        Ok(ended) => ended,
+        Err(stopped) if stopped.is_panic() => std::panic::resume_unwind(stopped.into_panic()),
+        Err(_cancelled) => Err(EngineError::Closed),
     }
 }
 

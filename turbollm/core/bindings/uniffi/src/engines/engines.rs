@@ -114,10 +114,11 @@ impl CoreEngines {
         )))
     }
 
+    /// Once asked, the unload runs to its end even if this future is dropped.
     pub async fn unload(&self) -> Result<(), CoreEngineException> {
         refuse_reentry()?;
         let manager = self.manager().clone();
-        on_core(&self.engines, async move { manager.unload().await }).await
+        on_core_to_completion(&self.engines, async move { manager.unload().await }).await
     }
 
     /// Waits for a gate slot; the generation's events are then pulled with `next`.
@@ -136,11 +137,12 @@ impl CoreEngines {
         Ok(Arc::new(CoreGeneration::new(generation)))
     }
 
-    /// Unloads, then refuses every call with `Closed`; a successor waiting on this core continues.
+    /// Unloads, then refuses every call with `Closed`; a successor waiting on this core continues. Once
+    /// asked, the shutdown runs to its end even if this future is dropped.
     pub async fn shutdown(&self) -> Result<(), CoreEngineException> {
         refuse_reentry()?;
         let manager = self.manager().clone();
-        on_core(&self.engines, async move {
+        on_core_to_completion(&self.engines, async move {
             manager.shutdown().await;
             Ok(())
         })
@@ -193,7 +195,21 @@ where
     F: Future<Output = Result<T, EngineError>> + Send + 'static,
     T: Send + 'static,
 {
-    let finished = engines.spawn(work).await;
+    answer(engines.spawn(work).await)
+}
+
+/// Runs `work` on the core's runtime to its end; dropping the returned future only stops the wait.
+async fn on_core_to_completion<T, F>(engines: &Engines, work: F) -> Result<T, CoreEngineException>
+where
+    F: Future<Output = Result<T, EngineError>> + Send + 'static,
+    T: Send + 'static,
+{
+    answer(engines.spawn_to_completion(work).await)
+}
+
+fn answer<T>(
+    finished: Result<Result<T, EngineError>, JoinError>,
+) -> Result<T, CoreEngineException> {
     let outcome = finished.unwrap_or_else(|stopped| Err(task_stopped(stopped)));
     outcome.map_err(CoreEngineException::from)
 }
@@ -535,6 +551,28 @@ mod tests {
 
         assert_eq!(state(&c.core), CoreEngineState::Idle);
         eventually("the foreign model to be released", || c.log.has("release"));
+    }
+
+    #[test]
+    fn an_unload_whose_future_is_dropped_after_one_poll_still_ends_idle() {
+        let c = replying(vec![]);
+        load(&c.core, "org/a");
+
+        let _ = poll_once(c.core.unload());
+
+        eventually("Idle", || state(&c.core) == CoreEngineState::Idle);
+        eventually("the foreign model to be released", || c.log.has("release"));
+    }
+
+    #[test]
+    fn a_shutdown_whose_future_is_dropped_after_one_poll_still_ends_closed() {
+        let c = replying(vec![]);
+        load(&c.core, "org/a");
+
+        let _ = poll_once(c.core.shutdown());
+
+        eventually("Closed", || state(&c.core) == CoreEngineState::Closed);
+        assert!(c.log.has("release"));
     }
 
     #[test]

@@ -73,13 +73,21 @@ impl Engines {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .expect("the runtime lives as long as the handle");
         AbortOnDrop {
-            task: runtime.spawn(f),
+            task: self.spawn_to_completion(f),
         }
+    }
+
+    /// Runs `f` on this handle's runtime to its end; dropping the returned handle only stops the wait.
+    pub fn spawn_to_completion<F>(&self, f: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.runtime
+            .as_ref()
+            .expect("the runtime lives as long as the handle")
+            .spawn(f)
     }
 }
 
@@ -218,6 +226,24 @@ mod tests {
         drop(handle);
 
         wait_until("the task was aborted", || aborted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_task_spawned_to_completion_runs_on_after_its_handle_is_dropped() {
+        let dir = TempDir::new().unwrap();
+        let engines = engines_of(config_in(dir.path()), vec![]);
+        let (release, released) = mpsc::channel::<()>();
+        let (finished, has_finished) = mpsc::channel();
+
+        let handle = engines.spawn_to_completion(async move {
+            tokio::task::yield_now().await;
+            let _ = released.recv_timeout(WAIT_LIMIT);
+            finished.send(()).unwrap();
+        });
+        drop(handle);
+        release.send(()).unwrap();
+
+        has_finished.recv_timeout(WAIT_LIMIT).unwrap();
     }
 
     #[test]

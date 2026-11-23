@@ -19,6 +19,7 @@ import org.junit.Rule
 import org.junit.rules.TemporaryFolder
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNull
@@ -164,10 +165,12 @@ class EnginesBindingTest {
             within { backend.opened.await() }
 
             loading.cancelAndJoin()
+            assertFalse(core.claimsAgain(), "the abandoned open still holds the lifecycle")
             openMayFinish.complete(Unit)
 
             within { backend.released.await() }
             within { core.awaitState<CoreEngineState.Idle>() }
+            within { while (!core.claimsAgain()) delay(GC_POLL_MS) }
             assertEquals(ENGINE_ID, core.load().engineId)
         }
     }
