@@ -1339,6 +1339,7 @@ dependencies = [
  "tokio",
  "turbollm-core",
  "turbollm-engine",
+ "turbollm-engine-llama",
  "turbollm-gguf",
  "turbollm-platform",
 ]
