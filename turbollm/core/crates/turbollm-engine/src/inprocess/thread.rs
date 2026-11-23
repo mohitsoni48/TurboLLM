@@ -101,16 +101,19 @@ fn open_catching_panics<B: NativeBackend>(
     spec: &LoadSpec,
     ctl: &LoadControl,
 ) -> Result<(B::Model, ModelInfo), EngineError> {
-    panic::catch_unwind(AssertUnwindSafe(|| backend.open(spec, ctl)))
-        .unwrap_or_else(|payload| Err(EngineError::ModelLoadFailed(panic_message(payload))))
+    panic::catch_unwind(AssertUnwindSafe(|| backend.open(spec, ctl))).unwrap_or_else(|payload| {
+        let message = panic_message(payload, PANIC_WITHOUT_MESSAGE);
+        Err(EngineError::ModelLoadFailed(message))
+    })
 }
 
-fn panic_message(payload: Box<dyn Any + Send>) -> String {
+/// The text a panic carried, or `without_message` when it carried none.
+pub(crate) fn panic_message(payload: Box<dyn Any + Send>, without_message: &str) -> String {
     match payload.downcast::<String>() {
         Ok(message) => *message,
         Err(payload) => payload
             .downcast_ref::<&str>()
-            .map_or(PANIC_WITHOUT_MESSAGE, |message| message)
+            .map_or(without_message, |message| message)
             .to_owned(),
     }
 }

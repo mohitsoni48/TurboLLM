@@ -35,8 +35,12 @@ pub struct ScriptedBackend {
     script: Vec<Step>,
     open_outcome: OpenOutcome,
     close_pause: Duration,
+    probe: ScriptedProbe,
     record: Arc<ScriptRecord>,
 }
+
+/// What a `ScriptedBackend`'s probe answers: `None` = can run here, else why not.
+pub type ScriptedProbe = Box<dyn Fn() -> Option<String> + Send + Sync>;
 
 enum OpenOutcome {
     Opens,
@@ -51,8 +55,17 @@ impl ScriptedBackend {
             script,
             open_outcome: OpenOutcome::Opens,
             close_pause: Duration::ZERO,
+            probe: Box::new(|| None),
             record: Arc::new(ScriptRecord::default()),
         }
+    }
+
+    pub fn with_probe(
+        mut self,
+        probe: impl Fn() -> Option<String> + Send + Sync + 'static,
+    ) -> ScriptedBackend {
+        self.probe = Box::new(probe);
+        self
     }
 
     pub fn with_open_failure(mut self, error: EngineError) -> ScriptedBackend {
@@ -84,7 +97,7 @@ impl NativeBackend for ScriptedBackend {
     }
 
     fn probe(&self, _host: &HostFacts) -> Option<String> {
-        None
+        (self.probe)()
     }
 
     fn stall_policy(&self) -> StallPolicy {

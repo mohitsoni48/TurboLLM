@@ -21,6 +21,7 @@ use crate::request::{GenerateRequest, LoadSpec};
 
 pub use backend::{NativeBackend, NativeModel};
 pub use sink::{EventSink, SinkClosed};
+pub(crate) use thread::panic_message;
 
 /// An `Engine` over a native backend that runs each loaded model on its own thread.
 pub struct InProcess<B: NativeBackend> {
