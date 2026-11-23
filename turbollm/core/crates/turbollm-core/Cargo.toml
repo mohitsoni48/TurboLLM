@@ -6,5 +6,19 @@ license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[features]
+# The engine layer (plan P-2): off by default, so the napi addon (9 npm binaries and the
+# nodejs-mobile addon) carries no engine code and no tokio. turbollm-ffi turns it on.
+engines = ["dep:turbollm-engine", "dep:turbollm-platform", "dep:tokio"]
+
 [dependencies]
 turbollm-gguf = { path = "../turbollm-gguf" }
+turbollm-engine = { path = "../turbollm-engine", optional = true }
+turbollm-platform = { path = "../turbollm-platform", optional = true }
+tokio = { version = "=1.54.1", features = ["rt", "rt-multi-thread", "time"], optional = true }
+
+[dev-dependencies]
+turbollm-core = { path = ".", features = ["engines"] }
+turbollm-engine = { path = "../turbollm-engine", features = ["testing"] }
+tempfile = "=3.27.0"
+tokio = { version = "=1.54.1", features = ["macros", "rt", "time"] }
