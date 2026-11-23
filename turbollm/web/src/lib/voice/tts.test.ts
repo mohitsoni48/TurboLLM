@@ -1027,3 +1027,22 @@ describe('the Android bridge', () => {
     })
   })
 })
+
+describe('reading completion outcome', () => {
+  it('distinguishes a natural finish from pressing stop', () => {
+    const { utterances } = installSpeechSynthesis([voice('en', 'en-US')])
+    speaker.speak('done-reply', 'A complete sentence.', EN)
+    drain(utterances)
+    expect(speaker.lastOutcome()).toEqual({ id: 'done-reply', completed: true })
+    speaker.speak('stopped-reply', 'Another sentence.', EN)
+    speaker.stop()
+    expect(speaker.lastOutcome()).toEqual({ id: 'stopped-reply', completed: false })
+  })
+
+  it('reports a failed utterance as incomplete', () => {
+    const { utterances } = installSpeechSynthesis([voice('en', 'en-US')])
+    speaker.speak('failed-reply', 'A complete sentence.', EN)
+    utterances[0].onerror?.()
+    expect(speaker.lastOutcome()).toEqual({ id: 'failed-reply', completed: false })
+  })
+})

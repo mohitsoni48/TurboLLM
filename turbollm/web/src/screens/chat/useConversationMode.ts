@@ -161,6 +161,7 @@ export function useConversationMode(options: ConversationModeOptions): Conversat
   // The reply: once the message is handed over, wait for it to start streaming (or give up), then for it to end.
   const replyStreaming = options.replyStreaming
   const sawReply = useRef(false)
+  const claimedReading = useRef<string | null>(null)
   useEffect(() => {
     if (state.phase !== 'generating') { sawReply.current = false; return }
     if (replyStreaming) { sawReply.current = true; return }
@@ -174,7 +175,9 @@ export function useConversationMode(options: ConversationModeOptions): Conversat
     let timer: ReturnType<typeof setTimeout> | undefined
     const check = (): void => {
       if (stateRef.current.phase !== 'generating') return
-      if (speaker.activeId() !== null) {
+      const reading = speaker.activeId()
+      if (reading !== null) {
+        claimedReading.current = reading
         dispatchRef.current({ type: 'reply-done' })
         return
       }
@@ -190,7 +193,12 @@ export function useConversationMode(options: ConversationModeOptions): Conversat
   // this effect has registered.
   useEffect(() => {
     if (state.phase !== 'speaking') return
-    const check = (): void => { if (speaker.activeId() === null) dispatchRef.current({ type: 'speak-done' }) }
+    const readingId = claimedReading.current
+    const check = (): void => {
+      if (speaker.activeId() !== null) return
+      const outcome = speaker.lastOutcome()
+      dispatchRef.current({ type: outcome?.id === readingId && outcome.completed ? 'speak-done' : 'speak-failed' })
+    }
     const unsubscribe = speaker.subscribe(check)
     check()
     return unsubscribe

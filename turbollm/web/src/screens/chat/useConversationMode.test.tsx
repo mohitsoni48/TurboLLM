@@ -14,6 +14,8 @@ const fakeSpeaker = vi.hoisted(() => {
     /** What activeId() answers: each call takes the next value, the last one repeats. */
     queue: [null] as Array<string | null>,
     stop: vi.fn(),
+    outcome: { id: 'reply-1', completed: true },
+    lastOutcome: () => state.outcome,
     listeners,
     notify: () => { for (const l of [...listeners]) l() },
     activeId: () => (state.queue.length > 1 ? state.queue.shift()! : state.queue[0]),
@@ -53,6 +55,7 @@ beforeEach(() => {
   visibility = 'visible'
   Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility })
   fakeSpeaker.queue = [null]
+  fakeSpeaker.outcome = { id: 'reply-1', completed: true }
   fakeSpeaker.stop.mockClear()
   fakeSpeaker.listeners.clear()
   useVoiceStore.setState({ audioMode: 'ask', readAloud: 'off', autoStop: false })
@@ -377,4 +380,22 @@ describe('the Settings opt-in is the master switch', () => {
     act(() => h.result.current.enable())
     expect(h.result.current.active).toBe(true)
   })
+})
+
+
+it('does not reopen the mic when reading was stopped or failed', () => {
+  const h = setup()
+  act(() => h.result.current.enable())
+  h.voice('starting', 'recording', 'transcribing')
+  act(() => h.result.current.emit({ type: 'message-sent' }))
+  h.voice('idle')
+  h.update({ replyStreaming: true })
+  fakeSpeaker.queue = ['reply-1']
+  h.update({ replyStreaming: false })
+  expect(h.result.current.phase).toBe('speaking')
+  fakeSpeaker.outcome = { id: 'reply-1', completed: false }
+  fakeSpeaker.queue = [null]
+  act(() => fakeSpeaker.notify())
+  expect(h.result.current.phase).toBe('idle')
+  expect(h.start).toHaveBeenCalledTimes(1)
 })
