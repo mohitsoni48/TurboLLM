@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
-import { CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, FileText, HelpCircle, Loader2, Pencil, RefreshCw, Trash2, XCircle } from 'lucide-react'
+import { CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, FileText, GitBranch, HelpCircle, Loader2, Pencil, RefreshCw, Trash2, XCircle } from 'lucide-react'
 import type { ClaimVerdict, LiveToolCall, Message, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from '../../lib/chat-types'
 import type { LiveBlock } from '../../lib/live-timeline'
 import { activateVariant, getMessageVariants } from '../../lib/chat-api'
@@ -708,6 +708,7 @@ export function MessageBubble({
   onEdit,
   onDelete,
   onRegenerate,
+  onFork,
   editingId,
   onEditSave,
   onEditCancel,
@@ -724,6 +725,8 @@ export function MessageBubble({
   onEdit?: (m: Message) => void
   onDelete?: (m: Message) => void
   onRegenerate?: () => void
+  /** "Fork from here" (GitHub issue 323): a new chat with the history up to and including this message. */
+  onFork?: (m: Message) => void
   editingId: string | null
   onEditSave: (content: string) => void
   onEditCancel: () => void
@@ -906,6 +909,7 @@ export function MessageBubble({
               <div className="hover-actions flex items-center gap-0.5">
                 <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" screen="chat" />
                 {onEdit && <ActionBtn icon={<Pencil size={12} />}  label="Edit"   onClick={() => { track('chat', 'open_edit_message'); beginEdit() }} />}
+                {onFork && <ActionBtn icon={<GitBranch size={12} />} label="Fork from here" onClick={() => { track('chat', 'fork_message'); onFork(message) }} />}
                 {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => { track('chat', 'delete_message'); onDelete(message) }} destructive />}
               </div>
             </div>
@@ -1024,6 +1028,7 @@ export function MessageBubble({
             {!hasError && !stillGenerating && <SpeakButton id={message.id} text={message.content} />}
             {!hasError && !stillGenerating && onEdit && <ActionBtn icon={<Pencil size={12} />} label="Edit" onClick={() => { track('chat', 'open_edit_message'); beginEdit() }} />}
             {isLast && onRegenerate && <ActionBtn icon={<RefreshCw size={12} />} label="Regenerate" onClick={() => { track('chat', 'regenerate_message'); onRegenerate() }} />}
+            {!stillGenerating && onFork && <ActionBtn icon={<GitBranch size={12} />} label="Fork from here" onClick={() => { track('chat', 'fork_message'); onFork(message) }} />}
             {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => { track('chat', 'delete_message'); onDelete(message) }} destructive />}
           </div>
         </div>
