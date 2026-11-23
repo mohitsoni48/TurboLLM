@@ -1,8 +1,11 @@
 //! The engine manager over `ScriptedBackend` engines: every `EngineHostTest.kt` and `FakeEngineTest.kt`
 //! case, one for one, plus arch 9's manager list, E-4 and E-6, and PG-4.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -239,6 +242,11 @@ async fn claim_once_free(f: &Fixture, id: &str) -> LoadClaim {
             Err(other) => panic!("claim refused: {other:?}"),
         }
     }
+}
+
+/// Polls `future` once, leaving it suspended where it waits.
+fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+    future.poll(&mut Context::from_waker(Waker::noop()))
 }
 
 fn has(record: &ScriptRecord, entry: &str) -> bool {
@@ -667,6 +675,24 @@ async fn unload_cancels_the_running_generation_before_the_model_closes() {
     assert!(aborted < closed, "{history:?}");
     assert_eq!(generation.next().await, Err(unloaded_cancel()));
     assert_eq!(f.state(), EngineState::Idle);
+}
+
+#[tokio::test]
+async fn e9_a_next_already_waiting_when_the_model_unloads_ends_with_the_unload_text() {
+    let script = vec![
+        Step::Emit(EngineEvent::Text("a".to_owned())),
+        Step::Pause(LONG),
+    ];
+    let f = fixture(ScriptedBackend::new(script));
+    f.load("org/repo/a").await;
+    let mut generation = f.manager.generate(request()).await.unwrap();
+    generation.next().await.expect("first event");
+    let mut waiting = pin!(generation.next());
+    assert!(poll_once(waiting.as_mut()).is_pending());
+
+    f.manager.unload().await.expect("unload");
+
+    assert_eq!(waiting.await, Err(unloaded_cancel()));
 }
 
 #[tokio::test]

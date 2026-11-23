@@ -247,6 +247,7 @@ fn unpaired(descriptors: usize, backends: usize) -> EngineError {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::pin;
     use std::sync::{Arc, Barrier};
     use std::task::Poll;
     use std::thread;
@@ -596,6 +597,23 @@ mod tests {
         finish(c.core.unload()).unwrap();
 
         let ended = failure_of(finish(generation.next()).unwrap_err());
+        assert_eq!(
+            (ended.code, ended.detail.as_str()),
+            (CoreFailureCode::Cancelled, MODEL_UNLOADED)
+        );
+    }
+
+    #[test]
+    fn a_next_already_waiting_when_the_model_unloads_ends_with_the_unload_text() {
+        let c = core_with(FakeForeign::replying(Reply::UntilAborted(vec![])));
+        load(&c.core, "org/a");
+        let generation = finish(c.core.generate(request())).unwrap();
+        let mut waiting = pin!(generation.next());
+        assert!(poll_once(waiting.as_mut()).is_pending());
+
+        finish(c.core.unload()).unwrap();
+
+        let ended = failure_of(finish(waiting).unwrap_err());
         assert_eq!(
             (ended.code, ended.detail.as_str()),
             (CoreFailureCode::Cancelled, MODEL_UNLOADED)
