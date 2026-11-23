@@ -985,6 +985,25 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     return c.json({ ok: true })
   })
 
+  // Fork (GitHub #323): a new chat with this one's settings and its shown history up to and including `messageId`
+  // (ConversationStore.forkConversation). Not from the reply being written: its text is not saved yet, so the copy
+  // would hold a placeholder. A Code session forks through its own route (code-routes.ts), which also makes it a
+  // session; a bare copy of its conversation here would be a Code chat no session points at.
+  app.post('/api/v1/conversations/:id/fork', async (c) => {
+    const convId = c.req.param('id')
+    const b = await body<{ messageId?: unknown }>(c)
+    if (typeof b.messageId !== 'string' || !b.messageId) return err(c, 400, 'invalid_input', 'messageId is required.')
+    const conv = db.getConversation(convId)
+    if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
+    if (conv.kind === 'code') return err(c, 400, 'invalid_input', 'Fork a Code session from the Code screen.')
+    if (d.chatTurns.slotState(convId).runningReplyId === b.messageId) {
+      return err(c, 409, 'generation_in_flight', 'This reply is still being written. Wait for it to finish, or fork from an earlier message.')
+    }
+    const r = db.forkConversation(convId, b.messageId)
+    if (!r.ok) return err(c, 404, 'not_found', r.reason === 'conversation_not_found' ? 'Conversation not found.' : 'That message is not in this chat.')
+    return c.json(r.conversation, 201)
+  })
+
   // Chat branching: list all siblings (active + inactive) for the ‹ 1/2 › switcher UI.
   app.get('/api/v1/conversations/:id/messages/:msgId/variants', (c) => {
     const { id: convId, msgId } = c.req.param()

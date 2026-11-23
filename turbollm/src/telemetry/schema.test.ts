@@ -167,7 +167,7 @@ test('validateEvent: ui_action accepts the Phase 6f MessageBubble batch actions'
   const actions = [
     'toggle_thinking_block', 'toggle_tool_call_detail', 'toggle_source_row', 'toggle_sources_panel',
     'open_edit_message', 'cancel_edit_message', 'save_edited_message', 'save_edited_reply',
-    'delete_message', 'regenerate_message', 'switch_message_variant',
+    'delete_message', 'regenerate_message', 'switch_message_variant', 'fork_message',
   ]
   for (const action of actions) {
     const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'chat', action } }))
