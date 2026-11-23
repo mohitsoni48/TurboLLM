@@ -18,21 +18,28 @@ use crate::request::{GenerateRequest, LoadSpec};
 
 pub const SCRIPTED_THREAD_NAME: &str = "turbollm-scripted";
 
+/// What a scripted open that heeds the load's abort fails with once aborted.
+pub const SCRIPTED_OPEN_ABORTED: &str = "The scripted open was aborted.";
+
 const PAUSE_SLICE: Duration = Duration::from_millis(5);
 
 /// One step a scripted generation plays.
 #[derive(Debug, Clone)]
 pub enum Step {
     Emit(EngineEvent),
+    /// Waits, ending the generation early when it is aborted.
     Pause(Duration),
+    /// A native call that does not look at the abort until it returns.
+    Block(Duration),
     Fail(EngineError),
 }
 
 /// A `NativeBackend` whose open and generate follow a script. History entries, in order:
-/// `open`, `generate`, `aborted`, `abort hook`, `generate returned`, `close`.
+/// `open`, `open aborted`, `generate`, `aborted`, `abort hook`, `generate returned`, `close`.
 pub struct ScriptedBackend {
     descriptor: EngineDescriptor,
     script: Vec<Step>,
+    open_pause: OpenPause,
     open_outcome: OpenOutcome,
     close_pause: Duration,
     probe: ScriptedProbe,
@@ -41,6 +48,12 @@ pub struct ScriptedBackend {
 
 /// What a `ScriptedBackend`'s probe answers: `None` = can run here, else why not.
 pub type ScriptedProbe = Box<dyn Fn() -> Option<String> + Send + Sync>;
+
+enum OpenPause {
+    None,
+    HeedingAbort(Duration),
+    IgnoringAbort(Duration),
+}
 
 enum OpenOutcome {
     Opens,
@@ -53,11 +66,31 @@ impl ScriptedBackend {
         ScriptedBackend {
             descriptor: scripted_descriptor(),
             script,
+            open_pause: OpenPause::None,
             open_outcome: OpenOutcome::Opens,
             close_pause: Duration::ZERO,
             probe: Box::new(|| None),
             record: Arc::new(ScriptRecord::default()),
         }
+    }
+
+    /// Stands in for another engine: its id, name, kind and formats.
+    pub fn with_descriptor(mut self, descriptor: EngineDescriptor) -> ScriptedBackend {
+        self.descriptor = descriptor;
+        self
+    }
+
+    /// Makes the open take this long, or until the load is aborted (then it fails `Cancelled`).
+    /// It never reports progress, so a watched load stalls.
+    pub fn with_open_pause(mut self, pause: Duration) -> ScriptedBackend {
+        self.open_pause = OpenPause::HeedingAbort(pause);
+        self
+    }
+
+    /// Makes the open take this long whatever happens to the load meanwhile.
+    pub fn with_unabortable_open_pause(mut self, pause: Duration) -> ScriptedBackend {
+        self.open_pause = OpenPause::IgnoringAbort(pause);
+        self
     }
 
     pub fn with_probe(
@@ -110,11 +143,12 @@ impl NativeBackend for ScriptedBackend {
 
     fn open(
         &self,
-        _spec: &LoadSpec,
-        _ctl: &LoadControl,
+        spec: &LoadSpec,
+        ctl: &LoadControl,
     ) -> Result<(ScriptedModel, ModelInfo), EngineError> {
         self.record.note_open_thread();
-        self.record.note("open");
+        self.record.note_open(spec);
+        self.pause_open(&ctl.abort)?;
         match &self.open_outcome {
             OpenOutcome::Opens => Ok((self.model(), scripted_model_info())),
             OpenOutcome::Fails(error) => Err(error.clone()),
@@ -124,6 +158,21 @@ impl NativeBackend for ScriptedBackend {
 }
 
 impl ScriptedBackend {
+    fn pause_open(&self, abort: &AbortSignal) -> Result<(), EngineError> {
+        match self.open_pause {
+            OpenPause::None => Ok(()),
+            OpenPause::IgnoringAbort(pause) => {
+                std::thread::sleep(pause);
+                Ok(())
+            }
+            OpenPause::HeedingAbort(pause) if pause_unless_aborted(pause, abort) => Ok(()),
+            OpenPause::HeedingAbort(_) => {
+                self.record.note("open aborted");
+                Err(EngineError::Cancelled(SCRIPTED_OPEN_ABORTED.to_owned()))
+            }
+        }
+    }
+
     fn model(&self) -> ScriptedModel {
         ScriptedModel {
             script: self.script.clone(),
@@ -178,6 +227,7 @@ impl ScriptedModel {
                         return Err(self.aborted());
                     }
                 }
+                Step::Block(busy) => std::thread::sleep(*busy),
                 Step::Fail(error) => return Err(error.clone()),
             }
         }
@@ -206,6 +256,7 @@ fn pause_unless_aborted(pause: Duration, abort: &AbortSignal) -> bool {
 #[derive(Default)]
 pub struct ScriptRecord {
     history: Mutex<Vec<String>>,
+    opened_specs: Mutex<Vec<LoadSpec>>,
     open_thread: Mutex<Option<String>>,
     engine_thread_exited: AtomicBool,
 }
@@ -213,6 +264,16 @@ pub struct ScriptRecord {
 impl ScriptRecord {
     pub fn history(&self) -> Vec<String> {
         self.history.lock().unwrap().clone()
+    }
+
+    /// The spec of every open, in order.
+    pub fn opened_specs(&self) -> Vec<LoadSpec> {
+        self.opened_specs.lock().unwrap().clone()
+    }
+
+    fn note_open(&self, spec: &LoadSpec) {
+        self.opened_specs.lock().unwrap().push(spec.clone());
+        self.note("open");
     }
 
     pub fn open_thread(&self) -> Option<String> {

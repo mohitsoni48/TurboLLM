@@ -1,7 +1,356 @@
+mod claim;
 mod gate;
+mod generation;
 mod journal;
 mod stall;
+mod state;
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError, Weak};
+use std::time::Duration;
+
+use tokio::sync::Mutex;
+
+use crate::catalog::Catalog;
+use crate::descriptor::LoadedModelInfo;
+use crate::engine::LoadedModel;
+use crate::error::{EngineError, MODEL_UNLOADED};
+use crate::ids::EngineKind;
+use crate::request::{GenerateRequest, LoadTarget};
+
+pub use claim::LoadClaim;
 pub use gate::{GatePermit, GenerationGate, OccupancyListener};
+pub use generation::Generation;
 pub use journal::LoadJournal;
 pub use stall::{ProgressListener, StallWatch};
+pub use state::{EngineState, Snapshot};
+
+use generation::ActiveGenerations;
+use state::Snapshots;
+
+/// `TurboLLMException.kt:59`: a generation asked for while no model is resident.
+pub const MODEL_NOT_LOADED: &str = "The model is not loaded.";
+
+/// `LlamaCppEngine.kt:54`, `LiteRtLmEngine.kt:50`: a second model offered to an engine holding one.
+pub const ALREADY_HOLDS_A_MODEL: &str = "This engine already holds a model.";
+
+/// What one manager is built from.
+pub struct ManagerConfig {
+    pub catalog: Catalog,
+    pub journal: Option<LoadJournal>,
+    pub predecessor: Option<EngineManager>,
+    /// The load stall window (ADR-460); zero turns the watch off.
+    pub stall: Duration,
+    pub max_queued: usize,
+    pub cache_dir: PathBuf,
+}
+
+/// Loads, unloads and serves one resident model (ADR-455 point 2) with the Kotlin `EngineHost`
+/// behaviour (arch 2.3.5). Cheap to clone; clones share one manager.
+#[derive(Clone)]
+pub struct EngineManager {
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    catalog: Catalog,
+    lifecycle: Arc<Mutex<()>>,
+    resident: StdMutex<Option<Resident>>,
+    snapshots: Arc<Snapshots>,
+    journal: Option<LoadJournal>,
+    predecessor: Option<EngineManager>,
+    stall: Duration,
+    max_queued: usize,
+    cache_dir: PathBuf,
+    epochs: AtomicU64,
+}
+
+/// The one model a manager holds, with its gate and the generations running on it.
+struct Resident {
+    epoch: u64,
+    info: LoadedModelInfo,
+    model: Box<dyn LoadedModel>,
+    gate: Arc<GenerationGate>,
+    generations: ActiveGenerations,
+}
+
+impl EngineManager {
+    pub fn new(config: ManagerConfig) -> EngineManager {
+        EngineManager {
+            shared: Arc::new(Shared {
+                catalog: config.catalog,
+                lifecycle: Arc::new(Mutex::new(())),
+                resident: StdMutex::new(None),
+                snapshots: Arc::new(Snapshots::new()),
+                journal: config.journal,
+                predecessor: config.predecessor,
+                stall: config.stall,
+                max_queued: config.max_queued,
+                cache_dir: config.cache_dir,
+                epochs: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    pub fn catalog(&self) -> &Catalog {
+        &self.shared.catalog
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        self.shared.snapshots.current()
+    }
+
+    /// The first snapshot whose revision is above `after_revision`.
+    pub async fn next_snapshot(&self, after_revision: u64) -> Snapshot {
+        self.shared.snapshots.after(after_revision).await
+    }
+
+    /// Takes the lifecycle at once or refuses with `LoadInProgress` (`EngineHost.kt:92-95`);
+    /// `Loading` is published before this returns.
+    pub fn claim_load(&self, target: LoadTarget) -> Result<LoadClaim, EngineError> {
+        self.refuse_when_closed()?;
+        let lifecycle = Arc::clone(&self.shared.lifecycle)
+            .try_lock_owned()
+            .map_err(|_held| EngineError::LoadInProgress)?;
+        self.refuse_when_closed()?;
+        let loading = EngineState::Loading(target.model_ref.clone());
+        self.shared.snapshots.publish(loading);
+        Ok(LoadClaim::new(self.clone(), target, lifecycle))
+    }
+
+    /// Cancels the resident model's generations, waits for their native calls, closes the model.
+    /// Waits for a running load first.
+    pub async fn unload(&self) -> Result<(), EngineError> {
+        self.refuse_when_closed()?;
+        let _lifecycle = self.shared.lifecycle.lock().await;
+        self.refuse_when_closed()?;
+        self.unload_resident().await;
+        self.shared.snapshots.publish(EngineState::Idle);
+        Ok(())
+    }
+
+    /// The gate first, then the resident check (`ChatService.kt:51-60`). With nothing resident
+    /// there is no gate to queue at, so even a full queue reads `ModelNotLoaded` (E-4).
+    pub async fn generate(&self, req: GenerateRequest) -> Result<Generation, EngineError> {
+        self.refuse_when_closed()?;
+        let gate = self.resident_gate()?;
+        let permit = gate.acquire().await?;
+        self.start_generation(&gate, req, permit)
+    }
+
+    /// Unloads, then refuses everything with `Closed`; a successor waiting on it continues.
+    pub async fn shutdown(&self) {
+        let _lifecycle = self.shared.lifecycle.lock().await;
+        if self.shared.snapshots.is_closed() {
+            return;
+        }
+        self.unload_resident().await;
+        self.shared.snapshots.publish(EngineState::Closed);
+    }
+
+    fn refuse_when_closed(&self) -> Result<(), EngineError> {
+        match self.shared.snapshots.is_closed() {
+            true => Err(EngineError::Closed),
+            false => Ok(()),
+        }
+    }
+
+    fn resident_gate(&self) -> Result<Arc<GenerationGate>, EngineError> {
+        self.resident()
+            .as_ref()
+            .map(|resident| Arc::clone(&resident.gate))
+            .ok_or_else(|| EngineError::ModelNotLoaded(MODEL_NOT_LOADED.to_owned()))
+    }
+
+    /// Registers the generation and hands it to the model, unless the model it queued for was
+    /// unloaded meanwhile.
+    fn start_generation(
+        &self,
+        gate: &Arc<GenerationGate>,
+        req: GenerateRequest,
+        permit: GatePermit,
+    ) -> Result<Generation, EngineError> {
+        let resident = self.resident();
+        let Some(serving) = resident
+            .as_ref()
+            .filter(|held| Arc::ptr_eq(&held.gate, gate))
+        else {
+            drop(resident);
+            drop(permit);
+            return Err(EngineError::ModelNotLoaded(MODEL_UNLOADED.to_owned()));
+        };
+        let registration = serving.generations.register();
+        let events = serving
+            .model
+            .generate(req, permit, registration.abort_signal())?;
+        Ok(Generation::new(events, registration))
+    }
+
+    async fn await_predecessor_closed(&self) {
+        if let Some(predecessor) = &self.shared.predecessor {
+            predecessor.shared.snapshots.reached_closed().await;
+        }
+    }
+
+    /// Closes the resident model, if any, after its generations ended (`EngineHost.kt:162-169`).
+    /// The published state is left as it was until the model is gone.
+    async fn unload_resident(&self) {
+        let leaving = self.resident().take();
+        if let Some(resident) = leaving {
+            resident.close().await;
+        }
+    }
+
+    /// Makes `model` the resident with a fresh gate and publishes it `Ready`.
+    async fn install(
+        &self,
+        target: &LoadTarget,
+        kind: EngineKind,
+        model: Box<dyn LoadedModel>,
+    ) -> Result<LoadedModelInfo, EngineError> {
+        let arriving = self.resident_for(target, kind, model);
+        let info = arriving.info.clone();
+        let refused = {
+            let mut resident = self.resident();
+            let held = take_residence(&mut resident, arriving);
+            if held.is_ok() {
+                self.show_resident_or_idle_in(&resident);
+            }
+            held
+        };
+        match refused {
+            Ok(()) => Ok(info),
+            Err((rejected, failure)) => {
+                rejected.close().await;
+                Err(failure)
+            }
+        }
+    }
+
+    fn resident_for(
+        &self,
+        target: &LoadTarget,
+        kind: EngineKind,
+        model: Box<dyn LoadedModel>,
+    ) -> Resident {
+        let epoch = self.shared.epochs.fetch_add(1, Ordering::SeqCst) + 1;
+        let snapshots = Arc::clone(&self.shared.snapshots);
+        let slots = model.slots();
+        let max_queued = self.shared.max_queued;
+        let gate = Arc::new_cyclic(|gate: &Weak<GenerationGate>| {
+            let listener = occupancy_listener(snapshots, epoch, Weak::clone(gate));
+            GenerationGate::new(slots, max_queued, listener)
+        });
+        Resident {
+            epoch,
+            info: loaded_model_info(target, kind, model.as_ref()),
+            model,
+            gate,
+            generations: ActiveGenerations::default(),
+        }
+    }
+
+    /// Publishes the resident model `Ready`, or `Idle` when none is held.
+    fn show_resident_or_idle(&self) {
+        let resident = self.resident();
+        self.show_resident_or_idle_in(&resident);
+    }
+
+    fn show_resident_or_idle_in(&self, resident: &Option<Resident>) {
+        let snapshots = &self.shared.snapshots;
+        match resident {
+            Some(held) => snapshots.publish_ready(held.epoch, held.info.clone(), held.occupancy()),
+            None => snapshots.publish(EngineState::Idle),
+        }
+    }
+
+    fn resident(&self) -> MutexGuard<'_, Option<Resident>> {
+        self.shared
+            .resident
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Resident {
+    fn occupancy(&self) -> (bool, usize) {
+        (self.gate.busy(), self.gate.queued())
+    }
+
+    /// Ends every generation with the unload text, waits for their native calls, frees the model.
+    async fn close(self) {
+        self.generations.cancel_for_unload();
+        self.gate.close();
+        self.gate.await_idle().await;
+        self.model.close().await;
+    }
+}
+
+/// Keeps the snapshot's `busy` and `queued` live while this gate's model is the resident one
+/// (`EngineHost.kt:76-79`).
+fn occupancy_listener(
+    snapshots: Arc<Snapshots>,
+    epoch: u64,
+    gate: Weak<GenerationGate>,
+) -> OccupancyListener {
+    Box::new(move || {
+        if let Some(gate) = gate.upgrade() {
+            snapshots.show_occupancy(epoch, || (gate.busy(), gate.queued()));
+        }
+    })
+}
+
+fn loaded_model_info(
+    target: &LoadTarget,
+    kind: EngineKind,
+    model: &dyn LoadedModel,
+) -> LoadedModelInfo {
+    LoadedModelInfo {
+        id: target.id.clone(),
+        path: std::path::absolute(&target.path).unwrap_or_else(|_| target.path.clone()),
+        format: target.format,
+        engine: target.engine.clone(),
+        kind,
+        info: model.info().clone(),
+    }
+}
+
+/// Puts `arriving` in an empty slot. A slot that already holds a model refuses it, as an engine
+/// holding one refuses a second (`LlamaCppEngine.kt:54`), and hands it back to be closed.
+fn take_residence<T>(slot: &mut Option<T>, arriving: T) -> Result<(), (T, EngineError)> {
+    if slot.is_some() {
+        let failure = EngineError::ModelLoadFailed(ALREADY_HOLDS_A_MODEL.to_owned());
+        return Err((arriving, failure));
+    }
+    *slot = Some(arriving);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_slot_takes_the_arriving_model() {
+        let mut slot = None;
+
+        assert!(take_residence(&mut slot, 7).is_ok());
+
+        assert_eq!(slot, Some(7));
+    }
+
+    #[test]
+    fn a_slot_holding_a_model_refuses_another_with_the_kotlin_text() {
+        let mut slot = Some(1);
+
+        let (refused, failure) = take_residence(&mut slot, 2).unwrap_err();
+
+        assert_eq!((refused, slot), (2, Some(1)));
+        assert_eq!(
+            failure,
+            EngineError::ModelLoadFailed(ALREADY_HOLDS_A_MODEL.to_owned())
+        );
+        assert_eq!(failure.to_string(), "This engine already holds a model.");
+    }
+}

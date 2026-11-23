@@ -1088,6 +1088,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "turbollm-engine",
  "turbollm-platform",
 ]
 
