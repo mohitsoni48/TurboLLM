@@ -3,26 +3,24 @@
 
 pub mod fake_llama;
 pub mod gguf;
+pub mod llama_manager;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use turbollm_engine::{
-    AbortSignal, Backend, Catalog, CatalogEntry, ChatMessage, Engine, EngineError, EngineEvent,
-    EngineId, EngineManager, GenerateRequest, Generation, GenerationParams, InProcess, LoadControl,
-    LoadSpec, LoadTarget, ManagerConfig, MessageContent, ModelFormat, ModelRef, PlatformKind,
-    PlatformKinds, Role,
+    AbortSignal, Backend, ChatMessage, EngineError, EngineEvent, EngineId, EngineManager,
+    GenerateRequest, Generation, GenerationParams, LoadControl, LoadSpec, LoadTarget,
+    MessageContent, ModelFormat, ModelRef, Role,
 };
 use turbollm_engine_llama::LlamaBackend;
-use turbollm_platform::HostFacts;
 
 use fake_llama::FakeLlama;
 
 pub const MODEL: &str = "models/tiny.gguf";
 pub const PROMPT_LIMIT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(2);
-const MAX_QUEUED: usize = 8;
 
 pub fn backend(fake: &Arc<FakeLlama>) -> LlamaBackend {
     let fake = Arc::clone(fake);
@@ -89,30 +87,7 @@ pub fn asking(params: GenerationParams) -> GenerateRequest {
 
 /// A manager whose only engine is llama.cpp over `fake`, in-process on every host.
 pub fn manager_over(fake: &Arc<FakeLlama>) -> EngineManager {
-    let engine: Arc<dyn Engine> = Arc::new(InProcess::new(backend(fake)));
-    let entry = CatalogEntry {
-        descriptor: engine.descriptor().clone(),
-        per_platform: in_process_everywhere(),
-        engine,
-    };
-    EngineManager::new(ManagerConfig {
-        catalog: Catalog::new(HostFacts::detect()).with_entry(entry),
-        journal: None,
-        predecessor: None,
-        stall: Duration::ZERO,
-        max_queued: MAX_QUEUED,
-        cache_dir: PathBuf::from("cache"),
-    })
-}
-
-fn in_process_everywhere() -> PlatformKinds {
-    PlatformKinds {
-        android: PlatformKind::InProcess,
-        ios: PlatformKind::InProcess,
-        linux: PlatformKind::InProcess,
-        windows: PlatformKind::InProcess,
-        mac_os: PlatformKind::InProcess,
-    }
+    llama_manager::manager_over(backend(fake), Duration::ZERO, PathBuf::from("cache"))
 }
 
 pub fn target(threads: Option<u32>) -> LoadTarget {

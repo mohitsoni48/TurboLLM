@@ -4,18 +4,22 @@
 //! and `TURBOLLM_TEST_GGUF` a small model (`core/fixtures/engines/README.md`). Without them the
 //! tests skip, except on CI, where they fail.
 
+#[path = "support/llama_manager.rs"]
+mod llama_manager;
+#[path = "support/native_host.rs"]
+mod native_host;
+
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use libloading::Library;
 use turbollm_engine::{
-    Backend, Catalog, CatalogEntry, ChatMessage, Engine, EngineError, EngineEvent, EngineId,
-    EngineManager, FinishReason, GenerateRequest, Generation, GenerationParams, InProcess,
-    LoadTarget, LoadedModelInfo, ManagerConfig, MessageContent, ModelFormat, ModelRef,
-    PlatformKind, PlatformKinds, Role,
+    Backend, ChatMessage, EngineError, EngineEvent, EngineId, EngineManager, FinishReason,
+    GenerateRequest, Generation, GenerationParams, LoadTarget, LoadedModelInfo, MessageContent,
+    ModelFormat, ModelRef, Role,
 };
 use turbollm_engine_llama::api::{
     Delta, LlamaApi, LlamaCalls, LoadRequest, ModelInfo, ProgressFn, Sampling, Session, Stats,
@@ -23,7 +27,10 @@ use turbollm_engine_llama::api::{
 };
 use turbollm_engine_llama::variant::{self, Variant};
 use turbollm_engine_llama::{LlamaBackend, LoadedLibrary};
-use turbollm_platform::{HostFacts, library_file_name};
+use turbollm_platform::library_file_name;
+
+use llama_manager::manager_over;
+use native_host::{NativeTestEnv, take_turn};
 
 const LOAD_STALL: Duration = Duration::from_secs(120);
 const SHORT_STALL: Duration = Duration::from_secs(1);
@@ -37,12 +44,8 @@ const SMALL_CONTEXT: u32 = 512;
 const GREEDY_PROMPT: &str = "Name three colours.";
 const GREEDY_SEED: i64 = 42;
 const GREEDY_MAX_TOKENS: u32 = 48;
-const MAX_QUEUED: usize = 8;
 /// About 3,000 tokens (QA E-23): far beyond `SMALL_CONTEXT`, and a prefill that outlasts `CANCEL_AFTER`.
 const LONG_PROMPT_SENTENCES: usize = 300;
-
-/// The live-session count is process-wide, so the tests take turns even without `--test-threads=1`.
-static NATIVE: Mutex<()> = Mutex::new(());
 
 #[test]
 fn a_tiny_gguf_loads_and_streams_prefilled_then_text_then_done() {
@@ -167,7 +170,7 @@ fn twenty_load_chat_unload_cycles_leave_no_session_behind() {
 #[test]
 fn a_load_whose_progress_goes_quiet_is_stopped_by_the_stall_watch() {
     on_the_real_library(|host| async move {
-        let manager = host.manager_over(host.backend_whose_progress_goes_quiet(), SHORT_STALL);
+        let manager = manager_with_stall(host.backend_whose_progress_goes_quiet(), SHORT_STALL);
 
         let failure = host.load(&manager, None).await.err();
 
@@ -198,10 +201,6 @@ where
         .block_on(test(host));
 }
 
-fn take_turn() -> MutexGuard<'static, ()> {
-    NATIVE.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// The host build and the model the environment names, and a handle on the library's test probe.
 struct Host {
     library_dir: PathBuf,
@@ -211,13 +210,7 @@ struct Host {
 
 impl Host {
     fn from_env() -> Option<Host> {
-        let (Some(library_dir), Some(model)) = (
-            env_path("TURBOLLM_LLAMA_LIB_DIR").map(from_workspace_root),
-            env_path("TURBOLLM_TEST_GGUF"),
-        ) else {
-            skip("TURBOLLM_LLAMA_LIB_DIR and TURBOLLM_TEST_GGUF must both be set");
-            return None;
-        };
+        let NativeTestEnv { library_dir, model } = NativeTestEnv::read()?;
         let probe = open_base_library(&library_dir);
         Some(Host {
             library_dir,
@@ -227,27 +220,10 @@ impl Host {
     }
 
     fn manager(&self) -> EngineManager {
-        self.manager_over(
+        manager_with_stall(
             LlamaBackend::new(Some(self.library_dir.clone())),
             LOAD_STALL,
         )
-    }
-
-    fn manager_over(&self, backend: LlamaBackend, stall: Duration) -> EngineManager {
-        let engine: Arc<dyn Engine> = Arc::new(InProcess::new(backend));
-        let entry = CatalogEntry {
-            descriptor: engine.descriptor().clone(),
-            per_platform: in_process_everywhere(),
-            engine,
-        };
-        EngineManager::new(ManagerConfig {
-            catalog: Catalog::new(HostFacts::detect()).with_entry(entry),
-            journal: None,
-            predecessor: None,
-            stall,
-            max_queued: MAX_QUEUED,
-            cache_dir: std::env::temp_dir(),
-        })
     }
 
     /// The real library, with every load progress report after the first held back.
@@ -318,14 +294,8 @@ fn open_base_library(library_dir: &Path) -> Library {
     unsafe { Library::new(&path) }.unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-fn in_process_everywhere() -> PlatformKinds {
-    PlatformKinds {
-        android: PlatformKind::InProcess,
-        ios: PlatformKind::InProcess,
-        linux: PlatformKind::InProcess,
-        windows: PlatformKind::InProcess,
-        mac_os: PlatformKind::InProcess,
-    }
+fn manager_with_stall(backend: LlamaBackend, stall: Duration) -> EngineManager {
+    manager_over(backend, stall, std::env::temp_dir())
 }
 
 /// Everything one generation streamed, and how it ended.
@@ -521,26 +491,4 @@ impl LlamaCalls for QuietAfterFirstProgress {
     fn free(&self, session: Session) {
         self.library.free(session);
     }
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-/// Cargo runs tests from the crate folder; a relative path is meant from `core/`, where cargo is invoked.
-fn from_workspace_root(path: PathBuf) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join(path)
-}
-
-fn skip(reason: &str) {
-    assert!(
-        std::env::var("CI").as_deref() != Ok("true"),
-        "{reason}: required on CI"
-    );
-    println!("skipped: {reason}");
 }

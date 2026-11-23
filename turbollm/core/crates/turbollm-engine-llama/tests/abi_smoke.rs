@@ -2,13 +2,16 @@
 //! Needs a host build (`cargo xtask build-llama --host`): `TURBOLLM_LLAMA_LIB_DIR` names its folder and
 //! `TURBOLLM_TEST_GGUF` a small model. Without them the tests skip, except on CI, where they fail.
 
+#[path = "support/native_host.rs"]
+mod native_host;
+
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Mutex, MutexGuard};
 
 use libloading::Library;
 use turbollm_platform::library_file_name;
+
+use native_host::{NativeTestEnv, take_turn};
 
 const LIBRARY_STEM: &str = "turbollm_core_llama_base";
 const TEST_CONTEXT: i32 = 512;
@@ -33,9 +36,6 @@ type LoadFn = unsafe extern "C" fn(
     *mut c_char,
     usize,
 ) -> *mut TlSession;
-
-/// The live-session count is process-wide, so the tests that load take turns.
-static NATIVE: Mutex<()> = Mutex::new(());
 
 #[test]
 fn the_library_speaks_abi_version_one() {
@@ -71,12 +71,6 @@ fn a_progress_callback_that_returns_false_fails_the_load_with_a_message() {
     assert_eq!(llama.live_sessions(), 0);
 }
 
-fn take_turn() -> MutexGuard<'static, ()> {
-    NATIVE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 extern "C" fn refuse_progress(_progress: f32, _data: *mut c_void) -> bool {
     false
 }
@@ -88,13 +82,7 @@ struct Llama {
 
 impl Llama {
     fn open() -> Option<Llama> {
-        let (Some(library_dir), Some(model)) = (
-            env_path("TURBOLLM_LLAMA_LIB_DIR").map(from_workspace_root),
-            env_path("TURBOLLM_TEST_GGUF"),
-        ) else {
-            skip("TURBOLLM_LLAMA_LIB_DIR and TURBOLLM_TEST_GGUF must both be set");
-            return None;
-        };
+        let NativeTestEnv { library_dir, model } = NativeTestEnv::read()?;
         let library_path = library_dir.join(library_file_name(LIBRARY_STEM));
         // SAFETY: the library is ours; its initialisers only set up llama.cpp's static state.
         let library = unsafe { Library::new(&library_path) }
@@ -151,26 +139,4 @@ impl Llama {
         let symbol = unsafe { self.library.get::<F>(name.as_bytes()) };
         *symbol.unwrap_or_else(|e| panic!("{name}: {e}"))
     }
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-/// Cargo runs tests from the crate folder; a relative path is meant from `core/`, where cargo is invoked.
-fn from_workspace_root(path: PathBuf) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join(path)
-}
-
-fn skip(reason: &str) {
-    assert!(
-        std::env::var("CI").as_deref() != Ok("true"),
-        "{reason}: required on CI"
-    );
-    println!("skipped: {reason}");
 }
