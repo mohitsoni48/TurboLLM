@@ -27,6 +27,8 @@ import {
 } from '../components/ui/alert-dialog'
 import { focusManager, useQuery, useQueryClient } from '@tanstack/react-query'
 import { skillKeys, fetchSkills } from '../lib/agent-api'
+import { CHAT_UNSUPPORTED_SKILLS, enabledSkillsOf, pendingSkillsFor, skillIdsForNewConversation } from '../lib/chat-skills'
+import { completeMention, dismissMention, findMentionedSkillIds, trailingMentionQuery } from '../lib/skill-mentions'
 import { cn, readLastChatConvId, writeLastChatConvId } from '../lib/utils'
 import { useChatInAddress } from '../lib/chat-address'
 import { ThinkingBudgetSlider } from '../components/ThinkingBudgetSlider'
@@ -302,8 +304,24 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
 
   // Skills enabled before a conversation exists yet (first message hasn't been sent).
   // Once activeId exists, conv.skillIds is the source of truth instead.
-  const [pendingSkillIds, setPendingSkillIds] = useState<string[]>([])
-  const enabledSkillIds = conv?.skillIds ?? pendingSkillIds
+  // null = untouched, so a blank chat shows (and starts with) the skills switched on by default.
+  const [pendingSkillSelection, setPendingSkillSelection] = useState<string[] | null>(null)
+  const savedDefaultSkillIds = settingsQ.data?.defaultSkillIds
+  const defaultSkillIds = useMemo(() => (savedDefaultSkillIds ?? []).filter((id) => !CHAT_UNSUPPORTED_SKILLS.has(id)), [savedDefaultSkillIds])
+  // What an untouched empty chat shows is what a chat on the SELECTED agent would start with: the defaults for a plain chat, none for
+  // Blank or an agent with a skill list of its own. A boolean dep keeps this array stable while the agents list is rebuilt per render.
+  const selectedAgentHasSkillList = allAgents.find((a) => a.id === selectedPersonaId)?.skillIds !== undefined
+  const untouchedPendingSkillIds = useMemo(
+    () => pendingSkillsFor({ selection: null, defaults: defaultSkillIds, agentSkillIds: selectedAgentHasSkillList ? [] : undefined, isBlankAgent: selectedPersonaId === 'blank' }),
+    [defaultSkillIds, selectedAgentHasSkillList, selectedPersonaId],
+  )
+  const pendingSkillIds = pendingSkillSelection ?? untouchedPendingSkillIds
+  const setPendingSkillIds = useCallback(
+    (next: string[] | ((prev: string[]) => string[])) =>
+      setPendingSkillSelection((prev) => (typeof next === 'function' ? next(prev ?? untouchedPendingSkillIds) : next)),
+    [untouchedPendingSkillIds],
+  )
+  const enabledSkillIds = enabledSkillsOf({ chatOpen: !!activeId, convSkillIds: conv?.skillIds, pending: pendingSkillIds })
   // The agent this chat runs under: the one the daemon stored with it, else this browser's memory of it (chats from before the
   // daemon kept it), else the default. Not `selectedPersonaId`, which is the empty chat's picker and is not re-seeded for every
   // way a chat can open (a routine run shown inside this screen, another device's chat).
@@ -348,23 +366,24 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     }
   }, [hasConv, modelLoaded, pendingSystemPrompt, pendingSampling, pendingSkillIds, pendingPreserveThinking, draftOnChange])
 
-  // '/' picker: typing '/' (optionally followed by letters, at the START of an
-  // otherwise-empty composer) shows a filtered skill list. Selecting one enables
-  // that skill for the conversation and clears the token.
+  // Skill picker: typing '/' (optionally followed by letters, at the START of an otherwise-empty
+  // composer) or '@partial' (at the END of the text) shows a filtered skill list. Selecting one
+  // enables that skill for the conversation and completes the token.
   const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills, staleTime: 30_000 })
-  const CHAT_UNSUPPORTED_SKILLS = new Set(['filesystem'])
   const pickableSkills = (skillsQ.data ?? []).filter((s) => !CHAT_UNSUPPORTED_SKILLS.has(s.id))
-  const skillPickerMatch = /^\/([a-z0-9-]*)$/i.exec(input)
-  const skillPickerQuery = skillPickerMatch?.[1]?.toLowerCase() ?? ''
-  const filteredSkills = skillPickerMatch
+  const slashMatch = /^\/([a-z0-9-]*)$/i.exec(input)
+  const mentionQuery = trailingMentionQuery(input)
+  const skillPickerTriggered = slashMatch !== null || mentionQuery !== null
+  const skillPickerQuery = slashMatch?.[1]?.toLowerCase() ?? mentionQuery ?? ''
+  const filteredSkills = skillPickerTriggered
     ? pickableSkills.filter((s) => !skillPickerQuery || s.id.includes(skillPickerQuery) || s.name.toLowerCase().includes(skillPickerQuery))
     : []
-  const skillPickerOpen = !!skillPickerMatch && filteredSkills.length > 0 && !live
+  const skillPickerOpen = skillPickerTriggered && filteredSkills.length > 0 && !live
   const [skillPickerIndex, setSkillPickerIndex] = useState(0)
   useEffect(() => { setSkillPickerIndex(0) }, [skillPickerQuery, skillPickerOpen])
 
   const selectSkill = (skill: { id: string; name: string }) => {
-    setInput(`/${skill.id} `)
+    setInput(slashMatch ? `/${skill.id} ` : completeMention(input, skill.id))
     setTimeout(autoResize, 0)
     if (activeId) {
       const next = Array.from(new Set([...enabledSkillIds, skill.id]))
@@ -873,6 +892,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     const skillMatch = /^\/([a-z0-9-]+)(?:\s+([\s\S]*))?$/.exec(rawText)
     const matchedSkill = skillMatch ? pickableSkills.find((s) => s.id === skillMatch[1]) : undefined
     const text = matchedSkill ? (skillMatch?.[2] ?? '').trim() : rawText
+    // '@skill-id' anywhere in the message turns that skill on too, and stays in the text as the user wrote it.
+    const mentionedSkillIds = findMentionedSkillIds(text, pickableSkills)
 
     // Discriminate by file.type (authoritative, same as the preview thumbnail below) rather
     // than sniffing the extracted dataUrl content — a text/PDF attachment whose content
@@ -936,11 +957,15 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           try { hardware = hardwareSection(await fetchSysInfo()) } catch { /* non-fatal — proceed without hardware info */ }
         }
         const agentConfig = buildAgentConfig(selectedPersonaId, resolved, getPersonalization(), { memoryFacts, hardware })
-        const initialSkillIds = Array.from(new Set([
-          ...pendingSkillIds,
-          ...agentConfig.agentSkillIds,
-          ...(matchedSkill ? [matchedSkill.id] : []),
-        ]))
+        // resolved?.skillIds, not agentConfig.agentSkillIds: the config turns "the agent names no skills" into [], and
+        // skillIdsForNewConversation needs that case (undefined) to know the chat takes the user's defaults.
+        const initialSkillIds = skillIdsForNewConversation({
+          selection: pendingSkillSelection,
+          defaults: defaultSkillIds,
+          agentSkillIds: resolved?.skillIds,
+          isBlankAgent: selectedPersonaId === 'blank',
+          named: [...(matchedSkill ? [matchedSkill.id] : []), ...mentionedSkillIds],
+        })
         // A system prompt set via Thread settings before the first message is an
         // explicit override — it wins over the agent's own default system prompt.
         const finalSystemPrompt = pendingSystemPrompt.trim() || agentConfig.systemPrompt
@@ -951,7 +976,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           systemPrompt: finalSystemPrompt || undefined,
           toolPolicy: agentConfig.toolPolicy,
           chatAgentId: selectedPersonaId,
-          skillIds: initialSkillIds.length ? initialSkillIds : undefined,
+          // Undefined lets the daemon seed the defaults; any list, even an empty one, is exactly what the chat gets.
+          skillIds: initialSkillIds,
           // Pass an explicit empty array through as-is (e.g. Blank's fixed []) — collapsing it
           // to undefined here would silently turn "zero tools" back into "unrestricted" before
           // the request ever reaches the backend (GitHub #52).
@@ -968,14 +994,15 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         if (thinkingBudget !== readThinkingBudget(null)) localStorage.setItem(`tllm.thinkingBudget.${convId}`, String(thinkingBudget))
         if (reasoningEffort !== readReasoningEffort(null)) localStorage.setItem(`tllm.reasoningEffort.${convId}`, reasoningEffort)
         setActiveId(convId)
-        setPendingSkillIds([])
+        setPendingSkillSelection(null)
         setPendingSystemPrompt('')
         setPendingSampling({})
         setPendingPreserveThinking(true)
-      } else if (matchedSkill && !enabledSkillIds.includes(matchedSkill.id)) {
-        // Existing conversation missing this skill — enable it before sending so the
+      } else {
+        const missing = [...(matchedSkill ? [matchedSkill.id] : []), ...mentionedSkillIds].filter((id) => !enabledSkillIds.includes(id))
+        // Existing conversation missing a named skill — enable it before sending so the
         // system-prompt injection picks it up on this very turn, not the next one.
-        await mut.update.mutateAsync({ id: convId, skillIds: Array.from(new Set([...enabledSkillIds, matchedSkill.id])) })
+        if (missing.length) await mut.update.mutateAsync({ id: convId, skillIds: Array.from(new Set([...enabledSkillIds, ...missing])) })
       }
       if (matchedSkill) toast.success(`Using skill: ${matchedSkill.name}`)
 
@@ -1705,7 +1732,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         {/* Composer area (always visible; disabled when no model; hidden in readonly) */}
         {readonly ? null : <div className="mx-auto w-full max-w-3xl px-3 pb-3 md:px-8 md:pb-5">
           <div className="relative w-full">
-            {/* '/' skill picker */}
+            {/* '/' and '@' skill picker */}
             {skillPickerOpen && (
               <div className="absolute bottom-full left-0 mb-2 w-full max-w-sm overflow-hidden rounded-lg border border-border bg-panel shadow-[var(--shadow-2)]">
                 {filteredSkills.map((s, i) => (
@@ -1718,7 +1745,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                       i === skillPickerIndex ? 'bg-panel-2' : 'hover:bg-panel-2',
                     )}
                   >
-                    <span className="text-ink">/{s.id}{enabledSkillIds.includes(s.id) ? ' · already on' : ''}</span>
+                    <span className="text-ink">{slashMatch ? '/' : '@'}{s.id}{enabledSkillIds.includes(s.id) ? ' · already on' : ''}</span>
                     {s.description && <span className="text-[12px] text-muted">{s.description}</span>}
                   </button>
                 ))}
@@ -1844,12 +1871,12 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                         // (Enter still does that, now unambiguous once the text is a full match).
                         e.preventDefault()
                         const s = filteredSkills[Math.min(skillPickerIndex, filteredSkills.length - 1)]
-                        setInput(`/${s.id}`)
+                        setInput(slashMatch ? `/${s.id}` : completeMention(input, s.id).trimEnd())
                         setTimeout(autoResize, 0)
                         return
                       }
                       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); selectSkill(filteredSkills[Math.min(skillPickerIndex, filteredSkills.length - 1)]); return }
-                      if (e.key === 'Escape') { e.preventDefault(); setInput(''); return }
+                      if (e.key === 'Escape') { e.preventDefault(); setInput(slashMatch ? '' : dismissMention(input)); return }
                     }
                     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() }
                     if (e.key === 'ArrowUp' && !input && !live) {

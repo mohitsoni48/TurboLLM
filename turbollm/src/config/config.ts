@@ -692,6 +692,10 @@ export interface Config {
    *  A key no scanned model has is ignored. Bounded: PUT /api/v1/models/:key/hidden adds only a scanned model's key,
    *  deleting a model through TurboLLM drops its key, and normalize keeps the newest {@link HIDDEN_MODELS_CAP}. */
   hiddenModels: string[]
+  /** Ids of the skills switched on for every new chat (Skills library → "On by default"). A new conversation created
+   *  without skillIds of its own starts with these; one that names skillIds, even an empty list, gets exactly those.
+   *  Ids the library no longer holds are dropped when the conversation is created. normalize always sets it. */
+  defaultSkillIds: string[]
   /** Persisted auto-tune results keyed by modelKey (spec 09 §1, 01 §4). Additive;
    *  absent in old configs → normalize seeds {}. Never throws on load. */
   benchResults: Record<string, BenchResult>
@@ -887,6 +891,7 @@ export function defaultConfig(): Config {
     modelPresets: {},
     lastPresetId: {},
     hiddenModels: [],
+    defaultSkillIds: [],
     benchResults: {},
     vramHeadroomMb: VRAM_HEADROOM_DEFAULT_MB,
     lastLoaded: { modelKey: '', engineId: '' },
@@ -1536,6 +1541,10 @@ function normalize(c: Config): void {
   c.hiddenModels = Array.isArray(c.hiddenModels)
     ? [...new Set(c.hiddenModels.filter((k): k is string => typeof k === 'string' && k !== ''))].slice(-HIDDEN_MODELS_CAP)
     : []
+  // Default skills: absent in older configs → []. Non-empty strings only, each once.
+  c.defaultSkillIds = Array.isArray(c.defaultSkillIds)
+    ? [...new Set(c.defaultSkillIds.filter((id): id is string => typeof id === 'string' && id !== ''))].slice(-DEFAULT_SKILLS_CAP)
+    : []
   // Built-in agent overrides (Customize → Agents "Edit" + Reset): absent in
   // pre-feature configs → {}. Filter to well-shaped entries.
   const rawOverrides = (c.builtinAgentOverrides ?? {}) as Record<string, unknown>
@@ -1751,6 +1760,10 @@ function validate(c: Config): void {
 /** Preset cap is PER MODEL — at most this many in any one modelKey's array. (customAgents is a
  *  flat list so its cap is global; modelPresets is a Record<string, ModelPreset[]>.) */
 export const MODEL_PRESET_CAP = 50
+
+/** At most this many default skill ids (Config.defaultSkillIds): the skill library's own size limit, so nothing the
+ *  library can hold is turned away and a hand-edited list cannot grow past it. */
+export const DEFAULT_SKILLS_CAP = 200
 
 /** At most this many hidden model keys (Config.hiddenModels); past it the oldest is dropped, and that model shows again.
  *  Far above any library, so only a list no library could fill reaches it. */
