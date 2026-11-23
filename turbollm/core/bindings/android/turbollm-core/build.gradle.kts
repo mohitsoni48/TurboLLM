@@ -104,6 +104,44 @@ val cargoHostBuild by tasks.registering(Exec::class) {
     commandLine("cargo", "build", "--manifest-path", coreManifest, "-p", "turbollm-ffi", "--release")
 }
 
+// The llama.cpp session libraries, one per CPU variant (arch 2.4.3, 2.8). They join the library only when the build
+// sets turbollm.engines=true (D-7: false until the Android repo switches to the core's engines; M-4 removes the
+// switch); otherwise no CMake build is configured at all.
+val packageEngines = providers.gradleProperty("turbollm.engines").map(String::toBoolean).getOrElse(false)
+val allLlamaVariants = "base;dotprod;i8mm"
+val debugLlamaVariants = providers.gradleProperty("turbollm.allLlamaVariants")
+    .map { if (it.toBoolean()) allLlamaVariants else "base" }
+    .getOrElse("base")
+val llamaSource = layout.buildDirectory.dir("llama-src")
+
+if (packageEngines) {
+    val fetchLlamaSource by tasks.registering(Exec::class) {
+        description = "Puts the pinned llama.cpp source at build/llama-src/llama.cpp for the CMake build."
+        workingDir = coreDir
+        commandLine("cargo", "xtask", "fetch-llama", "--out", llamaSource.get().asFile.path)
+    }
+
+    android {
+        defaultConfig.externalNativeBuild.cmake.arguments += listOf(
+            "-DTURBOLLM_LLAMA_DIR=${llamaSource.get().dir("llama.cpp").asFile.invariantSeparatorsPath}",
+            "-DANDROID_STL=c++_static",
+            "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
+        )
+        buildTypes {
+            getByName("debug").externalNativeBuild.cmake.arguments += "-DTURBOLLM_VARIANTS=$debugLlamaVariants"
+            getByName("release").externalNativeBuild.cmake.arguments += "-DTURBOLLM_VARIANTS=$allLlamaVariants"
+        }
+        externalNativeBuild.cmake {
+            path = coreDir.resolve("crates/turbollm-engine-llama/native/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
+    tasks.matching { it.name.startsWith("configureCMake") }.configureEach {
+        dependsOn(fetchLlamaSource)
+    }
+}
+
 // The napi addon the Android app's nodejs-mobile loads (arch 2.6, 4). Run on demand with
 // -Pturbollm.libnodeDir=<dir holding <abi>/libnode.so>; not part of the library build. build-node.mjs links
 // each ABI against its libnode.so, writes <abi>/libturbollm_core_node.so and runs xtask check-android-elf.
