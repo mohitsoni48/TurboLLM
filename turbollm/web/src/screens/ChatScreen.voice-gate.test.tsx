@@ -170,7 +170,7 @@ async function composerReady() {
 }
 
 describe('ChatScreen — the voice conversation is behind the Settings opt-in', () => {
-  afterEach(() => { focusManager.setFocused(undefined) })
+  afterEach(() => { focusManager.setFocused(undefined); vi.unstubAllGlobals() })
 
   it('offers dictation only while the opt-in is off: no conversation button anywhere', async () => {
     mockLibrary = [loadedRow()]
