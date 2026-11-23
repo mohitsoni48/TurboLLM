@@ -28,8 +28,8 @@ pub struct LlamaModel {
 }
 
 impl LlamaModel {
-    /// Opens `spec`'s model at the context `ContextPlan` picks, reopening once at llama.cpp's
-    /// trained context when that is smaller and no size was asked for (E-1, PG-9).
+    /// Opens `spec`'s model at the context `ContextPlan` picks, reopening once at the Kotlin
+    /// result `min(n_ctx_train, 4096)` when that differs and no size was asked for (E-1, PG-9).
     pub(crate) fn open(
         calls: SharedCalls,
         spec: &LoadSpec,
@@ -46,10 +46,10 @@ impl LlamaModel {
             abort_flag: Arc::new(AtomicBool::new(false)),
         };
         let (mut session, mut native) = opener.open(plan.requested())?;
-        if let Some(trained) = plan.reopen_at(native) {
-            plan.log_disagreement(trained, log);
+        if let Some(kotlin_context) = plan.reopen_at(native) {
+            plan.log_disagreement(native, kotlin_context, log);
             calls.free(session);
-            (session, native) = opener.open(trained)?;
+            (session, native) = opener.open(kotlin_context)?;
         }
         let info = model_info(native, spec.backend);
         let abort_flag = opener.abort_flag;
@@ -125,21 +125,25 @@ impl ContextPlan {
         }
     }
 
-    /// llama.cpp's trained context when it is smaller than what was opened.
+    /// The context the Kotlin rule ends at, `min(n_ctx_train, 4096)`, whenever it differs from
+    /// what was opened, so a header that is too high or too low lands where Kotlin did (E-1, PG-9).
     fn reopen_at(&self, opened: NativeModelInfo) -> Option<u32> {
         if matches!(self, ContextPlan::Explicit(_)) {
             return None;
         }
         u32::try_from(opened.n_ctx_train)
             .ok()
-            .filter(|trained| (1..self.requested()).contains(trained))
+            .filter(|&trained| trained > 0)
+            .map(|trained| trained.min(DEFAULT_CONTEXT_SIZE))
+            .filter(|&kotlin| kotlin != self.requested())
     }
 
-    fn log_disagreement(&self, trained: u32, log: &LlamaLog) {
+    fn log_disagreement(&self, opened: NativeModelInfo, reopened: u32, log: &LlamaLog) {
         if let ContextPlan::FromHeader(header) = self {
+            let trained = opened.n_ctx_train;
             log(&format!(
                 "context from the GGUF header ({header}) disagreed with llama.cpp ({trained}); \
-                 reopened at {trained}"
+                 reopened at {reopened}"
             ));
         }
     }

@@ -742,14 +742,50 @@ fn pg9_a_header_llama_cpp_disagrees_with_is_reopened_at_llama_cpps_context_and_l
     assert_eq!(fake.opened_contexts(), [4096, 2048]);
     assert_eq!(fake.seen().freed.len(), 1);
     assert_eq!(info.context_size, 2048);
-    let disagreements: Vec<String> = log
-        .lock()
+    assert_eq!(header_disagreements(&log), [HEADER_DISAGREED]);
+}
+
+#[test]
+fn pg9_a_header_below_the_trained_context_reopens_at_the_kotlin_context() {
+    let (dir, fake) = (TempDir::new().unwrap(), FakeLlama::new());
+    fake.script().trained_context = 40_960;
+    let header = header_with_contexts(&[
+        ("qwen3.context_length", 40_960),
+        ("foo.context_length", 1024),
+    ]);
+    let model = write(dir.path(), "late-small-key.gguf", &header);
+    let (backend, log) = logged_backend(&fake);
+
+    let (_model, info) = backend.open(&default_spec(&model), &control()).unwrap();
+
+    assert_eq!(fake.opened_contexts(), [1024, 4096]);
+    assert_eq!(fake.seen().freed.len(), 1);
+    assert_eq!(info.context_size, 4096);
+    assert_eq!(
+        header_disagreements(&log),
+        ["context from the GGUF header (1024) disagreed with llama.cpp (40960); reopened at 4096"]
+    );
+}
+
+#[test]
+fn pg9_a_header_below_a_small_trained_context_reopens_at_the_trained_context() {
+    let (dir, fake) = (TempDir::new().unwrap(), FakeLlama::new());
+    fake.script().trained_context = 2048;
+    let model = model_trained_at(dir.path(), "understated.gguf", 1024);
+
+    let info = open_info(&fake, &default_spec(&model));
+
+    assert_eq!(fake.opened_contexts(), [1024, 2048]);
+    assert_eq!(info.context_size, 2048);
+}
+
+fn header_disagreements(log: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+    log.lock()
         .unwrap()
         .iter()
-        .filter(|l| l.contains("GGUF header"))
+        .filter(|line| line.contains("GGUF header"))
         .cloned()
-        .collect();
-    assert_eq!(disagreements, [HEADER_DISAGREED]);
+        .collect()
 }
 
 #[test]
