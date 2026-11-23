@@ -18,6 +18,10 @@ pub const TL_CONTEXT_LENGTH_EXCEEDED: i32 = -2;
 pub const TL_TEMPLATE_UNSUPPORTED: i32 = -3;
 pub const TL_ABORTED: i32 = -4;
 
+/// `tl_llama_next_token` statuses, not `TL_*` codes: a sampled token, and the end of the reply.
+pub const TOKEN_SAMPLED: i32 = 1;
+pub const END_OF_REPLY: i32 = 0;
+
 /// `tl_progress_fn`: false aborts the load.
 pub type ProgressFn = unsafe extern "C" fn(progress: f32, data: *mut c_void) -> bool;
 /// `tl_abort_fn`: polled by llama.cpp; true stops the running decode.
@@ -84,7 +88,7 @@ pub struct Sampling {
     pub seed: i64,
 }
 
-/// `tl_llama_next_token`: status 1 with the token's bytes, 0 at the end of the reply, else `TL_*`.
+/// `tl_llama_next_token`: `TOKEN_SAMPLED` with the token's bytes, `END_OF_REPLY`, else a `TL_*` code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
     pub status: i32,

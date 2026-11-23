@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use turbollm_engine::EngineError;
 use turbollm_engine_llama::api::{
-    AbortFn, Delta, LlamaCalls, LoadRequest, ModelInfo, Sampling, Session, Stats, TL_ABORTED,
-    TL_FAILED, TL_OK, Token,
+    AbortFn, Delta, END_OF_REPLY, LlamaCalls, LoadRequest, ModelInfo, Sampling, Session, Stats,
+    TL_ABORTED, TL_FAILED, TL_OK, TOKEN_SAMPLED, Token,
 };
 use turbollm_engine_llama::{ENGINE_THREAD_NAME, LoadedLibrary};
 
@@ -21,7 +21,6 @@ const PREFILL_LIMIT: Duration = Duration::from_secs(30);
 const ABORT_POLL: Duration = Duration::from_millis(1);
 pub const FAKE_LIBRARY_FILE: &str = "fake/turbollm_core_llama_base";
 pub const LOAD_ABORTED: &str = "llama_model_load: the progress callback cancelled the load";
-const TOKEN_STATUS: i32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opened {
@@ -252,7 +251,7 @@ impl FakeLlama {
         reply.sampled += 1;
         reply.deltas.push_back(delta("x", ""));
         Token {
-            status: TOKEN_STATUS,
+            status: TOKEN_SAMPLED,
             piece: b"x".to_vec(),
         }
     }
@@ -351,7 +350,7 @@ impl LlamaCalls for FakeLlama {
             Some(piece) => {
                 self.reply_state().sampled += 1;
                 Token {
-                    status: TOKEN_STATUS,
+                    status: TOKEN_SAMPLED,
                     piece,
                 }
             }
@@ -410,7 +409,7 @@ impl FakeLlama {
         let failure = self.script().token_failure.clone();
         if failure.is_empty() {
             return Token {
-                status: 0,
+                status: END_OF_REPLY,
                 piece: Vec::new(),
             };
         }

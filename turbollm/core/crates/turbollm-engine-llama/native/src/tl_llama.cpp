@@ -27,6 +27,10 @@
 
 using turbollm::session_failure;
 
+// tl_llama_next_token statuses, not TL_* codes (api.rs TOKEN_SAMPLED / END_OF_REPLY).
+constexpr int32_t token_sampled = 1;
+constexpr int32_t end_of_reply  = 0;
+
 struct tl_session {
     std::unique_ptr<turbollm::llama_session> session;
     std::string                              piece;
@@ -165,11 +169,11 @@ int32_t tl_llama_next_token(tl_session * session, tl_str * piece) {
         [&] {
             std::optional<std::string> next = session->session->next_token();
             if (!next) {
-                return int32_t{ 0 };
+                return end_of_reply;
             }
             session->piece = std::move(*next);
             *piece         = borrowed(session->piece);
-            return int32_t{ 1 };
+            return token_sampled;
         },
         failure_code);
 }

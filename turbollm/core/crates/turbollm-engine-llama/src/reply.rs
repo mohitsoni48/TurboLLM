@@ -7,8 +7,8 @@ use turbollm_engine::{
 };
 
 use crate::api::{
-    Delta, LlamaCalls, Sampling, Session, Stats, TL_CONTEXT_LENGTH_EXCEEDED, TL_OK,
-    TL_TEMPLATE_UNSUPPORTED,
+    Delta, END_OF_REPLY, LlamaCalls, Sampling, Session, Stats, TL_CONTEXT_LENGTH_EXCEEDED, TL_OK,
+    TL_TEMPLATE_UNSUPPORTED, TOKEN_SAMPLED,
 };
 use crate::utf8::Utf8Completion;
 use crate::wire;
@@ -18,10 +18,6 @@ const DEFAULT_TEMPERATURE: f32 = 0.8;
 const DEFAULT_TOP_P: f32 = 0.95;
 const DEFAULT_TOP_K: i32 = 40;
 const RANDOM_SEED: i64 = -1;
-
-/// `tl_llama_next_token`'s status for a sampled token.
-const TOKEN_SAMPLED: i32 = 1;
-const END_OF_REPLY: i32 = 0;
 
 const PROMPT_FAILED: &str = "llama.cpp could not process the prompt: ";
 const SAMPLING_FAILED: &str = "llama.cpp could not start sampling: ";
