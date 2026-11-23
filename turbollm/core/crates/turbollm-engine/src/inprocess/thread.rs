@@ -26,6 +26,8 @@ pub(crate) enum Command {
         sink: EventSink,
         permit: GatePermit,
         abort: AbortSignal,
+        /// Reaches the model-wide abort hook; raised by `abort`.
+        interrupt: AbortSignal,
     },
     Close,
 }
@@ -120,21 +122,24 @@ pub(crate) fn panic_message(payload: Box<dyn Any + Send>, without_message: &str)
 
 /// Runs each generation to its end, then frees the model; a load whose caller left before the
 /// model was handed over ends here too, because its command sender is gone. A generation's abort
-/// stops reaching the model before the next generation may start (E-11).
+/// stops reaching the model once its native call returned (E-11), yet still wakes a failure
+/// waiting on a consumer that stopped reading (E-26).
 fn serve<M: NativeModel>(mut model: M, commands: &mpsc::Receiver<Command>) {
     while let Ok(Command::Generate {
         req,
         mut sink,
         permit,
         abort,
+        interrupt,
     }) = commands.recv()
     {
         let generated = model.generate(&req, &mut sink, &abort);
-        abort.retire();
+        interrupt.retire();
         drop(permit);
         if let Err(error) = generated {
             sink.fail(error);
         }
+        abort.retire();
     }
     model.close();
 }

@@ -3,7 +3,6 @@
 //! model it got is closed, the journal is cleared, and only then is the lifecycle released).
 
 use std::path::Path;
-use std::sync::Arc;
 
 use tokio::sync::OwnedMutexGuard;
 use turbollm_platform::default_thread_count;
@@ -79,7 +78,7 @@ impl EngineManager {
         abandoned: &AbortSignal,
     ) -> Result<Box<dyn LoadedModel>, EngineError> {
         let abort = AbortSignal::new();
-        abandoned.add_hook(raising(&abort));
+        abandoned.add_hook(abort.relay());
         let watch = StallWatch::start(engine.stall_policy(), self.shared.stall, abort.clone());
         let ctl = LoadControl {
             progress: watch.progress_listener(),
@@ -134,11 +133,6 @@ impl EngineManager {
             reason,
         }
     }
-}
-
-fn raising(abort: &AbortSignal) -> crate::engine::AbortHook {
-    let abort = abort.clone();
-    Arc::new(move || abort.abort())
 }
 
 /// The crash journal record of one load, cleared however the load ends (E-34). A record that

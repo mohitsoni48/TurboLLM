@@ -109,12 +109,13 @@ impl LoadedModel for InProcessModel {
         abort: AbortSignal,
     ) -> Result<EventStream, EngineError> {
         let (sink, stream) = sink::reply_channel(&abort);
-        abort.add_hook(Arc::clone(&self.abort_hook));
+        let interrupt = self.native_interrupt(&abort);
         let generate = thread::Command::Generate {
             req,
             sink,
             permit,
             abort,
+            interrupt,
         };
         self.commands
             .send(generate)
@@ -135,6 +136,15 @@ impl LoadedModel for InProcessModel {
 }
 
 impl InProcessModel {
+    /// The generation's way into the model-wide abort hook, kept apart from its reply hooks so the
+    /// engine thread can retire it the moment the native call returns.
+    fn native_interrupt(&self, abort: &AbortSignal) -> AbortSignal {
+        let interrupt = AbortSignal::new();
+        interrupt.add_hook(Arc::clone(&self.abort_hook));
+        abort.add_hook(interrupt.relay());
+        interrupt
+    }
+
     /// An engine thread that already stopped has nothing left to free.
     fn request_close(&self) {
         let _ = self.commands.send(thread::Command::Close);

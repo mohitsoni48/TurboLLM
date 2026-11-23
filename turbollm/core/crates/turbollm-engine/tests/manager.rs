@@ -1457,6 +1457,47 @@ async fn cancel_wakes_an_engine_thread_blocked_on_an_unread_reply() {
     drop(generation);
 }
 
+/// A reply that failed after filling its buffer: the engine thread waits to hand over the failure.
+fn a_failure_behind_a_full_reply() -> Vec<Step> {
+    let mut script = texts(REPLY_BUFFER);
+    script.push(Step::Fail(EngineError::EngineFailure("boom".to_owned())));
+    script
+}
+
+#[tokio::test]
+async fn a_cancelled_failed_reply_never_blocks_unload() {
+    let f = fixture(ScriptedBackend::new(a_failure_behind_a_full_reply()));
+    f.load("org/repo/a").await;
+    let generation = f.manager.generate(request()).await.unwrap();
+    eventually("the native call to return", || {
+        has(f.record(), "generate returned")
+    })
+    .await;
+
+    generation.cancel();
+
+    let unload = tokio::time::timeout(Duration::from_secs(2), f.manager.unload()).await;
+    assert_eq!(unload, Ok(Ok(())), "unload with the unread generation held");
+    drop(generation);
+}
+
+#[tokio::test]
+async fn a_cancel_while_a_failed_reply_waits_on_its_consumer_never_reaches_the_model() {
+    let f = fixture(ScriptedBackend::new(a_failure_behind_a_full_reply()));
+    f.load("org/repo/a").await;
+    let generation = f.manager.generate(request()).await.unwrap();
+    eventually("the native call to return", || {
+        has(f.record(), "generate returned")
+    })
+    .await;
+
+    generation.cancel();
+
+    eventually_within(CANCEL_LIMIT, "the freed slot", || !occupancy(&f.state()).0).await;
+    assert!(!has(f.record(), "abort hook"), "{:?}", f.record().history());
+    drop(generation);
+}
+
 #[tokio::test]
 async fn e26_a_slow_consumer_back_pressures_the_engine_and_cancel_wakes_it() {
     let f = fixture(ScriptedBackend::new(texts(10_000)));

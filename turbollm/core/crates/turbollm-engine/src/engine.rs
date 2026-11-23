@@ -105,6 +105,12 @@ impl AbortSignal {
         }
     }
 
+    /// A hook that raises this signal, so an abort of another signal reaches this one's hooks.
+    pub fn relay(&self) -> AbortHook {
+        let relayed = self.clone();
+        Arc::new(move || relayed.abort())
+    }
+
     /// Drops every hook once the native call they interrupt has returned: a later abort still raises
     /// the flag but reaches no native code, so it cannot stop the call that runs next (E-11).
     pub fn retire(&self) {
@@ -206,6 +212,20 @@ mod tests {
 
         aborting.join().unwrap();
         assert!(!ran_after_retire.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_signal_raised_through_its_relay_runs_its_own_hooks() {
+        let relayed = AbortSignal::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        relayed.add_hook(counting_hook(&count));
+        let source = AbortSignal::new();
+        source.add_hook(relayed.relay());
+
+        source.abort();
+
+        assert!(relayed.is_aborted());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
