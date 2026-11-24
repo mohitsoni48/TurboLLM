@@ -193,6 +193,27 @@ fn an_engine_that_cannot_run_on_this_device_is_unavailable_and_not_retried_on_th
 }
 
 #[test]
+fn the_backend_logs_the_library_file_it_opened_once() {
+    let fake = FakeLiteRt::new();
+    let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&log);
+    let backend = backend(&fake).with_log(Arc::new(move |line| {
+        sink.lock().unwrap().push(line.to_owned());
+    }));
+
+    for _ in 0..2 {
+        backend
+            .open(&spec(Some(1024), 4, Backend::Cpu), &control())
+            .unwrap();
+    }
+
+    assert_eq!(
+        *log.lock().unwrap(),
+        [format!("LiteRT-LM loaded {FAKE_LIBRARY_FILE}")]
+    );
+}
+
+#[test]
 fn the_stall_watch_does_not_apply_to_a_load_that_reports_no_progress() {
     let fake = FakeLiteRt::new();
 

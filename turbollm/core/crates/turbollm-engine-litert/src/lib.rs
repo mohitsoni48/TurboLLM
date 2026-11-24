@@ -39,7 +39,17 @@ pub type SharedCalls = Arc<dyn LiteRtCalls + Send + Sync>;
 /// stand in a scripted one.
 pub type Clock = Arc<dyn Fn() -> Duration + Send + Sync>;
 
-type LibraryOpener = Box<dyn Fn() -> Result<SharedCalls, EngineError> + Send + Sync>;
+/// Where the backend reports what a host log should keep: the library file it loaded. The Android
+/// core sends it to logcat (QA H-8); desktop cores write it nowhere.
+pub type LiteRtLog = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// An opened library's calls, and the file they came from.
+pub struct LoadedLibrary {
+    pub calls: SharedCalls,
+    pub file: PathBuf,
+}
+
+type LibraryOpener = Box<dyn Fn() -> Result<LoadedLibrary, EngineError> + Send + Sync>;
 
 /// LiteRT-LM for `InProcess`: the runtime library opens on the first load, once per backend
 /// instance (T-9), and every model runs on its own `turbollm-litert` thread.
@@ -48,6 +58,7 @@ pub struct LiteRtBackend {
     open_library: LibraryOpener,
     library: Mutex<Option<SharedCalls>>,
     clock: Clock,
+    log: LiteRtLog,
 }
 
 impl LiteRtBackend {
@@ -60,7 +71,7 @@ impl LiteRtBackend {
     /// A backend over the calls `open_library` gives, opened on the first load; a failed open is
     /// tried again by the next load.
     pub fn over(
-        open_library: impl Fn() -> Result<SharedCalls, EngineError> + Send + Sync + 'static,
+        open_library: impl Fn() -> Result<LoadedLibrary, EngineError> + Send + Sync + 'static,
     ) -> LiteRtBackend {
         let start = Instant::now();
         LiteRtBackend {
@@ -68,7 +79,12 @@ impl LiteRtBackend {
             open_library: Box::new(open_library),
             library: Mutex::new(None),
             clock: Arc::new(move || start.elapsed()),
+            log: Arc::new(|_| {}),
         }
+    }
+
+    pub fn with_log(self, log: LiteRtLog) -> LiteRtBackend {
+        LiteRtBackend { log, ..self }
     }
 
     pub fn with_clock(self, clock: Clock) -> LiteRtBackend {
@@ -80,8 +96,9 @@ impl LiteRtBackend {
         if let Some(calls) = library.as_ref() {
             return Ok(Arc::clone(calls));
         }
-        let calls = (self.open_library)()?;
-        Ok(Arc::clone(library.insert(calls)))
+        let loaded = (self.open_library)()?;
+        (self.log)(&format!("LiteRT-LM loaded {}", loaded.file.display()));
+        Ok(Arc::clone(library.insert(loaded.calls)))
     }
 }
 
@@ -116,11 +133,16 @@ impl NativeBackend for LiteRtBackend {
 }
 
 /// The first candidate that opens; when none does, the last one's reason.
-fn open_native(library_dir: Option<&Path>) -> Result<SharedCalls, EngineError> {
+fn open_native(library_dir: Option<&Path>) -> Result<LoadedLibrary, EngineError> {
     let mut failure = None;
     for file in library_candidates(LIBRARY_STEM, library_dir) {
         match LiteRtApi::open(&file) {
-            Ok(api) => return Ok(Arc::new(api)),
+            Ok(api) => {
+                return Ok(LoadedLibrary {
+                    calls: Arc::new(api),
+                    file,
+                });
+            }
             Err(error) => failure = Some(error),
         }
     }

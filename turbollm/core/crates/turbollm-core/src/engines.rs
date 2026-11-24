@@ -179,7 +179,8 @@ fn native_entries(library_dir: Option<PathBuf>) -> Vec<CatalogEntry> {
         ))),
         #[cfg(feature = "litert")]
         CatalogEntry::litert_lm(Arc::new(InProcess::new(
-            turbollm_engine_litert::LiteRtBackend::new(library_dir),
+            turbollm_engine_litert::LiteRtBackend::new(library_dir)
+                .with_log(crate::platform_log::platform_log()),
         ))),
     ]
     .into_iter()

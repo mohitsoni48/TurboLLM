@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use turbollm_engine_llama::LlamaLog;
 
-/// The log the llama backend writes to on this platform.
+/// The log the llama and LiteRT backends write to on this platform (their log types are the same shape).
 #[cfg(target_os = "android")]
 pub(crate) fn platform_log() -> LlamaLog {
     Arc::new(logcat::write)
 }
 
-/// The log the llama backend writes to on this platform.
+/// The log the llama and LiteRT backends write to on this platform (their log types are the same shape).
 #[cfg(not(target_os = "android"))]
 pub(crate) fn platform_log() -> LlamaLog {
     Arc::new(|_| {})

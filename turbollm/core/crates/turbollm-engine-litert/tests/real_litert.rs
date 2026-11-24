@@ -19,7 +19,7 @@ use turbollm_engine::{
     PlatformKind, PlatformKinds, Role,
 };
 use turbollm_engine_litert::api::LiteRtApi;
-use turbollm_engine_litert::{LiteRtBackend, SharedCalls};
+use turbollm_engine_litert::{LiteRtBackend, LoadedLibrary, SharedCalls};
 use turbollm_platform::HostFacts;
 
 use native_env::{NativeTestEnv, take_turn};
@@ -301,7 +301,10 @@ impl Host {
     fn manager(&self) -> EngineManager {
         let library = self.library.clone();
         let engine: Arc<dyn Engine> = Arc::new(InProcess::new(LiteRtBackend::over(move || {
-            Ok(Arc::new(LiteRtApi::open(&library)?) as SharedCalls)
+            Ok(LoadedLibrary {
+                calls: Arc::new(LiteRtApi::open(&library)?) as SharedCalls,
+                file: library.clone(),
+            })
         })));
         let entry = CatalogEntry {
             descriptor: engine.descriptor().clone(),

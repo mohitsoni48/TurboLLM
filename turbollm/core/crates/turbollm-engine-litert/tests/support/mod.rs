@@ -13,7 +13,7 @@ use turbollm_engine::{
     LoadSpec, LoadTarget, ManagerConfig, MessageContent, ModelFormat, ModelRef, PlatformKind,
     PlatformKinds, Role,
 };
-use turbollm_engine_litert::LiteRtBackend;
+use turbollm_engine_litert::{LiteRtBackend, LoadedLibrary};
 use turbollm_platform::HostFacts;
 
 use fake_litert::FakeLiteRt;
@@ -24,9 +24,17 @@ pub const PROMPT_LIMIT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(2);
 const MAX_QUEUED: usize = 8;
 
+pub const FAKE_LIBRARY_FILE: &str = "fake-litert-lm.so";
+
 pub fn backend(fake: &Arc<FakeLiteRt>) -> LiteRtBackend {
     let calls = fake.calls();
-    LiteRtBackend::over(move || Ok(Arc::clone(&calls))).with_clock(fake.clock())
+    LiteRtBackend::over(move || {
+        Ok(LoadedLibrary {
+            calls: Arc::clone(&calls),
+            file: PathBuf::from(FAKE_LIBRARY_FILE),
+        })
+    })
+    .with_clock(fake.clock())
 }
 
 pub fn spec(context_size: Option<u32>, threads: u32, backend: Backend) -> LoadSpec {
