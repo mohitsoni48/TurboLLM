@@ -20,10 +20,10 @@ uniffi-kotlin --lib <library> --out <dir>  generate Kotlin bindings from a built
 check-android-elf <file> [--needs <library>]  fail unless every PT_LOAD is 16 KB aligned (and <library> is DT_NEEDED)\n  \
 check-glibc --max <x.y> <file>  fail if the file needs a GLIBC_ symbol version above <x.y>\n  \
 fetch-llama --out <dir>  put the pinned, sha256-checked llama.cpp source at <dir>/llama.cpp\n  \
-build-llama --host [--variant base]  CMake-build turbollm_core_llama_<variant> into target/llama/<host-triple>
-  \nfetch-litert --abis <arm64-v8a,x86_64> --out <dir>  stage the pinned LiteRT-LM library per Android ABI
-  \nfetch-litert --host --out <dir>  stage the pinned LiteRT-LM library for this OS
-  check-litert-packaged <aar> [--abis <list>]  fail unless the AAR's LiteRT library is byte-identical to the pin";
+build-llama --host [--variant base]  CMake-build turbollm_core_llama_<variant> into target/llama/<host-triple>\n  \
+fetch-litert --abis <arm64-v8a,x86_64> --out <dir>  stage the pinned LiteRT-LM library per Android ABI\n  \
+fetch-litert --host --out <dir>  stage the pinned LiteRT-LM library for this OS\n  \
+check-litert-packaged <aar> [--abis <list>]  fail unless the AAR's LiteRT library is byte-identical to the pin";
 const FAILURE_EXIT: u8 = 1;
 const UNKNOWN_COMMAND_EXIT: u8 = 2;
 
@@ -315,4 +315,24 @@ fn package_json() -> PathBuf {
 
 fn read(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::USAGE;
+
+    #[test]
+    fn every_command_line_of_the_usage_text_is_indented_two_spaces_and_none_is_blank() {
+        let commands = USAGE
+            .split_once("commands:\n")
+            .expect("a commands: heading")
+            .1;
+        for line in commands.lines() {
+            assert!(
+                line.starts_with("  ") && !line.trim().is_empty(),
+                "{line:?}"
+            );
+        }
+        assert_eq!(commands.lines().count(), 11, "{commands}");
+    }
 }
