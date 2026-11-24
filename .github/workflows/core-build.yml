@@ -153,7 +153,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/turbollm-test-models
-          key: engine-test-models-${{ hashFiles('turbollm/core/fixtures/engines/README.md') }}
+          key: engine-test-models-${{ hashFiles('turbollm/core/fixtures/engines/README.md') }}-${{ env.TEST_LITERTLM_SHA256 }}
 
       # A cached file is checked like a download; a miss or a bad file is fetched again from the pinned commit.
       - name: Download the test GGUF on a cache miss
@@ -595,7 +595,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/turbollm-test-models
-          key: engine-test-models-${{ hashFiles('turbollm/core/fixtures/engines/README.md') }}
+          key: engine-test-models-${{ hashFiles('turbollm/core/fixtures/engines/README.md') }}-${{ env.TEST_LITERTLM_SHA256 }}
 
       # A cached file is checked like a download; a miss or a bad file is fetched again from the pinned commit.
       - name: Download the test GGUF on a cache miss

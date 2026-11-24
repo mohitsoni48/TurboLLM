@@ -680,6 +680,12 @@ for (const name of MODEL_JOBS) {
     assert.ok(download.name, `${name}: the download step has no name (P-21)`)
     assert.ok(stepIndex(job, gguf) !== stepIndex(job, download))
   })
+
+  test(`${name}: the model cache key changes with the .litertlm pin, so a GGUF-only entry is not reused`, () => {
+    const cache = cacheKeyedOn(jobs[name], ENGINE_MODELS_HASH)
+
+    assert.ok(String(cache.with?.key).includes('env.TEST_LITERTLM_SHA256'), `${name}: the key ignores the .litertlm pin`)
+  })
 }
 
 test('rust-checks stages the host LiteRT-LM library from a cache keyed on litert-runtime.json before the Rust tests', () => {
@@ -714,6 +720,6 @@ test('android-emulator pushes the test .litertlm to the device and passes it as 
   assert.equal(emulator.env?.TURBOLLM_TEST_LITERTLM, download.env?.TURBOLLM_TEST_LITERTLM)
   assert.ok(push >= 0, 'the .litertlm is not pushed to the device')
   assert.ok(push < script.indexOf('./gradlew'), 'the instrumented tests start before the push')
-  assert.match(script, new RegExp(`-Pandroid\.testInstrumentationRunnerArguments\.turbollmTestLitertlm=${DEVICE_LITERTLM}`))
+  assert.match(script, new RegExp(`-Pandroid\\.testInstrumentationRunnerArguments\\.turbollmTestLitertlm=${DEVICE_LITERTLM}`))
   assert.ok(stepIndex(job, download) < stepIndex(job, emulator))
 })
