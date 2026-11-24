@@ -8,6 +8,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../lib/api'
 import { toast } from '../components/ui/sonner'
+import { useVoiceStore } from '../stores/voice'
 import type { ChatSseEvent } from '../lib/chat-types'
 
 beforeEach(() => {
