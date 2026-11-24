@@ -9,6 +9,20 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../lib/api'
 import { toast } from '../components/ui/sonner'
 import type { ChatSseEvent } from '../lib/chat-types'
+import type { VoiceInputOptions } from './chat/useVoiceInput'
+import { useVoiceStore } from '../stores/voice'
+
+let voiceOptions: VoiceInputOptions
+vi.mock('./chat/useVoiceInput', () => ({
+  useVoiceInput: (options: VoiceInputOptions) => {
+    voiceOptions = options
+    return {
+      phase: 'idle', block: null, startedAt: null, pendingMs: 0,
+      meter: { subscribe: () => () => {}, level: () => 0 },
+      start: vi.fn(), stop: vi.fn(), cancel: vi.fn(), choose: vi.fn(),
+    }
+  },
+}))
 
 beforeEach(() => {
   const store = new Map<string, string>()
@@ -717,4 +731,33 @@ describe('ChatScreen — streaming a reply', () => {
     // row alone would add one call per token).
     expect(mutationHookCalls / TOKENS).toBeLessThan(5)
   })
+})
+
+
+describe('hands-free input during a live reply', () => {
+it('keeps hands-free speech and reports a refusal when a reply is already live', async () => {
+  nextGen = hangingStream()
+  const toastError = vi.spyOn(toast, 'error')
+  useVoiceStore.setState({ conversation: true })
+  try {
+    await renderScreen('/chat/c1')
+    act(() => {
+      const button = screen.getAllByRole('button', { name: /Start a voice conversation/ })[0]
+      fireEvent.click(button)
+    })
+    expect(screen.getAllByRole('button', { name: /Stop voice conversation/ })[0]).toHaveAttribute('aria-pressed', 'true')
+    await sendText('start a reply')
+    await screen.findByTitle('Stop generation (Esc)')
+    act(() => voiceOptions.onText('  keep this spoken text \n  '))
+    expect(await composer()).toHaveValue('  keep this spoken text \n  ')
+    expect(toastError).toHaveBeenCalledWith('Wait for the current reply to finish, or stop it before sending.', { duration: Infinity, closeButton: true })
+    expect(screen.getAllByRole('button', { name: /Stop voice conversation/ })[0]).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByTitle('Stop generation (Esc)')).toBeInTheDocument()
+    expect(sendCalls).toHaveLength(1)
+    expect(stopSpy).not.toHaveBeenCalled()
+  } finally {
+    useVoiceStore.setState({ conversation: false })
+    toastError.mockRestore()
+  }
+})
 })
