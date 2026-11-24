@@ -563,7 +563,7 @@ async fn endless_reply_after_first_text(
     fake.script().endless = true;
     let manager = loaded(fake).await;
     let mut generation = manager.generate(question()).await.unwrap();
-    while !matches!(generation.next().await, Ok(Some(EngineEvent::Text(_)))) {}
+    until_first_text(&mut generation).await;
     (manager, generation)
 }
 
@@ -752,7 +752,7 @@ async fn every_litert_call_but_the_cancel_runs_on_the_engines_own_thread_and_the
     reply(&manager, question()).await.unwrap();
     fake.script().endless = true;
     let mut generation = manager.generate(question()).await.unwrap();
-    while !matches!(generation.next().await, Ok(Some(EngineEvent::Text(_)))) {}
+    until_first_text(&mut generation).await;
     generation.cancel();
     let _ = every_event(&mut generation).await;
     manager.unload().await.unwrap();

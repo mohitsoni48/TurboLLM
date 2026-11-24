@@ -167,3 +167,21 @@ pub async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
         tokio::time::sleep(POLL).await;
     }
 }
+
+/// Reads until the first text arrives; a reply that ends or fails first, or takes longer than
+/// `PROMPT_LIMIT`, fails the test saying what it saw instead of spinning.
+pub async fn until_first_text(generation: &mut Generation) {
+    let reading = async {
+        loop {
+            match generation.next().await {
+                Ok(Some(EngineEvent::Text(_))) => return,
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the reply ended before any text"),
+                Err(error) => panic!("the reply failed before any text: {error:?}"),
+            }
+        }
+    };
+    tokio::time::timeout(PROMPT_LIMIT, reading)
+        .await
+        .unwrap_or_else(|_| panic!("no text arrived within {PROMPT_LIMIT:?}"));
+}
