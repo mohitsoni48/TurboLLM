@@ -638,3 +638,72 @@ function instructionAfter(lines: string[], index: number): string {
   const end = rest.findIndex((line) => !line.endsWith('\\'))
   return rest.slice(0, end + 1).join('\n')
 }
+
+// T26 (rust-core Phase 2a): the real LiteRT CPU tests run on Linux in rust-checks, and the LiteRT instrumented test on
+// the emulator. The .litertlm comes from the pinned Hugging Face commit of core/fixtures/engines/README.md, into the
+// same cache folder as the GGUF; the library is the host wheel member fetch-litert stages. No extra job (P-21).
+const TEST_LITERTLM = 'Qwen3-0.6B.litertlm'
+const DEVICE_LITERTLM = `/data/local/tmp/turbollm/${TEST_LITERTLM}`
+const LITERT_RUNTIME_HASH = "hashFiles('turbollm/core/crates/turbollm-engine-litert/litert-runtime.json')"
+const LITERT_ARCHIVE_CACHE = 'turbollm/core/target/cache/litert'
+const HOST_LITERT_LIBRARY = 'target/litert/liblitert-lm.so'
+
+test('the pinned test .litertlm URL and sha256 are the ones of the engine fixtures README', () => {
+  const { repo, commit, sha256 } = pinnedModel(TEST_LITERTLM)
+
+  assert.equal(workflow.env?.TEST_LITERTLM_URL, `https://huggingface.co/${repo}/resolve/${commit}/${TEST_LITERTLM}`)
+  assert.equal(workflow.env?.TEST_LITERTLM_SHA256, sha256)
+})
+
+for (const name of MODEL_JOBS) {
+  test(`${name} downloads the test .litertlm into the GGUF's cache folder, a miss checked by sha256`, () => {
+    const job = jobs[name]
+    const gguf = stepRunning(job, '"$TEST_GGUF_URL"')
+    const download = stepRunning(job, '"$TEST_LITERTLM_URL"')
+    const cache = cacheKeyedOn(job, ENGINE_MODELS_HASH)
+
+    assert.match(String(download.run), /sha256sum -c/, `${name}: the download is not checked`)
+    assert.match(String(download.run), /\$TEST_LITERTLM_SHA256/)
+    assert.ok(download.env?.TURBOLLM_TEST_LITERTLM?.endsWith(`/${TEST_LITERTLM}`))
+    assert.equal(dirnameOf(download.env?.TURBOLLM_TEST_LITERTLM), cache.with?.path, `${name}: another folder than the cache`)
+    assert.ok(stepIndex(job, cache) < stepIndex(job, download), `${name}: download runs before the cache restore`)
+    assert.ok(download.name, `${name}: the download step has no name (P-21)`)
+    assert.ok(stepIndex(job, gguf) !== stepIndex(job, download))
+  })
+}
+
+test('rust-checks stages the host LiteRT-LM library from a cache keyed on litert-runtime.json before the Rust tests', () => {
+  const job = jobs['rust-checks']
+  const cache = cacheKeyedOn(job, LITERT_RUNTIME_HASH)
+  const fetch = stepRunning(job, 'cargo xtask fetch-litert --host --out target/litert')
+  const tests = stepRunning(job, 'cargo test --workspace')
+
+  assert.equal(cache.with?.path, LITERT_ARCHIVE_CACHE)
+  assert.ok(stepIndex(job, cache) < stepIndex(job, fetch))
+  assert.ok(stepIndex(job, fetch) < stepIndex(job, tests))
+  for (const step of [cache, fetch]) assert.ok(step.name, 'a LiteRT step has no name (P-21)')
+})
+
+test('rust-checks runs the Rust tests with the LiteRT library and model, and adds no job', () => {
+  const tests = stepRunning(jobs['rust-checks'], 'cargo test --workspace')
+  const download = stepRunning(jobs['rust-checks'], '"$TEST_LITERTLM_URL"')
+
+  assert.equal(tests.env?.TURBOLLM_LITERT_LIB, HOST_LITERT_LIBRARY)
+  assert.equal(tests.env?.TURBOLLM_TEST_LITERTLM, download.env?.TURBOLLM_TEST_LITERTLM)
+  assert.equal(Object.keys(jobs).length, 5)
+})
+
+test('android-emulator pushes the test .litertlm to the device and passes it as turbollmTestLitertlm', () => {
+  const job = jobs['android-emulator']
+  const emulator = job.steps.find((step) => step.uses?.startsWith('reactivecircus/android-emulator-runner@'))
+  const script = String(emulator?.with?.script)
+  const download = stepRunning(job, '"$TEST_LITERTLM_URL"')
+  const push = script.indexOf(`adb push "$TURBOLLM_TEST_LITERTLM" ${DEVICE_LITERTLM}`)
+
+  assert.ok(emulator, 'no emulator step')
+  assert.equal(emulator.env?.TURBOLLM_TEST_LITERTLM, download.env?.TURBOLLM_TEST_LITERTLM)
+  assert.ok(push >= 0, 'the .litertlm is not pushed to the device')
+  assert.ok(push < script.indexOf('./gradlew'), 'the instrumented tests start before the push')
+  assert.match(script, new RegExp(`-Pandroid\.testInstrumentationRunnerArguments\.turbollmTestLitertlm=${DEVICE_LITERTLM}`))
+  assert.ok(stepIndex(job, download) < stepIndex(job, emulator))
+})

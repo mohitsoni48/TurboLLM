@@ -24,7 +24,7 @@
       "url": "https://files.pythonhosted.org/packages/73/07/f2817c145fd04983607d830259e620700638a426ed7b9dda50722a737c90/litert_lm_api-0.19.0-py3-none-manylinux_2_27_x86_64.whl",
       "sha256": "c5a8a9538acffbd01530eab812424c0e96a2c193b4b16b8f8df630a8d346be76",
       "member": "litert_lm/liblitert-lm.so",
-      "librarySha256": null,
+      "librarySha256": "35175c60e0a9becef03b53fd0b3fc0ce3d25a0aa71168f13483ec9d59a9a6465",
       "elfMachine": 62
     },
     "macos-aarch64": {
@@ -32,7 +32,7 @@
       "url": "https://files.pythonhosted.org/packages/ce/a1/8686d7c8323d15680c9d3c0a950c6349c03390d4f2c69180095075a1587c/litert_lm_api-0.19.0-py3-none-macosx_12_0_arm64.whl",
       "sha256": "6f2a517266fe4dcac451ce8f41c45c02ef08078a6589e5e0253197937e1f70a5",
       "member": "litert_lm/liblitert-lm.dylib",
-      "librarySha256": null,
+      "librarySha256": "0e1eba3a125295322af745502fdfb3f76c57b012696c20744764e83b51baec9e",
       "elfMachine": null
     },
     "windows-x86_64": {
