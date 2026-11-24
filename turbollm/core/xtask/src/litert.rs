@@ -280,10 +280,7 @@ fn wheel_pin(key: &str, wheel: &Value) -> Result<WheelPin, String> {
         url: text_field(wheel, "url").map_err(|e| format!("{key}: {e}"))?,
         sha256: text_field(wheel, "sha256").map_err(|e| format!("{key}: {e}"))?,
         member: text_field(wheel, "member").map_err(|e| format!("{key}: {e}"))?,
-        library_sha256: wheel
-            .get("librarySha256")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        library_sha256: library_sha256(key, wheel)?,
         elf_machine: machine
             .map(|value| {
                 value
@@ -293,6 +290,17 @@ fn wheel_pin(key: &str, wheel: &Value) -> Result<WheelPin, String> {
             })
             .transpose()?,
     })
+}
+
+/// Absent or `null` means "not pinned yet"; any other non-string would silently unpin the library.
+fn library_sha256(key: &str, wheel: &Value) -> Result<Option<String>, String> {
+    match wheel.get("librarySha256") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(hash)) => Ok(Some(hash.clone())),
+        Some(_) => Err(format!(
+            "{PIN_FILE}: {key}: librarySha256 must be a string or null"
+        )),
+    }
 }
 
 fn text_field(object: &Value, name: &str) -> Result<String, String> {
@@ -712,6 +720,30 @@ mod tests {
         assert!(parse_request(&strings(&["--out", "o"])).is_err());
         assert!(parse_request(&strings(&["--abis", "x86_64", "--host", "--out", "o"])).is_err());
         assert!(parse_request(&strings(&["--abis", "", "--out", "o"])).is_err());
+    }
+
+    fn runtime_json_with_library_sha256(value: &str) -> String {
+        format!(
+            r#"{{"version":"0.19.0","android":{{"arm64-v8a":{{"file":"f.whl","url":"https://x/f.whl","sha256":"aa","member":"m","librarySha256":{value}}}}},"host":{{}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_librarysha256_that_is_not_a_string_is_refused() {
+        for bad in ["42", r#"{"a":1}"#, "true"] {
+            let error = parse_runtime(&runtime_json_with_library_sha256(bad)).unwrap_err();
+            assert!(
+                error.contains("arm64-v8a")
+                    && error.contains("librarySha256 must be a string or null"),
+                "{bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_null_librarysha256_means_not_pinned() {
+        let runtime = parse_runtime(&runtime_json_with_library_sha256("null")).unwrap();
+        assert_eq!(runtime.android["arm64-v8a"].library_sha256, None);
     }
 
     fn shipped_runtime() -> Runtime {
