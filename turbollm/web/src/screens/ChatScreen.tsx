@@ -1254,6 +1254,10 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     chatKey: activeId,
     stopReply: () => { void handleStop() },
     enabled: conversationEnabled,
+    onStop: () => {
+      speakNextReplyIn.current = null
+      speaker.stop()
+    },
   })
   conversationRef.current = conversation
   const onMicClick = () => {
