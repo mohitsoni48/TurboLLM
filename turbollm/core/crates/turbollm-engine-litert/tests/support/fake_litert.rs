@@ -95,6 +95,8 @@ pub struct Script {
     /// The error the final chunk carries when it was.
     pub error_on_cancel: Option<String>,
     pub cancel_failure: Option<String>,
+    /// How many cancels the runtime loses, as one landing between prefill and decode is.
+    pub lost_cancels: usize,
     pub benchmark: Result<Benchmark, String>,
 }
 
@@ -113,6 +115,7 @@ impl Default for Script {
             reply_error: None,
             error_on_cancel: None,
             cancel_failure: None,
+            lost_cancels: 0,
             benchmark: Ok(counters(10, 1000.0, 5, 100.0)),
         }
     }
@@ -204,6 +207,7 @@ pub struct FakeLiteRt {
     callback_threads: Arc<Mutex<Vec<String>>>,
     streams: Mutex<HashMap<usize, Streaming>>,
     next_conversation: AtomicUsize,
+    cancels_seen: AtomicUsize,
     stream_drops: Arc<AtomicUsize>,
     clock_millis: Arc<AtomicU64>,
     open_gate: Mutex<Option<Arc<OpenGate>>>,
@@ -220,6 +224,7 @@ impl FakeLiteRt {
             callback_threads: Arc::default(),
             streams: Mutex::default(),
             next_conversation: AtomicUsize::new(1),
+            cancels_seen: AtomicUsize::new(0),
             stream_drops: Arc::default(),
             clock_millis: Arc::default(),
             open_gate: Mutex::default(),
@@ -423,7 +428,8 @@ impl LiteRtCalls for FakeLiteRt {
     fn cancel_reply(&self, conversation: &ConversationHandle) -> Result<(), String> {
         self.record("cancel_reply");
         let id = conversation.as_ptr().addr();
-        if let Some(streaming) = locked(&self.streams).get(&id) {
+        let lost = self.cancels_seen.fetch_add(1, Ordering::SeqCst) < self.script().lost_cancels;
+        if let Some(streaming) = locked(&self.streams).get(&id).filter(|_| !lost) {
             streaming.cancelled.store(true, Ordering::SeqCst);
         }
         match self.script().cancel_failure.clone() {

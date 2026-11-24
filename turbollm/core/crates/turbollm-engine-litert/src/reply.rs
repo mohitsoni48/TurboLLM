@@ -4,8 +4,8 @@
 //! is never freed under it.
 
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
 
 use turbollm_engine::{
     AbortSignal, EngineError, EngineEvent, EventSink, FinishReason, GenerateRequest,
@@ -18,6 +18,12 @@ use crate::model::{CurrentConversation, cancel_current, lock};
 use crate::prompt::LiteRtPrompt;
 
 const GENERATING_FAILED: &str = "LiteRT-LM failed while generating: ";
+/// How often a reply that should stop is told so again. A cancel flags only the tasks the runtime
+/// has queued, and the decode task is queued, with a fresh flag, only once prefill has finished: a
+/// cancel landing in between is lost, and the turn would run to its end for nobody, holding the
+/// engine. The repo's own server re-cancels every 200 ms until the final chunk
+/// (`engines/litert-lm-server/src/main.cc:2303-2311`); cancelling an ended turn is a no-op.
+const RECANCEL_EVERY: Duration = Duration::from_millis(200);
 const ENDED_WITHOUT_FINAL_CHUNK: &str = "the reply ended without a final chunk";
 
 /// What a reply runs on: the engine's calls and handle, and where its conversation is kept.
@@ -61,6 +67,8 @@ struct Streamed {
     ended_at: Duration,
     error: Option<String>,
     consumer_left: bool,
+    /// When the next re-cancel is due, once the reply is known to be leaving.
+    recancel_at: Option<Instant>,
 }
 
 struct Reply<'a, 'b> {
@@ -111,18 +119,49 @@ impl Reply<'_, '_> {
     }
 
     /// Drains chunks until the final one; after an error, a cancel or a departed consumer it
-    /// still reads on, but emits nothing.
+    /// still reads on, emits nothing, and keeps telling the library to stop.
     fn stream(&mut self, arrivals: &Receiver<Arrival>) -> Result<Streamed, EngineError> {
         let mut streamed = Streamed::default();
         loop {
-            let arrival = arrivals
-                .recv()
-                .map_err(|_| self.failure(ENDED_WITHOUT_FINAL_CHUNK))?;
-            self.take(arrival.chunk.clone(), arrival.at, &mut streamed);
-            if arrival.chunk.is_final {
-                streamed.ended_at = arrival.at;
-                return Ok(streamed);
+            match arrivals.recv_timeout(RECANCEL_EVERY) {
+                Ok(arrival) => {
+                    self.take(arrival.chunk.clone(), arrival.at, &mut streamed);
+                    if arrival.chunk.is_final {
+                        streamed.ended_at = arrival.at;
+                        return Ok(streamed);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(self.failure(ENDED_WITHOUT_FINAL_CHUNK));
+                }
             }
+            self.cancel_again_when_due(&mut streamed);
+        }
+    }
+
+    /// The first cancel came from the abort hook or from `emit`; this repeats it, under the same
+    /// lock, so a repeat never reaches a conversation being deleted.
+    fn cancel_again_when_due(&self, streamed: &mut Streamed) {
+        if self.ended_well(streamed) {
+            return;
+        }
+        let now = Instant::now();
+        match streamed.recancel_at {
+            Some(due) if now < due => {}
+            Some(_) => {
+                cancel_current(self.context.calls, self.context.current);
+                streamed.recancel_at = Some(now + RECANCEL_EVERY);
+            }
+            None => streamed.recancel_at = Some(now + RECANCEL_EVERY),
+        }
+    }
+
+    /// An error chunk is not necessarily the end of the generation (the runtime reports a tool call
+    /// it cannot parse and keeps decoding), so the turn is stopped, as `main.cc:2330-2337` does.
+    fn stop_on_first_error(&self, streamed: &Streamed) {
+        if self.ended_well(streamed) {
+            cancel_current(self.context.calls, self.context.current);
         }
     }
 
@@ -130,6 +169,7 @@ impl Reply<'_, '_> {
     /// that delivered nothing, as in Kotlin, where Done then measures from the end (`LiteRtReply.kt:43`).
     fn take(&mut self, chunk: RawChunk, at: Duration, streamed: &mut Streamed) {
         if let Some(error) = chunk.error {
+            self.stop_on_first_error(streamed);
             streamed.error.get_or_insert(error);
         }
         if !self.ended_well(streamed) {

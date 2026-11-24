@@ -594,6 +594,58 @@ async fn a_collector_that_goes_away_mid_stream_cancels_the_process_then_deletes_
 }
 
 #[tokio::test]
+async fn a_cancel_lost_between_prefill_and_decode_is_sent_again() {
+    let fake = FakeLiteRt::new();
+    fake.script().lost_cancels = 1;
+    let (_manager, mut generation) = endless_reply_after_first_text(&fake).await;
+
+    generation.cancel();
+    let ended = every_event(&mut generation).await;
+
+    assert_eq!(
+        ended,
+        Err(EngineError::Cancelled(REPLY_CANCELLED.to_owned()))
+    );
+    eventually("the conversation to be deleted", || {
+        fake.count("stream_dropped") == 1
+    })
+    .await;
+    assert!(fake.count("cancel_reply") >= 2, "{:?}", fake.names());
+}
+
+#[tokio::test]
+async fn a_departed_consumer_is_cancelled_again_until_the_final_chunk() {
+    let fake = FakeLiteRt::new();
+    fake.script().lost_cancels = 1;
+    let (_manager, generation) = endless_reply_after_first_text(&fake).await;
+
+    drop(generation);
+
+    eventually("the conversation to be deleted", || {
+        fake.count("stream_dropped") == 1
+    })
+    .await;
+    assert!(fake.count("cancel_reply") >= 2, "{:?}", fake.names());
+}
+
+#[tokio::test]
+async fn an_error_chunk_cancels_the_turn_before_the_conversation_is_deleted() {
+    let fake = FakeLiteRt::new();
+    fake.script().reply_error = Some("decode failed".to_owned());
+    let manager = loaded(&fake).await;
+
+    let _ = reply(&manager, question()).await;
+
+    let names = fake.names();
+    let position = |name: &str| names.iter().position(|seen| seen == name);
+    assert!(
+        position("cancel_reply")
+            .is_some_and(|cancel| Some(cancel) < position("delete_conversation")),
+        "{names:?}"
+    );
+}
+
+#[tokio::test]
 async fn an_error_the_library_raises_after_the_cancel_is_still_a_cancellation() {
     let fake = FakeLiteRt::new();
     fake.script().error_on_cancel = Some("Process cancelled".to_owned());
