@@ -26,6 +26,8 @@ const PRIVATE_RANGES: Array<(ip: string) => boolean> = [
   (ip) => /^f[cd][0-9a-f]{2}:/i.test(ip),
   // fe80::/10 link-local
   (ip) => /^fe[89ab][0-9a-f]:/i.test(ip),
+  // 64:ff9b:1::/48 local-use NAT64 (RFC 8215): never a public destination
+  (ip) => /^64:ff9b:1:/i.test(ip),
 ]
 
 /** Exported for its tests. */
@@ -38,6 +40,16 @@ export function isPrivateIp(ip: string): boolean {
   if (hex) {
     const hi = parseInt(hex[1], 16)
     const lo = parseInt(hex[2], 16)
+    ip = `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`
+  }
+  // A NAT64 gateway (64:ff9b::/96, RFC 6052) forwards 64:ff9b::a.b.c.d to the IPv4 host a.b.c.d, so the embedded
+  // address is what gets reached: `64:ff9b::7f00:1` is 127.0.0.1, `64:ff9b::a9fe:a9fe` the cloud metadata address.
+  const nat64Dotted = ip.match(/^64:ff9b::(\d+\.\d+\.\d+\.\d+)$/i)
+  if (nat64Dotted) ip = nat64Dotted[1]
+  const nat64Hex = ip.match(/^64:ff9b::(?:([0-9a-f]{1,4}):)?([0-9a-f]{0,4})$/i)
+  if (nat64Hex) {
+    const hi = parseInt(nat64Hex[1] || '0', 16)
+    const lo = parseInt(nat64Hex[2] || '0', 16)
     ip = `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`
   }
   return PRIVATE_RANGES.some((fn) => fn(ip))
