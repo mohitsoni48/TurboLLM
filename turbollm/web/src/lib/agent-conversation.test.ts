@@ -153,3 +153,15 @@ test('promptLooksCustomised: CRLF and repeated blank lines in custom instruction
     assert.equal(promptLooksCustomised(`${generated}\n\nAnswer in French.`, 'concise', byId('concise'), personalization), true)
   }
 })
+
+
+
+
+test('promptLooksCustomised: tries the later multiline segment after a generated-name prefix', () => {
+  const customInstructions = 'Your name is Ada.\n\nYour name is Be'
+  const personalization = { assistantName: '', userName: '', customInstructions }
+  const base = buildAgentConfig('concise', byId('concise'), NO_PERSONALIZATION).systemPrompt
+  const current = `${base}\n\nYour name is Ada.\n\nYour name is Beatrice.\n\n${customInstructions}`
+  assert.equal(promptLooksCustomised(current, 'concise', byId('concise'), personalization), false)
+  assert.equal(promptLooksCustomised(`${current}\n\nAnswer in French.`, 'concise', byId('concise'), personalization), true)
+})
