@@ -1,0 +1,12 @@
+processor	: 0
+vendor_id	: GenuineIntel
+cpu family	: 6
+model name	: Intel(R) Core(TM) i7-12700H
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr sse sse2 ssse3 sse4_1 sse4_2 avx avx2 avx_vnni
+
+processor	: 1
+vendor_id	: GenuineIntel
+cpu family	: 6
+model name	: Intel(R) Core(TM) i7-12700H
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr sse sse2 ssse3 sse4_1 sse4_2 avx avx2 avx_vnni
+

@@ -1,0 +1,358 @@
+//! Phase 1's GGUF exports, unchanged in name and type (ADR-465). Every export here is synchronous (B-8):
+//! Kotlin callers move it off the main thread themselves.
+
+use std::path::Path;
+
+use turbollm_core::gguf;
+
+/// The GGUF header facts, field for field the core's `GgufMeta`. Integers are `i64` so Kotlin sees `Long`.
+#[derive(Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GgufMeta {
+    pub arch: String,
+    pub name: String,
+    pub quant: String,
+    pub size_label: String,
+    pub native_ctx: i64,
+    pub block_count: i64,
+    pub embed_len: i64,
+    pub head_count_kv: i64,
+    pub head_dim: i64,
+    pub expert_count: i64,
+    pub nextn_layers: i64,
+    pub has_chat_template: bool,
+    pub reasoning_effort: bool,
+    pub sliding_window: i64,
+    pub sliding_window_pattern: Vec<bool>,
+    pub head_dim_swa: i64,
+    pub head_count_kv_per_layer: Vec<i64>,
+    pub full_attention_interval: i64,
+    pub ssm_inner_size: i64,
+    pub ssm_state_size: i64,
+    pub ssm_conv_kernel: i64,
+    pub data_end: i64,
+}
+
+#[derive(Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CoreInfo {
+    pub version: String,
+    pub git_sha: String,
+    pub target: String,
+}
+
+/// A GGUF failure, one variant per core error code, carrying the core's message.
+///
+/// Flat on the Kotlin side: each variant is `GgufException.<Variant>(message)` and `exception.message` is the core
+/// message. The field form would emit a constructor `val message` beside `override val message` in every variant,
+/// which Kotlin rejects as a conflicting declaration.
+#[derive(Debug, PartialEq, Eq, thiserror::Error, uniffi::Error)]
+#[uniffi(flat_error)]
+pub enum GgufException {
+    #[error("{message}")]
+    NotGguf { message: String },
+    #[error("{message}")]
+    BadVersion { message: String },
+    #[error("{message}")]
+    Truncated { message: String },
+    #[error("{message}")]
+    BadType { message: String },
+    #[error("{message}")]
+    TooLarge { message: String },
+    #[error("{message}")]
+    Io { message: String },
+}
+
+/// Parses the GGUF header at `path`, reading at most `max_read` bytes (256 MiB when absent).
+#[uniffi::export]
+pub fn parse_gguf(path: String, max_read: Option<u64>) -> Result<GgufMeta, GgufException> {
+    let budget = max_read.unwrap_or(gguf::MAX_HEADER_READ);
+    let meta = gguf::parse_file(Path::new(&path), budget)?;
+    Ok(GgufMeta::from(meta))
+}
+
+/// True when the GGUF at `path`, `size` bytes long, is cut short.
+#[uniffi::export]
+pub fn gguf_cut_short(path: String, size: u64) -> bool {
+    gguf::is_cut_short(Path::new(&path), size)
+}
+
+/// The quant label in a GGUF file name, if it has one.
+#[uniffi::export]
+pub fn quant_from_name(file_name: String) -> Option<String> {
+    gguf::quant_from_name(&file_name)
+}
+
+#[uniffi::export]
+pub fn core_info() -> CoreInfo {
+    let core = turbollm_core::core_info();
+    CoreInfo {
+        version: core.version,
+        git_sha: core.git_sha,
+        target: core.target,
+    }
+}
+
+impl From<gguf::GgufMeta> for GgufMeta {
+    fn from(meta: gguf::GgufMeta) -> Self {
+        GgufMeta {
+            arch: meta.arch,
+            name: meta.name,
+            quant: meta.quant,
+            size_label: meta.size_label,
+            native_ctx: meta.native_ctx.into(),
+            block_count: meta.block_count.into(),
+            embed_len: meta.embed_len.into(),
+            head_count_kv: meta.head_count_kv.into(),
+            head_dim: meta.head_dim.into(),
+            expert_count: meta.expert_count.into(),
+            nextn_layers: meta.nextn_layers.into(),
+            has_chat_template: meta.has_chat_template,
+            reasoning_effort: meta.reasoning_effort,
+            sliding_window: meta.sliding_window.into(),
+            sliding_window_pattern: meta.sliding_window_pattern,
+            head_dim_swa: meta.head_dim_swa.into(),
+            head_count_kv_per_layer: meta
+                .head_count_kv_per_layer
+                .into_iter()
+                .map(i64::from)
+                .collect(),
+            full_attention_interval: meta.full_attention_interval.into(),
+            ssm_inner_size: meta.ssm_inner_size.into(),
+            ssm_state_size: meta.ssm_state_size.into(),
+            ssm_conv_kernel: meta.ssm_conv_kernel.into(),
+            data_end: saturated_long(meta.data_end),
+        }
+    }
+}
+
+/// Kotlin has no unsigned `Long` in this record: a tensor end past `i64::MAX` (only a crafted file reaches one)
+/// saturates rather than wrapping negative.
+fn saturated_long(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+impl From<gguf::GgufError> for GgufException {
+    fn from(failure: gguf::GgufError) -> Self {
+        let message = failure.to_string();
+        match failure {
+            gguf::GgufError::NotGguf => GgufException::NotGguf { message },
+            gguf::GgufError::BadVersion(_) => GgufException::BadVersion { message },
+            gguf::GgufError::Truncated => GgufException::Truncated { message },
+            gguf::GgufError::BadType(_) => GgufException::BadType { message },
+            gguf::GgufError::TooLarge => GgufException::TooLarge { message },
+            gguf::GgufError::Io(_) => GgufException::Io { message },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn crafted(name: &str) -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/gguf/crafted")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn text(message: &str) -> String {
+        message.to_string()
+    }
+
+    fn core_meta() -> gguf::GgufMeta {
+        gguf::GgufMeta {
+            arch: text("gemma4"),
+            name: text("Gemma"),
+            quant: text("Q4_0"),
+            size_label: text("26B"),
+            native_ctx: 262_144,
+            block_count: 30,
+            embed_len: 2816,
+            head_count_kv: 8,
+            head_dim: 256,
+            expert_count: 128,
+            nextn_layers: 1,
+            has_chat_template: true,
+            reasoning_effort: false,
+            sliding_window: 1024,
+            sliding_window_pattern: vec![true, false],
+            head_dim_swa: 128,
+            head_count_kv_per_layer: vec![8, 2],
+            full_attention_interval: 4,
+            ssm_inner_size: 4096,
+            ssm_state_size: 128,
+            ssm_conv_kernel: 4,
+            data_end: 15_859_712,
+        }
+    }
+
+    #[test]
+    fn every_meta_field_reaches_kotlin_unchanged() {
+        let expected = GgufMeta {
+            arch: text("gemma4"),
+            name: text("Gemma"),
+            quant: text("Q4_0"),
+            size_label: text("26B"),
+            native_ctx: 262_144,
+            block_count: 30,
+            embed_len: 2816,
+            head_count_kv: 8,
+            head_dim: 256,
+            expert_count: 128,
+            nextn_layers: 1,
+            has_chat_template: true,
+            reasoning_effort: false,
+            sliding_window: 1024,
+            sliding_window_pattern: vec![true, false],
+            head_dim_swa: 128,
+            head_count_kv_per_layer: vec![8, 2],
+            full_attention_interval: 4,
+            ssm_inner_size: 4096,
+            ssm_state_size: 128,
+            ssm_conv_kernel: 4,
+            data_end: 15_859_712,
+        };
+        assert_eq!(GgufMeta::from(core_meta()), expected);
+    }
+
+    #[test]
+    fn u32_fields_widen_to_i64_without_turning_negative() {
+        let mut meta = core_meta();
+        meta.native_ctx = u32::MAX;
+        meta.ssm_conv_kernel = u32::MAX;
+        meta.head_count_kv_per_layer = vec![u32::MAX, 0];
+        let kotlin = GgufMeta::from(meta);
+        assert_eq!(kotlin.native_ctx, 4_294_967_295);
+        assert_eq!(kotlin.ssm_conv_kernel, 4_294_967_295);
+        assert_eq!(kotlin.head_count_kv_per_layer, vec![4_294_967_295, 0]);
+    }
+
+    #[test]
+    fn data_end_is_exact_above_2_pow_53() {
+        let mut meta = core_meta();
+        meta.data_end = 9_007_199_254_741_165;
+        assert_eq!(GgufMeta::from(meta).data_end, 9_007_199_254_741_165);
+    }
+
+    #[test]
+    fn data_end_beyond_i64_saturates_instead_of_turning_negative() {
+        let mut meta = core_meta();
+        meta.data_end = u64::MAX;
+        assert_eq!(GgufMeta::from(meta).data_end, i64::MAX);
+    }
+
+    fn assert_thrown(failure: gguf::GgufError, expected: GgufException, message: &str) {
+        let thrown = GgufException::from(failure);
+        assert_eq!(thrown.to_string(), message);
+        assert_eq!(thrown, expected);
+    }
+
+    #[test]
+    fn every_gguf_failure_becomes_its_exception_variant_with_the_same_message() {
+        let not_gguf = "Not a GGUF file.";
+        let bad_version = "Unsupported GGUF version 7.";
+        let truncated = "Unexpected EOF in GGUF header.";
+        let bad_type = "Unknown GGUF value type 13.";
+        let too_large = "GGUF header is too large to read.";
+        assert_thrown(
+            gguf::GgufError::NotGguf,
+            GgufException::NotGguf {
+                message: text(not_gguf),
+            },
+            not_gguf,
+        );
+        assert_thrown(
+            gguf::GgufError::BadVersion(7),
+            GgufException::BadVersion {
+                message: text(bad_version),
+            },
+            bad_version,
+        );
+        assert_thrown(
+            gguf::GgufError::Truncated,
+            GgufException::Truncated {
+                message: text(truncated),
+            },
+            truncated,
+        );
+        assert_thrown(
+            gguf::GgufError::BadType(13),
+            GgufException::BadType {
+                message: text(bad_type),
+            },
+            bad_type,
+        );
+        assert_thrown(
+            gguf::GgufError::TooLarge,
+            GgufException::TooLarge {
+                message: text(too_large),
+            },
+            too_large,
+        );
+    }
+
+    #[test]
+    fn an_io_failure_becomes_io_with_the_os_message() {
+        let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let expected = GgufException::Io {
+            message: text("no such file"),
+        };
+        assert_thrown(gguf::GgufError::Io(not_found), expected, "no such file");
+    }
+
+    #[test]
+    fn parse_gguf_reads_a_file_with_the_default_budget() {
+        let meta = parse_gguf(crafted("cut-short-tensors-short.gguf"), None).unwrap();
+        assert_eq!((meta.arch.as_str(), meta.data_end), ("llama", 16_512));
+    }
+
+    #[test]
+    fn parse_gguf_stops_at_max_read() {
+        let failure = parse_gguf(crafted("cut-short-tensors-short.gguf"), Some(8)).unwrap_err();
+        assert!(
+            matches!(failure, GgufException::TooLarge { .. }),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn parse_gguf_throws_the_core_error_for_a_file_that_is_not_gguf() {
+        let failure = parse_gguf(crafted("err-not-gguf-html.gguf"), None).unwrap_err();
+        let expected = GgufException::NotGguf {
+            message: text("Not a GGUF file."),
+        };
+        assert_eq!(failure, expected);
+    }
+
+    #[test]
+    fn parse_gguf_throws_io_for_a_missing_file() {
+        let failure = parse_gguf(crafted("no-such-fixture.gguf"), None).unwrap_err();
+        assert!(matches!(failure, GgufException::Io { .. }), "{failure:?}");
+    }
+
+    #[test]
+    fn gguf_cut_short_compares_the_tensor_end_with_the_size() {
+        let path = crafted("cut-short-tensors-short.gguf");
+        assert!(gguf_cut_short(path.clone(), 15_512));
+        assert!(!gguf_cut_short(path, 16_512));
+    }
+
+    #[test]
+    fn quant_from_name_passes_the_core_answer_through() {
+        let quant = quant_from_name(text("model-Q4_K_M.gguf"));
+        assert_eq!(quant.as_deref(), Some("Q4_K_M"));
+        assert_eq!(quant_from_name(text("model.gguf")), None);
+    }
+
+    #[test]
+    fn core_info_reports_the_core_version_sha_and_target() {
+        let core = turbollm_core::core_info();
+        let expected = CoreInfo {
+            version: core.version,
+            git_sha: core.git_sha,
+            target: core.target,
+        };
+        assert_eq!(core_info(), expected);
+    }
+}

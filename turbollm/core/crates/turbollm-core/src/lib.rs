@@ -3,6 +3,10 @@ pub mod gguf {
     pub use turbollm_gguf::*;
 }
 
+/// The engine layer: one tokio runtime and one `EngineManager` per handle (feature `engines`).
+#[cfg(feature = "engines")]
+pub mod engines;
+
 const VERSION_MARKER_PREFIX: &str = "TURBOLLM_CORE_VERSION=";
 
 /// The release version as searchable bytes, so the publish job can check every target's binary

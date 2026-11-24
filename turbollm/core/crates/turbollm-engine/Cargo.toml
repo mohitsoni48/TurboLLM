@@ -1,0 +1,23 @@
+[package]
+name = "turbollm-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[features]
+testing = ["tokio/test-util"]
+
+[dependencies]
+turbollm-platform = { path = "../turbollm-platform" }
+thiserror = "=2.0.21"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+tokio = { version = "=1.54.1", features = ["sync", "time", "rt"] }
+futures-core = "=0.3.34"
+
+[dev-dependencies]
+turbollm-engine = { path = ".", features = ["testing"] }
+tempfile = "=3.27.0"
+tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "test-util"] }

@@ -46,10 +46,16 @@ kotlin {
     }
 }
 
+// The Android repo's kotlinxCoroutines pin (gradle/libs.versions.toml).
+val coroutinesVersion = "1.11.0"
+
 dependencies {
     api("net.java.dev.jna:jna:$jnaVersion@aar")
+    // The generated engine bindings suspend (UniFFI async exports).
+    api("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
 
     testImplementation("net.java.dev.jna:jna:$jnaVersion")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:$coroutinesVersion")
     testImplementation(kotlin("test"))
     testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
 

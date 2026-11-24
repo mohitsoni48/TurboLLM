@@ -509,6 +509,16 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
+name = "libloading"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1832accd5a4ca2795ace4d05d15c4039be15b62d3b950eff99746a990e3cc10"
@@ -602,7 +612,7 @@ version = "3.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d153beb7d5c973f4b9395be8a83054a28968b61188f1dd1a2cc2321af22daea2"
 dependencies = [
- "libloading",
+ "libloading 0.9.1",
 ]
 
 [[package]]
@@ -989,6 +999,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio"
+version = "1.54.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
+dependencies = [
+ "pin-project-lite",
+ "tokio-macros",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
 name = "toml"
 version = "1.2.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1044,15 +1075,38 @@ checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
 name = "turbollm-core"
 version = "1.15.2"
 dependencies = [
+ "tempfile",
+ "tokio",
+ "turbollm-core",
+ "turbollm-engine",
  "turbollm-gguf",
+ "turbollm-platform",
+]
+
+[[package]]
+name = "turbollm-engine"
+version = "1.15.2"
+dependencies = [
+ "futures-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "turbollm-engine",
+ "turbollm-platform",
 ]
 
 [[package]]
 name = "turbollm-ffi"
 version = "1.15.2"
 dependencies = [
+ "tempfile",
  "thiserror",
+ "tokio",
  "turbollm-core",
+ "turbollm-engine",
+ "turbollm-platform",
  "uniffi",
 ]
 
@@ -1076,6 +1130,14 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "turbollm-core",
+]
+
+[[package]]
+name = "turbollm-platform"
+version = "1.15.2"
+dependencies = [
+ "libloading 0.8.9",
+ "tempfile",
 ]
 
 [[package]]
