@@ -8,6 +8,7 @@ mod model;
 pub mod prompt;
 mod reply;
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -15,9 +16,9 @@ use turbollm_engine::{
     Backend, EngineDescriptor, EngineError, EngineId, EngineKind, LoadControl, LoadSpec,
     ModelFormat, ModelInfo, NativeBackend, StallPolicy,
 };
-use turbollm_platform::HostFacts;
+use turbollm_platform::{HostFacts, library_candidates};
 
-use crate::api::LiteRtCalls;
+use crate::api::{LiteRtApi, LiteRtCalls};
 
 pub use model::LiteRtModel;
 
@@ -26,6 +27,10 @@ pub const ENGINE_THREAD_NAME: &str = "turbollm-litert";
 
 /// What a load that fell back from the GPU to the CPU says, before the GPU's own reason.
 pub const GPU_UNAVAILABLE_PREFIX: &str = "GPU unavailable: ";
+
+/// The runtime's library name without its OS prefix and suffix: `libturbollm_core_litertlm.so` on
+/// Android (never Google's own `liblitert-lm.so`, which the app's opt-in server ships, ADR-432).
+pub const LIBRARY_STEM: &str = "turbollm_core_litertlm";
 
 /// The function table a backend shares with each model it opens.
 pub type SharedCalls = Arc<dyn LiteRtCalls + Send + Sync>;
@@ -46,6 +51,12 @@ pub struct LiteRtBackend {
 }
 
 impl LiteRtBackend {
+    /// The runtime library from `library_dir` when it is there, else from the loader's search
+    /// path; opened by the first load.
+    pub fn new(library_dir: Option<PathBuf>) -> LiteRtBackend {
+        LiteRtBackend::over(move || open_native(library_dir.as_deref()))
+    }
+
     /// A backend over the calls `open_library` gives, opened on the first load; a failed open is
     /// tried again by the next load.
     pub fn over(
@@ -102,6 +113,18 @@ impl NativeBackend for LiteRtBackend {
     ) -> Result<(LiteRtModel, ModelInfo), EngineError> {
         LiteRtModel::open(self.library()?, spec, Arc::clone(&self.clock))
     }
+}
+
+/// The first candidate that opens; when none does, the last one's reason.
+fn open_native(library_dir: Option<&Path>) -> Result<SharedCalls, EngineError> {
+    let mut failure = None;
+    for file in library_candidates(LIBRARY_STEM, library_dir) {
+        match LiteRtApi::open(&file) {
+            Ok(api) => return Ok(Arc::new(api)),
+            Err(error) => failure = Some(error),
+        }
+    }
+    Err(failure.unwrap_or_else(|| api::unavailable(&"no library to open")))
 }
 
 fn litert_descriptor() -> EngineDescriptor {

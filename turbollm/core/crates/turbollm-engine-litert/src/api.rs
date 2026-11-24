@@ -262,7 +262,7 @@ unsafe fn open_library(path: &Path) -> Result<Library, libloading::Error> {
     unsafe { Library::new(path) }
 }
 
-fn unavailable(error: &dyn std::fmt::Display) -> EngineError {
+pub(crate) fn unavailable(error: &dyn std::fmt::Display) -> EngineError {
     EngineError::EngineUnavailable {
         engine: EngineId::new(EngineId::LITERT_LM),
         kind: EngineKind::LitertLm,
@@ -461,6 +461,7 @@ impl LiteRtApi {
             self.check("could not set num_threads", status)?;
         }
         if let Some(cache_dir) = &settings.cache_dir {
+            create_cache_dir(cache_dir)?;
             let cache_dir = to_c_string(cache_dir)?;
             let status =
                 unsafe { (t.engine_settings_set_cache_dir)(owned.raw, cache_dir.as_ptr()) };
@@ -496,6 +497,13 @@ impl LiteRtApi {
             })
             .collect()
     }
+}
+
+/// The library refuses a cache folder that is not there, so a load makes it (Android's own cache
+/// folder always exists; a desktop host's may not yet).
+fn create_cache_dir(path: &str) -> Result<(), String> {
+    std::fs::create_dir_all(path)
+        .map_err(|error| format!("could not create the cache folder {path}: {error}"))
 }
 
 fn to_c_string(text: &str) -> Result<CString, String> {
@@ -692,6 +700,32 @@ mod tests {
             .filter(|name| !headers.contains(&format!("{name}(")))
             .collect();
         assert!(undeclared.is_empty(), "not in the headers: {undeclared:?}");
+    }
+
+    #[test]
+    fn a_cache_folder_that_is_not_there_is_created_with_its_parents() {
+        let root = tempfile::TempDir::new().unwrap();
+        let cache = root.path().join("a").join("b");
+
+        create_cache_dir(cache.to_str().unwrap()).unwrap();
+
+        assert!(cache.is_dir());
+    }
+
+    #[test]
+    fn a_cache_folder_that_cannot_be_made_names_the_folder_and_the_reason() {
+        let root = tempfile::TempDir::new().unwrap();
+        let file = root.path().join("file");
+        fs::write(&file, b"").unwrap();
+        let cache = file.join("cache");
+
+        let error = create_cache_dir(cache.to_str().unwrap()).unwrap_err();
+
+        assert!(
+            error.starts_with("could not create the cache folder "),
+            "{error}"
+        );
+        assert!(error.contains("cache"), "{error}");
     }
 
     #[test]

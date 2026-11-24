@@ -175,6 +175,20 @@ fn consecutive_replies_each_run_in_their_own_conversation() {
 }
 
 #[test]
+fn a_cache_folder_that_does_not_exist_yet_is_created_by_the_load() {
+    on_the_real_library(|host| async move {
+        let manager = host.manager();
+        assert!(!host.cache_dir().exists());
+
+        host.load(&manager)
+            .await
+            .expect("the model loads with a missing cache folder");
+
+        assert!(host.cache_dir().is_dir());
+    });
+}
+
+#[test]
 fn a_model_that_is_not_there_fails_to_load() {
     on_the_real_library(|host| async move {
         let manager = host.manager();
@@ -251,6 +265,12 @@ impl Host {
         })
     }
 
+    /// A folder that is not there yet: the library needs its cache folder to exist, so a load that
+    /// is handed a missing one has to make it.
+    fn cache_dir(&self) -> PathBuf {
+        self.cache.path().join("litert-cache")
+    }
+
     fn manager(&self) -> EngineManager {
         let library = self.library.clone();
         let engine: Arc<dyn Engine> = Arc::new(InProcess::new(LiteRtBackend::over(move || {
@@ -267,7 +287,7 @@ impl Host {
             predecessor: None,
             stall: Duration::ZERO,
             max_queued: MAX_QUEUED,
-            cache_dir: self.cache.path().to_owned(),
+            cache_dir: self.cache_dir(),
         })
     }
 

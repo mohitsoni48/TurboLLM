@@ -4,6 +4,10 @@
 //! is what is checked instead. Needs the four variables of the llama and LiteRT real-native tests
 //! (`TURBOLLM_LLAMA_LIB_DIR`, `TURBOLLM_TEST_GGUF`, `TURBOLLM_LITERT_LIB`, `TURBOLLM_TEST_LITERTLM`);
 //! without them the test skips, except on CI, where it fails.
+//!
+//! Both engines come from the core's own constructors (`LlamaBackend::new`, `LiteRtBackend::new`, the
+//! ones the `llama` and `litert` features put in the catalogue), looking in a library folder. A desktop
+//! core lists no native row (they are Android-only, ADR-239), so they are handed in as extra engines.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,9 +21,9 @@ use turbollm_engine::{
     GenerateRequest, GenerationParams, InProcess, LoadTarget, MessageContent, ModelFormat,
     ModelRef, Role,
 };
-use turbollm_engine_litert::api::LiteRtApi;
-use turbollm_engine_litert::{LiteRtBackend, SharedCalls};
+use turbollm_engine_litert::{LIBRARY_STEM, LiteRtBackend};
 use turbollm_engine_llama::LlamaBackend;
+use turbollm_platform::library_file_name;
 
 const MISSING_ENV: &str = "TURBOLLM_LLAMA_LIB_DIR, TURBOLLM_TEST_GGUF, TURBOLLM_LITERT_LIB and \
                            TURBOLLM_TEST_LITERTLM must all be set";
@@ -108,7 +112,8 @@ fn question() -> GenerateRequest {
 struct Natives {
     llama_dir: PathBuf,
     gguf: PathBuf,
-    litert_library: PathBuf,
+    /// The folder `LiteRtBackend::new` looks in: the library under the name the AAR stages it by.
+    litert_dir: TempDir,
     litertlm: PathBuf,
 }
 
@@ -129,7 +134,7 @@ impl Natives {
         Some(Natives {
             llama_dir,
             gguf,
-            litert_library,
+            litert_dir: stage_litert(&litert_library),
             litertlm,
         })
     }
@@ -139,10 +144,9 @@ impl Natives {
         let llama: Arc<dyn Engine> = Arc::new(InProcess::new(LlamaBackend::new(Some(
             self.llama_dir.clone(),
         ))));
-        let library = self.litert_library.clone();
-        let litert: Arc<dyn Engine> = Arc::new(InProcess::new(LiteRtBackend::over(move || {
-            Ok(Arc::new(LiteRtApi::open(&library)?) as SharedCalls)
-        })));
+        let litert: Arc<dyn Engine> = Arc::new(InProcess::new(LiteRtBackend::new(Some(
+            self.litert_dir.path().to_owned(),
+        ))));
         let config = EnginesConfig {
             cache_dir: cache_dir.to_owned(),
             library_dir: None,
@@ -162,6 +166,14 @@ impl Natives {
     fn litertlm_target(&self) -> LoadTarget {
         target(&self.litertlm, ModelFormat::Litertlm, EngineId::LITERT_LM)
     }
+}
+
+/// The library in a folder of its own as `libturbollm_core_litertlm` (the host build is `litert-lm.dll`).
+fn stage_litert(library: &Path) -> TempDir {
+    let dir = TempDir::new().expect("a library folder");
+    std::fs::copy(library, dir.path().join(library_file_name(LIBRARY_STEM)))
+        .unwrap_or_else(|e| panic!("staging {}: {e}", library.display()));
+    dir
 }
 
 fn target(path: &Path, format: ModelFormat, engine: &str) -> LoadTarget {

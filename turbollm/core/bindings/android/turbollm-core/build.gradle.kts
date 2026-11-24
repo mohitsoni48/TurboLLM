@@ -142,6 +142,29 @@ if (packageEngines) {
     }
 }
 
+// The LiteRT-LM runtime (arch 2.8, ADR-482): Google's litert-lm-api 0.19.0 wheel library, sha256-pinned, staged
+// byte-identical as libturbollm_core_litertlm.so (never as liblitert-lm.so, the name the app's opt-in server ships,
+// ADR-432). It joins the library only when turbollm.engines is true, like the llama libraries.
+val litertJniLibs = layout.buildDirectory.dir("litertJniLibs")
+
+if (packageEngines) {
+    val stageLitertRuntime by tasks.registering(Exec::class) {
+        description = "Stages libturbollm_core_litertlm.so for arm64-v8a and x86_64 from the pinned wheels."
+        workingDir = coreDir
+        outputs.dir(litertJniLibs)
+        commandLine(
+            "cargo", "xtask", "fetch-litert", "--abis", "arm64-v8a,x86_64",
+            "--out", litertJniLibs.get().asFile.path,
+        )
+    }
+
+    android.sourceSets.getByName("main").jniLibs.srcDir(litertJniLibs)
+
+    tasks.matching { it.name.matches(Regex("merge\\w*JniLibFolders")) }.configureEach {
+        dependsOn(stageLitertRuntime)
+    }
+}
+
 // The napi addon the Android app's nodejs-mobile loads (arch 2.6, 4). Run on demand with
 // -Pturbollm.libnodeDir=<dir holding <abi>/libnode.so>; not part of the library build. build-node.mjs links
 // each ABI against its libnode.so, writes <abi>/libturbollm_core_node.so and runs xtask check-android-elf.
