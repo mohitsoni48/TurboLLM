@@ -86,11 +86,7 @@ impl Reply<'_, '_> {
         self.check_not_aborted()?;
         let arrivals = self.start()?;
         let streamed = self.stream(&arrivals);
-        let benchmark = self.release_conversation(
-            streamed
-                .as_ref()
-                .is_ok_and(|streamed| self.ended_well(streamed)),
-        );
+        let benchmark = self.release_conversation(streamed.as_ref().ok());
         self.conclude(&streamed?, &benchmark)
     }
 
@@ -214,13 +210,16 @@ impl Reply<'_, '_> {
     }
 
     /// Takes the conversation back under the lock, so no abort can reach it, then ends it. The
-    /// benchmark is read only for a reply that is about to report its usage.
-    fn release_conversation(&self, read_benchmark: bool) -> Benchmark {
+    /// benchmark is read only for a reply that is about to report its usage, and that is decided
+    /// after the take: an abort in the gap before it cancels the finished conversation, which
+    /// `engine.h:114-116` says must not be reused.
+    fn release_conversation(&self, streamed: Option<&Streamed>) -> Benchmark {
         let conversation = lock(self.context.current).take();
         let Some(conversation) = conversation else {
             return Benchmark::default();
         };
-        let benchmark = if read_benchmark {
+        let reports_usage = streamed.is_some_and(|streamed| self.ended_well(streamed));
+        let benchmark = if reports_usage {
             self.context
                 .calls
                 .benchmark(&conversation)
