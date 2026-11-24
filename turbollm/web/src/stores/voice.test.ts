@@ -8,6 +8,10 @@ async function loadStore() {
 
 beforeEach(() => localStorage.clear())
 afterEach(() => {
+  const key = Symbol.for('tllm.voice.storageListener')
+  const host = window as Window & { [key]?: (event: StorageEvent) => void }
+  if (host[key]) window.removeEventListener('storage', host[key]!)
+  delete host[key]
   vi.unstubAllGlobals()
   localStorage.clear()
 })

@@ -12,6 +12,8 @@ import type { ModelEntry } from '../lib/types'
 // timeout does not cover; the assertions themselves stay unchanged.
 vi.setConfig({ testTimeout: 30_000 })
 
+afterEach(() => { vi.unstubAllGlobals() })
+
 beforeEach(() => {
   const store = new Map<string, string>()
   vi.stubGlobal('localStorage', {
@@ -170,7 +172,7 @@ async function composerReady() {
 }
 
 describe('ChatScreen — the voice conversation is behind the Settings opt-in', () => {
-  afterEach(() => { focusManager.setFocused(undefined); vi.unstubAllGlobals() })
+  afterEach(() => { focusManager.setFocused(undefined) })
 
   it('offers dictation only while the opt-in is off: no conversation button anywhere', async () => {
     mockLibrary = [loadedRow()]
