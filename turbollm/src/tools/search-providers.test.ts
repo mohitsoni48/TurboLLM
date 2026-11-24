@@ -1,4 +1,4 @@
-// F-020: pluggable search-provider abstraction (Tavily / Kagi / SearXNG).
+// F-020: pluggable search-provider abstraction (Tavily / Kagi / SearXNG / Keenable).
 // The web_search tool calls a SearchClient behind a factory; only this module
 // changes per provider. Tests use an injected fetch so no network is hit.
 import assert from 'node:assert/strict'
@@ -119,4 +119,73 @@ test('adapter throws on non-ok response so the tool can surface an error', async
   const { fn } = stubFetch({ error: 'bad' }, { ok: false, status: 401 })
   const client = searchProviderClient({ provider: 'tavily', tavilyApiKey: 'k' }, fn)!
   await assert.rejects(() => client.search('q', 5), /401/)
+})
+
+// ── Keenable adapter ─────────────────────────────────────────────────────
+
+test('searchConfigured: keenable is configured without a key', () => {
+  assert.equal(searchConfigured({ provider: 'keenable' }), true)
+  assert.equal(searchConfigured({ provider: 'keenable', keenableApiKey: 'k' }), true)
+})
+
+test('searchProviderClient: returns a keenable client without a key', () => {
+  const c = searchProviderClient({ provider: 'keenable' })
+  assert.ok(c)
+  assert.equal(c!.provider, 'keenable')
+})
+
+test('keenable keyless adapter posts to /v1/search/public with X-Keenable-Title and no X-API-Key', async () => {
+  const { calls, fn } = stubFetch({
+    results: [
+      { title: 'A', url: 'https://a.com', snippet: 'alpha', acquired_at: '2026-11-19T00:00:00Z' },
+      { title: 'B', url: 'https://b.com', description: 'beta' },
+    ],
+  })
+  const client = searchProviderClient({ provider: 'keenable' }, fn)!
+  const out = await client.search('q', 5)
+  assert.equal(out.length, 2)
+  assert.deepEqual(out[0], { title: 'A', url: 'https://a.com', content: 'alpha' })
+  assert.deepEqual(out[1], { title: 'B', url: 'https://b.com', content: 'beta' })
+  assert.equal(out[0].publishedDate, undefined)
+  assert.equal(calls[0].url, 'https://api.keenable.ai/v1/search/public')
+  const headers = calls[0].init?.headers as Record<string, string>
+  assert.equal(headers['X-Keenable-Title'], 'TurboLLM')
+  assert.equal(headers['X-API-Key'], undefined)
+  const body = JSON.parse(String(calls[0].init?.body))
+  assert.deepEqual(body, { query: 'q', max_results: 5 })
+})
+
+test('keenable keyed adapter posts to /v1/search with X-API-Key and does not follow redirects', async () => {
+  const { calls, fn } = stubFetch({
+    results: [{ title: 'C', url: 'https://c.com', snippet: 'gamma' }],
+  })
+  const client = searchProviderClient({ provider: 'keenable', keenableApiKey: 'secret' }, fn)!
+  const out = await client.search('q', 3)
+  assert.equal(out[0].content, 'gamma')
+  assert.equal(calls[0].url, 'https://api.keenable.ai/v1/search')
+  const headers = calls[0].init?.headers as Record<string, string>
+  assert.equal(headers['X-API-Key'], 'secret')
+  assert.equal(headers['X-Keenable-Title'], 'TurboLLM')
+  assert.equal(calls[0].init?.redirect, 'error')
+})
+
+test('keenable adapter maps recent to published_after 30d and returns published_at as publishedDate', async () => {
+  const { calls, fn } = stubFetch({
+    results: [
+      { title: 'A', url: 'https://a.com', snippet: 'alpha', published_at: '2026-11-18T09:30:00Z' },
+      { title: 'B', url: 'https://b.com', snippet: 'beta', published_at: 'not a date' },
+    ],
+  })
+  const client = searchProviderClient({ provider: 'keenable' }, fn)!
+  const out = await client.search('q', 5, { recent: true })
+  assert.deepEqual(JSON.parse(String(calls[0].init?.body)), { query: 'q', max_results: 5, published_after: '30d' })
+  assert.equal(out[0].publishedDate, '2026-11-18')
+  assert.equal('publishedDate' in out[1], false)
+})
+
+test('keenable adapter leaves the body unchanged when recent is false', async () => {
+  const { calls, fn } = stubFetch({ results: [] })
+  const client = searchProviderClient({ provider: 'keenable' }, fn)!
+  await client.search('q', 5, { recent: false })
+  assert.deepEqual(JSON.parse(String(calls[0].init?.body)), { query: 'q', max_results: 5 })
 })
