@@ -752,20 +752,20 @@ it('barge-in during first-message chat creation prevents the old message being s
   await act(async () => { finishCreate({ id: 'new1' }) })
   expect(sendCalls).toHaveLength(0)
 })
-it('clears the pending speech claim at screen level when hands-free stops before meta', async () => {
+it.each([false, true])('pending speech before meta: stopped=%s', async (stopped) => {
   const feed = steppedStream()
   nextGen = feed.gen
-  useVoiceStore.setState({ conversation: true, readAloud: 'off' })
+  useVoiceStore.setState({ conversation: true, readAloud: 'always' })
   try {
     await renderScreen('/chat/c1')
-    act(() => fireEvent.click(screen.getAllByRole('button', { name: /Start a voice conversation/ })[0]))
     await sendText('a reply that would be spoken')
-    act(() => stopConversationOutput?.())
+    if (stopped) act(() => stopConversationOutput?.())
     await feed.push(meta)
     await feed.push({ event: 'delta', data: { delta: 'A complete sentence.' } } as ChatSseEvent)
-    expect(speechStream).not.toHaveBeenCalled()
+    if (stopped) expect(speechStream).not.toHaveBeenCalled()
+    else await waitFor(() => expect(speechStream).toHaveBeenCalled())
   } finally {
-    useVoiceStore.setState({ conversation: false })
+    useVoiceStore.setState({ conversation: false, readAloud: 'off' })
   }
 })
 
