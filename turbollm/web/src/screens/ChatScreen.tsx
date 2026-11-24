@@ -1259,7 +1259,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const conversation = useConversationMode({
     voice,
     replyStreaming: !!live || daemonGenerating,
-    canListen: ready,
+    canListen: ready && !modelBusy,
     chatKey: activeId,
     stopReply: () => { void handleStop() },
     enabled: conversationEnabled,
