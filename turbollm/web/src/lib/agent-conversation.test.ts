@@ -143,3 +143,13 @@ test('promptLooksCustomised: a custom-instruction prefix never hides appended ed
   assert.equal(promptLooksCustomised(`${generated} Answer in French.`, 'concise', byId('concise'), personalization), true)
   assert.equal(promptLooksCustomised(`${generated}\nAnswer in French.`, 'concise', byId('concise'), personalization), true)
 })
+
+
+test('promptLooksCustomised: CRLF and repeated blank lines in custom instructions remain generated', () => {
+  for (const customInstructions of ['Be brief.\r\n\r\nUse examples.', 'Be brief.\n\n\nUse examples.', 'Your name is Ada.\n\nUse examples.']) {
+    const personalization = { assistantName: '', userName: '', customInstructions }
+    const generated = buildAgentConfig('concise', byId('concise'), personalization).systemPrompt
+    assert.equal(promptLooksCustomised(generated, 'concise', byId('concise'), personalization), false)
+    assert.equal(promptLooksCustomised(`${generated}\n\nAnswer in French.`, 'concise', byId('concise'), personalization), true)
+  }
+})
