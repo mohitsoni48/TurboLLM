@@ -79,9 +79,22 @@ export function promptLooksCustomised(current: string, agentId: string, agent: R
   // Blank generates nothing, and every string starts with the empty string: any text there is the user's own.
   if (!expected) return actual.trim() !== ''
   if (!actual.startsWith(expected)) return true
-  const tail = actual.slice(expected.length)
+  let tail = actual.slice(expected.length)
   if (tail === '') return false
   if (!tail.startsWith('\n\n')) return true
+  // Custom instructions may contain blank lines of their own. Match the whole
+  // generated segment before splitting the remaining name/memory/hardware blocks.
+  // Require block boundaries so an appended edit cannot hide behind a prefix match.
+  const custom = personalization.customInstructions.trim()
+  if (custom) {
+    const segment = `\n\n${custom}`
+    const start = tail.indexOf(segment)
+    if (start !== -1) {
+      const end = start + segment.length
+      if (end === tail.length || tail.startsWith('\n\n', end)) tail = tail.slice(0, start) + tail.slice(end)
+    }
+  }
+  if (!tail) return false
   return !tail.slice(2).split('\n\n').every((block) => isGeneratedBlock(block, personalization))
 }
 
