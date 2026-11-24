@@ -151,6 +151,9 @@ if (packageEngines) {
     val stageLitertRuntime by tasks.registering(Exec::class) {
         description = "Stages libturbollm_core_litertlm.so for arm64-v8a and x86_64 from the pinned wheels."
         workingDir = coreDir
+        // The pin and the parser that checks it: a pin bump must re-stage, an unrelated xtask edit must not.
+        inputs.file(coreDir.resolve("crates/turbollm-engine-litert/litert-runtime.json"))
+        inputs.file(coreDir.resolve("xtask/src/litert.rs"))
         outputs.dir(litertJniLibs)
         commandLine(
             "cargo", "xtask", "fetch-litert", "--abis", "arm64-v8a,x86_64",
