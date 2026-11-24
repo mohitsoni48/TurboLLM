@@ -27,16 +27,12 @@ const SAMPLER_TOP_P: c_int = 2;
 type StreamCallback = unsafe extern "C" fn(data: *mut c_void, chunk: *const c_void);
 
 macro_rules! table {
-    ($($name:ident: $ty:ty,)*) => {
+    ($($(#[$meta:meta])* $name:ident: $ty:ty,)*) => {
         /// Every function of the table, by its exported name.
         pub const SYMBOLS: &[&str] = &[$(concat!("litert_lm_", stringify!($name))),*];
 
-        #[expect(
-            dead_code,
-            reason = "the table is the architecture 3.2 list; set_min_log_level is resolved but no caller sets a level (D-9)"
-        )]
         struct Table {
-            $($name: $ty,)*
+            $($(#[$meta])* $name: $ty,)*
         }
 
         impl Table {
@@ -100,6 +96,7 @@ table! {
     benchmark_info_delete: unsafe extern "C" fn(Raw),
     get_last_error_message: unsafe extern "C" fn() -> *const c_char,
     clear_last_error: unsafe extern "C" fn(),
+    #[expect(dead_code, reason = "resolved with the rest of the architecture 3.2 table; no caller sets a log level (D-9)")]
     set_min_log_level: unsafe extern "C" fn(c_int) -> Status,
 }
 
