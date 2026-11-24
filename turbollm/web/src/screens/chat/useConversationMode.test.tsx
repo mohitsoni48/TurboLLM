@@ -33,6 +33,7 @@ function setup(initial: Partial<Props> = {}) {
   const start = vi.fn(async () => {})
   const cancel = vi.fn()
   const stopReply = vi.fn()
+  const onStop = vi.fn()
   const props: Props = { voicePhase: 'idle', replyStreaming: false, canListen: true, chatKey: 'chat-1', enabled: true, ...initial }
   const hook = renderHook((p: Props) => useConversationMode({
     voice: { phase: p.voicePhase, start, cancel },
@@ -40,6 +41,7 @@ function setup(initial: Partial<Props> = {}) {
     canListen: p.canListen,
     chatKey: p.chatKey,
     stopReply,
+    onStop,
     enabled: p.enabled,
   }), { initialProps: props })
   const update = (change: Partial<Props>) => {
@@ -48,7 +50,7 @@ function setup(initial: Partial<Props> = {}) {
   }
   /** The recorder moves through phases as it really does. */
   const voice = (...phases: VoicePhase[]) => { for (const phase of phases) update({ voicePhase: phase }) }
-  return { ...hook, start, cancel, stopReply, update, voice }
+  return { ...hook, start, cancel, stopReply, onStop, update, voice }
 }
 
 beforeEach(() => {
@@ -398,4 +400,28 @@ it('does not reopen the mic when reading was stopped or failed', () => {
   act(() => fakeSpeaker.notify())
   expect(h.result.current.phase).toBe('idle')
   expect(h.start).toHaveBeenCalledTimes(1)
+})
+
+describe('pending read-aloud when the mode stops', () => {
+  it('drops queued speech when the beta is turned off during generation', () => {
+    const h = setup()
+    act(() => h.result.current.enable())
+    h.voice('starting', 'recording', 'transcribing')
+    act(() => h.result.current.emit({ type: 'message-sent' }))
+    h.voice('idle')
+    expect(h.result.current.phase).toBe('generating')
+    h.update({ enabled: false })
+    expect(h.onStop).toHaveBeenCalledOnce()
+    expect(h.stopReply).not.toHaveBeenCalled()
+    expect(h.result.current.active).toBe(false)
+  })
+
+  it('drops queued speech on an explicit stop too, but not while already off', () => {
+    const h = setup()
+    act(() => h.result.current.disable())
+    expect(h.onStop).not.toHaveBeenCalled()
+    act(() => h.result.current.enable())
+    act(() => h.result.current.disable())
+    expect(h.onStop).toHaveBeenCalledOnce()
+  })
 })
