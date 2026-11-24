@@ -734,6 +734,7 @@ describe('ChatScreen — streaming a reply', () => {
 })
 
 
+describe('hands-free input during a live reply', () => {
 it('keeps hands-free speech and reports a refusal when a reply is already live', async () => {
   nextGen = hangingStream()
   const toastError = vi.spyOn(toast, 'error')
@@ -744,13 +745,19 @@ it('keeps hands-free speech and reports a refusal when a reply is already live',
       const button = screen.getAllByRole('button', { name: /Start a voice conversation/ })[0]
       fireEvent.click(button)
     })
+    expect(screen.getAllByRole('button', { name: /Stop voice conversation/ })[0]).toHaveAttribute('aria-pressed', 'true')
     await sendText('start a reply')
     await screen.findByTitle('Stop generation (Esc)')
-    act(() => voiceOptions.onText('keep this spoken text'))
-    expect(await composer()).toHaveValue('keep this spoken text')
-    expect(toastError).toHaveBeenCalledWith('Wait for the current reply to finish, or stop it before sending.')
+    act(() => voiceOptions.onText('  keep this spoken text \n  '))
+    expect(await composer()).toHaveValue('  keep this spoken text \n  ')
+    expect(toastError).toHaveBeenCalledWith('Wait for the current reply to finish, or stop it before sending.', { duration: Infinity, closeButton: true })
+    expect(screen.getAllByRole('button', { name: /Stop voice conversation/ })[0]).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByTitle('Stop generation (Esc)')).toBeInTheDocument()
+    expect(sendCalls).toHaveLength(1)
+    expect(stopSpy).not.toHaveBeenCalled()
   } finally {
     useVoiceStore.setState({ conversation: false })
     toastError.mockRestore()
   }
+})
 })
