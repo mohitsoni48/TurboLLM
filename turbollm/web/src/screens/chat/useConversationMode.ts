@@ -46,7 +46,8 @@ export interface ConversationModeOptions {
   /** The Settings → Voice opt-in for the beta. The master switch: the mode cannot be turned on without it, and turning it off
    *  while the mode is on ends the mode (so a composer that no longer offers it cannot keep a live loop running). */
   enabled: boolean
-  /** Drop any queued read-aloud when the mode stops, even before speech starts. */
+  /** End mode-owned output, including queued speech and current manual or
+   *  always-on reading. Does not cancel generation. */
   onStop?: () => void
 }
 

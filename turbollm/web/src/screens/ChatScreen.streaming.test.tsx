@@ -20,6 +20,7 @@ beforeEach(() => {
   })
   Object.defineProperty(Element.prototype, 'scrollTo', { configurable: true, writable: true, value: () => {} })
   stopSpy.mockClear()
+  speechStream.mockClear()
   regenerateSpy.mockClear()
   editMsgMutate.mockReset()
   sendCalls.length = 0
@@ -54,10 +55,17 @@ vi.mock('../lib/queries', async (importOriginal) => {
 let engineState = 'running'
 let createMutateAsync = vi.fn(() => Promise.resolve({ id: 'new1' }))
 let stopConversationReply: (() => void) | undefined
+let stopConversationOutput: (() => void) | undefined
+const speechStream = vi.hoisted(() => vi.fn(() => ({ update: vi.fn(), end: vi.fn() })))
+vi.mock('../lib/voice/tts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/voice/tts')>()
+  return { ...actual, ttsAvailable: () => true, speaker: { stream: speechStream, stop: vi.fn(), activeId: () => null, subscribe: () => () => {}, lastOutcome: () => null } }
+})
 vi.mock('./chat/useConversationMode', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./chat/useConversationMode')>()
   return { ...actual, useConversationMode: (options: Parameters<typeof actual.useConversationMode>[0]) => {
     stopConversationReply = options.stopReply
+    stopConversationOutput = options.onStop
     return actual.useConversationMode(options)
   } }
 })
@@ -743,3 +751,20 @@ it('barge-in during first-message chat creation prevents the old message being s
   await act(async () => { finishCreate({ id: 'new1' }) })
   expect(sendCalls).toHaveLength(0)
 })
+it('clears the pending speech claim at screen level when hands-free stops before meta', async () => {
+  const feed = steppedStream()
+  nextGen = feed.gen
+  useVoiceStore.setState({ conversation: true, readAloud: 'off' })
+  try {
+    await renderScreen('/chat/c1')
+    act(() => fireEvent.click(screen.getAllByRole('button', { name: /Start a voice conversation/ })[0]))
+    await sendText('a reply that would be spoken')
+    act(() => stopConversationOutput?.())
+    await feed.push(meta)
+    await feed.push({ event: 'delta', data: { delta: 'A complete sentence.' } } as ChatSseEvent)
+    expect(speechStream).not.toHaveBeenCalled()
+  } finally {
+    useVoiceStore.setState({ conversation: false })
+  }
+})
+
