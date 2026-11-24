@@ -1,5 +1,6 @@
 mod elf;
 mod goldens;
+mod litert;
 mod llama;
 mod uniffi;
 mod version;
@@ -19,7 +20,9 @@ uniffi-kotlin --lib <library> --out <dir>  generate Kotlin bindings from a built
 check-android-elf <file> [--needs <library>]  fail unless every PT_LOAD is 16 KB aligned (and <library> is DT_NEEDED)\n  \
 check-glibc --max <x.y> <file>  fail if the file needs a GLIBC_ symbol version above <x.y>\n  \
 fetch-llama --out <dir>  put the pinned, sha256-checked llama.cpp source at <dir>/llama.cpp\n  \
-build-llama --host [--variant base]  CMake-build turbollm_core_llama_<variant> into target/llama/<host-triple>";
+build-llama --host [--variant base]  CMake-build turbollm_core_llama_<variant> into target/llama/<host-triple>
+  \nfetch-litert --abis <arm64-v8a,x86_64> --out <dir>  stage the pinned LiteRT-LM library per Android ABI
+  \nfetch-litert --host --out <dir>  stage the pinned LiteRT-LM library for this OS";
 const FAILURE_EXIT: u8 = 1;
 const UNKNOWN_COMMAND_EXIT: u8 = 2;
 
@@ -34,6 +37,7 @@ fn main() -> ExitCode {
         "check-glibc" => check_glibc(),
         "fetch-llama" => fetch_llama(),
         "build-llama" => build_llama(),
+        "fetch-litert" => fetch_litert(),
         _ => {
             eprintln!("unknown command {command:?}\n{USAGE}");
             return ExitCode::from(UNKNOWN_COMMAND_EXIT);
@@ -150,6 +154,47 @@ fn build_llama() -> Result<(), String> {
     Ok(())
 }
 
+fn fetch_litert() -> Result<(), String> {
+    let request = litert::parse_request(&command_args())?;
+    let runtime = litert::parse_runtime(&read(&litert_runtime_pin())?)?;
+    let mut places = litert::Places {
+        cache_dir: core_dir().join("target").join("cache").join("litert"),
+        out_dir: PathBuf::new(),
+    };
+    let staged = match request {
+        litert::Request::Android { abis, out } => {
+            places.out_dir = out;
+            litert::stage_android(&runtime, &abis, &places, &llama::HttpsFetcher)?
+        }
+        litert::Request::Host { out } => {
+            places.out_dir = out;
+            let key = litert::host_key(env::consts::OS, env::consts::ARCH)?;
+            vec![litert::stage_host(
+                &runtime,
+                key,
+                &places,
+                &llama::HttpsFetcher,
+            )?]
+        }
+    };
+    for library in &staged {
+        println!(
+            "fetch-litert: {} {}: wheel {}, library sha256 {}{}, wrote {}",
+            runtime.version,
+            library.target,
+            library.wheel,
+            library.library_sha256,
+            if library.library_pinned {
+                ""
+            } else {
+                " (not pinned yet: add it to litert-runtime.json)"
+            },
+            library.file.display()
+        );
+    }
+    Ok(())
+}
+
 fn fetched_llama_tree(out_dir: PathBuf) -> Result<PathBuf, String> {
     let source = llama::parse_source(&read(&llama_source_pin())?)?;
     let places = llama::SourcePlaces {
@@ -234,6 +279,13 @@ fn llama_source_pin() -> PathBuf {
 
 fn llama_crate_dir() -> PathBuf {
     core_dir().join("crates").join("turbollm-engine-llama")
+}
+
+fn litert_runtime_pin() -> PathBuf {
+    core_dir()
+        .join("crates")
+        .join("turbollm-engine-litert")
+        .join("litert-runtime.json")
 }
 
 fn workspace_manifest() -> PathBuf {

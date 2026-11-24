@@ -152,11 +152,11 @@ fn verified_archive(
     }
     let archive = fetcher.fetch(&source.archive_url())?;
     verify_sha256(source, &archive)?;
-    keep_in_cache(&cached, &archive)?;
+    write_through_partial(&cached, &archive)?;
     Ok((archive, ArchiveOrigin::Downloaded))
 }
 
-fn forget_cached(cached: &Path, mismatch: &str) -> String {
+pub fn forget_cached(cached: &Path, mismatch: &str) -> String {
     match fs::remove_file(cached) {
         Ok(()) => format!(
             "{mismatch}; removed the cached archive {}, the next run downloads it again",
@@ -169,21 +169,24 @@ fn forget_cached(cached: &Path, mismatch: &str) -> String {
     }
 }
 
-fn keep_in_cache(cached: &Path, archive: &[u8]) -> Result<(), String> {
-    let cache_dir = cached
-        .parent()
-        .expect("the cached archive lives in the cache folder");
-    fs::create_dir_all(cache_dir).map_err(io_error(cache_dir))?;
-    let partial = cached.with_extension("partial");
-    fs::write(&partial, archive).map_err(io_error(&partial))?;
-    fs::rename(&partial, cached).map_err(io_error(cached))
+/// Writes through a `.partial` file and renames it into place, so a reader never sees half a file.
+pub fn write_through_partial(file: &Path, contents: &[u8]) -> Result<(), String> {
+    let folder = file.parent().expect("the file lives in a folder");
+    fs::create_dir_all(folder).map_err(io_error(folder))?;
+    let partial = file.with_extension("partial");
+    fs::write(&partial, contents).map_err(io_error(&partial))?;
+    fs::rename(&partial, file).map_err(io_error(file))
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn verify_sha256(source: &LlamaSource, archive: &[u8]) -> Result<(), String> {
-    let actual: String = Sha256::digest(archive)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let actual = sha256_hex(archive);
     if actual != source.sha256 {
         return Err(format!(
             "llama.cpp archive {}: sha256 mismatch, expected {:?} (llama-source.json), actual {actual}",
@@ -377,7 +380,7 @@ fn path_define(name: &str, path: &Path) -> OsString {
     define
 }
 
-fn io_error(path: &Path) -> impl Fn(std::io::Error) -> String + '_ {
+pub fn io_error(path: &Path) -> impl Fn(std::io::Error) -> String + '_ {
     move |e| format!("{}: {e}", path.display())
 }
 

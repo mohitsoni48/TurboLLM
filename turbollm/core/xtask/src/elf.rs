@@ -51,6 +51,13 @@ pub fn read_shared_library(file: &[u8]) -> Result<SharedLibrary, String> {
     })
 }
 
+/// The `e_machine` of a 64-bit ELF file: the CPU the library was built for.
+pub fn elf_machine(file: &[u8]) -> Result<u16, String> {
+    let library =
+        ElfFile64::<Endianness>::parse(file).map_err(|e| format!("not a 64-bit ELF file: {e}"))?;
+    Ok(library.elf_header().e_machine.get(library.endian()).0)
+}
+
 /// Why Android would refuse to load the library, or would load it without `needs`; empty when it is fine.
 pub fn android_problems(library: &SharedLibrary, needs: Option<&str>) -> Vec<String> {
     let mut problems = alignment_problems(&library.load_alignments);
@@ -274,6 +281,17 @@ mod tests {
         writer.write_gnu_verneed_section_header(0);
         writer.write_shstrtab_section_header();
         bytes
+    }
+
+    #[test]
+    fn reads_the_machine_the_library_was_built_for() {
+        let bytes = shared_library(&LibrarySpec {
+            load_align: 16384,
+            needed: &[],
+            glibc_versions: &[],
+        });
+        assert_eq!(elf_machine(&bytes).unwrap(), elf::EM_AARCH64.0);
+        assert!(elf_machine(b"MZ not an elf").is_err());
     }
 
     fn library(load_align: u64, needed: &[&str]) -> SharedLibrary {
