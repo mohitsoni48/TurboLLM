@@ -723,3 +723,19 @@ test('android-emulator pushes the test .litertlm to the device and passes it as 
   assert.match(script, new RegExp(`-Pandroid\\.testInstrumentationRunnerArguments\\.turbollmTestLitertlm=${DEVICE_LITERTLM}`))
   assert.ok(stepIndex(job, download) < stepIndex(job, emulator))
 })
+
+test('rust-checks clippies turbollm-core with litert alone, llama alone, both and neither, so no feature set stops compiling unseen', () => {
+  const job = jobs['rust-checks']
+  const commands = [
+    'cargo clippy -p turbollm-core --no-default-features -- -D warnings',
+    'cargo clippy -p turbollm-core --no-default-features --features llama -- -D warnings',
+    'cargo clippy -p turbollm-core --no-default-features --features litert -- -D warnings',
+    'cargo clippy -p turbollm-core --no-default-features --features llama,litert -- -D warnings',
+  ]
+
+  for (const command of commands) {
+    const step = job.steps.find((candidate) => candidate.run?.trim() === command)
+    assert.ok(step, `no rust-checks step runs: ${command}`)
+    assert.equal(step['working-directory'], 'turbollm/core')
+  }
+})

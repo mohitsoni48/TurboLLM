@@ -6,17 +6,18 @@
 use std::ffi::CString;
 use std::sync::Arc;
 
-use turbollm_engine_llama::LlamaLog;
+/// A line sink; the llama and LiteRT backends each name this same shape, so neither crate owns it here.
+pub(crate) type PlatformLog = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// The log the llama and LiteRT backends write to on this platform (their log types are the same shape).
 #[cfg(target_os = "android")]
-pub(crate) fn platform_log() -> LlamaLog {
+pub(crate) fn platform_log() -> PlatformLog {
     Arc::new(logcat::write)
 }
 
 /// The log the llama and LiteRT backends write to on this platform (their log types are the same shape).
 #[cfg(not(target_os = "android"))]
-pub(crate) fn platform_log() -> LlamaLog {
+pub(crate) fn platform_log() -> PlatformLog {
     Arc::new(|_| {})
 }
 

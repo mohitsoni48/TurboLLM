@@ -7,7 +7,7 @@ pub mod gguf {
 #[cfg(feature = "engines")]
 pub mod engines;
 
-#[cfg(feature = "llama")]
+#[cfg(any(feature = "llama", feature = "litert"))]
 mod platform_log;
 
 const VERSION_MARKER_PREFIX: &str = "TURBOLLM_CORE_VERSION=";

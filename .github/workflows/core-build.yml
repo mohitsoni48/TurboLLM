@@ -110,6 +110,24 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
         working-directory: turbollm/core
 
+      # The workspace build unifies features, so it never builds turbollm-core with one engine alone.
+      # Each feature set a host can pick (ffi: both; napi: neither) must compile on its own.
+      - name: Clippy turbollm-core, no engine
+        run: cargo clippy -p turbollm-core --no-default-features -- -D warnings
+        working-directory: turbollm/core
+
+      - name: Clippy turbollm-core, llama only
+        run: cargo clippy -p turbollm-core --no-default-features --features llama -- -D warnings
+        working-directory: turbollm/core
+
+      - name: Clippy turbollm-core, litert only
+        run: cargo clippy -p turbollm-core --no-default-features --features litert -- -D warnings
+        working-directory: turbollm/core
+
+      - name: Clippy turbollm-core, llama and litert
+        run: cargo clippy -p turbollm-core --no-default-features --features llama,litert -- -D warnings
+        working-directory: turbollm/core
+
       - name: Licenses, sources and advisories
         run: cargo deny check
         working-directory: turbollm/core
