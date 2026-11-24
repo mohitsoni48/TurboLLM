@@ -385,6 +385,7 @@ describe('the Settings opt-in is the master switch', () => {
 })
 
 
+describe('reading completion safety', () => {
 it('does not reopen the mic when reading was stopped or failed', () => {
   const h = setup()
   act(() => h.result.current.enable())
@@ -400,6 +401,27 @@ it('does not reopen the mic when reading was stopped or failed', () => {
   act(() => fakeSpeaker.notify())
   expect(h.result.current.phase).toBe('idle')
   expect(h.start).toHaveBeenCalledTimes(1)
+})
+
+it('does not reopen the mic after another reading replaces the claimed reply', () => {
+  const h = setup()
+  act(() => h.result.current.enable())
+  h.voice('starting', 'recording', 'transcribing')
+  act(() => h.result.current.emit({ type: 'message-sent' }))
+  h.voice('idle')
+  h.update({ replyStreaming: true })
+  fakeSpeaker.queue = ['reply-1']
+  h.update({ replyStreaming: false })
+  fakeSpeaker.queue = ['manual-old-message']
+  act(() => fakeSpeaker.notify())
+  expect(h.result.current.phase).toBe('speaking')
+  fakeSpeaker.outcome = { id: 'manual-old-message', completed: true }
+  fakeSpeaker.queue = [null]
+  act(() => fakeSpeaker.notify())
+  expect(h.result.current.phase).toBe('idle')
+  expect(h.result.current.active).toBe(true)
+  expect(h.start).toHaveBeenCalledTimes(1)
+})
 })
 
 describe('pending read-aloud when the mode stops', () => {

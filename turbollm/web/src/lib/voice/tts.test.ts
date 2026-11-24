@@ -1045,4 +1045,17 @@ describe('reading completion outcome', () => {
     utterances[0].onerror?.()
     expect(speaker.lastOutcome()).toEqual({ id: 'failed-reply', completed: false })
   })
+  it('does not let a replaced reading finish even after the new reading finishes', () => {
+    const { utterances } = installSpeechSynthesis([voice('en', 'en-US')])
+    speaker.speak('old-reply', 'First reading.', EN)
+    speaker.speak('new-reply', 'Replacement reading.', EN)
+    expect(speaker.activeId()).toBe('new-reply')
+    // A late completion from the replaced backend cannot finish the new reading.
+    utterances[0].onend?.()
+    expect(speaker.activeId()).toBe('new-reply')
+    vi.advanceTimersByTime(500)
+    drain(utterances)
+    expect(speaker.lastOutcome()).toEqual({ id: 'new-reply', completed: true })
+  })
+
 })
