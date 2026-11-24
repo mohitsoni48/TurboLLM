@@ -14,3 +14,4 @@ serde_json = "=1.0.154"
 
 [dev-dependencies]
 tokio = { version = "=1.54.1", features = ["macros", "rt", "time"] }
+tempfile = "=3.27.0"

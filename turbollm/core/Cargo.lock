@@ -1384,6 +1384,7 @@ dependencies = [
  "tokio",
  "turbollm-core",
  "turbollm-engine",
+ "turbollm-engine-litert",
  "turbollm-engine-llama",
  "turbollm-gguf",
  "turbollm-platform",
@@ -1409,6 +1410,7 @@ version = "1.15.2"
 dependencies = [
  "libloading 0.8.9",
  "serde_json",
+ "tempfile",
  "tokio",
  "turbollm-engine",
  "turbollm-platform",
