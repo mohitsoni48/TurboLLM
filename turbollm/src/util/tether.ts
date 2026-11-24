@@ -127,7 +127,7 @@ import { fileURLToPath } from 'node:url'
 import type { AddReply, JobSentinel } from './win-job-sentinel'
 
 export type TetherKind = 'engine' | 'tunnel' | 'routine-cli' | 'code-bash' | 'agent-install' | 'mcp' | 'lsp' | 'build'
-  | 'install' | 'provision' | 'extract' | 'usage' | 'chrome' | 'git' | 'probe'
+  | 'install' | 'provision' | 'extract' | 'usage' | 'chrome' | 'git' | 'probe' | 'sandbox'
 export type TetherEnd = 'kill' | 'term-then-kill' | 'term'
 export interface Tether {
   kind: TetherKind

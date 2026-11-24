@@ -62,7 +62,7 @@ const fetchSysInfoMock = vi.fn(() => Promise.resolve({ gpus: [{ name: 'RTX 3050'
 
 const WRITER = { id: 'writer', name: 'Writer', description: 'Drafts prose', systemPrompt: 'You write.', skillIds: ['s-write'], tools: ['web_search'] }
 let customAgents: Array<typeof WRITER> = [WRITER]
-let settingsData: { autoMemoryEnabled?: boolean } | undefined
+let settingsData: { autoMemoryEnabled?: boolean; defaultSkillIds?: string[] } | undefined
 
 /** What `agentId` generates for a chat, so a chat starts out with an unedited prompt (no confirmation) unless a test edits it. */
 const promptOf = (agentId: string) =>
@@ -212,6 +212,16 @@ describe('ChatScreen — switching the agent of a chat that has messages', () =>
     })
     await waitFor(() => expect(localStorage.getItem('tllm.persona.conv.c1')).toBe('blank'))
     expect(trackSpy).toHaveBeenCalledWith('chat', 'switch_agent')
+  })
+
+  it('a chat the daemon stored without a skill list has none, so the user’s defaults are not added to it by a switch', async () => {
+    mockLibrary = [loadedRow()]
+    settingsData = { defaultSkillIds: ['web'] }
+    conv = { ...BASE_CONV, chatAgentId: 'writer', systemPrompt: promptOf('writer'), skillIds: undefined }
+    await renderScreen()
+    await pick(/Blank/)
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1))
+    expect((updateMutateAsync.mock.calls[0][0] as { skillIds: string[] }).skillIds).toEqual([])
   })
 
   it('Research forces web search and leaves every tool allowed (null clears the allow-list)', async () => {

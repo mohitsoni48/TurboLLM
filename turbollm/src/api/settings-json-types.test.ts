@@ -35,6 +35,7 @@ test('PATCH /api/v1/settings answers a wrong JSON type with 400 invalid_config_v
     ['comfyui.url', { comfyui: { url: 8188 } }],
     ['search.tavilyApiKey', { search: { tavilyApiKey: 123 } }],
     ['search.kagiApiKey', { search: { kagiApiKey: { key: 'k' } } }],
+    ['search.keenableApiKey', { search: { keenableApiKey: { key: 'k' } } }],
     ['search.searxngUrl', { search: { searxngUrl: null } }],
     ['remoteAccess.tokenGrant.capabilities', { remoteAccess: { tokenGrant: { capabilities: 'models:use' } } }],
     ['remoteAccess.tokenGrant.models', { remoteAccess: { tokenGrant: { models: 5 } } }],

@@ -1,3 +1,6 @@
+/** Tools that ask before every call, offered no standing approval (the daemon's tool-policy.ts ALWAYS_ASK_TOOLS). */
+export const ALWAYS_ASK_TOOLS: ReadonlySet<string> = new Set(['run_python'])
+
 /** Strips an MCP tool's server-prefix (`mcp__server__tool` → `tool`) and turns
  *  underscores into spaces for display, e.g. in the approval bar and tool-call cards. */
 export function friendlyName(name: string): string {
@@ -23,6 +26,10 @@ export function describeToolCall(name: string, args: Record<string, unknown>): s
   if (name === 'run_code') {
     const code = String(args.code)
     return `Run JavaScript: ${code.slice(0, 80)}${code.length > 80 ? '…' : ''}`
+  }
+  if (name === 'run_python') {
+    const lines = String(args.code ?? '').split('\n').length
+    return `Run Python in the sandbox (${lines} ${lines === 1 ? 'line' : 'lines'})`
   }
   if (name.startsWith('mcp__')) {
     const match = name.match(/^mcp__([^_]+(?:_[^_]+)*)__/)

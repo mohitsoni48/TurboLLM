@@ -27,6 +27,7 @@ import type { LinkManager } from './link/link-manager'
 import type { RemoteCatalog } from './link/remote-catalog'
 import type { VoiceService } from './voice/voice-service'
 import type { SandboxRuntime } from './sandbox/runtime-install'
+import type { SandboxManager } from './sandbox/sandbox-manager'
 
 /** What deleting a Code session came to (code-routes.ts deleteCodeSessionWithCleanup). */
 export type CodeSessionDeletion =
@@ -91,6 +92,8 @@ export interface Deps {
   /** The Python sandbox's downloaded runtime (GitHub #52): Deno plus Pyodide under `<config dir>/runtimes/sandbox/`.
    *  Built by bootDaemon on every desktop platform; absent on Android and under tests that don't exercise it. */
   sandboxRuntime?: SandboxRuntime
+  /** The chats' running Python sandboxes over that runtime (run_python). Built with it; absent where it is. */
+  sandbox?: SandboxManager
   /** Background agent-task registry (reviewer + skill distill). Surfaced via /status
    *  so the UI can show running bg tasks inline. Optional — absent under tests. */
   agentTasks?: AgentTaskState
