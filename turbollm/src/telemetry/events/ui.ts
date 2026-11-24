@@ -605,7 +605,7 @@ export const UI_ACTIONS = [
   'navigate_fs_up', 'navigate_fs_to_path', 'refresh_fs_browser', 'open_fs_folder',
   'cancel_fs_browser',
 
-  'open_skill', 'upload_skill_file', 'create_skill', 'learn_skill_from_folder',
+  'open_skill', 'upload_skill_file', 'create_skill', 'learn_skill_from_folder', 'default_skill_on', 'default_skill_off',
 
   'toggle_code_tool_detail', 'send_queued_code_message',
 

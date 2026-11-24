@@ -159,3 +159,31 @@ describe('useVoiceStore conversation opt-in across tabs', () => {
     expect(store.getState().conversation).toBe(false)
   })
 })
+
+describe('voice storage listener lifetime', () => {
+  it('replaces the old module listener instead of stacking handlers', async () => {
+    const first = await loadStore()
+    const oldUpdate = vi.fn()
+    const unsubscribe = first.subscribe(oldUpdate)
+    const second = await loadStore()
+    const currentUpdate = vi.fn()
+    const unsubscribeCurrent = second.subscribe(currentUpdate)
+    localStorage.setItem('tllm.voice.conversation', 'true')
+    window.dispatchEvent(new StorageEvent('storage', { key: 'tllm.voice.conversation' }))
+    expect(second.getState().conversation).toBe(true)
+    expect(currentUpdate).toHaveBeenCalledOnce()
+    expect(oldUpdate).not.toHaveBeenCalled()
+    unsubscribe()
+    unsubscribeCurrent()
+  })
+
+  it('still handles storage clearing after a reload', async () => {
+    await loadStore()
+    localStorage.setItem('tllm.voice.conversation', 'true')
+    const store = await loadStore()
+    expect(store.getState().conversation).toBe(true)
+    localStorage.clear()
+    window.dispatchEvent(new StorageEvent('storage', { key: null }))
+    expect(store.getState().conversation).toBe(false)
+  })
+})
