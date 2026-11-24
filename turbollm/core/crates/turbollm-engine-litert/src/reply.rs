@@ -43,6 +43,7 @@ pub(crate) fn generate(
         abort,
         prompt,
         sent_at: Duration::ZERO,
+        prompt_tokens: 0,
     };
     reply.run()
 }
@@ -68,6 +69,8 @@ struct Reply<'a, 'b> {
     abort: &'b AbortSignal,
     prompt: LiteRtPrompt,
     sent_at: Duration,
+    /// What the conversation held before the user turn was sent.
+    prompt_tokens: u32,
 }
 
 impl Reply<'_, '_> {
@@ -93,8 +96,9 @@ impl Reply<'_, '_> {
             .context
             .calls
             .start_reply(self.context.engine, &self.prompt, sink);
-        let conversation = started.map_err(|message| self.failure(&message))?;
-        lock(self.context.current).replace(conversation);
+        let started = started.map_err(|message| self.failure(&message))?;
+        self.prompt_tokens = started.prompt_tokens;
+        lock(self.context.current).replace(started.conversation);
         self.cancel_if_aborted();
         Ok(arrivals)
     }
@@ -143,10 +147,10 @@ impl Reply<'_, '_> {
     }
 
     /// LiteRT does not say when its prefill ends; the first chunk arriving is the earliest sign of
-    /// it, and the prompt's tokens are counted only once the reply is over.
+    /// it. The prompt count is the one read before the send, as Kotlin's `Prefilled` carried.
     fn prefilled(&self, first_chunk_at: Duration) -> EngineEvent {
         EngineEvent::Prefilled {
-            prompt_tokens: 0,
+            prompt_tokens: self.prompt_tokens,
             prompt_ms: millis(first_chunk_at.saturating_sub(self.sent_at)),
         }
     }
@@ -208,7 +212,7 @@ impl Reply<'_, '_> {
         let completion_tokens = tokens_of(decode);
         EngineEvent::Done {
             reason: self.finish_reason(completion_tokens),
-            prompt_tokens: tokens_of(prefill),
+            prompt_tokens: prefill.map_or(self.prompt_tokens, |turn| tokens_of(Some(turn))),
             completion_tokens,
             prompt_ms: measured_ms(prefill, prompt_wall),
             gen_ms: measured_ms(decode, gen_wall),

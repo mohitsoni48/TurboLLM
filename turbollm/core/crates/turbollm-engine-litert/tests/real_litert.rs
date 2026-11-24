@@ -78,6 +78,33 @@ fn a_reply_reports_the_benchmark_read_after_its_final_chunk() {
 }
 
 #[test]
+fn prefilled_carries_the_count_read_before_the_send_never_above_the_benchmarks_prefill() {
+    on_the_real_library(|host| async move {
+        let manager = host.manager();
+        host.load(&manager).await.expect("the model loads");
+        let request = GenerateRequest {
+            messages: vec![
+                message(Role::System, "You are terse."),
+                message(Role::User, "Name three colours."),
+            ],
+            params: capped(SHORT_REPLY),
+        };
+
+        let reply = Reply::read(manager.generate(request).await.expect("the gate is free")).await;
+
+        let counted = reply.events.iter().find_map(|event| match event {
+            EngineEvent::Prefilled { prompt_tokens, .. } => Some(*prompt_tokens),
+            _ => None,
+        });
+        let Some(EngineEvent::Done { prompt_tokens, .. }) = reply.events.last() else {
+            panic!("no Done event: {:?}", reply.events);
+        };
+        println!("prefilled prompt_tokens {counted:?}, done prompt_tokens {prompt_tokens}");
+        assert!(counted.is_some_and(|counted| counted <= *prompt_tokens));
+    });
+}
+
+#[test]
 fn a_reply_with_thinking_streams_reasoning_apart_from_text() {
     on_the_real_library(|host| async move {
         let manager = host.manager();
@@ -416,11 +443,15 @@ impl Reply {
 
 fn chat(text: &str, params: GenerationParams) -> GenerateRequest {
     GenerateRequest {
-        messages: vec![ChatMessage {
-            role: Role::User,
-            content: MessageContent::Text(text.to_owned()),
-        }],
+        messages: vec![message(Role::User, text)],
         params,
+    }
+}
+
+fn message(role: Role, text: &str) -> ChatMessage {
+    ChatMessage {
+        role,
+        content: MessageContent::Text(text.to_owned()),
     }
 }
 

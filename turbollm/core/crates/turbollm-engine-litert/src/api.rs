@@ -82,6 +82,7 @@ table! {
     conversation_send_message_stream: unsafe extern "C" fn(Raw, *const c_char, *const c_char, Raw, Option<StreamCallback>, *mut c_void) -> Status,
     conversation_cancel_process: unsafe extern "C" fn(Raw) -> Status,
     conversation_get_benchmark_info: unsafe extern "C" fn(Raw, *mut Raw) -> Status,
+    conversation_get_token_count: unsafe extern "C" fn(Raw, *mut usize) -> Status,
     conversation_delete: unsafe extern "C" fn(Raw),
     stream_chunk_get_text: unsafe extern "C" fn(*const c_void, *mut *const c_char) -> Status,
     stream_chunk_get_error: unsafe extern "C" fn(*const c_void, *mut *const c_char) -> Status,
@@ -204,6 +205,12 @@ impl ConversationHandle {
     }
 }
 
+/// A conversation whose user turn was sent, and the tokens it held before that (see `start_reply`).
+pub struct StartedReply {
+    pub conversation: ConversationHandle,
+    pub prompt_tokens: u32,
+}
+
 /// LiteRT-LM as the engine thread calls it. `Err` holds the library's message.
 pub trait LiteRtCalls {
     fn set_min_log_level(&self, level: LogSeverity) -> Result<(), String>;
@@ -218,7 +225,7 @@ pub trait LiteRtCalls {
         engine: &EngineHandle,
         prompt: &LiteRtPrompt,
         sink: ChunkSink,
-    ) -> Result<ConversationHandle, String>;
+    ) -> Result<StartedReply, String>;
     /// Stops the reply; the conversation may only be deleted afterwards.
     fn cancel_reply(&self, conversation: &ConversationHandle) -> Result<(), String>;
     fn benchmark(&self, conversation: &ConversationHandle) -> Result<Benchmark, String>;
@@ -530,7 +537,7 @@ impl LiteRtCalls for LiteRtApi {
         engine: &EngineHandle,
         prompt: &LiteRtPrompt,
         sink: ChunkSink,
-    ) -> Result<ConversationHandle, String> {
+    ) -> Result<StartedReply, String> {
         self.open_conversation(engine, prompt, sink)
     }
 
@@ -565,7 +572,7 @@ impl LiteRtApi {
         engine: &EngineHandle,
         prompt: &LiteRtPrompt,
         sink: ChunkSink,
-    ) -> Result<ConversationHandle, String> {
+    ) -> Result<StartedReply, String> {
         let t = &self.table;
         let config = self.conversation_config(prompt)?;
         let mut conversation: Raw = ptr::null_mut();
@@ -587,14 +594,27 @@ impl LiteRtApi {
             raw: conversation,
             _stream: state,
         };
+        let prompt_tokens = self.count_tokens(&handle);
         let sent = self.send(&handle, prompt, data.cast());
         match sent {
-            Ok(()) => Ok(handle),
+            Ok(()) => Ok(StartedReply {
+                conversation: handle,
+                prompt_tokens,
+            }),
             Err(message) => {
                 self.delete_conversation(handle);
                 Err(message)
             }
         }
+    }
+
+    /// The tokens the conversation holds, read before the user turn is sent, when nothing runs on it
+    /// (Kotlin's `LiteRtReply.kt:39`). A count is no reason to fail a reply, so a failed read is 0.
+    fn count_tokens(&self, conversation: &ConversationHandle) -> u32 {
+        let mut count = 0;
+        let status =
+            unsafe { (self.table.conversation_get_token_count)(conversation.as_ptr(), &mut count) };
+        counted_tokens(status, count)
     }
 
     fn read_benchmark(&self, conversation: &ConversationHandle) -> Result<Benchmark, String> {
@@ -663,6 +683,14 @@ impl LiteRtApi {
     }
 }
 
+fn counted_tokens(status: Status, count: usize) -> u32 {
+    if status == STATUS_OK {
+        u32::try_from(count).unwrap_or(u32::MAX)
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -671,10 +699,10 @@ mod tests {
     use super::*;
 
     /// The architecture 3.2 list, which `table!` must be exactly.
-    const EXPECTED_COUNT: usize = 46;
+    const EXPECTED_COUNT: usize = 47;
 
     #[test]
-    fn the_table_is_the_forty_six_functions_of_architecture_3_2() {
+    fn the_table_is_the_forty_seven_functions_of_architecture_3_2() {
         assert_eq!(SYMBOLS.len(), EXPECTED_COUNT);
         let mut unique = SYMBOLS.to_vec();
         unique.sort_unstable();
@@ -700,6 +728,13 @@ mod tests {
             .filter(|name| !headers.contains(&format!("{name}(")))
             .collect();
         assert!(undeclared.is_empty(), "not in the headers: {undeclared:?}");
+    }
+
+    #[test]
+    fn a_failed_token_count_reads_zero_and_a_huge_one_saturates() {
+        assert_eq!(counted_tokens(STATUS_OK, 37), 37);
+        assert_eq!(counted_tokens(1, 37), 0);
+        assert_eq!(counted_tokens(STATUS_OK, usize::MAX), u32::MAX);
     }
 
     #[test]

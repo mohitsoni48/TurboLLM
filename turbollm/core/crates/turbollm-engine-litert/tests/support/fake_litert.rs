@@ -12,7 +12,7 @@ use std::time::Duration;
 use turbollm_engine::EngineError;
 use turbollm_engine_litert::api::{
     Benchmark, BenchmarkTurn, ChunkSink, ConversationHandle, EngineHandle, EngineSettings,
-    LiteRtCalls, LogSeverity, RawChunk,
+    LiteRtCalls, LogSeverity, RawChunk, StartedReply,
 };
 use turbollm_engine_litert::prompt::LiteRtPrompt;
 use turbollm_engine_litert::{Clock, SharedCalls};
@@ -81,6 +81,10 @@ pub struct Script {
     pub cpu_failure: Option<EngineError>,
     pub start_failure: Option<String>,
     pub chunks: Vec<Piece>,
+    /// What the final chunk itself carries; empty by default.
+    pub final_piece: Piece,
+    /// The count the conversation reports before the user turn is sent.
+    pub prompt_tokens: usize,
     /// The clock reads this when the first chunk arrives, and `generation_ms` later at the last.
     pub prefill_ms: u64,
     pub generation_ms: u64,
@@ -101,6 +105,8 @@ impl Default for Script {
             cpu_failure: None,
             start_failure: None,
             chunks: vec![text("Hel"), text("lo")],
+            final_piece: Piece::default(),
+            prompt_tokens: 0,
             prefill_ms: 0,
             generation_ms: 0,
             endless: false,
@@ -328,7 +334,14 @@ impl Reply {
         } else {
             self.script.reply_error.clone()
         };
-        self.send(String::new(), error, true);
+        let payload = if self.script.final_piece.text.is_empty()
+            && self.script.final_piece.thought.is_empty()
+        {
+            String::new()
+        } else {
+            self.script.final_piece.payload()
+        };
+        self.send(payload, error, true);
     }
 
     fn stream_until_cancelled(&self) {
@@ -382,12 +395,13 @@ impl LiteRtCalls for FakeLiteRt {
         _engine: &EngineHandle,
         prompt: &LiteRtPrompt,
         sink: ChunkSink,
-    ) -> Result<ConversationHandle, String> {
+    ) -> Result<StartedReply, String> {
         self.record("start_reply");
         let script = self.script().clone();
         if let Some(failure) = script.start_failure.clone() {
             return Err(failure);
         }
+        let prompt_tokens = script.prompt_tokens;
         locked(&self.prompts).push(prompt.clone());
         let state = Arc::new(StreamState {
             sink: Mutex::new(sink),
@@ -399,7 +413,11 @@ impl LiteRtCalls for FakeLiteRt {
         locked(&self.streams).insert(id, streaming);
         let raw = NonNull::new(ptr::without_provenance_mut::<c_void>(id)).expect("an id above 0");
         // SAFETY: a fake handle is never given to the real table; `state` is what the stream uses.
-        Ok(unsafe { ConversationHandle::from_raw(raw, Box::new(state)) })
+        let conversation = unsafe { ConversationHandle::from_raw(raw, Box::new(state)) };
+        Ok(StartedReply {
+            conversation,
+            prompt_tokens: u32::try_from(prompt_tokens).unwrap_or(u32::MAX),
+        })
     }
 
     fn cancel_reply(&self, conversation: &ConversationHandle) -> Result<(), String> {

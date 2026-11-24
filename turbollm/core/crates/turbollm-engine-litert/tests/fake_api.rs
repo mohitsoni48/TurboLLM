@@ -294,6 +294,69 @@ async fn a_benchmark_without_speeds_falls_back_to_the_wall_clock_for_the_timings
 }
 
 #[tokio::test]
+async fn prefilled_carries_the_token_count_the_conversation_reported_before_the_send() {
+    let fake = FakeLiteRt::new();
+    fake.script().prompt_tokens = 37;
+    let manager = loaded(&fake).await;
+
+    let events = reply(&manager, question()).await.unwrap();
+
+    assert!(
+        matches!(
+            events[0],
+            EngineEvent::Prefilled {
+                prompt_tokens: 37,
+                ..
+            }
+        ),
+        "{:?}",
+        events[0]
+    );
+}
+
+#[tokio::test]
+async fn without_a_benchmark_done_reports_the_counted_prompt_tokens() {
+    let fake = FakeLiteRt::new();
+    {
+        let mut script = fake.script();
+        script.prompt_tokens = 37;
+        script.benchmark = Err("no benchmark".to_owned());
+    }
+    let manager = loaded(&fake).await;
+
+    let events = reply(&manager, question()).await.unwrap();
+
+    assert!(
+        matches!(
+            done_of(&events),
+            EngineEvent::Done {
+                prompt_tokens: 37,
+                ..
+            }
+        ),
+        "{:?}",
+        done_of(&events)
+    );
+}
+
+#[tokio::test]
+async fn the_benchmarks_prefill_count_still_wins_for_done_over_the_counted_one() {
+    let fake = FakeLiteRt::new();
+    fake.script().prompt_tokens = 37;
+    let manager = loaded(&fake).await;
+
+    let events = reply(&manager, question()).await.unwrap();
+
+    assert!(matches!(
+        done_of(&events),
+        EngineEvent::Done {
+            prompt_tokens: 10,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
 async fn the_time_to_the_first_chunk_is_reported_before_the_first_piece() {
     let fake = FakeLiteRt::new();
     {
