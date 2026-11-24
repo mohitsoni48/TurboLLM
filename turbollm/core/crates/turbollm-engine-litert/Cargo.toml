@@ -8,5 +8,9 @@ rust-version.workspace = true
 
 [dependencies]
 turbollm-engine = { path = "../turbollm-engine" }
+turbollm-platform = { path = "../turbollm-platform" }
 libloading = "=0.8.9"
 serde_json = "=1.0.154"
+
+[dev-dependencies]
+tokio = { version = "=1.54.1", features = ["macros", "rt", "time"] }

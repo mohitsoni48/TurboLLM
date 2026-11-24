@@ -207,7 +207,9 @@ impl ConversationHandle {
 /// LiteRT-LM as the engine thread calls it. `Err` holds the library's message.
 pub trait LiteRtCalls {
     fn set_min_log_level(&self, level: LogSeverity) -> Result<(), String>;
-    fn create_engine(&self, settings: &EngineSettings) -> Result<EngineHandle, String>;
+    /// `Err` is `EngineUnavailable` when this device cannot run LiteRT-LM at all, which the caller
+    /// must not retry on another backend; any other failure is an `EngineFailure`.
+    fn create_engine(&self, settings: &EngineSettings) -> Result<EngineHandle, EngineError>;
     fn delete_engine(&self, engine: EngineHandle);
     /// A fresh conversation seeded with the prompt's context, then the user turn sent; the reply
     /// arrives through `sink`, whose last chunk is final or carries an error.
@@ -506,7 +508,41 @@ impl LiteRtCalls for LiteRtApi {
         self.check("could not set the log level", status)
     }
 
-    fn create_engine(&self, settings: &EngineSettings) -> Result<EngineHandle, String> {
+    fn create_engine(&self, settings: &EngineSettings) -> Result<EngineHandle, EngineError> {
+        self.open_engine(settings)
+            .map_err(EngineError::EngineFailure)
+    }
+
+    fn delete_engine(&self, engine: EngineHandle) {
+        unsafe { (self.table.engine_delete)(engine.as_ptr()) }
+    }
+
+    fn start_reply(
+        &self,
+        engine: &EngineHandle,
+        prompt: &LiteRtPrompt,
+        sink: ChunkSink,
+    ) -> Result<ConversationHandle, String> {
+        self.open_conversation(engine, prompt, sink)
+    }
+
+    fn cancel_reply(&self, conversation: &ConversationHandle) -> Result<(), String> {
+        let status = unsafe { (self.table.conversation_cancel_process)(conversation.as_ptr()) };
+        self.check("could not cancel the reply", status)
+    }
+
+    fn benchmark(&self, conversation: &ConversationHandle) -> Result<Benchmark, String> {
+        self.read_benchmark(conversation)
+    }
+
+    fn delete_conversation(&self, conversation: ConversationHandle) {
+        unsafe { (self.table.conversation_delete)(conversation.as_ptr()) }
+        // The stream state is dropped with the handle, after the stream is gone.
+    }
+}
+
+impl LiteRtApi {
+    fn open_engine(&self, settings: &EngineSettings) -> Result<EngineHandle, String> {
         let settings = self.engine_settings(settings)?;
         let mut engine: Raw = ptr::null_mut();
         unsafe { (self.table.clear_last_error)() };
@@ -516,11 +552,7 @@ impl LiteRtCalls for LiteRtApi {
         Ok(EngineHandle(engine))
     }
 
-    fn delete_engine(&self, engine: EngineHandle) {
-        unsafe { (self.table.engine_delete)(engine.as_ptr()) }
-    }
-
-    fn start_reply(
+    fn open_conversation(
         &self,
         engine: &EngineHandle,
         prompt: &LiteRtPrompt,
@@ -557,12 +589,7 @@ impl LiteRtCalls for LiteRtApi {
         }
     }
 
-    fn cancel_reply(&self, conversation: &ConversationHandle) -> Result<(), String> {
-        let status = unsafe { (self.table.conversation_cancel_process)(conversation.as_ptr()) };
-        self.check("could not cancel the reply", status)
-    }
-
-    fn benchmark(&self, conversation: &ConversationHandle) -> Result<Benchmark, String> {
+    fn read_benchmark(&self, conversation: &ConversationHandle) -> Result<Benchmark, String> {
         let t = &self.table;
         let mut raw: Raw = ptr::null_mut();
         let status =
@@ -588,13 +615,6 @@ impl LiteRtCalls for LiteRtApi {
         })
     }
 
-    fn delete_conversation(&self, conversation: ConversationHandle) {
-        unsafe { (self.table.conversation_delete)(conversation.as_ptr()) }
-        // The stream state is dropped with the handle, after the stream is gone.
-    }
-}
-
-impl LiteRtApi {
     /// Sends the user turn; the optional args carry the output cap.
     fn send(
         &self,

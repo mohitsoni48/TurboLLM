@@ -1409,7 +1409,9 @@ version = "1.15.2"
 dependencies = [
  "libloading 0.8.9",
  "serde_json",
+ "tokio",
  "turbollm-engine",
+ "turbollm-platform",
 ]
 
 [[package]]

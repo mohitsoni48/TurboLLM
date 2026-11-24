@@ -4,4 +4,112 @@
 
 pub mod api;
 pub mod chunk;
+mod model;
 pub mod prompt;
+mod reply;
+
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+use turbollm_engine::{
+    Backend, EngineDescriptor, EngineError, EngineId, EngineKind, LoadControl, LoadSpec,
+    ModelFormat, ModelInfo, NativeBackend, StallPolicy,
+};
+use turbollm_platform::HostFacts;
+
+use crate::api::LiteRtCalls;
+
+pub use model::LiteRtModel;
+
+/// The name of every LiteRT-LM model's engine thread (`LiteRtLmEngine.kt:13`).
+pub const ENGINE_THREAD_NAME: &str = "turbollm-litert";
+
+/// What a load that fell back from the GPU to the CPU says, before the GPU's own reason.
+pub const GPU_UNAVAILABLE_PREFIX: &str = "GPU unavailable: ";
+
+/// The function table a backend shares with each model it opens.
+pub type SharedCalls = Arc<dyn LiteRtCalls + Send + Sync>;
+
+/// Monotonic time since some fixed start, read on the thread LiteRT streams a reply from; tests
+/// stand in a scripted one.
+pub type Clock = Arc<dyn Fn() -> Duration + Send + Sync>;
+
+type LibraryOpener = Box<dyn Fn() -> Result<SharedCalls, EngineError> + Send + Sync>;
+
+/// LiteRT-LM for `InProcess`: the runtime library opens on the first load, once per backend
+/// instance (T-9), and every model runs on its own `turbollm-litert` thread.
+pub struct LiteRtBackend {
+    descriptor: EngineDescriptor,
+    open_library: LibraryOpener,
+    library: Mutex<Option<SharedCalls>>,
+    clock: Clock,
+}
+
+impl LiteRtBackend {
+    /// A backend over the calls `open_library` gives, opened on the first load; a failed open is
+    /// tried again by the next load.
+    pub fn over(
+        open_library: impl Fn() -> Result<SharedCalls, EngineError> + Send + Sync + 'static,
+    ) -> LiteRtBackend {
+        let start = Instant::now();
+        LiteRtBackend {
+            descriptor: litert_descriptor(),
+            open_library: Box::new(open_library),
+            library: Mutex::new(None),
+            clock: Arc::new(move || start.elapsed()),
+        }
+    }
+
+    pub fn with_clock(self, clock: Clock) -> LiteRtBackend {
+        LiteRtBackend { clock, ..self }
+    }
+
+    fn library(&self) -> Result<SharedCalls, EngineError> {
+        let mut library = self.library.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(calls) = library.as_ref() {
+            return Ok(Arc::clone(calls));
+        }
+        let calls = (self.open_library)()?;
+        Ok(Arc::clone(library.insert(calls)))
+    }
+}
+
+impl NativeBackend for LiteRtBackend {
+    type Model = LiteRtModel;
+
+    fn descriptor(&self) -> &EngineDescriptor {
+        &self.descriptor
+    }
+
+    /// Loads no native code: whether the library is there is learnt by opening it.
+    fn probe(&self, _host: &HostFacts) -> Option<String> {
+        None
+    }
+
+    /// LiteRT-LM reports no load progress, so a long load is not a stalled one (ADR-460).
+    fn stall_policy(&self) -> StallPolicy {
+        StallPolicy::Exempt
+    }
+
+    fn thread_name(&self) -> &'static str {
+        ENGINE_THREAD_NAME
+    }
+
+    fn open(
+        &self,
+        spec: &LoadSpec,
+        _ctl: &LoadControl,
+    ) -> Result<(LiteRtModel, ModelInfo), EngineError> {
+        LiteRtModel::open(self.library()?, spec, Arc::clone(&self.clock))
+    }
+}
+
+fn litert_descriptor() -> EngineDescriptor {
+    EngineDescriptor {
+        id: EngineId::new(EngineId::LITERT_LM),
+        name: "LiteRT-LM".to_owned(),
+        kind: EngineKind::LitertLm,
+        formats: vec![ModelFormat::Litertlm],
+        backends: vec![Backend::Gpu, Backend::Cpu],
+    }
+}
