@@ -1,6 +1,7 @@
 // F-020: pluggable web-search backends. The web_search tool calls a SearchClient
 // produced by searchProviderClient(); only this module knows provider specifics.
-// Supported providers: Tavily (default, BYO key), Kagi (BYO key), SearXNG (self-hosted URL).
+// Supported providers: Tavily (default, BYO key), Kagi (BYO key), SearXNG (self-hosted URL),
+// Keenable (optional key; keyless works).
 import type { SearchConfig, SearchProvider } from '../config/config'
 
 export type { SearchConfig, SearchProvider }
@@ -62,6 +63,8 @@ export function searchConfigured(cfg?: SearchConfig): boolean {
       return !!cfg.kagiApiKey
     case 'searxng':
       return !!cfg.searxngUrl
+    case 'keenable':
+      return true
     default:
       return false
   }
@@ -80,6 +83,8 @@ export function searchProviderClient(
       return new KagiClient(cfg.kagiApiKey!, fetchImpl)
     case 'searxng':
       return new SearxngClient(cfg.searxngUrl!, fetchImpl)
+    case 'keenable':
+      return new KeenableClient(cfg.keenableApiKey, fetchImpl)
     default:
       return null
   }
@@ -176,6 +181,41 @@ class SearxngClient implements SearchClient {
         score: r.score,
         ...(publishedDate ? { publishedDate } : {}),
       }
+    })
+  }
+}
+
+class KeenableClient implements SearchClient {
+  readonly provider = 'keenable' as const
+  constructor(private key: string | undefined, private fetchImpl: FetchImpl) {}
+
+  async search(query: string, maxResults: number, opts?: SearchOptions): Promise<SearchResult[]> {
+    const keyed = typeof this.key === 'string' && this.key.length > 0
+    const url = keyed ? 'https://api.keenable.ai/v1/search' : 'https://api.keenable.ai/v1/search/public'
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'X-Keenable-Title': 'TurboLLM',
+    }
+    if (keyed) headers['X-API-Key'] = this.key as string
+    const resp = await this.fetchImpl(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ query, max_results: maxResults, ...(opts?.recent ? { published_after: '30d' } : {}) }),
+      signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
+      // A keyed request must not let fetch follow a redirect with X-API-Key still attached.
+      ...(keyed ? { redirect: 'error' as const } : {}),
+    })
+    if (!resp.ok) throw new Error(await httpError('Keenable', resp))
+    const data = (await resp.json()) as {
+      results?: Array<{ title?: string; url?: string; snippet?: string; description?: string; published_at?: string }>
+    }
+    return (data.results ?? []).map((r) => {
+      const content = (typeof r.snippet === 'string' && r.snippet)
+        || (typeof r.description === 'string' && r.description)
+        || ''
+      const publishedDate = normalizePublishedDate(r.published_at)
+      return { title: r.title ?? '', url: r.url ?? '', content, ...(publishedDate ? { publishedDate } : {}) }
     })
   }
 }

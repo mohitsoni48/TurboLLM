@@ -2,7 +2,7 @@
 // all of them together (the daemon's tools.chatApprovalWaitMinutes, 0-1440, default 30; 0 waits until answered).
 // Saved on blur or Enter.
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ToolPermissionsSection } from './ToolPermissionsSection'
@@ -16,7 +16,7 @@ vi.mock('../../lib/queries', () => ({
   useSettings: () => ({ query: { data: settings }, save }),
 }))
 vi.mock('../../lib/chat-api', () => ({
-  fetchAvailableTools: async () => [{ name: 'run_code', description: 'Run code' }],
+  fetchAvailableTools: async () => [{ name: 'run_code', description: 'Run code' }, { name: 'run_python', description: 'Run Python' }],
 }))
 
 function renderOpen() {
@@ -102,5 +102,29 @@ describe('ToolPermissionsSection: Read PDFs in fetch_url', () => {
     settings.pdfReading = true
     await renderOpen()
     expect(pdfSwitch().getAttribute('aria-checked')).toBe('true')
+  })
+})
+
+describe('ToolPermissionsSection: a tool that asks before every call (run_python, GitHub #52)', () => {
+  const row = async (name: string) => within((await screen.findByText(name)).closest('div.flex.items-center') as HTMLElement)
+
+  it('offers Ask and Deny only, never Allow', async () => {
+    await renderOpen()
+    const py = await row('run python')
+    expect(py.getByText('Ask')).toBeTruthy()
+    expect(py.getByText('Deny')).toBeTruthy()
+    expect(py.queryByText('Allow')).toBeNull()
+    expect((await row('run code')).getByText('Allow')).toBeTruthy()
+  })
+
+  it('shows an Allow saved for it as Ask, which is what the daemon does with it', async () => {
+    settings.toolPolicies = { run_python: 'allow' }
+    try {
+      await renderOpen()
+      const ask = (await row('run python')).getByText('Ask')
+      expect(ask.getAttribute('style')).toContain('var(--accent)')
+    } finally {
+      settings.toolPolicies = {}
+    }
   })
 })
