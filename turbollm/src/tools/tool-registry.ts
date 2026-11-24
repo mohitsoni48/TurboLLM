@@ -19,6 +19,7 @@ import {
 } from '../chat/chat-agent-tools'
 import { LIST_MODELS_TOOL, execListModels, type ModelToolsStore } from '../models/model-tools'
 import { isTextClassifierKey } from '../models/text-classifier'
+import { RUN_PYTHON, RUN_PYTHON_TOOL, RUN_PYTHON_UNAVAILABLE } from '../sandbox/run-python'
 
 export interface ToolDefinition {
   type: 'function'
@@ -175,8 +176,11 @@ export class ToolRegistry {
    *  executeTool refuses them). Without it this is also the tool catalog (GET /api/v1/tools) an
    *  agent's saved allow-list is picked from, which must not depend on who asks.
    *  `refuseMcp`: leave out every MCP server tool, which executeTool then refuses too. Live chat
-   *  sets it for a turn whose caller may not act on the host (see executeTool). */
-  async buildToolDefinitions(opts: { forGeneration?: boolean; refuseMcp?: boolean } = {}): Promise<ToolDefinition[]> {
+   *  sets it for a turn whose caller may not act on the host (see executeTool).
+   *  `sandbox`: offer run_python (GitHub #52). A generation sets it only when its turn has a sandbox
+   *  to run it in (generation-core.ts); the catalog sets it while the sandbox is switched on, so Tool
+   *  Permissions and an agent's allow-list can name it. */
+  async buildToolDefinitions(opts: { forGeneration?: boolean; refuseMcp?: boolean; sandbox?: boolean } = {}): Promise<ToolDefinition[]> {
     const defs: ToolDefinition[] = []
 
     // Built-in tools — only available when the required config is present
@@ -184,6 +188,7 @@ export class ToolRegistry {
     if (searchConfigured(this.toolsCfg.search)) defs.push(webSearchTool())
     defs.push(FETCH_URL_TOOL)
     defs.push(RUN_CODE_TOOL)
+    if (opts.sandbox) defs.push(RUN_PYTHON_TOOL)
     // Routine tools (Phase 4) — gated on whether a RoutineToolsStore was actually injected
     // (production always injects one via cli.ts; tests that construct a bare ToolRegistry to
     // exercise fetch_url/run_code/MCP behavior are unaffected). Persona scoping is NOT done
@@ -290,6 +295,10 @@ export class ToolRegistry {
     // Built-in: run_code — approval gating happens upstream in execute-with-approval.ts
     // before executeTool is ever called, so run_code always executes here.
     if (name === 'run_code') return execRunCode(args)
+
+    // run_python runs only through executeToolCallWithApproval with a live chat turn's sandbox (GitHub #52), which
+    // asks before every run. Every other way here (a Code session, a routine, anything added later) is refused.
+    if (name === RUN_PYTHON) return RUN_PYTHON_UNAVAILABLE
 
     // Routine tools (Phase 4) — the same shared executors chat and the in-app Code/pi session
     // both reach (code-session.ts calls THIS method too, not a second implementation).

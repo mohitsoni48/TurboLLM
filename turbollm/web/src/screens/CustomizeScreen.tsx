@@ -78,7 +78,7 @@ export function CustomizeScreen() {
       ) : activeTab === 'mcp' ? (
         <McpSection
           servers={settings?.mcp?.servers ?? []}
-          search={settings?.search ?? { provider: 'tavily', tavilyKeySet: false, kagiKeySet: false, searxngUrl: '' }}
+          search={settings?.search ?? { provider: 'tavily', tavilyKeySet: false, kagiKeySet: false, keenableKeySet: false, searxngUrl: '' }}
         />
       ) : (
         <div className="flex flex-col gap-6">
@@ -371,6 +371,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
   // True once the ACTIVE provider actually has a key/URL saved (not just picked as default).
   const searchConfigured = search.provider === 'tavily' ? search.tavilyKeySet
     : search.provider === 'kagi' ? search.kagiKeySet
+    : search.provider === 'keenable' ? true
     : !!search.searxngUrl?.trim()
   const activeBuiltin = searchConfigured ? BUILTIN_SEARCH.find((b) => b.id === search.provider) : undefined
 
@@ -430,10 +431,11 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
   const saveSearch = (provider: NonNullable<DaemonSettings['search']>['provider'], secret: string) => {
     const patch: DaemonSettingsPatch['search'] = { provider }
     if (provider === 'searxng') patch.searxngUrl = secret
+    else if (provider === 'keenable') { if (secret.trim()) patch.keenableApiKey = secret }
     else if (secret.trim()) patch[provider === 'tavily' ? 'tavilyApiKey' : 'kagiApiKey'] = secret
     save.mutate({ search: patch }, {
       onSuccess: () => {
-        const displayName = provider === 'tavily' ? 'Tavily' : provider === 'kagi' ? 'Kagi' : 'SearXNG'
+        const displayName = provider === 'tavily' ? 'Tavily' : provider === 'kagi' ? 'Kagi' : provider === 'keenable' ? 'Keenable' : 'SearXNG'
         toast.success(`Search set to ${displayName}`)
         selectBuiltin(null)
       },
@@ -660,6 +662,13 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
                         placeholder="http://localhost:8080"
                         className="rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-ink outline-none" />
                     </div>
+                  ) : entry.id === 'keenable' ? (
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[12px] text-muted">Keenable API Key (optional)</label>
+                      <input type="password" value={searchSecret} onChange={(e) => setSearchSecret(e.target.value)}
+                        placeholder="optional — works without a key" autoComplete="off"
+                        className="rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-ink outline-none" />
+                    </div>
                   ) : (
                     <div className="flex flex-col gap-1">
                       <label className="text-[12px] text-muted">{entry.name} API Key</label>
@@ -669,7 +678,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
                     </div>
                   )}
 
-                  <Button size="sm" onClick={() => { track('customize', 'save_builtin_search'); saveSearch(entry.id, searchSecret) }} disabled={!searchSecret.trim()}>
+                  <Button size="sm" onClick={() => { track('customize', 'save_builtin_search'); saveSearch(entry.id, searchSecret) }} disabled={entry.id !== 'keenable' && !searchSecret.trim()}>
                     Save &amp; make active
                   </Button>
                 </div>

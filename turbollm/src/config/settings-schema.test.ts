@@ -72,7 +72,7 @@ test('every host-only setting the hand-written route listed is still host-only, 
     autoAllowAll: '"Auto-allow all"', 'requestLog.enabled': 'the request log', 'requestLog.captureBodies': '"Log prompts and responses"',
     'retention.enabled': 'data retention', 'retention.apiUsageRawDays': 'data retention', 'retention.routineRunsKept': 'data retention',
     hfToken: 'the Hugging Face token', ghToken: 'the GitHub token', 'search.tavilyApiKey': 'the Tavily API key',
-    'search.kagiApiKey': 'the Kagi API key', 'search.searxngUrl': 'the SearXNG URL',
+    'search.kagiApiKey': 'the Kagi API key', 'search.searxngUrl': 'the SearXNG URL', 'search.keenableApiKey': 'the Keenable API key',
   }
   for (const [field, label] of Object.entries(legacy)) assert.equal(declared.get(field), label, field)
 })

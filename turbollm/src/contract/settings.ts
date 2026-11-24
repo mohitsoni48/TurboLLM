@@ -61,7 +61,7 @@ export type McpServer = {
 /** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */
 export type ToolPolicy = 'ask' | 'allow' | 'deny'
 
-export type SearchProvider = 'tavily' | 'kagi' | 'searxng'
+export type SearchProvider = 'tavily' | 'kagi' | 'searxng' | 'keenable'
 
 /** Remote access (ADR-422): the settings-payload mirror of the daemon's redacted `remoteAccess` block. Secrets are
  *  write-only — the `has*` booleans say whether one is stored, never what it is, same posture as hfToken/ghTokenSet.
@@ -139,6 +139,7 @@ export type DaemonSettings = {
     provider: SearchProvider
     tavilyKeySet: boolean
     kagiKeySet: boolean
+    keenableKeySet: boolean
     searxngUrl: string
   }
   /** MCP server list. */
@@ -176,6 +177,8 @@ export type DaemonSettings = {
    *  together, in whole minutes (0-1440, default 30); past it they are not run and the reply goes
    *  on. 0 waits until answered. Optional: a daemon from before the setting does not send it. */
   chatApprovalWaitMinutes?: number
+  /** Ids of the skills switched on for every new chat (Skills library → "On by default"). */
+  defaultSkillIds?: string[]
   /** Remote access (ADR-422). */
   remoteAccess: RemoteAccessSettings
   /** Files the download manager streams at once (1–8, default 2). Host-only, no Settings control; absent from older daemons. */
@@ -222,6 +225,7 @@ export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'spee
     tavilyApiKey?: string
     kagiApiKey?: string
     searxngUrl?: string
+    keenableApiKey?: string
   }
 }
 
