@@ -1,0 +1,6 @@
+Vendored LiteRT-LM C headers (plan P-13, ADR-482).
+Repository: https://github.com/google-ai-edge/LiteRT-LM
+Tag:        v0.19.0
+Commit:     83ce6067f2e2a3fb697556928f93936693ded971
+Files:      LICENSE, c/engine.h, c/conversation.h, c/error_reporter.h, c/api_export.h (unmodified, fetched from raw.githubusercontent.com at that commit)
+Matches the pinned runtime: litert_lm_api 0.19.0 wheels (see ../../litert-runtime.json).

@@ -1406,6 +1406,11 @@ dependencies = [
 [[package]]
 name = "turbollm-engine-litert"
 version = "1.15.2"
+dependencies = [
+ "libloading 0.8.9",
+ "serde_json",
+ "turbollm-engine",
+]
 
 [[package]]
 name = "turbollm-engine-llama"
