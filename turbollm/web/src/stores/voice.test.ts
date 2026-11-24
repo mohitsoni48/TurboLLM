@@ -168,13 +168,16 @@ describe('voice storage listener lifetime', () => {
     const second = await loadStore()
     const currentUpdate = vi.fn()
     const unsubscribeCurrent = second.subscribe(currentUpdate)
-    localStorage.setItem('tllm.voice.conversation', 'true')
-    window.dispatchEvent(new StorageEvent('storage', { key: 'tllm.voice.conversation' }))
-    expect(second.getState().conversation).toBe(true)
-    expect(currentUpdate).toHaveBeenCalledOnce()
-    expect(oldUpdate).not.toHaveBeenCalled()
-    unsubscribe()
-    unsubscribeCurrent()
+    try {
+      localStorage.setItem('tllm.voice.conversation', 'true')
+      window.dispatchEvent(new StorageEvent('storage', { key: 'tllm.voice.conversation' }))
+      expect(second.getState().conversation).toBe(true)
+      expect(currentUpdate).toHaveBeenCalledOnce()
+      expect(oldUpdate).not.toHaveBeenCalled()
+    } finally {
+      unsubscribe()
+      unsubscribeCurrent()
+    }
   })
 
   it('still handles storage clearing after a reload', async () => {

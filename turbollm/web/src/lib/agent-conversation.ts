@@ -69,8 +69,8 @@ function isGeneratedBlock(block: string, personalization: Personalization): bool
  *  capability text, the date, the agent's own prompt, then blocks for the user's personalization, memory and (Expert) hardware.
  *  Text that is not one of those blocks (a line appended in Thread settings, a prompt replaced outright, an agent edited since)
  *  is the user's, and a switch replaces it, so the user is asked first. The blocks are matched by shape, not by value: memory
- *  facts and personalization change over time, and a changed value must not read as an edit. The one value compared is the
- *  user's custom instructions, which have no shape; changing them after the chat began shows the dialog once (noise, not loss).
+ *  facts and personalization change over time, and a changed value must not read as an edit. The custom-instruction block is compared by value before splitting the other blocks;
+ *  changing it since creation can cause a conservative extra dialog (noise, not loss).
  *  Text glued onto the end of a memory fact or a name line reads as part of it (that line has no shape to tell it apart).
  *  An empty prompt is what Blank generates. */
 export function promptLooksCustomised(current: string, agentId: string, agent: ResolvedAgent | undefined, personalization: Personalization = NO_PERSONALIZATION): boolean {
@@ -88,10 +88,14 @@ export function promptLooksCustomised(current: string, agentId: string, agent: R
   const custom = personalization.customInstructions.trim()
   if (custom) {
     const segment = `\n\n${custom}`
-    const start = tail.indexOf(segment)
-    if (start !== -1) {
+    let start = tail.indexOf(segment)
+    while (start !== -1) {
       const end = start + segment.length
-      if (end === tail.length || tail.startsWith('\n\n', end)) tail = tail.slice(0, start) + tail.slice(end)
+      if (end === tail.length || tail.startsWith('\n\n', end)) {
+        tail = tail.slice(0, start) + tail.slice(end)
+        break
+      }
+      start = tail.indexOf(segment, start + 1)
     }
   }
   if (!tail) return false
@@ -116,7 +120,7 @@ export function agentSwitchPatch(agentId: string, next: AgentConversationConfig,
 export function conversationAfterSwitch<C extends { messages?: unknown }>(
   old: C,
   updated: { chatAgentId?: string; systemPrompt?: string; allowedTools?: string[]; toolPolicy?: string; skillIds?: string[] },
-): C {
+): Omit<C, keyof typeof updated> & typeof updated {
   return {
     ...old,
     ...updated,
@@ -126,5 +130,5 @@ export function conversationAfterSwitch<C extends { messages?: unknown }>(
     toolPolicy: updated.toolPolicy,
     skillIds: updated.skillIds,
     messages: old.messages,
-  } as C
+  }
 }

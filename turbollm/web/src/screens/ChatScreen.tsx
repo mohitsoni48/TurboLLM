@@ -870,9 +870,18 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // `overrideAttachments`: what a voice message sends when it goes out the moment it is recorded, before the
   // attachment state it was added to has rendered.
   const send = async (overrideInput?: string, overrideAttachments?: typeof attachments): Promise<ConversationSendResult> => {
-    const rawText = (overrideInput ?? input).trim()
+    const draftText = overrideInput ?? input
+    const rawText = draftText.trim()
     const outgoing = overrideAttachments ?? attachments
-    if ((!rawText && outgoing.length === 0) || live) return { started: false, aborted: false }
+    if (!rawText && outgoing.length === 0) return { started: false, aborted: false }
+    if (live) {
+      // Voice input may arrive after a reply became live. Keep the spoken text or
+      // clip in the composer instead of dropping it without an explanation.
+      setInput(draftText)
+      setAttachments(outgoing)
+      toast.error('Wait for the current reply to finish, or stop it before sending.', { duration: Infinity, closeButton: true })
+      return { started: false, aborted: false }
+    }
     if (!ready) { toast.error('Load a model first.'); return { started: false, aborted: false } }
 
     // `/compact` — a composer command, not a real turn: it never reaches the engine as a
