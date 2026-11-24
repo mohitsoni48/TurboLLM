@@ -126,9 +126,7 @@ impl Natives {
             env_path("TURBOLLM_LITERT_LIB").map(from_workspace_root),
             env_path("TURBOLLM_TEST_LITERTLM"),
         ) else {
-            let on_ci = std::env::var("CI").as_deref() == Ok("true");
-            assert!(!on_ci, "{MISSING_ENV}: required on CI");
-            println!("skipped: {MISSING_ENV}");
+            skip_unless_on_ci(std::env::var("CI").as_deref() == Ok("true"), MISSING_ENV);
             return None;
         };
         Some(Natives {
@@ -201,4 +199,25 @@ fn from_workspace_root(path: PathBuf) -> PathBuf {
         .join("..")
         .join("..")
         .join(path)
+}
+
+/// The rule of every real-native test: a missing environment skips, except on CI, where it fails, so
+/// the native tests can never pass vacuously there.
+fn skip_unless_on_ci(on_ci: bool, reason: &str) {
+    assert!(!on_ci, "{reason}: required on CI");
+    println!("skipped: {reason}");
+}
+
+/// The rule's own check; its reason says so, so a CI log never reads it as a skipped native test.
+const SELF_CHECK: &str = "two_runtimes self-check, no native test skipped";
+
+#[test]
+#[should_panic(expected = "two_runtimes self-check, no native test skipped: required on CI")]
+fn a_missing_environment_fails_the_test_on_ci() {
+    skip_unless_on_ci(true, SELF_CHECK);
+}
+
+#[test]
+fn a_missing_environment_skips_the_test_off_ci() {
+    skip_unless_on_ci(false, SELF_CHECK);
 }

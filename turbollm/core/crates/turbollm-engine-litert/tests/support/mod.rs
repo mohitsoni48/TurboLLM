@@ -2,19 +2,18 @@
 //! manager that owns it.
 
 pub mod fake_litert;
+mod litert_manager;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use turbollm_engine::{
-    AbortSignal, Backend, Catalog, CatalogEntry, ChatMessage, Engine, EngineError, EngineEvent,
-    EngineId, EngineManager, GenerateRequest, Generation, GenerationParams, InProcess, LoadControl,
-    LoadSpec, LoadTarget, ManagerConfig, MessageContent, ModelFormat, ModelRef, PlatformKind,
-    PlatformKinds, Role,
+    AbortSignal, Backend, ChatMessage, EngineError, EngineEvent, EngineId, EngineManager,
+    GenerateRequest, Generation, GenerationParams, LoadControl, LoadSpec, LoadTarget,
+    MessageContent, ModelFormat, ModelRef, Role,
 };
 use turbollm_engine_litert::{LiteRtBackend, LoadedLibrary};
-use turbollm_platform::HostFacts;
 
 use fake_litert::FakeLiteRt;
 
@@ -22,7 +21,6 @@ pub const MODEL: &str = "models/gemma.litertlm";
 pub const CACHE: &str = "cache/turbollm";
 pub const PROMPT_LIMIT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(2);
-const MAX_QUEUED: usize = 8;
 
 pub const FAKE_LIBRARY_FILE: &str = "fake-litert-lm.so";
 
@@ -82,30 +80,7 @@ pub fn message(role: Role, text: &str) -> ChatMessage {
 
 /// A manager whose only engine is LiteRT-LM over `fake`, in-process on every host.
 pub fn manager_over(fake: &Arc<FakeLiteRt>) -> EngineManager {
-    let engine: Arc<dyn Engine> = Arc::new(InProcess::new(backend(fake)));
-    let entry = CatalogEntry {
-        descriptor: engine.descriptor().clone(),
-        per_platform: in_process_everywhere(),
-        engine,
-    };
-    EngineManager::new(ManagerConfig {
-        catalog: Catalog::new(HostFacts::detect()).with_entry(entry),
-        journal: None,
-        predecessor: None,
-        stall: Duration::ZERO,
-        max_queued: MAX_QUEUED,
-        cache_dir: PathBuf::from(CACHE),
-    })
-}
-
-fn in_process_everywhere() -> PlatformKinds {
-    PlatformKinds {
-        android: PlatformKind::InProcess,
-        ios: PlatformKind::InProcess,
-        linux: PlatformKind::InProcess,
-        windows: PlatformKind::InProcess,
-        mac_os: PlatformKind::InProcess,
-    }
+    litert_manager::manager_over(backend(fake), Duration::ZERO, PathBuf::from(CACHE))
 }
 
 pub fn target(backend: Backend) -> LoadTarget {

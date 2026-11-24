@@ -4,6 +4,8 @@
 //! (`cargo xtask fetch-litert --host`) and `TURBOLLM_TEST_LITERTLM` a small model
 //! (`core/fixtures/engines/README.md`). Without them the tests skip, except on CI, where they fail.
 
+#[path = "support/litert_manager.rs"]
+mod litert_manager;
 #[path = "support/native_env.rs"]
 mod native_env;
 
@@ -13,14 +15,12 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use turbollm_engine::{
-    Backend, Catalog, CatalogEntry, ChatMessage, Engine, EngineError, EngineEvent, EngineId,
-    EngineManager, FinishReason, GenerateRequest, Generation, GenerationParams, InProcess,
-    LoadTarget, LoadedModelInfo, ManagerConfig, MessageContent, ModelFormat, ModelRef,
-    PlatformKind, PlatformKinds, Role,
+    Backend, ChatMessage, EngineError, EngineEvent, EngineId, EngineManager, FinishReason,
+    GenerateRequest, Generation, GenerationParams, LoadTarget, LoadedModelInfo, MessageContent,
+    ModelFormat, ModelRef, Role,
 };
 use turbollm_engine_litert::api::LiteRtApi;
 use turbollm_engine_litert::{LiteRtBackend, LoadedLibrary, SharedCalls};
-use turbollm_platform::HostFacts;
 
 use native_env::{NativeTestEnv, take_turn};
 
@@ -31,7 +31,6 @@ const THREADS: u32 = 4;
 const SHORT_REPLY: u32 = 24;
 const LONG_REPLY: u32 = 512;
 const RELOAD_CYCLES: usize = 3;
-const MAX_QUEUED: usize = 8;
 const LONG_STORY: &str = "Write a very long story about a fox.";
 
 #[test]
@@ -300,25 +299,13 @@ impl Host {
 
     fn manager(&self) -> EngineManager {
         let library = self.library.clone();
-        let engine: Arc<dyn Engine> = Arc::new(InProcess::new(LiteRtBackend::over(move || {
+        let backend = LiteRtBackend::over(move || {
             Ok(LoadedLibrary {
                 calls: Arc::new(LiteRtApi::open(&library)?) as SharedCalls,
                 file: library.clone(),
             })
-        })));
-        let entry = CatalogEntry {
-            descriptor: engine.descriptor().clone(),
-            per_platform: in_process_everywhere(),
-            engine,
-        };
-        EngineManager::new(ManagerConfig {
-            catalog: Catalog::new(HostFacts::detect()).with_entry(entry),
-            journal: None,
-            predecessor: None,
-            stall: Duration::ZERO,
-            max_queued: MAX_QUEUED,
-            cache_dir: self.cache_dir(),
-        })
+        });
+        litert_manager::manager_over(backend, Duration::ZERO, self.cache_dir())
     }
 
     async fn load(&self, manager: &EngineManager) -> Result<LoadedModelInfo, EngineError> {
@@ -342,16 +329,6 @@ impl Host {
             threads: Some(THREADS),
             backend: Backend::Cpu,
         }
-    }
-}
-
-fn in_process_everywhere() -> PlatformKinds {
-    PlatformKinds {
-        android: PlatformKind::InProcess,
-        ios: PlatformKind::InProcess,
-        linux: PlatformKind::InProcess,
-        windows: PlatformKind::InProcess,
-        mac_os: PlatformKind::InProcess,
     }
 }
 
