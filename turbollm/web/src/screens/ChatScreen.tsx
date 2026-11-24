@@ -781,11 +781,14 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // daemon has answered does the page stop following it: a Stop that failed leaves the reply
   // running, and the page shows it with its Stop still there. `stopped: false` (it had ended, or
   // was stopped elsewhere) is the same for this page, with no toast.
+  const pendingSend = useRef<{ cancelled: boolean } | null>(null)
   const handleStop = async () => {
+    // First-message setup can still be awaiting memory/hardware/create, before
+    // activeId exists. Cancel that handover too, not just an established stream.
+    if (pendingSend.current) pendingSend.current.cancelled = true
+    speaker.stop()
     const convId = activeId
     if (!convId) return
-    // A stopped reply is not read on: what was queued of it goes quiet with it.
-    speaker.stop()
     const replyId = liveByConv[convId]?.assistantId ?? (conv?.id === convId ? conv.runningReplyId ?? undefined : undefined)
     await session.stop(convId, replyId, () => mut.stop.mutateAsync({ convId, messageId: replyId }))
   }
@@ -936,6 +939,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     // Hoisted above the try so the catch block (and restoreComposer) can target the right
     // conversation even when it fails partway through creating a new conversation.
     let convId = activeId
+    const attempt = { cancelled: false }
+    pendingSend.current = attempt
     try {
       // Create conversation on first message, baking in the selected agent + personalization.
       if (!convId) {
@@ -954,6 +959,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         if (selectedPersonaId === 'expert') {
           try { hardware = hardwareSection(await fetchSysInfo()) } catch { /* non-fatal — proceed without hardware info */ }
         }
+        if (attempt.cancelled) return { started: false, aborted: true }
         const agentConfig = buildAgentConfig(selectedPersonaId, resolved, getPersonalization(), { memoryFacts, hardware })
         // resolved?.skillIds, not agentConfig.agentSkillIds: the config turns "the agent names no skills" into [], and
         // skillIdsForNewConversation needs that case (undefined) to know the chat takes the user's defaults.
@@ -1002,6 +1008,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         // system-prompt injection picks it up on this very turn, not the next one.
         if (missing.length) await mut.update.mutateAsync({ id: convId, skillIds: Array.from(new Set([...enabledSkillIds, ...missing])) })
       }
+      if (attempt.cancelled) return { started: false, aborted: true }
       if (matchedSkill) toast.success(`Using skill: ${matchedSkill.name}`)
 
       const textAttachmentNames = textAttachments.map((a) => a.file.name)
@@ -1023,6 +1030,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       }
       if (convId) void qc.invalidateQueries({ queryKey: ['conversation', convId] })
       return { started: false, aborted: (e as Error)?.name === 'AbortError' }
+    } finally {
+      if (pendingSend.current === attempt) pendingSend.current = null
     }
   }
 

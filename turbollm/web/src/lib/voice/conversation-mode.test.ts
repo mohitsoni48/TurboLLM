@@ -151,7 +151,6 @@ describe('a failure ends the turn, never the mode', () => {
   const FAILURES: Array<[string, ConversationEvent[]]> = [
     ['a clip with no speech in it', [{ type: 'start' }, { type: 'clip-empty' }]],
     ['a transcription that came back empty or failed', [{ type: 'start' }, { type: 'clip-ended' }, { type: 'clip-empty' }]],
-    ['a send that was refused', [{ type: 'start' }, { type: 'clip-ended' }, { type: 'send-failed' }]],
     ['a send refused after the message was handed over', [{ type: 'start' }, { type: 'clip-ended' }, { type: 'message-sent' }, { type: 'send-failed' }]],
     ['a reply that never started or failed', [{ type: 'start' }, { type: 'clip-ended' }, { type: 'message-sent' }, { type: 'reply-failed' }]],
     ['a reply that cannot be read aloud', [...TURN.slice(0, 3), { type: 'speak-failed' }]],
@@ -222,5 +221,15 @@ describe('stray events are ignored', () => {
   it('a clip-empty that arrives after the message was handed over does not end the turn', () => {
     expect(step(on('generating'), { type: 'clip-empty' })).toEqual([on('generating'), []])
     expect(step(on('speaking'), { type: 'clip-empty' })).toEqual([on('speaking'), []])
+  })
+})
+
+
+describe('late send refusal after barge-in', () => {
+  it('does not drop a fresh recording or transcription', () => {
+    for (const phase of ['recording', 'transcribing'] as const) {
+      expect(step(on(phase), { type: 'send-failed' })).toEqual([on(phase), []])
+    }
+    expect(step(on('generating'), { type: 'send-failed' })).toEqual([on('idle'), []])
   })
 })

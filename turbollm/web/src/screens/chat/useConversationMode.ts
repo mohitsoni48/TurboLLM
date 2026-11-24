@@ -219,6 +219,14 @@ export function useConversationMode(options: ConversationModeOptions): Conversat
     if (was && !enabled && stateRef.current.on) dispatchRef.current({ type: 'stop' })
   }, [enabled])
 
+  // Eject/model loading can abort a send before any stream metadata exists.
+  // End the turn immediately rather than waiting for the reply-start watchdog.
+  useEffect(() => {
+    if (!options.canListen && stateRef.current.on && stateRef.current.phase === 'generating') {
+      dispatchRef.current({ type: 'reply-failed' })
+    }
+  }, [options.canListen])
+
   // Another chat, or a new one, is not this loop's: the mode ends. The new chat a first message creates is.
   const chatKey = options.chatKey
   const prevChatKey = useRef(chatKey)

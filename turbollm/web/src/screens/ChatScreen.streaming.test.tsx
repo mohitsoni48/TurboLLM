@@ -31,6 +31,7 @@ beforeEach(() => {
   engineState = 'running'
   skills = []
   updateMutateAsync = vi.fn(() => Promise.resolve())
+  createMutateAsync = vi.fn(() => Promise.resolve({ id: 'new1' }))
 })
 
 vi.mock('../lib/queries', async (importOriginal) => {
@@ -51,6 +52,15 @@ vi.mock('../lib/queries', async (importOriginal) => {
 
 /** 'stopped' = no model ready to answer. */
 let engineState = 'running'
+let createMutateAsync = vi.fn(() => Promise.resolve({ id: 'new1' }))
+let stopConversationReply: (() => void) | undefined
+vi.mock('./chat/useConversationMode', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./chat/useConversationMode')>()
+  return { ...actual, useConversationMode: (options: Parameters<typeof actual.useConversationMode>[0]) => {
+    stopConversationReply = options.stopReply
+    return actual.useConversationMode(options)
+  } }
+})
 /** What GET /skills lists. */
 let skills: unknown[] = []
 /** mut.update's mutateAsync (PATCH /conversations/:id, which a '/skill' send turns the skill on with). */
@@ -95,7 +105,7 @@ vi.mock('../lib/chat-queries', async (importOriginal) => {
       mutationHookCalls++
       const idle = () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false })
       return {
-        create: { ...idle(), mutateAsync: vi.fn(() => Promise.resolve({ id: 'new1' })) },
+        create: { ...idle(), mutateAsync: () => createMutateAsync() },
         update: { ...idle(), mutateAsync: (...args: unknown[]) => updateMutateAsync(...(args as [])) }, compact: { ...idle(), isPending: compactingConv !== null, variables: compactingConv ? { convId: compactingConv } : undefined }, deleteMsg: idle(), editMsg: { ...idle(), mutate: editMsgMutate }, regenerate: { ...idle(), mutateAsync: regenerateSpy },
         stop: { ...idle(), mutateAsync: stopSpy }, undoCompaction: idle(), remove: idle(), moveToFolder: idle(),
         createFolder: idle(), deleteFolder: idle(), renameFolder: idle(),
@@ -717,4 +727,19 @@ describe('ChatScreen — streaming a reply', () => {
     // row alone would add one call per token).
     expect(mutationHookCalls / TOKENS).toBeLessThan(5)
   })
+})
+
+
+it('barge-in during first-message chat creation prevents the old message being sent', async () => {
+  let finishCreate!: (v: { id: string }) => void
+  createMutateAsync = vi.fn(() => new Promise((resolve) => { finishCreate = resolve }))
+  nextGen = quickStream()
+  await renderScreen('/chat')
+  const composer = await screen.findByPlaceholderText(/^Message /)
+  fireEvent.change(composer, { target: { value: 'old turn' } })
+  fireEvent.keyDown(composer, { key: 'Enter' })
+  await waitFor(() => expect(createMutateAsync).toHaveBeenCalledOnce())
+  act(() => stopConversationReply?.())
+  await act(async () => { finishCreate({ id: 'new1' }) })
+  expect(sendCalls).toHaveLength(0)
 })
