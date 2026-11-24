@@ -160,6 +160,10 @@ if (packageEngines) {
 
     android.sourceSets.getByName("main").jniLibs.srcDir(litertJniLibs)
 
+    // AGP strips debug symbols from every jniLibs file, which shortens the library by a few bytes. ADR-482 wants the
+    // pinned wheel member byte for byte; `cargo xtask check-litert-packaged` proves it on the built AAR.
+    android.packaging.jniLibs.keepDebugSymbols += "**/libturbollm_core_litertlm.so"
+
     tasks.matching { it.name.matches(Regex("merge\\w*JniLibFolders")) }.configureEach {
         dependsOn(stageLitertRuntime)
     }

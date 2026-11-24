@@ -513,6 +513,12 @@ jobs:
           ./gradlew -Pturbollm.ndkVersion="$NDK_VERSION" :turbollm-core:assembleRelease :turbollm-core:testDebugUnitTest :r8-consumer:assembleRelease
         working-directory: turbollm/core/bindings/android
 
+      # ADR-482: the LiteRT library in the AAR is the pinned wheel member, byte for byte (AGP strips debug symbols
+      # from jniLibs unless the module keeps them).
+      - name: The AAR's LiteRT library is the pinned one
+        run: cargo xtask check-litert-packaged bindings/android/turbollm-core/build/outputs/aar/turbollm-core-release.aar --abis arm64-v8a,x86_64
+        working-directory: turbollm/core
+
       - uses: actions/upload-artifact@v7
         with:
           name: core-android-aar

@@ -170,6 +170,16 @@ test('android-library builds the AAR, runs the JVM goldens and minifies the R8 c
   assert.ok(run.includes('chmod +x'), 'gradlew is not executable in git')
 })
 
+test('android-library checks the LiteRT library inside the built AAR against the pin, for both ABIs', () => {
+  const job = jobs['android-library']
+  const build = stepRunning(job, ':turbollm-core:assembleRelease')
+  const check = stepRunning(job, 'cargo xtask check-litert-packaged')
+
+  assert.ok(stepIndex(job, build) < stepIndex(job, check), 'the packaged check runs before the AAR is built')
+  assert.match(String(check.run), /turbollm-core-release\.aar/)
+  assert.match(String(check.run), /--abis arm64-v8a,x86_64/)
+})
+
 test('android-emulator runs both instrumented suites on an x86_64 API 34 emulator', () => {
   const emulator = jobs['android-emulator'].steps.find((step) =>
     step.uses?.startsWith('reactivecircus/android-emulator-runner@'),

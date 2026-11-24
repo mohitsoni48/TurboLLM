@@ -146,6 +146,10 @@ cargo xtask fetch-litert --host --out target/litert   # pinned LiteRT-LM library
 - `fetch-litert --host` supports Linux x86_64, macOS aarch64 and Windows x86_64; the pins are in
   `crates/turbollm-engine-litert/litert-runtime.json`. Android ABIs use `--abis arm64-v8a,x86_64` instead of
   `--host`; Gradle runs that for you (below).
+- `check-litert-packaged <aar> [--abis <list>]` fails unless each ABI's LiteRT library inside the AAR hashes to the pin. The
+  module keeps that file's debug symbols (`keepDebugSymbols`), because AGP strips them otherwise. An app that packages
+  the AAR needs the same `packaging { jniLibs { keepDebugSymbols += "**/libturbollm_core_litertlm.so" } }` line, or its
+  own packaging strips the library again.
 
 **Real-native tests** load those libraries and a small model. They read four environment variables:
 

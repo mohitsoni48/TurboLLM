@@ -211,9 +211,73 @@ fn verify_wheel_sha256(pin: &WheelPin, wheel: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq)]
+pub struct PackagedRequest {
+    pub aar: PathBuf,
+    /// `None` checks every ABI the pin file lists for Android.
+    pub abis: Option<Vec<String>>,
+}
+
+const PACKAGED_USAGE: &str =
+    "usage: cargo xtask check-litert-packaged <aar> [--abis <arm64-v8a,x86_64>]";
+
+/// Reads `<aar> [--abis <a,b>]`.
+pub fn parse_packaged_request(args: &[String]) -> Result<PackagedRequest, String> {
+    match args {
+        [aar] => Ok(PackagedRequest {
+            aar: aar.into(),
+            abis: None,
+        }),
+        [aar, flag, list] if flag == "--abis" => Ok(PackagedRequest {
+            aar: aar.into(),
+            abis: Some(list.split(',').map(str::to_string).collect()),
+        }),
+        _ => Err(PACKAGED_USAGE.to_string()),
+    }
+}
+
+/// Fails unless each ABI's `jni/<abi>/libturbollm_core_litertlm.so` in the AAR hashes to the pinned library
+/// (ADR-482: byte-identical to the wheel member). Returns one report line per ABI.
+pub fn check_packaged(
+    runtime: &Runtime,
+    aar: &[u8],
+    abis: &[String],
+) -> Result<Vec<String>, String> {
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(aar)).map_err(|e| format!("not a readable AAR: {e}"))?;
+    abis.iter()
+        .map(|abi| {
+            let pin = runtime
+                .android
+                .get(abi)
+                .ok_or_else(|| format!("check-litert-packaged: no pin for ABI {abi} in {PIN_FILE}"))?;
+            let expected = pin.library_sha256.as_ref().ok_or_else(|| {
+                format!("check-litert-packaged: {abi}: librarySha256 is not pinned in {PIN_FILE}")
+            })?;
+            let member = format!("jni/{abi}/{ANDROID_LIBRARY_NAME}");
+            let library = library_in_archive(&mut archive, &member)
+                .map_err(|e| format!("check-litert-packaged: {abi}: {e}"))?;
+            let actual = sha256_hex(&library);
+            if &actual != expected {
+                return Err(format!(
+                    "check-litert-packaged: {abi}: {member} sha256 {actual} is not the pinned {expected} ({PIN_FILE}); the AAR's copy was altered while packaging (debug-symbol stripping?)"
+                ));
+            }
+            Ok(format!("{abi}: {member} sha256 {actual}"))
+        })
+        .collect()
+}
+
 fn library_in_wheel(wheel: &[u8], member: &str) -> Result<Vec<u8>, String> {
     let mut archive = zip::ZipArchive::new(Cursor::new(wheel))
         .map_err(|e| format!("not a readable wheel: {e}"))?;
+    library_in_archive(&mut archive, member)
+}
+
+fn library_in_archive(
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    member: &str,
+) -> Result<Vec<u8>, String> {
     let entry = archive
         .by_name(member)
         .map_err(|e| format!("no member {member}: {e}"))?;
@@ -720,6 +784,95 @@ mod tests {
         assert!(parse_request(&strings(&["--out", "o"])).is_err());
         assert!(parse_request(&strings(&["--abis", "x86_64", "--host", "--out", "o"])).is_err());
         assert!(parse_request(&strings(&["--abis", "", "--out", "o"])).is_err());
+    }
+
+    fn aar_member(abi: &str) -> String {
+        format!("jni/{abi}/{ANDROID_LIBRARY_NAME}")
+    }
+
+    fn pinned_runtime_for(library: &[u8]) -> Runtime {
+        let wheel = wheel_holding(MEMBER, library);
+        runtime_of(
+            vec![
+                ("arm64-v8a", pin_for(&wheel, library, Some(ARM64))),
+                ("x86_64", pin_for(&wheel, library, Some(X86_64))),
+            ],
+            vec![],
+        )
+    }
+
+    fn aar_with(libraries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (abi, bytes) in libraries {
+            writer
+                .start_file(aar_member(abi), SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn a_packaged_library_equal_to_the_pin_passes() {
+        let library = elf_library(ARM64, 0x4000);
+        let runtime = pinned_runtime_for(&library);
+        let aar = aar_with(&[("arm64-v8a", &library), ("x86_64", &library)]);
+        let checked = check_packaged(&runtime, &aar, &strings(&["arm64-v8a", "x86_64"])).unwrap();
+        assert_eq!(checked.len(), 2);
+        assert!(checked[0].contains("arm64-v8a") && checked[0].contains(&sha256_hex(&library)));
+    }
+
+    #[test]
+    fn a_packaged_library_eight_bytes_short_fails_naming_both_hashes() {
+        let library = elf_library(ARM64, 0x4000);
+        let runtime = pinned_runtime_for(&library);
+        let stripped = &library[..library.len() - 8];
+        let aar = aar_with(&[("arm64-v8a", stripped), ("x86_64", &library)]);
+        let error = check_packaged(&runtime, &aar, &strings(&["arm64-v8a", "x86_64"])).unwrap_err();
+        assert!(error.contains("arm64-v8a"), "{error}");
+        assert!(error.contains(&sha256_hex(&library)), "{error}");
+        assert!(error.contains(&sha256_hex(stripped)), "{error}");
+    }
+
+    #[test]
+    fn a_missing_abi_in_the_aar_fails() {
+        let library = elf_library(ARM64, 0x4000);
+        let runtime = pinned_runtime_for(&library);
+        let aar = aar_with(&[("arm64-v8a", &library)]);
+        let error = check_packaged(&runtime, &aar, &strings(&["arm64-v8a", "x86_64"])).unwrap_err();
+        assert!(
+            error.contains("x86_64") && error.contains(&aar_member("x86_64")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_abi_without_a_pinned_library_sha256_fails_the_packaged_check() {
+        let library = elf_library(ARM64, 0x4000);
+        let mut runtime = pinned_runtime_for(&library);
+        runtime.android.get_mut("arm64-v8a").unwrap().library_sha256 = None;
+        let aar = aar_with(&[("arm64-v8a", &library)]);
+        let error = check_packaged(&runtime, &aar, &strings(&["arm64-v8a"])).unwrap_err();
+        assert!(
+            error.contains("arm64-v8a") && error.contains("not pinned"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_packaged_check_takes_an_aar_and_optionally_the_abis() {
+        let request = parse_packaged_request(&strings(&["a.aar"])).unwrap();
+        assert_eq!(
+            request,
+            PackagedRequest {
+                aar: "a.aar".into(),
+                abis: None
+            }
+        );
+        let request = parse_packaged_request(&strings(&["a.aar", "--abis", "x86_64"])).unwrap();
+        assert_eq!(request.abis, Some(strings(&["x86_64"])));
+        assert!(parse_packaged_request(&strings(&[])).is_err());
+        assert!(parse_packaged_request(&strings(&["a.aar", "--abis"])).is_err());
     }
 
     fn runtime_json_with_library_sha256(value: &str) -> String {

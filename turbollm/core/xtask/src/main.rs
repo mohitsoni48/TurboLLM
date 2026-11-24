@@ -22,7 +22,8 @@ check-glibc --max <x.y> <file>  fail if the file needs a GLIBC_ symbol version a
 fetch-llama --out <dir>  put the pinned, sha256-checked llama.cpp source at <dir>/llama.cpp\n  \
 build-llama --host [--variant base]  CMake-build turbollm_core_llama_<variant> into target/llama/<host-triple>
   \nfetch-litert --abis <arm64-v8a,x86_64> --out <dir>  stage the pinned LiteRT-LM library per Android ABI
-  \nfetch-litert --host --out <dir>  stage the pinned LiteRT-LM library for this OS";
+  \nfetch-litert --host --out <dir>  stage the pinned LiteRT-LM library for this OS
+  check-litert-packaged <aar> [--abis <list>]  fail unless the AAR's LiteRT library is byte-identical to the pin";
 const FAILURE_EXIT: u8 = 1;
 const UNKNOWN_COMMAND_EXIT: u8 = 2;
 
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
         "fetch-llama" => fetch_llama(),
         "build-llama" => build_llama(),
         "fetch-litert" => fetch_litert(),
+        "check-litert-packaged" => check_litert_packaged(),
         _ => {
             eprintln!("unknown command {command:?}\n{USAGE}");
             return ExitCode::from(UNKNOWN_COMMAND_EXIT);
@@ -151,6 +153,18 @@ fn build_llama() -> Result<(), String> {
     run_cmake(&build.build_args())?;
     require_file(&build.library())?;
     println!("build-llama: built {}", build.library().display());
+    Ok(())
+}
+
+fn check_litert_packaged() -> Result<(), String> {
+    let request = litert::parse_packaged_request(&command_args())?;
+    let runtime = litert::parse_runtime(&read(&litert_runtime_pin())?)?;
+    let abis = request
+        .abis
+        .unwrap_or_else(|| runtime.android.keys().cloned().collect());
+    for line in litert::check_packaged(&runtime, &read_bytes(&request.aar)?, &abis)? {
+        println!("check-litert-packaged: {line}, ok");
+    }
     Ok(())
 }
 
