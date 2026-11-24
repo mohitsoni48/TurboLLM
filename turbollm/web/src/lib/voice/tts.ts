@@ -298,6 +298,8 @@ class Speaker {
   private current: string | null = null
   /** Set while a stream may still add pieces, so an empty queue is a pause and not the end. */
   private streaming = false
+  private ended: { id: string; completed: boolean } | null = null
+  private readingFailed = false
   /** Goes up at each new reading, so a piece ending late cannot continue one that was replaced. */
   private generation = 0
   private options: SpeakOptions = { voiceId: '', rate: 1 }
@@ -320,6 +322,9 @@ class Speaker {
 
   /** The id of what is being read, for the button that shows "stop". */
   activeId = (): string | null => this.current
+
+  /** Why the most recently ended reading stopped, scoped to that reading. */
+  lastOutcome = (): { id: string; completed: boolean } | null => this.ended
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
@@ -393,12 +398,14 @@ class Speaker {
     this.queue = []
     this.speaking = false
     this.streaming = false
+    this.ended = this.current === null ? this.ended : { id: this.current, completed: false }
     this.current = null
     backend()?.cancel()
     this.announce()
   }
 
   private begin(id: string, opts: SpeakOptions): void {
+    this.readingFailed = false
     this.generation++
     this.queue = []
     if (this.speaking) {
@@ -442,6 +449,7 @@ class Speaker {
       const skipped = cannotRead(choice.voice, choice.missing)
       this.reportMissing({ language: choice.missing, stoodIn: choice.voice, onlineOnly: choice.onlineOnly, skipped })
       if (!skipped) break
+      this.readingFailed = true
     }
     if (piece === undefined) {
       this.finishIfIdle()
@@ -449,8 +457,9 @@ class Speaker {
     }
     this.speaking = true
     const generation = this.generation
-    b.speak({ text: piece, voice, language: language ? voiceLanguage(language) : null, rate }, () => {
+    b.speak({ text: piece, voice, language: language ? voiceLanguage(language) : null, rate }, (completed) => {
       if (generation !== this.generation) return
+      if (!completed) this.readingFailed = true
       this.speaking = false
       this.next()
     })
@@ -475,6 +484,7 @@ class Speaker {
 
   private finishIfIdle(): void {
     if (this.speaking || this.streaming || this.queue.length > 0 || this.current === null) return
+    this.ended = { id: this.current, completed: !this.readingFailed }
     this.current = null
     this.announce()
   }

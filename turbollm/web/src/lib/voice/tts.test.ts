@@ -1027,3 +1027,35 @@ describe('the Android bridge', () => {
     })
   })
 })
+
+describe('reading completion outcome', () => {
+  it('distinguishes a natural finish from pressing stop', () => {
+    const { utterances } = installSpeechSynthesis([voice('en', 'en-US')])
+    speaker.speak('done-reply', 'A complete sentence.', EN)
+    drain(utterances)
+    expect(speaker.lastOutcome()).toEqual({ id: 'done-reply', completed: true })
+    speaker.speak('stopped-reply', 'Another sentence.', EN)
+    speaker.stop()
+    expect(speaker.lastOutcome()).toEqual({ id: 'stopped-reply', completed: false })
+  })
+
+  it('reports a failed utterance as incomplete', () => {
+    const { utterances } = installSpeechSynthesis([voice('en', 'en-US')])
+    speaker.speak('failed-reply', 'A complete sentence.', EN)
+    utterances[0].onerror?.()
+    expect(speaker.lastOutcome()).toEqual({ id: 'failed-reply', completed: false })
+  })
+  it('does not let a replaced reading finish even after the new reading finishes', () => {
+    const { utterances } = installSpeechSynthesis([voice('en', 'en-US')])
+    speaker.speak('old-reply', 'First reading.', EN)
+    speaker.speak('new-reply', 'Replacement reading.', EN)
+    expect(speaker.activeId()).toBe('new-reply')
+    // A late completion from the replaced backend cannot finish the new reading.
+    utterances[0].onend?.()
+    expect(speaker.activeId()).toBe('new-reply')
+    vi.advanceTimersByTime(500)
+    drain(utterances)
+    expect(speaker.lastOutcome()).toEqual({ id: 'new-reply', completed: true })
+  })
+
+})
