@@ -8,6 +8,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../lib/api'
 import { toast } from '../components/ui/sonner'
+import { useUiStore } from '../stores/ui'
 import { useVoiceStore } from '../stores/voice'
 import type { ChatSseEvent } from '../lib/chat-types'
 import type { VoiceInputOptions } from './chat/useVoiceInput'
@@ -33,6 +34,9 @@ beforeEach(() => {
     clear: () => store.clear(),
   })
   Object.defineProperty(Element.prototype, 'scrollTo', { configurable: true, writable: true, value: () => {} })
+  useUiStore.setState({ remoteModelId: null })
+  localModelLoading = false
+  observedCanListen = undefined
   stopSpy.mockClear()
   speechStream.mockClear()
   regenerateSpy.mockClear()
@@ -55,7 +59,7 @@ vi.mock('../lib/queries', async (importOriginal) => {
     ...actual,
     useStatus: () => ({ data: { engine: { state: engineState }, model: { key: 'm1', name: 'M1', ctx: 8192 } } }),
     useModels: () => ({ data: { models: [{ key: 'm1', name: 'M1', compatibleWithActiveEngine: true }] } }),
-    useModelActions: () => ({ load: { mutate: vi.fn(), isPending: false }, eject: { mutate: vi.fn(), isPending: false } }),
+    useModelActions: () => ({ load: { mutate: vi.fn(), isPending: localModelLoading }, eject: { mutate: vi.fn(), isPending: false } }),
     useModelDetail: () => ({ data: undefined }),
     useEngines: () => ({ data: undefined }),
     useSettings: () => ({ query: { data: undefined } }),
@@ -67,6 +71,8 @@ vi.mock('../lib/queries', async (importOriginal) => {
 
 /** 'stopped' = no model ready to answer. */
 let engineState = 'running'
+let localModelLoading = false
+let observedCanListen: boolean | undefined
 let createMutateAsync = vi.fn(() => Promise.resolve({ id: 'new1' }))
 let stopConversationReply: (() => void) | undefined
 let stopConversationOutput: (() => void) | undefined
@@ -78,6 +84,7 @@ vi.mock('../lib/voice/tts', async (importOriginal) => {
 vi.mock('./chat/useConversationMode', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./chat/useConversationMode')>()
   return { ...actual, useConversationMode: (options: Parameters<typeof actual.useConversationMode>[0]) => {
+    observedCanListen = options.canListen
     stopConversationReply = options.stopReply
     stopConversationOutput = options.onStop
     return actual.useConversationMode(options)
@@ -155,7 +162,7 @@ vi.mock('../lib/chat-api', async (importOriginal) => {
 })
 vi.mock('../lib/link-queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/link-queries')>()
-  return { ...actual, useLinks: () => ({ data: [] }), useRemoteModels: () => ({ data: [] }), useLinkStatus: () => ({ data: undefined }) }
+  return { ...actual, useLinks: () => ({ data: [{ id: 'l1', name: 'workstation', status: 'online' }] }), useRemoteModels: () => ({ data: [{ linkId: 'l1', machine: 'workstation', model: { key: 'qwen3', name: 'Qwen3', loaded: true } }] }), useLinkStatus: () => ({ data: undefined }) }
 })
 vi.mock('../lib/agent-api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/agent-api')>()
@@ -752,6 +759,13 @@ describe('ChatScreen — streaming a reply', () => {
 })
 
 
+describe('hands-free setup and queued speech', () => {
+it.each([false, true])('model transition wiring: remote=%s', async (remote) => {
+  localModelLoading = true
+  if (remote) useUiStore.setState({ remoteModelId: 'workstation/qwen3' })
+  await renderScreen('/chat/c1')
+  expect(observedCanListen).toBe(remote)
+})
 it('barge-in during first-message chat creation prevents the old message being sent', async () => {
   let finishCreate!: (v: { id: string }) => void
   createMutateAsync = vi.fn(() => new Promise((resolve) => { finishCreate = resolve }))
@@ -765,6 +779,25 @@ it('barge-in during first-message chat creation prevents the old message being s
   await act(async () => { finishCreate({ id: 'new1' }) })
   expect(sendCalls).toHaveLength(0)
 })
+it('reuses a cancelled first creation when a new message arrives before it resolves', async () => {
+  let finishCreate!: (v: { id: string }) => void
+  createMutateAsync = vi.fn(() => new Promise((resolve) => { finishCreate = resolve }))
+  nextGen = quickStream()
+  await renderScreen('/chat')
+  const box = await screen.findByPlaceholderText(/^Message /)
+  fireEvent.change(box, { target: { value: 'old turn' } })
+  fireEvent.keyDown(box, { key: 'Enter' })
+  await waitFor(() => expect(createMutateAsync).toHaveBeenCalledOnce())
+  act(() => stopConversationReply?.())
+  fireEvent.change(box, { target: { value: 'new turn' } })
+  fireEvent.keyDown(box, { key: 'Enter' })
+  await act(async () => { finishCreate({ id: 'new1' }) })
+  await waitFor(() => expect(sendCalls).toHaveLength(1))
+  expect(createMutateAsync).toHaveBeenCalledOnce()
+  expect(JSON.stringify(sendCalls[0])).toContain('new turn')
+  expect(JSON.stringify(sendCalls[0])).not.toContain('old turn')
+})
+// Wiring coverage inherited from #352, not a regression for this PR's new fixes.
 it.each([false, true])('pending speech before meta: stopped=%s', async (stopped) => {
   const feed = steppedStream()
   nextGen = feed.gen
@@ -781,6 +814,8 @@ it.each([false, true])('pending speech before meta: stopped=%s', async (stopped)
     useVoiceStore.setState({ conversation: false, readAloud: 'off' })
   }
 })
+})
+
 describe('hands-free input during a live reply', () => {
 it('keeps hands-free speech and reports a refusal when a reply is already live', async () => {
   nextGen = hangingStream()

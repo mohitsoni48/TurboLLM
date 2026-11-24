@@ -73,4 +73,20 @@ describe('hands-free send completion', () => {
     await sendForConversation({ emit }, async () => ({ started: true, aborted: false }))
     expect(emit).toHaveBeenCalledExactlyOnceWith({ type: 'message-sent' })
   })
+  it('ignores an old refusal after a newer send is already generating', async () => {
+    const h = setup()
+    const old = deferred()
+    const fresh = deferred()
+    let first!: Promise<void>
+    let second!: Promise<void>
+    act(() => { first = sendForConversation(h.result.current, () => old.promise) })
+    act(() => h.result.current.interrupt())
+    act(() => { second = sendForConversation(h.result.current, () => fresh.promise) })
+    expect(h.result.current.phase).toBe('generating')
+    await act(async () => { old.resolve({ started: false, aborted: false }); await first })
+    expect(h.result.current.phase).toBe('generating')
+    await act(async () => { fresh.resolve({ started: false, aborted: false }); await second })
+    expect(h.result.current.phase).toBe('idle')
+  })
+
 })

@@ -781,6 +781,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // daemon has answered does the page stop following it: a Stop that failed leaves the reply
   // running, and the page shows it with its Stop still there. `stopped: false` (it had ended, or
   // was stopped elsewhere) is the same for this page, with no toast.
+  const pendingCreate = useRef<Promise<{ id: string }> | null>(null)
   const pendingSend = useRef<{ cancelled: boolean } | null>(null)
   const handleStop = async () => {
     // First-message setup can still be awaiting memory/hardware/create, before
@@ -982,7 +983,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         // A system prompt set via Thread settings before the first message is an
         // explicit override — it wins over the agent's own default system prompt.
         const finalSystemPrompt = pendingSystemPrompt.trim() || agentConfig.systemPrompt
-        const newConv = await mut.create.mutateAsync({
+        const creating = pendingCreate.current ?? mut.create.mutateAsync({
           // The model this conversation was STARTED with, for the sidebar label. A remote
           // machine's qualified id is the honest value there — it is what answered.
           modelKey: activeRemoteId ?? loadedChatModel?.key ?? '',
@@ -998,6 +999,10 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           sampling: Object.keys(pendingSampling).length ? pendingSampling : undefined,
           preserveThinking: pendingPreserveThinking,
         })
+        pendingCreate.current = creating
+        let newConv: { id: string }
+        try { newConv = await creating }
+        finally { if (pendingCreate.current === creating) pendingCreate.current = null }
         convId = newConv.id
         setConvAgentId(convId, selectedPersonaId)
         // Carry a thinking budget / reasoning effort picked on the blank chat over to the new
@@ -1268,7 +1273,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const conversation = useConversationMode({
     voice,
     replyStreaming: !!live || daemonGenerating,
-    canListen: ready && !modelBusy,
+    canListen: ready && (activeRemoteId ? true : !modelBusy),
     chatKey: activeId,
     stopReply: () => { void handleStop() },
     enabled: conversationEnabled,
