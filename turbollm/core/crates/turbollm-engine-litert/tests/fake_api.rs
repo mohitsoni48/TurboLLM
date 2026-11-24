@@ -357,6 +357,45 @@ async fn the_benchmarks_prefill_count_still_wins_for_done_over_the_counted_one()
 }
 
 #[tokio::test]
+async fn a_reply_whose_only_chunk_is_an_empty_final_one_emits_no_prefilled() {
+    let fake = FakeLiteRt::new();
+    fake.script().chunks = Vec::new();
+    let manager = loaded(&fake).await;
+
+    let events = reply(&manager, question()).await.unwrap();
+
+    assert!(
+        matches!(events.as_slice(), [EngineEvent::Done { .. }]),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_final_chunk_with_text_still_emits_prefilled_first() {
+    let fake = FakeLiteRt::new();
+    {
+        let mut script = fake.script();
+        script.chunks = Vec::new();
+        script.final_piece = text("Hi");
+    }
+    let manager = loaded(&fake).await;
+
+    let events = reply(&manager, question()).await.unwrap();
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EngineEvent::Prefilled { .. },
+                EngineEvent::Text(_),
+                EngineEvent::Done { .. }
+            ]
+        ),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn the_time_to_the_first_chunk_is_reported_before_the_first_piece() {
     let fake = FakeLiteRt::new();
     {

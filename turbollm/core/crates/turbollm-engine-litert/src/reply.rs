@@ -126,6 +126,8 @@ impl Reply<'_, '_> {
         }
     }
 
+    /// The first chunk that delivers something is Prefilled's moment; a bare final chunk ends a reply
+    /// that delivered nothing, as in Kotlin, where Done then measures from the end (`LiteRtReply.kt:43`).
     fn take(&mut self, chunk: RawChunk, at: Duration, streamed: &mut Streamed) {
         if let Some(error) = chunk.error {
             streamed.error.get_or_insert(error);
@@ -133,11 +135,12 @@ impl Reply<'_, '_> {
         if !self.ended_well(streamed) {
             return;
         }
-        if streamed.first_chunk_at.is_none() {
+        let parts = parse_chunk(&chunk.payload);
+        let delivers_nothing = chunk.is_final && parts.text.is_empty() && parts.thought.is_empty();
+        if streamed.first_chunk_at.is_none() && !delivers_nothing {
             streamed.first_chunk_at = Some(at);
             self.emit(self.prefilled(at), streamed);
         }
-        let parts = parse_chunk(&chunk.payload);
         if !parts.thought.is_empty() {
             self.emit(EngineEvent::Reasoning(parts.thought), streamed);
         }
