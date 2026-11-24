@@ -139,7 +139,9 @@ export function reduceConversation(state: ConversationState, event: Conversation
       return phase === 'recording' || phase === 'transcribing' ? turn(state, 'generating') : stay(state)
 
     case 'send-failed':
-      return phase === 'recording' || phase === 'transcribing' || phase === 'generating' ? turn(state, 'idle') : stay(state)
+      // A send always emits message-sent first. A late refusal belongs to the
+      // old turn and must not drop a fresh recording after barge-in.
+      return phase === 'generating' ? turn(state, 'idle') : stay(state)
 
     case 'reply-done':
       return phase === 'generating' ? turn(state, 'speaking') : stay(state)

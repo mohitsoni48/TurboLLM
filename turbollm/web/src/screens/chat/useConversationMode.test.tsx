@@ -447,3 +447,24 @@ describe('pending read-aloud when the mode stops', () => {
     expect(h.onStop).toHaveBeenCalledOnce()
   })
 })
+
+
+it('losing the model before stream metadata ends the turn without waiting for the watchdog', () => {
+  const h = setup()
+  act(() => h.result.current.enable())
+  act(() => h.result.current.emit({ type: 'message-sent' }))
+  expect(h.result.current.phase).toBe('generating')
+  h.update({ canListen: false })
+  expect(h.result.current.phase).toBe('idle')
+  expect(h.result.current.active).toBe(true)
+})
+
+it('ignores a server-first stop refusal after barge-in starts a fresh recording', () => {
+  const h = setup()
+  act(() => h.result.current.enable())
+  act(() => h.result.current.emit({ type: 'message-sent' }))
+  act(() => h.result.current.interrupt())
+  act(() => h.result.current.emit({ type: 'send-failed' }))
+  expect(h.result.current.phase).toBe('recording')
+  expect(h.result.current.active).toBe(true)
+})

@@ -46,7 +46,8 @@ export interface ConversationModeOptions {
   /** The Settings → Voice opt-in for the beta. The master switch: the mode cannot be turned on without it, and turning it off
    *  while the mode is on ends the mode (so a composer that no longer offers it cannot keep a live loop running). */
   enabled: boolean
-  /** Drop any queued read-aloud when the mode stops, even before speech starts. */
+  /** End mode-owned output, including queued speech and current manual or
+   *  always-on reading. Does not cancel generation. */
   onStop?: () => void
 }
 
@@ -226,6 +227,14 @@ export function useConversationMode(options: ConversationModeOptions): Conversat
     prevEnabled.current = enabled
     if (was && !enabled && stateRef.current.on) dispatchRef.current({ type: 'stop' })
   }, [enabled])
+
+  // Eject/model loading can abort a send before any stream metadata exists.
+  // End the turn immediately rather than waiting for the reply-start watchdog.
+  useEffect(() => {
+    if (!options.canListen && stateRef.current.on && stateRef.current.phase === 'generating') {
+      dispatchRef.current({ type: 'reply-failed' })
+    }
+  }, [options.canListen])
 
   // Another chat, or a new one, is not this loop's: the mode ends. The new chat a first message creates is.
   const chatKey = options.chatKey
