@@ -12,7 +12,7 @@ use std::time::Duration;
 use turbollm_engine::EngineError;
 use turbollm_engine_litert::api::{
     Benchmark, BenchmarkTurn, ChunkSink, ConversationHandle, EngineHandle, EngineSettings,
-    LiteRtCalls, LogSeverity, RawChunk, StartedReply,
+    LiteRtCalls, RawChunk, StartedReply,
 };
 use turbollm_engine_litert::prompt::LiteRtPrompt;
 use turbollm_engine_litert::{Clock, SharedCalls};
@@ -367,11 +367,6 @@ impl Reply {
 }
 
 impl LiteRtCalls for FakeLiteRt {
-    fn set_min_log_level(&self, _level: LogSeverity) -> Result<(), String> {
-        self.record("set_min_log_level");
-        Ok(())
-    }
-
     fn create_engine(&self, settings: &EngineSettings) -> Result<EngineHandle, EngineError> {
         self.record(&format!("create_engine:{}", settings.backend));
         locked(&self.settings).push(settings.clone());

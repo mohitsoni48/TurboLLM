@@ -31,6 +31,10 @@ macro_rules! table {
         /// Every function of the table, by its exported name.
         pub const SYMBOLS: &[&str] = &[$(concat!("litert_lm_", stringify!($name))),*];
 
+        #[expect(
+            dead_code,
+            reason = "the table is the architecture 3.2 list; set_min_log_level is resolved but no caller sets a level (D-9)"
+        )]
         struct Table {
             $($name: $ty,)*
         }
@@ -112,13 +116,6 @@ pub struct RawChunk {
 /// Where a reply's chunks go. It runs on a LiteRT thread, so it must return quickly, must not call
 /// LiteRT, and must not panic (a panic in a C callback aborts the process).
 pub type ChunkSink = Box<dyn FnMut(RawChunk) + Send>;
-
-/// `LiteRtLmLogSeverity`, the values worth setting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogSeverity {
-    Error = 4,
-    Silent = 1000,
-}
 
 /// The engine settings a load asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,7 +210,6 @@ pub struct StartedReply {
 
 /// LiteRT-LM as the engine thread calls it. `Err` holds the library's message.
 pub trait LiteRtCalls {
-    fn set_min_log_level(&self, level: LogSeverity) -> Result<(), String>;
     /// `Err` is `EngineUnavailable` when this device cannot run LiteRT-LM at all, which the caller
     /// must not retry on another backend; any other failure is an `EngineFailure`.
     fn create_engine(&self, settings: &EngineSettings) -> Result<EngineHandle, EngineError>;
@@ -518,11 +514,6 @@ fn to_c_string(text: &str) -> Result<CString, String> {
 }
 
 impl LiteRtCalls for LiteRtApi {
-    fn set_min_log_level(&self, level: LogSeverity) -> Result<(), String> {
-        let status = unsafe { (self.table.set_min_log_level)(level as c_int) };
-        self.check("could not set the log level", status)
-    }
-
     fn create_engine(&self, settings: &EngineSettings) -> Result<EngineHandle, EngineError> {
         self.open_engine(settings)
             .map_err(EngineError::EngineFailure)
