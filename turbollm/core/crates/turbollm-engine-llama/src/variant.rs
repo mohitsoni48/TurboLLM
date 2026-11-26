@@ -94,13 +94,16 @@ fn first_that_opens<L>(
 
 /// The variant's library from `dir` when it is there, else from the loader's search path.
 fn open_variant(variant: Variant, dir: Option<&Path>) -> Option<(PathBuf, Library)> {
-    library_candidates(variant.library_stem(), dir)
-        .into_iter()
-        .find_map(|file| {
-            // SAFETY: a variant library's initialisers only set up llama.cpp's static state.
-            let library = unsafe { Library::new(&file) }.ok()?;
-            Some((file, library))
-        })
+    open_first(library_candidates(variant.library_stem(), dir))
+}
+
+/// The first of `files` that opens as a shared library, with the file it was.
+fn open_first(files: Vec<PathBuf>) -> Option<(PathBuf, Library)> {
+    files.into_iter().find_map(|file| {
+        // SAFETY: a variant library's initialisers only set up llama.cpp's static state.
+        let library = unsafe { Library::new(&file) }.ok()?;
+        Some((file, library))
+    })
 }
 
 #[cfg(test)]
@@ -227,16 +230,20 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_variant_file_falls_down_to_the_next_and_none_opening_is_unavailable() {
+    fn a_corrupt_variant_file_does_not_open_so_its_variant_is_skipped() {
         let dir = TempDir::new().unwrap();
         let corrupt = dir
             .path()
             .join(library_file_name(Variant::Dotprod.library_stem()));
         fs::write(&corrupt, b"not a shared library").unwrap();
+        let missing = dir
+            .path()
+            .join(library_file_name(Variant::Base.library_stem()));
 
-        let error = load_best_for(Some(dir.path()), &cpu_features_from_cpuinfo(S21FE)).unwrap_err();
+        // Only files in the temp dir: the loader's search path, which differs per host, stays out.
+        let opened = open_first(vec![corrupt, missing]);
 
-        assert_eq!(error, llama_unavailable());
+        assert!(opened.is_none());
     }
 
     fn candidates_for(cpuinfo: &str) -> Vec<Variant> {
