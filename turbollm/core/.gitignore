@@ -2,6 +2,7 @@
 /fixtures/gguf/.corpus-cache/
 /bindings/node/*.node
 /bindings/android/**/build/
+/bindings/android/**/.cxx/
 /bindings/android/.gradle/
 /bindings/android/local.properties
 /bindings/android/.kotlin/

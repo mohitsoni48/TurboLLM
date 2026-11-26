@@ -1,6 +1,6 @@
 //! The engine layer as a binding holds it (arch 2.6): each `Engines` handle owns one tokio runtime
-//! and one `EngineManager`; nothing is process-wide (B-5). In M-1 the catalogue is the `extra`
-//! engines only; the native llama.cpp and LiteRT-LM rows arrive with features `llama` and `litert`.
+//! and one `EngineManager`; nothing is process-wide (B-5). The catalogue is the native engines this
+//! build compiles in (feature `llama`; LiteRT-LM arrives with `litert`), then the `extra` engines.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::task::{JoinError, JoinHandle};
+#[cfg(feature = "llama")]
+use turbollm_engine::InProcess;
 use turbollm_engine::{
     Catalog, CatalogEntry, Engine, EngineError, EngineId, EngineManager, LoadJournal,
     ManagerConfig, PlatformKind, PlatformKinds,
@@ -22,7 +24,8 @@ use turbollm_platform::HostFacts;
 /// What one `Engines` handle is built from (the binding's `CoreEngineConfig`).
 pub struct EnginesConfig {
     pub cache_dir: PathBuf,
-    /// Where the native engine libraries are; unused until the native engines arrive (T18, T25).
+    /// Where the native engine libraries are (Android's `nativeLibraryDir`); `None` leaves it to
+    /// the loader's search path.
     pub library_dir: Option<PathBuf>,
     /// `<modelRoot>/.turbollm-sdk/loading.json`; `None` keeps no journal.
     pub journal_path: Option<PathBuf>,
@@ -40,15 +43,36 @@ pub struct Engines {
 }
 
 impl Engines {
-    /// A successor given its `predecessor` loads nothing before the predecessor reached `Closed`.
+    /// This build's native engines, then `extra`; an `extra` engine with a native engine's id takes
+    /// its place. A successor given its `predecessor` loads nothing before the predecessor reached
+    /// `Closed`.
     pub fn new(
         cfg: EnginesConfig,
         extra: Vec<Arc<dyn Engine>>,
         predecessor: Option<&Engines>,
     ) -> Result<Engines, EngineError> {
+        let lineup = native_then_extra(cfg.library_dir.clone(), extra);
+        Engines::hosting(HostFacts::detect(), lineup, cfg, predecessor)
+    }
+
+    /// The `extra` engines alone, for a host that brings an engine for every model it loads.
+    pub fn without_native(
+        cfg: EnginesConfig,
+        extra: Vec<Arc<dyn Engine>>,
+        predecessor: Option<&Engines>,
+    ) -> Result<Engines, EngineError> {
+        Engines::hosting(HostFacts::detect(), extra_entries(extra), cfg, predecessor)
+    }
+
+    fn hosting(
+        host: HostFacts,
+        lineup: Vec<CatalogEntry>,
+        cfg: EnginesConfig,
+        predecessor: Option<&Engines>,
+    ) -> Result<Engines, EngineError> {
         let runtime = core_runtime()?;
         let manager = EngineManager::new(ManagerConfig {
-            catalog: catalog_of(extra, cfg.forced_unavailable),
+            catalog: catalog_of(host, lineup, cfg.forced_unavailable),
             journal: cfg
                 .journal_path
                 .map(|path| LoadJournal::new(path, journal_owner())),
@@ -116,17 +140,50 @@ fn core_runtime() -> Result<Runtime, EngineError> {
         })
 }
 
-fn catalog_of(extra: Vec<Arc<dyn Engine>>, forced: BTreeMap<EngineId, String>) -> Catalog {
-    let with_engines = extra
+fn catalog_of(
+    host: HostFacts,
+    lineup: Vec<CatalogEntry>,
+    forced: BTreeMap<EngineId, String>,
+) -> Catalog {
+    let with_engines = lineup
         .into_iter()
-        .fold(Catalog::new(HostFacts::detect()), |catalog, engine| {
-            catalog.with_entry(extra_entry(engine))
-        });
+        .fold(Catalog::new(host), Catalog::with_entry);
     forced
         .into_iter()
         .fold(with_engines, |catalog, (id, reason)| {
             catalog.with_forced_unavailable(id, reason)
         })
+}
+
+fn native_then_extra(
+    library_dir: Option<PathBuf>,
+    extra: Vec<Arc<dyn Engine>>,
+) -> Vec<CatalogEntry> {
+    let mut lineup = native_entries(library_dir);
+    lineup.extend(extra_entries(extra));
+    lineup
+}
+
+/// The engines compiled into this build (arch 2.6: llama, then litert), each reading its library
+/// from `library_dir` (Android's `nativeLibraryDir`) or the loader's search path.
+#[cfg_attr(
+    not(feature = "llama"),
+    expect(unused_variables, reason = "no native engine is compiled in")
+)]
+fn native_entries(library_dir: Option<PathBuf>) -> Vec<CatalogEntry> {
+    [
+        #[cfg(feature = "llama")]
+        CatalogEntry::llama_cpp_cpu(Arc::new(InProcess::new(
+            turbollm_engine_llama::LlamaBackend::new(library_dir)
+                .with_log(crate::platform_log::platform_log()),
+        ))),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn extra_entries(extra: Vec<Arc<dyn Engine>>) -> Vec<CatalogEntry> {
+    extra.into_iter().map(extra_entry).collect()
 }
 
 /// An engine handed in by the host (a foreign backend or a test double) runs in the host's own
@@ -188,6 +245,7 @@ mod tests {
         GenerateRequest, GenerationParams, InProcess, LoadJournal, LoadTarget, MessageContent,
         ModelFormat, ModelRef, Role,
     };
+    use turbollm_platform::{Arch, CpuFeatures, Os};
 
     use super::*;
 
@@ -432,6 +490,110 @@ mod tests {
         second_open.release();
         second_load.await.unwrap().expect("second load");
         assert!(!journal.exists());
+    }
+
+    #[cfg(feature = "llama")]
+    #[test]
+    fn with_the_llama_feature_llama_cpp_is_listed_before_the_extra_engines() {
+        let dir = TempDir::new().unwrap();
+        let cfg = config_in(dir.path());
+        let lineup = native_then_extra(
+            cfg.library_dir.clone(),
+            vec![scripted(backend_named("extra-gguf"))],
+        );
+
+        let engines = Engines::hosting(android_host(), lineup, cfg, None).unwrap();
+
+        let hosted = engines.manager().catalog().hosted();
+        let ids: Vec<&str> = hosted.iter().map(|(d, _)| d.id.as_str()).collect();
+        assert_eq!(ids, [EngineId::LLAMA_CPP_CPU, "extra-gguf"]);
+        assert_eq!(
+            hosted[0].1,
+            Availability::Available,
+            "the probe loads no native code"
+        );
+    }
+
+    #[cfg(feature = "llama")]
+    #[tokio::test]
+    async fn a_llama_load_without_its_library_fails_unavailable_and_the_catalogue_marks_it() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config_in(dir.path());
+        let empty = TempDir::new().unwrap();
+        cfg.library_dir = Some(empty.path().to_path_buf());
+        let lineup = native_then_extra(cfg.library_dir.clone(), vec![]);
+        let engines = Engines::hosting(android_host(), lineup, cfg, None).unwrap();
+
+        let failure = load(&engines, dir.path(), "org/repo/a").await.unwrap_err();
+
+        let reason = "No llama.cpp library in this build runs on this CPU.".to_owned();
+        assert_eq!(
+            failure,
+            EngineError::EngineUnavailable {
+                engine: EngineId::new(EngineId::LLAMA_CPP_CPU),
+                kind: EngineKind::LlamaCpp,
+                reason: reason.clone(),
+            }
+        );
+        let (_, availability) = &engines.manager().catalog().hosted()[0];
+        assert_eq!(*availability, Availability::Unavailable { reason });
+    }
+
+    #[cfg(feature = "llama")]
+    #[tokio::test]
+    async fn an_extra_llama_cpp_cpu_engine_replaces_the_native_one() {
+        let dir = TempDir::new().unwrap();
+        let cfg = config_in(dir.path());
+        let foreign = backend_named(EngineId::LLAMA_CPP_CPU);
+        let record = foreign.record();
+        let lineup = native_then_extra(cfg.library_dir.clone(), vec![scripted(foreign)]);
+        let engines = Engines::hosting(android_host(), lineup, cfg, None).unwrap();
+
+        load(&engines, dir.path(), "org/repo/a").await.unwrap();
+
+        let hosted = engines.manager().catalog().hosted();
+        let ids: Vec<&str> = hosted.iter().map(|(d, _)| d.id.as_str()).collect();
+        assert_eq!(ids, [EngineId::LLAMA_CPP_CPU]);
+        assert_eq!(
+            record.history(),
+            ["open"],
+            "the load ran on the extra engine"
+        );
+    }
+
+    #[test]
+    fn without_native_the_catalogue_is_the_extra_engines_only() {
+        let dir = TempDir::new().unwrap();
+
+        let engines = Engines::without_native(
+            config_in(dir.path()),
+            vec![scripted(backend_named("extra-gguf"))],
+            None,
+        )
+        .unwrap();
+
+        let hosted = engines.manager().catalog().hosted();
+        let ids: Vec<&str> = hosted.iter().map(|(d, _)| d.id.as_str()).collect();
+        assert_eq!(ids, ["extra-gguf"]);
+    }
+
+    /// ADR-239: llama.cpp's row is in-process on Android only, so a desktop core does not list it.
+    #[cfg(all(feature = "llama", not(target_os = "android")))]
+    #[test]
+    fn a_desktop_core_does_not_list_the_android_only_llama_row() {
+        let dir = TempDir::new().unwrap();
+
+        let engines = engines_of(config_in(dir.path()), vec![]);
+
+        assert!(engines.manager().catalog().hosted().is_empty());
+    }
+
+    fn android_host() -> HostFacts {
+        HostFacts {
+            os: Os::Android,
+            arch: Arch::Aarch64,
+            cpu: CpuFeatures::default(),
+        }
     }
 
     struct SetOnDrop(Arc<AtomicBool>);

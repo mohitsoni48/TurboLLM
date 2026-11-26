@@ -11,8 +11,8 @@ name = "turbollm_core_ffi"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-# The engine layer (plan P-2); the napi addon never turns it on.
-turbollm-core = { path = "../../crates/turbollm-core", features = ["engines"] }
+# The engine layer and llama.cpp (plan P-2, T18); the napi addon never turns either on.
+turbollm-core = { path = "../../crates/turbollm-core", features = ["engines", "llama"] }
 # The domain types the engine records mirror (B-4: the domain crates carry no UniFFI dependency).
 turbollm-engine = { path = "../../crates/turbollm-engine" }
 # Same exact version as xtask's uniffi (bindgen): generated Kotlin must match the scaffolding.

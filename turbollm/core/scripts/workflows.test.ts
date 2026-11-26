@@ -22,6 +22,7 @@ interface Step {
   if?: string
   shell?: string
   with?: Record<string, unknown>
+  env?: Record<string, string>
   'working-directory'?: string
 }
 
@@ -180,6 +181,124 @@ test('android-emulator runs both instrumented suites on an x86_64 API 34 emulato
   assert.match(String(emulator.with?.script), /:turbollm-core:connectedDebugAndroidTest/)
   assert.match(String(emulator.with?.script), /:r8-consumer:connectedReleaseAndroidTest/)
 })
+
+// T20 (rust-core Phase 2a): the real-native llama tests run on Linux in rust-checks, and the llama instrumented tests
+// on the emulator. The test model comes from the pinned Hugging Face commit of core/fixtures/engines/README.md.
+const ENGINE_MODELS_README = join(CORE_DIR, 'fixtures', 'engines', 'README.md')
+const ENGINE_MODELS_HASH = "hashFiles('turbollm/core/fixtures/engines/README.md')"
+const LLAMA_SOURCE_HASH = "hashFiles('turbollm/core/crates/turbollm-engine-llama/llama-source.json')"
+const LLAMA_ARCHIVE_CACHE = 'turbollm/core/target/cache/llama'
+const TEST_GGUF = 'Qwen3-0.6B-Q4_K_M.gguf'
+const DEVICE_GGUF = `/data/local/tmp/turbollm/${TEST_GGUF}`
+const HOST_LLAMA_LIBRARY_DIR = 'target/llama/x86_64-unknown-linux-gnu'
+const MODEL_JOBS = ['rust-checks', 'android-emulator']
+
+test('the pinned test GGUF URL and sha256 are the ones of the engine fixtures README', () => {
+  const { repo, commit, sha256 } = pinnedModel(TEST_GGUF)
+
+  assert.equal(workflow.env?.TEST_GGUF_URL, `https://huggingface.co/${repo}/resolve/${commit}/${TEST_GGUF}`)
+  assert.equal(workflow.env?.TEST_GGUF_SHA256, sha256)
+})
+
+for (const name of MODEL_JOBS) {
+  test(`${name} restores the test GGUF from a cache keyed on the fixtures README, then downloads a miss checked by sha256`, () => {
+    const job = jobs[name]
+    const cache = cacheKeyedOn(job, ENGINE_MODELS_HASH)
+    const download = stepRunning(job, '"$TEST_GGUF_URL"')
+
+    assert.match(String(download.run), /sha256sum -c/, `${name}: the download is not checked`)
+    assert.match(String(download.run), /\$TEST_GGUF_SHA256/)
+    assert.equal(cache.with?.path, dirnameOf(download.env?.TURBOLLM_TEST_GGUF), `${name}: the cache holds another folder`)
+    assert.ok(download.env?.TURBOLLM_TEST_GGUF?.endsWith(`/${TEST_GGUF}`))
+    assert.ok(stepIndex(job, cache) < stepIndex(job, download), `${name}: download runs before the cache restore`)
+    for (const step of [cache, download]) assert.ok(step.name, `${name}: a model step has no name (P-21)`)
+  })
+}
+
+test('rust-checks fetches the pinned llama.cpp source from a cache keyed on llama-source.json, then builds the host library', () => {
+  const job = jobs['rust-checks']
+  const cache = cacheKeyedOn(job, LLAMA_SOURCE_HASH)
+  const fetch = stepRunning(job, 'cargo xtask fetch-llama')
+  const build = stepRunning(job, 'cargo xtask build-llama --host')
+  const tests = stepRunning(job, 'cargo test --workspace')
+
+  assert.equal(cache.with?.path, LLAMA_ARCHIVE_CACHE)
+  assert.ok(stepIndex(job, cache) < stepIndex(job, fetch))
+  assert.ok(stepIndex(job, fetch) < stepIndex(job, build))
+  assert.ok(stepIndex(job, build) < stepIndex(job, tests))
+  for (const step of [cache, fetch, build]) assert.ok(step.name, 'a llama step has no name (P-21)')
+})
+
+test('rust-checks runs the Rust tests with CI=true and the real-native library and model', () => {
+  const job = jobs['rust-checks']
+  const tests = stepRunning(job, 'cargo test --workspace')
+  const download = stepRunning(job, '"$TEST_GGUF_URL"')
+
+  assert.equal(tests.env?.CI, 'true')
+  assert.equal(tests.env?.TURBOLLM_LLAMA_LIB_DIR, HOST_LLAMA_LIBRARY_DIR)
+  assert.equal(tests.env?.TURBOLLM_TEST_GGUF, download.env?.TURBOLLM_TEST_GGUF)
+  assert.ok(stepIndex(job, download) < stepIndex(job, tests))
+})
+
+test('rust-checks keeps its 45-minute budget (P-21: a slow cold run moves the native tests out, T20b)', () => {
+  assert.equal(jobs['rust-checks']['timeout-minutes'], 45)
+})
+
+test('android-emulator pushes the test GGUF to the device and passes it as turbollmTestGguf', () => {
+  const job = jobs['android-emulator']
+  const emulator = job.steps.find((step) => step.uses?.startsWith('reactivecircus/android-emulator-runner@'))
+  const script = String(emulator?.with?.script)
+  const download = stepRunning(job, '"$TEST_GGUF_URL"')
+  const push = script.indexOf(`adb push "$TURBOLLM_TEST_GGUF" ${DEVICE_GGUF}`)
+
+  assert.ok(emulator, 'no emulator step')
+  assert.equal(emulator.env?.TURBOLLM_TEST_GGUF, download.env?.TURBOLLM_TEST_GGUF)
+  assert.ok(push >= 0, 'the GGUF is not pushed to the device')
+  assert.ok(push < script.indexOf('./gradlew'), 'the instrumented tests start before the push')
+  assert.match(script, new RegExp(`-Pandroid\\.testInstrumentationRunnerArguments\\.turbollmTestGguf=${DEVICE_GGUF}`))
+  assert.ok(stepIndex(job, download) < stepIndex(job, emulator))
+})
+
+test('android-library packages the llama libraries: turbollm.engines=true comes from gradle.properties', () => {
+  const properties = readFileSync(join(CORE_DIR, 'bindings', 'android', 'gradle.properties'), 'utf8')
+
+  assert.match(properties, /^turbollm\.engines=true$/m)
+  for (const [name, job] of Object.entries(jobs)) {
+    assert.doesNotMatch(allRuns(job), /turbollm\.engines=false/, `${name} turns the engines off`)
+  }
+})
+
+// xtask downloads through ureq with native-tls (T12), so building it on Linux needs the OpenSSL headers and pkg-config.
+test('every Linux job that builds xtask makes sure of the OpenSSL headers first', () => {
+  for (const name of ['rust-checks', 'node-addon', 'nodejs-mobile-addon', 'android-library', 'android-emulator']) {
+    const job = jobs[name]
+    const openssl = stepRunning(job, 'libssl-dev')
+    const firstBuild = job.steps.findIndex((step) => /cargo (clippy|xtask|test)|\.\/gradlew|build-node\.mjs/.test(step.run ?? ''))
+
+    assert.ok(openssl.name, `${name}: the OpenSSL step has no name`)
+    assert.ok(stepIndex(job, openssl) < firstBuild, `${name}: xtask is built before the OpenSSL check`)
+    if (job['runs-on'].includes('matrix')) assert.equal(openssl.if, "${{ runner.os == 'Linux' }}")
+  }
+})
+
+function pinnedModel(file: string): { repo: string; commit: string; sha256: string } {
+  const row = readFileSync(ENGINE_MODELS_README, 'utf8')
+    .split(/\r?\n/)
+    .find((line) => line.startsWith(`| \`${file}\` |`))
+  assert.ok(row, `the engine fixtures README has no row for ${file}`)
+  const [, repo, commit, , sha256] = row.split('|').slice(1, -1).map((cell) => cell.trim().replaceAll('`', ''))
+  return { repo, commit, sha256 }
+}
+
+function cacheKeyedOn(job: Job, hash: string): Step {
+  const cache = job.steps.find((step) => step.uses?.startsWith('actions/cache@') && String(step.with?.key).includes(hash))
+  assert.ok(cache, `no cache keyed on ${hash}`)
+  return cache
+}
+
+function dirnameOf(path: string | undefined): string {
+  return String(path).slice(0, String(path).lastIndexOf('/'))
+}
 
 // GITHUB_SHA is the caller's commit, not inputs.ref, so a dispatched release build would report main's sha (review
 // S2). build.rs prefers TURBOLLM_GIT_SHA, which every job sets from the commit it actually checked out.

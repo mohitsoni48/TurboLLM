@@ -13,7 +13,18 @@ serde_json = "=1.0.154"
 toml_edit = "=0.25.19"
 # Same exact version as bindings/uniffi's uniffi.
 uniffi = { version = "=0.32.2", features = ["bindgen"] }
+# fetch-llama: download, hash-check and unpack the pinned llama.cpp source archive (plan T12).
+flate2 = "=1.1.11"
+sha2 = "=0.11.1"
+tar = { version = "=0.4.46", default-features = false }
+# Platform-native TLS and the system's root certificates. ureq's default rustls pulls webpki-roots and
+# its platform verifier pulls webpki-root-certs, both CDLA-Permissive-2.0, which deny.toml does not allow
+# (plan P-22). On Linux this needs the OpenSSL development headers.
+ureq = { version = "=3.5.2", default-features = false, features = ["native-tls-no-default"] }
+# build-llama --host: the host's shared-library file name (libloading::library_filename) (plan T13).
+turbollm-platform = { path = "../crates/turbollm-platform" }
 
 [dev-dependencies]
+tempfile = "=3.27.0"
 # Builds the shared libraries elf.rs tests read.
 object = { version = "=0.41.0", default-features = false, features = ["std", "read_core", "elf", "write_std"] }

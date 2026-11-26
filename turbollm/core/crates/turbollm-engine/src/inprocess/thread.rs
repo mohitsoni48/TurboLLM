@@ -18,6 +18,7 @@ const JOINER_THREAD_NAME: &str = "turbollm-join";
 const THREAD_NOT_STARTED: &str = "The engine thread could not be started: ";
 pub(crate) const THREAD_STOPPED: &str = "The engine thread stopped before the model was open.";
 const PANIC_WITHOUT_MESSAGE: &str = "The engine panicked while opening the model.";
+const GENERATE_PANIC_WITHOUT_MESSAGE: &str = "The engine panicked while generating the reply.";
 
 /// What the engine thread is asked to do once its model is open.
 pub(crate) enum Command {
@@ -133,7 +134,7 @@ fn serve<M: NativeModel>(mut model: M, commands: &mpsc::Receiver<Command>) {
         interrupt,
     }) = commands.recv()
     {
-        let generated = model.generate(&req, &mut sink, &abort);
+        let generated = generate_catching_panics(&mut model, &req, &mut sink, &abort);
         interrupt.retire();
         drop(permit);
         if let Err(error) = generated {
@@ -142,4 +143,20 @@ fn serve<M: NativeModel>(mut model: M, commands: &mpsc::Receiver<Command>) {
         abort.retire();
     }
     model.close();
+}
+
+/// A panic ends only its own reply, as an engine failure; the model stays open for the next one
+/// and is still freed on this thread when it closes.
+fn generate_catching_panics<M: NativeModel>(
+    model: &mut M,
+    req: &GenerateRequest,
+    sink: &mut EventSink,
+    abort: &AbortSignal,
+) -> Result<(), EngineError> {
+    panic::catch_unwind(AssertUnwindSafe(|| model.generate(req, sink, abort))).unwrap_or_else(
+        |payload| {
+            let message = panic_message(payload, GENERATE_PANIC_WITHOUT_MESSAGE);
+            Err(EngineError::EngineFailure(message))
+        },
+    )
 }

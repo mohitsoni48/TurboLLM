@@ -53,12 +53,14 @@ impl CoreEngines {
         include_native: bool,
     ) -> Result<Arc<Self>, CoreEngineException> {
         refuse_reentry()?;
-        // M-1 builds no native engine; `include_native` takes effect with features `llama` (T18) and `litert` (T25).
-        let _ = include_native;
         let config = EnginesConfig::try_from(config)?;
         let foreign = foreign_engines(descriptors, backends)?;
         let preceding = predecessor.as_deref().map(|core| core.engines.as_ref());
-        let engines = Engines::new(config, foreign, preceding)?;
+        let engines = if include_native {
+            Engines::new(config, foreign, preceding)?
+        } else {
+            Engines::without_native(config, foreign, preceding)?
+        };
         Ok(Arc::new(CoreEngines {
             engines: Arc::new(engines),
         }))
