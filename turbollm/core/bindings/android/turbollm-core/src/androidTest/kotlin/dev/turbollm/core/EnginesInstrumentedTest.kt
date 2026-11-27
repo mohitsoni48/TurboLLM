@@ -32,7 +32,7 @@ class EnginesInstrumentedTest {
     private val core = CoreEngines(config(), predecessor = null)
 
     @After
-    fun shutDownTheCore() = runBlocking {
+    fun shutDownTheCore() = runBlocking<Unit> {
         withTimeout(AWAIT_MILLIS) { core.shutdown() }
         core.close()
     }
@@ -54,7 +54,7 @@ class EnginesInstrumentedTest {
     }
 
     @Test(timeout = TEST_MILLIS)
-    fun onX86_64TheCoreOpensTheBaseLibraryByItsBareName() = runBlocking {
+    fun onX86_64TheCoreOpensTheBaseLibraryByItsBareName() = runBlocking<Unit> {
         assumeTrue("an x86_64 device", Build.SUPPORTED_ABIS.first() == "x86_64")
         val model = testModelPath()
 
@@ -68,7 +68,7 @@ class EnginesInstrumentedTest {
     }
 
     @Test(timeout = TEST_MILLIS)
-    fun aReplyStreamsTextAndEndsWithStop() = runBlocking {
+    fun aReplyStreamsTextAndEndsWithStop() = runBlocking<Unit> {
         core.load(target(testModelPath()))
 
         val events = core.reply(QUESTION)
@@ -81,7 +81,7 @@ class EnginesInstrumentedTest {
     }
 
     @Test(timeout = TEST_MILLIS)
-    fun cancellingAfterTheFirstTokenEndsPromptlyAndTheNextReplyWorks() = runBlocking {
+    fun cancellingAfterTheFirstTokenEndsPromptlyAndTheNextReplyWorks() = runBlocking<Unit> {
         core.load(target(testModelPath()))
         val endless = withTimeout(AWAIT_MILLIS) { core.generate(request(maxTokens = ENDLESS_TOKENS)) }
         try {
@@ -97,7 +97,7 @@ class EnginesInstrumentedTest {
     }
 
     @Test(timeout = TEST_MILLIS)
-    fun aModelUnloadedCanBeLoadedAgain() = runBlocking {
+    fun aModelUnloadedCanBeLoadedAgain() = runBlocking<Unit> {
         val model = testModelPath()
         core.load(target(model))
         withTimeout(AWAIT_MILLIS) { core.unload() }
@@ -110,7 +110,7 @@ class EnginesInstrumentedTest {
     }
 
     @Test(timeout = TEST_MILLIS)
-    fun aGpuRequestRunsOnCpuWithTheNote() = runBlocking {
+    fun aGpuRequestRunsOnCpuWithTheNote() = runBlocking<Unit> {
         val loaded = core.load(target(testModelPath(), CoreBackend.GPU))
 
         assertEquals(CoreBackend.CPU, loaded.backend)
@@ -118,7 +118,7 @@ class EnginesInstrumentedTest {
     }
 
     @Test(timeout = TEST_MILLIS)
-    fun theLoadJournalHoldsTheModelWhileItLoadsAndIsClearedAfter() = runBlocking {
+    fun theLoadJournalHoldsTheModelWhileItLoadsAndIsClearedAfter() = runBlocking<Unit> {
         val claim = core.claimLoad(target(testModelPath()))
         try {
             val loading = async(Dispatchers.Default) { claim.run() }
@@ -138,7 +138,7 @@ class EnginesInstrumentedTest {
     }
 
     @Test(timeout = TEST_MILLIS)
-    fun aLiteRtLmReplyStreamsTextAndEndsWithDoneOnTheCpu() = runBlocking {
+    fun aLiteRtLmReplyStreamsTextAndEndsWithDoneOnTheCpu() = runBlocking<Unit> {
         val loaded = core.load(liteRtTarget(testModelPath(LITERT_MODEL_ARGUMENT)))
 
         val events = core.reply(QUESTION)
@@ -150,7 +150,7 @@ class EnginesInstrumentedTest {
     }
 
     @Test(timeout = TEST_MILLIS)
-    fun cancellingALiteRtLmReplyEndsPromptlyAndTheNextReplyWorks() = runBlocking {
+    fun cancellingALiteRtLmReplyEndsPromptlyAndTheNextReplyWorks() = runBlocking<Unit> {
         core.load(liteRtTarget(testModelPath(LITERT_MODEL_ARGUMENT)))
         val endless = withTimeout(AWAIT_MILLIS) { core.generate(request(maxTokens = ENDLESS_TOKENS)) }
         try {
@@ -166,7 +166,7 @@ class EnginesInstrumentedTest {
     }
 
     @Test(timeout = TEST_MILLIS)
-    fun aLlamaCppModelLoadsAfterALiteRtLmModelWasUnloaded() = runBlocking {
+    fun aLlamaCppModelLoadsAfterALiteRtLmModelWasUnloaded() = runBlocking<Unit> {
         val liteRtModel = testModelPath(LITERT_MODEL_ARGUMENT)
         val ggufModel = testModelPath(MODEL_ARGUMENT)
         core.load(liteRtTarget(liteRtModel))
