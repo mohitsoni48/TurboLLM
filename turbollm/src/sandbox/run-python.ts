@@ -104,27 +104,28 @@ export type ChatRow = Pick<Message, 'role' | 'toolCalls'> & UserFiles
  *  one name in the same user message keep both (`-2`), and in one reply the last run's file wins. Newest first under
  *  the caps; the names the caps left out go in `leftOut`, newest first. */
 export async function turnFiles(rows: Array<UserFiles & Partial<Pick<ChatRow, 'role' | 'toolCalls'>>>, store: Pick<AttachmentStore, 'inline' | 'read'>, leftOut: string[] = []): Promise<SandboxFile[]> {
-  const perRow: Array<Array<{ name: string; bytes: Buffer }>> = []
+  const perRow: Candidate[][] = []
   let img = 0
   for (const row of rows) {
     if (row.role === 'assistant') {
-      perRow.push(await outputsOf(row.toolCalls ?? [], store))
+      perRow.push(outputsOf(row.toolCalls ?? [], store))
       continue
     }
-    const mine: Array<{ name: string; bytes: Buffer }> = []
+    const mine: Candidate[] = []
     for (const a of row.attachments ?? []) {
       const url = await store.inline(a)
       const m = url ? /^data:image\/(png|jpeg|gif|webp|bmp|avif);base64,(.*)$/.exec(url) : null
       if (!m) continue
       img++
-      mine.push({ name: `image-${img}.${m[1] === 'jpeg' ? 'jpg' : m[1]}`, bytes: Buffer.from(m[2], 'base64') })
+      mine.push(loaded(`image-${img}.${m[1] === 'jpeg' ? 'jpg' : m[1]}`, Buffer.from(m[2], 'base64')))
     }
     for (const doc of documentsFrom(row.docContext, row.textAttachments ?? [])) {
-      if (DOCUMENT_TYPES.test(doc.name)) mine.push({ name: safeName(doc.name, 'document.txt'), bytes: Buffer.from(doc.text, 'utf8') })
+      if (DOCUMENT_TYPES.test(doc.name)) mine.push(loaded(safeName(doc.name, 'document.txt'), Buffer.from(doc.text, 'utf8')))
     }
     perRow.push(mine)
   }
-  // Chosen newest message first (that is who wins a name and the caps), handed over oldest first.
+  // Chosen newest message first (that is who wins a name and the caps), handed over oldest first. A file is read only
+  // once it is chosen: one a newer message replaced, or one over the caps, is never read.
   const chosen: SandboxFile[][] = perRow.map(() => [])
   const taken = new Set<string>()
   let count = 0
@@ -135,40 +136,52 @@ export async function turnFiles(rows: Array<UserFiles & Partial<Pick<ChatRow, 'r
       if (taken.has(f.name)) continue // a newer message has this name
       let n = f.name
       for (let k = 2; here.has(n); k++) n = f.name.replace(/(\.[^.]*)?$/, (ext) => `-${k}${ext}`)
-      if (count >= MAX_INPUT_FILES || total + f.bytes.length > MAX_INPUT_TOTAL) {
+      const over = (size: number) => count >= MAX_INPUT_FILES || total + size > MAX_INPUT_TOTAL
+      let bytes: Buffer | null = null
+      if (!over(f.size)) {
+        bytes = await f.load()
+        if (!bytes) continue // gone: an older file of this name may come back in its place
+      }
+      // Counted at the larger of its recorded size and what was read: neither alone may slip past the caps.
+      const size = bytes ? Math.max(f.size, bytes.length) : f.size
+      if (!bytes || over(size)) {
         // Taken all the same: an older, smaller file of this name must not come back in its place.
         here.add(n)
         leftOut.push(n)
         continue
       }
       here.add(n)
-      chosen[i].push({ name: n, bytes: f.bytes })
+      chosen[i].push({ name: n, bytes })
       count++
-      total += f.bytes.length
+      total += size
     }
     for (const n of here) taken.add(n)
   }
   return chosen.flat()
 }
 
+/** A file a run may start with: its name, its size, and its bytes, read only when it is chosen (null when it is gone). */
+interface Candidate {
+  name: string
+  size: number
+  load(): Promise<Buffer | null>
+}
+
+const loaded = (name: string, bytes: Buffer): Candidate => ({ name, size: bytes.length, load: async () => bytes })
+
 /** The files a reply's run_python calls handed back, by the names the code gave them, the last call's file winning a
- *  name. A file that is gone is left out. */
-async function outputsOf(calls: ToolCallRecord[], store: Pick<AttachmentStore, 'read'>): Promise<Array<{ name: string; bytes: Buffer }>> {
-  const byName = new Map<string, { name: string; file: string }>()
+ *  name. Sized by ToolOutput.size, so none is read before turnFiles chooses it. */
+function outputsOf(calls: ToolCallRecord[], store: Pick<AttachmentStore, 'read'>): Candidate[] {
+  const byName = new Map<string, Candidate>()
   for (const call of calls) {
     if (call.name !== RUN_PYTHON) continue
     for (const o of call.outputs ?? []) {
       const name = isSandboxName(o.sandboxName) ? o.sandboxName : safeName(o.name, 'output')
       byName.delete(name) // re-added at the end: the last write is the newest
-      byName.set(name, { name, file: o.file })
+      byName.set(name, { name, size: o.size, load: () => store.read(o.file) })
     }
   }
-  const out: Array<{ name: string; bytes: Buffer }> = []
-  for (const { name, file } of byName.values()) {
-    const bytes = await store.read(file)
-    if (bytes) out.push({ name, bytes })
-  }
-  return out
+  return [...byName.values()]
 }
 
 /** Which rows' files a run starts with. A fresh sandbox gets every file of the chat, the user's and the ones earlier

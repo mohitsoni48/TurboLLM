@@ -83,6 +83,28 @@ test('turnFiles: when the newest file of a name is over the caps, an older one o
   delete STORED[ref('8')]
 })
 
+test('turnFiles: a replaced or over-cap output is never read, only the files chosen', async () => {
+  const ref = (n: number) => `attachment:${String(n % 10).repeat(63)}${n}.csv`
+  const reads: string[] = []
+  const counting = { ...store, read: async (a: string) => { reads.push(a); return Buffer.alloc(1) } }
+  const out = (name: string, file: string, size: number) => ({ name, file, size })
+  const rows = [
+    // An older reply: data.csv replaced by the newer reply's, and a 90 MB file that the newer 20 MB one pushes over the cap.
+    { role: 'assistant' as const, attachments: [], textAttachments: [], toolCalls: [{ id: 't', name: 'run_python', args: {}, outputs: [
+      out('data.csv', ref(1), 1), out('big.csv', ref(2), 90 * 1024 * 1024),
+    ] }] },
+    { role: 'assistant' as const, attachments: [], textAttachments: [], toolCalls: [
+      { id: 't', name: 'run_python', args: {}, outputs: [out('data.csv', ref(3), 1), out('mid.csv', ref(4), 20 * 1024 * 1024)] },
+      { id: 'u', name: 'run_python', args: {}, outputs: [out('data.csv', ref(5), 1)] },
+    ] },
+  ] as never[]
+  const leftOut: string[] = []
+  const files = await turnFiles(rows, counting, leftOut)
+  assert.deepEqual(files.map((f) => f.name).sort(), ['data.csv', 'mid.csv'])
+  assert.deepEqual(leftOut, ['big.csv'])
+  assert.deepEqual(reads.sort(), [ref(4), ref(5)].sort(), 'only the newest data.csv and mid.csv are read')
+})
+
 const user = (name: string) => ({ role: 'user' as const, toolCalls: [], attachments: [], textAttachments: [name], docContext: `[Attached: ${name}]\nx` })
 const reply = (ran: boolean) => ({ role: 'assistant' as const, toolCalls: ran ? [{ id: 't', name: 'run_python', args: {} }] : [], attachments: [], textAttachments: [] })
 
