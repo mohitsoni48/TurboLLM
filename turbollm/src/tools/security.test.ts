@@ -77,6 +77,30 @@ test('isPrivateIp: 0.0.0.0/8, CGNAT, IPv6 unique-local/link-local and IPv4-mappe
   }
 })
 
+test('isPrivateIp: NAT64 (64:ff9b::/96) addresses embedding a private IPv4 are private', () => {
+  // A NAT64 gateway forwards 64:ff9b::a.b.c.d to the IPv4 host a.b.c.d, so the embedded address decides.
+  for (const ip of ['64:ff9b::7f00:1', '64:ff9b::127.0.0.1', '64:ff9b::a9fe:a9fe', '64:ff9b::169.254.169.254',
+    '64:ff9b::a00:1', '64:ff9b::c0a8:101', '64:ff9b::ac14:1', '64:ff9b::6440:1', '64:ff9b::1', '64:ff9b::',
+    '64:FF9B::7F00:1']) {
+    assert.equal(isPrivateIp(ip), true, ip)
+  }
+  // Local-use NAT64 (RFC 8215, 64:ff9b:1::/48) is never a public destination.
+  assert.equal(isPrivateIp('64:ff9b:1::1'), true)
+  assert.equal(isPrivateIp('64:ff9b:1:abcd::7f00:1'), true)
+  // An embedded public IPv4 stays reachable, and so do non-NAT64 addresses with a similar prefix.
+  for (const ip of ['64:ff9b::808:808', '64:ff9b::8.8.8.8', '64:ff9b::5db8:d822', '2606:4700::1', '64:ff9a::7f00:1']) {
+    assert.equal(isPrivateIp(ip), false, ip)
+  }
+})
+
+test('checkSsrf blocks a name that resolves to a NAT64 address embedding a private IPv4', async (t) => {
+  t.after(() => _setSsrfResolver(null))
+  _setSsrfResolver(async () => [{ address: '64:ff9b::a9fe:a9fe', family: 6 }])
+  assert.match((await checkSsrf('https://nat64.example.com/latest/meta-data'))!, /blocked/)
+  _setSsrfResolver(async () => [{ address: '64:ff9b::808:808', family: 6 }])
+  assert.strictEqual(await checkSsrf('https://nat64.example.com/'), null)
+})
+
 test('checkSsrf blocks 0.0.0.0', async () => {
   assert.match((await checkSsrf('http://0.0.0.0:6996/api/v1/settings'))!, /blocked/)
 })
