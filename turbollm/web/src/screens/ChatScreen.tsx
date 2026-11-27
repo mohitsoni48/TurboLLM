@@ -928,8 +928,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     // setting says: the setting itself is left alone.
     const handsFree = !!conversationRef.current?.active
     // A recording sent as audio to a model that answers aloud gets its answer as speech, which has its own player: the
-    // browser's voices do not read the same words over it.
-    const replyAudio = asksForSpokenReply(status?.model, !!activeRemoteId, audio, images, audioAttachments.reduce((ms, a) => ms + (a.durationMs ?? 0), 0))
+    // browser's voices do not read the same words over it. Not in hands-free mode: nothing plays that clip by itself,
+    // and the loop listens again only once the browser has read the reply aloud.
+    const replyAudio = !handsFree && asksForSpokenReply(status?.model, !!activeRemoteId, audio, images, audioAttachments.reduce((ms, a) => ms + (a.durationMs ?? 0), 0))
     const speakReply = (readAloud === 'always' || (readAloud === 'voice' && spoken) || handsFree) && ttsAvailable() && !replyAudio
 
     const sentAttachments = outgoing

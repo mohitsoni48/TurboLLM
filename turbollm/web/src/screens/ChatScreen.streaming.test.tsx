@@ -36,6 +36,7 @@ beforeEach(() => {
   Object.defineProperty(Element.prototype, 'scrollTo', { configurable: true, writable: true, value: () => {} })
   useUiStore.setState({ remoteModelId: null })
   localModelLoading = false
+  modelAudioOut = false
   observedCanListen = undefined
   stopSpy.mockClear()
   speechStream.mockClear()
@@ -57,7 +58,7 @@ vi.mock('../lib/queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/queries')>()
   return {
     ...actual,
-    useStatus: () => ({ data: { engine: { state: engineState }, model: { key: 'm1', name: 'M1', ctx: 8192 } } }),
+    useStatus: () => ({ data: { engine: { state: engineState }, model: { key: 'm1', name: 'M1', ctx: 8192, audioOut: modelAudioOut } } }),
     useModels: () => ({ data: { models: [{ key: 'm1', name: 'M1', compatibleWithActiveEngine: true }] } }),
     useModelActions: () => ({ load: { mutate: vi.fn(), isPending: localModelLoading }, eject: { mutate: vi.fn(), isPending: false } }),
     useModelDetail: () => ({ data: undefined }),
@@ -72,6 +73,8 @@ vi.mock('../lib/queries', async (importOriginal) => {
 /** 'stopped' = no model ready to answer. */
 let engineState = 'running'
 let localModelLoading = false
+/** The loaded model answers aloud (status.model.audioOut). */
+let modelAudioOut = false
 let observedCanListen: boolean | undefined
 let createMutateAsync = vi.fn(() => Promise.resolve({ id: 'new1' }))
 let stopConversationReply: (() => void) | undefined
@@ -840,6 +843,39 @@ it('keeps hands-free speech and reports a refusal when a reply is already live',
   } finally {
     useVoiceStore.setState({ conversation: false })
     toastError.mockRestore()
+  }
+})
+})
+
+describe('hands-free with a model that answers aloud', () => {
+const clip = () => ({ file: new File(['RIFF'], 'voice-message.wav', { type: 'audio/wav' }), dataUrl: 'data:audio/wav;base64,UklGRg==', durationMs: 2000 })
+/** sendMessage's replyAudio argument (chat-session passes it 12th). */
+const askedForSpokenReply = (call: unknown[]) => call[11] === true
+it('asks for a spoken reply for a recording sent as audio outside hands-free', async () => {
+  modelAudioOut = true
+  nextGen = quickStream()
+  await renderScreen('/chat/c1')
+  await act(async () => { voiceOptions.onClip(clip()) })
+  await act(async () => { fireEvent.keyDown(await composer(), { key: 'Enter' }) })
+  await waitFor(() => expect(sendCalls).toHaveLength(1))
+  expect(askedForSpokenReply(sendCalls[0])).toBe(true)
+})
+it('does not ask for a spoken reply while hands-free is on, and still reads the reply aloud', async () => {
+  modelAudioOut = true
+  const feed = steppedStream()
+  nextGen = feed.gen
+  useVoiceStore.setState({ conversation: true, readAloud: 'off' })
+  try {
+    await renderScreen('/chat/c1')
+    act(() => { fireEvent.click(screen.getAllByRole('button', { name: /Start a voice conversation/ })[0]) })
+    await act(async () => { voiceOptions.onClip(clip()) })
+    await waitFor(() => expect(sendCalls).toHaveLength(1))
+    expect(askedForSpokenReply(sendCalls[0])).toBe(false)
+    await feed.push(meta)
+    await feed.push({ event: 'delta', data: { delta: 'A complete sentence.' } } as ChatSseEvent)
+    await waitFor(() => expect(speechStream).toHaveBeenCalled())
+  } finally {
+    useVoiceStore.setState({ conversation: false, readAloud: 'off' })
   }
 })
 })
