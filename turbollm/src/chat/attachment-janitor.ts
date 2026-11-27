@@ -81,7 +81,7 @@ export class AttachmentJanitor {
       await this.backfill(summary)
       await this.collect(summary)
       if (summary.converted || summary.deleted) {
-        this.d.log(`[attachments] moved images of ${summary.converted} messages into files; deleted ${summary.deleted} unused image files`)
+        this.d.log(`[attachments] moved images of ${summary.converted} messages into files; deleted ${summary.deleted} unused files`)
       }
       return summary
     } catch (e) {

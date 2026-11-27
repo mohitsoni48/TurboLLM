@@ -100,6 +100,13 @@ function sendableName(name, used) {
   return out
 }
 
+// The code's own name goes along (`as`) when the sendable one differs, so a fresh sandbox gets the file back under it:
+// only a name that passes the daemon's rule (sandbox-process.ts isSandboxName), else none and the result still stands.
+function sandboxName(name, sent) {
+  if (name === sent || name.length > MAX_NAME || name === '.' || name === '..' || /[/\\\p{C}\p{Zl}\p{Zp}]/u.test(name)) return undefined
+  return name
+}
+
 function capped(text) {
   const bytes = enc.encode(text)
   if (bytes.length <= TEXT_LIMIT) return bytes
@@ -178,7 +185,9 @@ for await (const { header, payload } of frames()) {
     if (!OUTPUT_TYPES.test(name)) { skip(name); continue }
     const bytes = py.FS.readFile(`${WORK}/${name}`)
     if (files.length >= MAX_OUTPUT_FILES || bytes.length > MAX_OUTPUT_FILE || total + bytes.length > MAX_OUTPUT_TOTAL) { skip(name); continue }
-    files.push({ name: sendableName(name, used), size: bytes.length })
+    const sent = sendableName(name, used)
+    const as = sandboxName(name, sent)
+    files.push({ name: sent, size: bytes.length, ...(as === undefined ? {} : { as }) })
     parts.push(bytes)
     total += bytes.length
   }

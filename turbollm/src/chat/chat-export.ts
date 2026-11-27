@@ -39,6 +39,16 @@ export interface ChatSnapshot {
    *  never-lossy fallback (summary PLUS every message, every turn) with no divider ever
    *  rendering to explain it. Exported for the reader of a snapshot, not for replay. */
   compaction?: { summary: string; uptoMessageId: string; tokensBefore: number }
+  /** Always false: an export carries the messages only. The chat's images and voice clips, and the files run_python
+   *  made, stay on this machine (GitHub #52), and the tool calls' references to them are left out. */
+  files_included: false
+}
+
+/** Tool-call records without their references to stored files (run_python's `files` and `outputs`, GitHub #52). An export carries
+ *  no files, so in an export file such a reference names a file of the chat it came from, or nothing. Export drops
+ *  them, and import drops them again, so an imported chat never reaches a file it did not bring. */
+export function withoutFileRefs(calls: ToolCallRecord[]): ToolCallRecord[] {
+  return calls.map(({ files: _files, outputs: _outputs, notKept: _notKept, ...rest }) => rest)
 }
 
 /**
@@ -65,7 +75,7 @@ export function buildSnapshot(
     }
     // Include tool call records on assistant turns that used tools.
     if (m.toolCalls && m.toolCalls.length > 0) {
-      entry.tool_calls = m.toolCalls
+      entry.tool_calls = withoutFileRefs(m.toolCalls)
     }
     return entry
   })
@@ -87,6 +97,7 @@ export function buildSnapshot(
       autoSwap: cfg.gateway?.autoSwap ?? true,
       tavilyConfigured: !!(cfg.tools?.tavily?.apiKey),
     },
+    files_included: false,
     ...(conv.compactionSummary && conv.compactionUpToMessageId
       ? { compaction: { summary: conv.compactionSummary, uptoMessageId: conv.compactionUpToMessageId, tokensBefore: conv.compactionTokensBefore ?? 0 } }
       : {}),

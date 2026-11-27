@@ -15,14 +15,29 @@ export interface MessageStats {
   aborted: boolean
 }
 
+/** A file a run_python call handed back (GitHub #52; the daemon's chat/db.ts ToolOutput). */
+export interface ToolOutput {
+  /** The name the code saved it under. */
+  name: string
+  /** Its attachment reference (`attachment:<id>`). */
+  file: string
+  size: number
+  /** A CSV with a cell a spreadsheet may run as a formula. */
+  formulaCells?: true
+}
+
 export interface ToolCallRecord {
   id: string
   name: string
   args: Record<string, unknown>
   result?: string
   error?: string
-  /** run_python only (GitHub #52): the images the run handed back, as attachment references. */
+  /** run_python only (GitHub #52): the files the run handed back (images and downloads), as attachment references. */
   files?: string[]
+  /** run_python only: each of `files` with the name the code gave it. */
+  outputs?: ToolOutput[]
+  /** run_python only: the files the run made that were not kept, the chat's files having reached their limit. */
+  notKept?: string[]
   /** Code mode only (pi's edit tool result) — a unified diff of the change, when the
    *  backend forwards one. Not currently persisted across a page reload; present only
    *  on records read straight off the live SSE stream. */
@@ -37,8 +52,12 @@ export interface LiveToolCall {
   args: Record<string, unknown>
   status: 'pending' | 'done' | 'error' | 'awaiting_approval'
   result?: string
-  /** run_python only: the images the run handed back, as attachment references. */
+  /** run_python only: the files the run handed back (images and downloads), as attachment references. */
   files?: string[]
+  /** run_python only: each of `files` with the name the code gave it. */
+  outputs?: ToolOutput[]
+  /** run_python only: the files the run made that were not kept, the chat's files having reached their limit. */
+  notKept?: string[]
   /** Code mode only — pi edit tool's real diff/patch output, carried on the terminal
    *  tool_call SSE event (see turbollm/src/code/code-session.ts's tool_result hook). */
   diff?: string
@@ -192,7 +211,7 @@ export type ChatSseEvent =
   | { event: 'progress';  data: { phase: string; processed: number; total: number; pct: number; tps: number } }
   | { event: 'reasoning'; data: { delta: string } }
   | { event: 'delta';     data: { delta: string } }
-  | { event: 'tool_call'; data: { id: string; name: string; args: Record<string, unknown>; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string; files?: string[]; diff?: string; patch?: string; firstChangedLine?: number } }
+  | { event: 'tool_call'; data: { id: string; name: string; args: Record<string, unknown>; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string; files?: string[]; outputs?: ToolOutput[]; notKept?: string[]; diff?: string; patch?: string; firstChangedLine?: number } }
   /** A note about this turn for the user: e.g. the loaded model cannot call tools, so none were sent. */
   | { event: 'notice';    data: { message: string } }
   /** `message`: the reply as the daemon saved it (null when it was deleted meanwhile). */

@@ -304,7 +304,7 @@ export class ChatSession {
           }
         } else if (evt.event === 'tool_call') {
           const tc = evt.data
-          const call: LiveToolCall = { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result, files: tc.files }
+          const call: LiveToolCall = { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result, files: tc.files, outputs: tc.outputs, notKept: tc.notKept }
           this.updateLive(convId, (l) => ({ ...l, timeline: upsertToolCall(l.timeline, call) }))
         } else if (evt.event === 'done') {
           if (own) this.finishedReplies.add(own)

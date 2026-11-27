@@ -1,7 +1,10 @@
 // The public message shape (dto.ts): `include=attachments` is documented as data: URIs (openapi.ts MessageInput), so
 // an image the chat store keeps as a file reference (chat/attachments.ts) goes out read back to its data URI.
 import assert from 'node:assert/strict'
+import { rmSync } from 'node:fs'
 import { test } from 'node:test'
+import { AttachmentStore } from '../chat/attachments'
+import { tmpDir } from '../test-support/tmp'
 import { toMessageDTO, type HeavyField } from './dto'
 import type { ChatMessage } from '../chat/store/types'
 
@@ -31,4 +34,16 @@ test('without include=attachments no file is read', async () => {
   const dto = await toMessageDTO(message([REF]), new Set<HeavyField>(), { inline: async (a) => { reads++; return a } })
   assert.equal(dto.attachments, undefined)
   assert.equal(reads, 0)
+})
+
+test('include=attachments leaves out a file made for download: the field carries images and clips only (GitHub #52)', async () => {
+  const dir = tmpDir('tllm-dto-download-')
+  try {
+    const store = new AttachmentStore(dir)
+    const csv = await store.saveFile(Buffer.from('a,b\n1,2\n'), 'csv')
+    const dto = await toMessageDTO(message([csv!, 'data:image/jpeg;base64,AAAA']), new Set<HeavyField>(['attachments']), store)
+    assert.deepEqual(dto.attachments, ['data:image/jpeg;base64,AAAA'])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

@@ -1,13 +1,18 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { describeRun, documentsFrom, filesFor, imageType, pythonError, resultBudget, RUN_PYTHON_TOOL, safeName, sandboxTurn, turnFiles } from './run-python'
+import { chatFilesBytes, csvHasFormulaCells, describeRun, documentsFrom, filesFor, imageType, pythonError, RESULT_MAX_CHARS, resultBudget, RUN_PYTHON_TOOL, safeName, sandboxTurn, turnFiles } from './run-python'
 import type { SandboxManager } from './sandbox-manager'
 import { SandboxError, type SandboxFile, type SandboxRunResult } from './sandbox-process'
 
 const PNG = Buffer.from('89504e470d0a1a0a', 'hex')
+/** Stored files by reference, for the fake store's read. */
+const STORED: Record<string, Buffer> = {}
 const store = {
+  read: async (a: string) => STORED[a] ?? null,
   inline: async (a: string) => (a === 'attachment:abc.png' ? `data:image/png;base64,${PNG.toString('base64')}` : a.startsWith('data:') ? a : null),
   save: async (urls: string[]) => urls.map((u) => (u.startsWith('data:image/') ? `attachment:${'0'.repeat(64)}.png` : u)),
+  saveFile: async (_bytes: Buffer, ext: string) => `attachment:${'1'.repeat(64)}.${ext}`,
+  size: () => 0,
 }
 
 test('run_python: its description is fixed text (the prompt cache)', () => {
@@ -36,10 +41,11 @@ test('safeName: no folders, no odd characters, never empty', () => {
 test('turnFiles: images and text documents, under unique names; other formats stay out', async () => {
   const files = await turnFiles([{
     attachments: ['attachment:abc.png', 'attachment:gone.png'],
-    textAttachments: ['data.csv', 'report.pdf', 'Data.csv'],
-    docContext: '[Attached: data.csv]\na\n\n[Attached: report.pdf]\nextracted\n\n[Attached: Data.csv]\nb',
+    textAttachments: ['data.csv', 'report.pdf', 'Data.csv', 'data.csv'],
+    docContext: '[Attached: data.csv]\na\n\n[Attached: report.pdf]\nextracted\n\n[Attached: Data.csv]\nb\n\n[Attached: data.csv]\nc',
   }], store)
-  assert.deepEqual(files.map((f) => f.name), ['image-1.png', 'data.csv', 'Data-2.csv'])
+  // The sandbox's folder tells Data.csv from data.csv; only the same name twice needs a -2.
+  assert.deepEqual(files.map((f) => f.name), ['image-1.png', 'data.csv', 'Data.csv', 'data-2.csv'])
   assert.deepEqual(files[0].bytes, PNG)
   assert.equal(files[1].bytes.toString(), 'a')
   assert.deepEqual(await turnFiles([], store), [])
@@ -57,35 +63,124 @@ test('turnFiles: across the chat, a name sent again is the newer file, and image
 
 test('turnFiles: over 20 files, the newest are the ones sent', async () => {
   const rows = Array.from({ length: 25 }, (_, i) => ({ attachments: [], textAttachments: [`f${i}.txt`], docContext: `[Attached: f${i}.txt]\n${i}` }))
-  const names = (await turnFiles(rows, store)).map((f) => f.name)
+  const leftOut: string[] = []
+  const names = (await turnFiles(rows, store, leftOut)).map((f) => f.name)
   assert.equal(names.length, 20)
   assert.equal(names[0], 'f5.txt')
   assert.equal(names[19], 'f24.txt')
+  assert.deepEqual(leftOut, ['f4.txt', 'f3.txt', 'f2.txt', 'f1.txt', 'f0.txt'], 'the ones left out, newest first')
+})
+
+test('turnFiles: when the newest file of a name is over the caps, an older one of that name does not come back instead', async () => {
+  const ref = (c: string) => `attachment:${c.repeat(64)}.csv`
+  STORED[ref('7')] = Buffer.from('old')
+  STORED[ref('8')] = Buffer.alloc(100 * 1024 * 1024 + 1)
+  const ran = (file: string) => ({ role: 'assistant' as const, attachments: [], textAttachments: [], toolCalls: [{ id: 't', name: 'run_python', args: {}, outputs: [{ name: 'data.csv', file, size: 1 }] }] })
+  const leftOut: string[] = []
+  const files = await turnFiles([ran(ref('7')), ran(ref('8'))] as never[], store, leftOut)
+  assert.deepEqual(files, [])
+  assert.deepEqual(leftOut, ['data.csv'])
+  delete STORED[ref('8')]
+})
+
+test('turnFiles: a replaced or over-cap output is never read, only the files chosen', async () => {
+  const ref = (n: number) => `attachment:${String(n % 10).repeat(63)}${n}.csv`
+  const reads: string[] = []
+  const counting = { ...store, read: async (a: string) => { reads.push(a); return Buffer.alloc(1) } }
+  const out = (name: string, file: string, size: number) => ({ name, file, size })
+  const rows = [
+    // An older reply: data.csv replaced by the newer reply's, and a 90 MB file that the newer 20 MB one pushes over the cap.
+    { role: 'assistant' as const, attachments: [], textAttachments: [], toolCalls: [{ id: 't', name: 'run_python', args: {}, outputs: [
+      out('data.csv', ref(1), 1), out('big.csv', ref(2), 90 * 1024 * 1024),
+    ] }] },
+    { role: 'assistant' as const, attachments: [], textAttachments: [], toolCalls: [
+      { id: 't', name: 'run_python', args: {}, outputs: [out('data.csv', ref(3), 1), out('mid.csv', ref(4), 20 * 1024 * 1024)] },
+      { id: 'u', name: 'run_python', args: {}, outputs: [out('data.csv', ref(5), 1)] },
+    ] },
+  ] as never[]
+  const leftOut: string[] = []
+  const files = await turnFiles(rows, counting, leftOut)
+  assert.deepEqual(files.map((f) => f.name).sort(), ['data.csv', 'mid.csv'])
+  assert.deepEqual(leftOut, ['big.csv'])
+  assert.deepEqual(reads.sort(), [ref(4), ref(5)].sort(), 'only the newest data.csv and mid.csv are read')
 })
 
 const user = (name: string) => ({ role: 'user' as const, toolCalls: [], attachments: [], textAttachments: [name], docContext: `[Attached: ${name}]\nx` })
 const reply = (ran: boolean) => ({ role: 'assistant' as const, toolCalls: ran ? [{ id: 't', name: 'run_python', args: {} }] : [], attachments: [], textAttachments: [] })
 
-test('filesFor: a fresh sandbox gets every user row; a warm one only the rows since the last run_python call', () => {
+test('filesFor: a fresh sandbox gets every row, replies included; a warm one only the user rows since the last run_python call', () => {
   // The real chat this came from: sales.csv in turn 1, a run, and a follow-up with no attachment after the sandbox
   // closed when idle. The follow-up's run must still find sales.csv.
   const rows = [user('sales.csv'), reply(true), user('extra.csv'), reply(false), user('q.txt')] as never[]
-  const names = (r: ReturnType<typeof filesFor>) => r.map((x) => x.textAttachments![0])
-  assert.deepEqual(names(filesFor(rows, true)), ['sales.csv', 'extra.csv', 'q.txt'])
+  const names = (r: ReturnType<typeof filesFor>) => r.map((x) => (x.role === 'user' ? x.textAttachments![0] : `reply:${x.toolCalls.length}`))
+  assert.deepEqual(names(filesFor(rows, true)), ['sales.csv', 'reply:1', 'extra.csv', 'reply:0', 'q.txt'])
   assert.deepEqual(names(filesFor(rows, false)), ['extra.csv', 'q.txt'])
   assert.deepEqual(names(filesFor([user('a.csv')] as never[], false)), ['a.csv'])
 })
 
+// A file earlier code made (cleaned.csv) was lost when the sandbox closed: the next run's code could not open it.
+test('turnFiles: a fresh sandbox gets back the files earlier runs made, the newest version of each name winning', async () => {
+  const ref = (c: string, ext: string) => `attachment:${c.repeat(64)}.${ext}`
+  STORED[ref('2', 'csv')] = Buffer.from('v1')
+  STORED[ref('3', 'csv')] = Buffer.from('v2')
+  STORED[ref('4', 'png')] = PNG
+  STORED[ref('5', 'json')] = Buffer.from('{}')
+  const ran = (outputs: Array<{ name: string; file: string }>, name = 'run_python') =>
+    ({ id: 't', name, args: {}, outputs: outputs.map((o) => ({ ...o, size: 1 })) })
+  const rows = [
+    user('sales.csv'),
+    { role: 'assistant' as const, attachments: [ref('4', 'png')], textAttachments: [], toolCalls: [
+      ran([{ name: 'cleaned.csv', file: ref('2', 'csv') }, { name: 'chart.png', file: ref('4', 'png') }]),
+      ran([{ name: 'cleaned.csv', file: ref('3', 'csv') }, { name: '../evil/sales.csv', file: ref('5', 'json') }]),
+      ran([{ name: 'other.json', file: ref('5', 'json') }], 'web_search'),
+      ran([{ name: 'gone.txt', file: ref('6', 'txt') }]),
+    ] },
+  ] as never[]
+  const files = await turnFiles(rows, store)
+  assert.deepEqual(files.map((f) => [f.name, f.bytes.toString('hex')]), [
+    ['chart.png', PNG.toString('hex')],
+    ['cleaned.csv', Buffer.from('v2').toString('hex')],
+    ['sales.csv', Buffer.from('{}').toString('hex')],
+  ], 'the second run\'s cleaned.csv; the code\'s sales.csv (no folders) over the user\'s older one; not another tool\'s; a gone file left out; the chart not counted as image-1')
+  // A user who attaches a new version after the run wins it back.
+  const again = await turnFiles([...rows, user('cleaned.csv')] as never[], store)
+  assert.equal(again.find((f) => f.name === 'cleaned.csv')!.bytes.toString(), 'x')
+})
+
+test('turnFiles: an output comes back under the name the code gave it, not the plain one shown to the user', async () => {
+  const ref = (c: string) => `attachment:${c.repeat(64)}.csv`
+  STORED[ref('a')] = Buffer.from('cv')
+  STORED[ref('b')] = Buffer.from('upper')
+  STORED[ref('c')] = Buffer.from('lower')
+  STORED[ref('d')] = Buffer.from('bad')
+  const rows = [{ role: 'assistant' as const, attachments: [], textAttachments: [], toolCalls: [{ id: 't', name: 'run_python', args: {}, outputs: [
+    { name: 'resume.csv', sandboxName: 'résumé.csv', file: ref('a'), size: 2 },
+    { name: 'Data.csv', file: ref('b'), size: 5 },
+    { name: 'data-2.csv', sandboxName: 'data.csv', file: ref('c'), size: 5 },
+    { name: 'x.csv', sandboxName: '../x.csv', file: ref('d'), size: 3 },
+  ] }] }] as never[]
+  const files = await turnFiles(rows, store)
+  assert.deepEqual(files.map((f) => [f.name, f.bytes.toString()]), [
+    ['résumé.csv', 'cv'], ['Data.csv', 'upper'], ['data.csv', 'lower'], ['x.csv', 'bad'],
+  ], 'Data.csv and data.csv are two files in the folder; a sandbox name that breaks the rule falls back to the plain one')
+})
+
 const result = (over: Partial<SandboxRunResult>): SandboxRunResult => ({ ok: true, stdout: '', stderr: '', files: [], skipped: [], ...over })
 
-test('describeRun: images to the store and the reply, text files back to the model, the rest named', async () => {
+test('describeRun: images shown, text files given to download and back to the model, the rest named', async () => {
   const big = 'x'.repeat(9000)
   const r = await describeRun(result({
     stdout: '12\n',
     files: [{ name: 'chart.png', bytes: PNG }, { name: 'out.csv', bytes: Buffer.from('a,b') }, { name: 'big.txt', bytes: Buffer.from(big) }],
     skipped: ['evil.exe'],
   }), store)
-  assert.deepEqual(r.files, [`attachment:${'0'.repeat(64)}.png`])
+  assert.deepEqual(r.files, [`attachment:${'0'.repeat(64)}.png`, `attachment:${'1'.repeat(64)}.csv`, `attachment:${'1'.repeat(64)}.txt`])
+  assert.deepEqual(r.outputs, [
+    { name: 'chart.png', file: `attachment:${'0'.repeat(64)}.png`, size: PNG.length },
+    { name: 'out.csv', file: `attachment:${'1'.repeat(64)}.csv`, size: 3 },
+    { name: 'big.txt', file: `attachment:${'1'.repeat(64)}.txt`, size: 9000 },
+  ])
+  assert.match(r.result, /Given to the user to download: out\.csv, big\.txt/)
   assert.match(r.result, /^Output:\n12/)
   assert.match(r.result, /out\.csv:\na,b/)
   assert.match(r.result, /\[cut off: 9000 characters in all\]/)
@@ -171,7 +266,7 @@ test('describeRun: a module the runtime does not ship is not sent to micropip', 
 // with onload, were stored and shown as images. Served as image/png with nosniff, nothing ran; they are no longer kept.
 test('describeRun: a .png or .jpg that is not really one is not stored or shown', async () => {
   const saved: string[] = []
-  const counting = { save: async (u: string[]) => { saved.push(...u); return u.map(() => `attachment:${'0'.repeat(64)}.png`) } }
+  const counting = { ...store, save: async (u: string[]) => { saved.push(...u); return u.map(() => `attachment:${'0'.repeat(64)}.png`) } }
   const JPEG = Buffer.from('ffd8ffe000104a464946', 'hex')
   const r = await describeRun(result({ files: [
     { name: 'chart.png', bytes: Buffer.from("<html><body><script>alert('x')</script></body></html>") },
@@ -187,7 +282,7 @@ test('describeRun: a .png or .jpg that is not really one is not stored or shown'
 })
 
 test('describeRun: an image the store could not keep is not claimed as shown', async () => {
-  const r = await describeRun(result({ files: [{ name: 'c.png', bytes: PNG }] }), { save: async (u: string[]) => u })
+  const r = await describeRun(result({ files: [{ name: 'c.png', bytes: PNG }] }), { save: async (u: string[]) => u, saveFile: async () => null })
   assert.deepEqual(r.files, [])
   assert.match(r.result, /could not be saved/)
 })
@@ -208,7 +303,7 @@ test('sandboxTurn: the turn\'s files go in with its first run only, and again in
   assert.deepEqual(calls.map((f) => f.length), [1, 0, 1])
   // The chat's first run is not a "new sandbox" to the model; the one after the kill is.
   assert.doesNotMatch(first.result, /new sandbox/)
-  assert.match(after.result, /^This run started a new sandbox: variables from earlier runs are gone\. The files attached in this chat are back in the folder: image-1\.png\./)
+  assert.match(after.result, /^This run started a new sandbox: variables from earlier runs are gone\. The files of this chat are back in the folder: image-1\.png\./)
 })
 
 test('sandboxTurn: a follow-up after the sandbox closed gets the chat\'s earlier files, and is told it is a new sandbox', async () => {
@@ -220,6 +315,18 @@ test('sandboxTurn: a follow-up after the sandbox closed gets the chat\'s earlier
   assert.match(r.result, /new sandbox.*back in the folder: sales\.csv\./)
 })
 
+test('sandboxTurn: the files the caps left out are named, in a fresh sandbox and in a warm one', async () => {
+  const history = Array.from({ length: 22 }, (_, i) => user(`f${i}.txt`)) as never[]
+  const run = async (warm: boolean, rows: never[]) => {
+    const manager = { has: () => warm, run: async () => result({ stdout: 'ok' }) } as unknown as SandboxManager
+    return (await sandboxTurn({ convId: 'c1', manager, store, history: () => rows }).run({ code: 'x' }, new AbortController().signal)).result
+  }
+  const fresh = await run(false, [...history, reply(true)] as never[])
+  assert.match(fresh, /^This run started a new sandbox: .* back in the folder: f2\.txt, .*, f21\.txt\. Not in the folder, a run starts with at most 20 files and 100 MB, the newest first: f1\.txt, f0\.txt\.\n\nOutput:\nok/)
+  const warm = await run(true, history)
+  assert.match(warm, /^Not in the folder, .*: f1\.txt, f0\.txt\.\n\nOutput:\nok/)
+})
+
 test('sandboxTurn: empty code, and a sandbox failure, come back as the tool\'s error text', async () => {
   const manager = { has: () => false, run: async () => { throw new SandboxError('timeout', 'The code ran longer than 60 seconds and was stopped.') } } as unknown as SandboxManager
   const turn = sandboxTurn({ convId: 'c1', manager, store, history: () => [] })
@@ -229,4 +336,80 @@ test('sandboxTurn: empty code, and a sandbox failure, come back as the tool\'s e
   // A process that ended on its own (Deno.exit, a crash) says the same: the next run is a new sandbox.
   const crashed = { has: () => false, run: async () => { throw new SandboxError('crashed', 'The sandbox stopped unexpectedly.') } } as unknown as SandboxManager
   assert.match((await sandboxTurn({ convId: 'c1', manager: crashed, store, history: () => [] }).run({ code: 'x' }, ac.signal)).result, /^Error: The sandbox stopped unexpectedly\. Variables from earlier runs are gone\.$/)
+})
+
+test('csvHasFormulaCells: a cell a spreadsheet may run, quoted or not, but not a plain number', () => {
+  for (const csv of ['a\n=SUM(A1)', 'a,@x', 'x,"=1"', 'a,b\r\n+cmd,1', 'a,\t=1', 'a,"say ""hi""",-x', '=HYPERLINK("http://x","y")', 'a,"=1'])
+    assert.equal(csvHasFormulaCells(csv), true, JSON.stringify(csv))
+  for (const csv of ['a,b\n1,2', 'n\n-5\n+3.2\n-1e5\n.5', 'a,-,+,=,@', 'x,"a=1"', '', 'note\n"hello, =world"', 'a,b\r\n1,2\r\n'])
+    assert.equal(csvHasFormulaCells(csv), false, JSON.stringify(csv))
+})
+
+test('csvHasFormulaCells: a byte order mark before the first cell, and `;` as the separator, do not hide a formula', () => {
+  for (const csv of ['﻿=1+1', '﻿a\n=1+1', 'a;=1+1', 'a;"=1"\n1;2', 'a,b;@x'])
+    assert.equal(csvHasFormulaCells(csv), true, JSON.stringify(csv))
+  for (const csv of ['﻿a,b\n1,2', 'a;b\n1;2', 'n;-5;+3.2', '"a;=1"'])
+    assert.equal(csvHasFormulaCells(csv), false, JSON.stringify(csv))
+})
+
+test('describeRun: an output keeps the name the code gave it, and the model is told both names', async () => {
+  const r = await describeRun(result({ files: [{ name: 'resume.csv', as: 'résumé.csv', bytes: Buffer.from('a') }, { name: 'plain.csv', bytes: Buffer.from('b') }] }), store)
+  assert.deepEqual(r.outputs.map((o) => [o.name, o.sandboxName]), [['resume.csv', 'résumé.csv'], ['plain.csv', undefined]])
+  assert.match(r.result, /Given to the user to download: resume\.csv \(résumé\.csv in the folder\), plain\.csv$/)
+})
+
+test('describeRun: a CSV with formula cells is marked; JSON and text are never scanned', async () => {
+  const r = await describeRun(result({ files: [
+    { name: 'risky.csv', bytes: Buffer.from('a\n=1+1') },
+    { name: 'safe.csv', bytes: Buffer.from('a\n-1') },
+    { name: 'x.txt', bytes: Buffer.from('=1+1') },
+  ] }), store)
+  assert.deepEqual(r.outputs.map((o) => [o.name, o.formulaCells ?? false]), [['risky.csv', true], ['safe.csv', false], ['x.txt', false]])
+})
+
+test('describeRun: files beyond the chat\'s room are not kept, and both the model and the user are told', async () => {
+  const r = await describeRun(result({ files: [
+    { name: 'a.csv', bytes: Buffer.alloc(60, 'a') },
+    { name: 'chart.png', bytes: Buffer.concat([PNG, Buffer.alloc(52)]) },
+    { name: 'b.csv', bytes: Buffer.alloc(30, 'b') },
+  ] }), store, RESULT_MAX_CHARS, 100)
+  assert.deepEqual(r.outputs.map((o) => o.name), ['a.csv', 'b.csv'], 'the chart did not fit what was left; the smaller CSV after it did')
+  assert.deepEqual(r.notKept, ['chart.png'], 'named apart from the result too, for the card')
+  assert.match(r.result, /Not kept for the user, this chat's files have reached 500 MB: chart\.png\. Deleting older messages with files makes room\./)
+  assert.match(r.result, /a\.csv:\na{60}/, 'a CSV that was not kept still comes back to the model as text')
+  const none = await describeRun(result({ files: [{ name: 'c.csv', bytes: Buffer.from('c') }] }), store, RESULT_MAX_CHARS, 0)
+  assert.deepEqual(none.files, [])
+  assert.deepEqual(none.notKept, ['c.csv'])
+  assert.match(none.result, /c\.csv:\nc/)
+})
+
+test('chatFilesBytes: each stored file once, however many rows name it, plus files not on a row yet', () => {
+  const ref = (c: string, ext = 'png') => `attachment:${c.repeat(64)}.${ext}`
+  const sizes: Record<string, number> = { [`${'a'.repeat(64)}.png`]: 10, [`${'b'.repeat(64)}.csv`]: 20, [`${'c'.repeat(64)}.json`]: 40 }
+  const sized = { size: (id: string) => sizes[id] ?? null }
+  const rows = [{ attachments: [ref('a'), 'data:image/png;base64,AAAA'] }, { attachments: [ref('a'), ref('b', 'csv')] }, { attachments: [ref('d')] }]
+  assert.equal(chatFilesBytes(rows, [], sized), 30, 'a named twice counts once; an inline image and a gone file count nothing')
+  assert.equal(chatFilesBytes(rows, [ref('c', 'json'), ref('b', 'csv')], sized), 70)
+})
+
+test('sandboxTurn: the chat\'s 500 MB counts what its rows name and what this turn already kept', async () => {
+  const BIG = 300 * 1024 * 1024
+  const old = `attachment:${'a'.repeat(64)}.png`
+  const sized = { ...store, size: (id: string) => (id === old.slice('attachment:'.length) ? BIG : id.endsWith('.csv') ? BIG / 2 : null) }
+  let warm = false
+  const manager = {
+    has: () => warm,
+    run: async () => { warm = true; return result({ files: [{ name: 'out.csv', bytes: Buffer.alloc(8) }] }) },
+  } as unknown as SandboxManager
+  const turn = sandboxTurn({ convId: 'c1', manager, store: sized, history: () => [{ role: 'assistant', toolCalls: [], attachments: [old], textAttachments: [] }] })
+  const first = await turn.run({ code: 'x' }, new AbortController().signal)
+  assert.equal(first.files.length, 1, 'kept: 300 MB used, room left')
+  const second = await turn.run({ code: 'x' }, new AbortController().signal)
+  assert.equal(second.files.length, 1, 'the same bytes again: the store counts the stored CSV once')
+  const full = { ...sized, saveFile: async (_b: Buffer, ext: string) => `attachment:${'e'.repeat(64)}.${ext}`, size: (id: string) => (id.startsWith('e') ? 250 * 1024 * 1024 : sized.size(id)) }
+  const turn2 = sandboxTurn({ convId: 'c2', manager, store: full, history: () => [{ role: 'assistant', toolCalls: [], attachments: [old], textAttachments: [] }] })
+  assert.equal((await turn2.run({ code: 'x' }, new AbortController().signal)).files.length, 1, '300 MB used: kept')
+  const over = await turn2.run({ code: 'x' }, new AbortController().signal)
+  assert.deepEqual(over.files, [], '300 MB on rows + 250 MB kept earlier this turn: no room')
+  assert.match(over.result, /this chat's files have reached 500 MB: out\.csv/)
 })

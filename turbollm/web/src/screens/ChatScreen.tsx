@@ -1544,7 +1544,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                 <DropdownMenuSeparator />
                 <DropdownMenuItem className="text-[13px]" onSelect={() => { track('chat', 'export_chat'); handleExportChat() }}>
                   <Download size={13} className="text-muted" />
-                  Export chat
+                  {/* The export carries the messages only (chat-export.ts files_included). */}
+                  <span className="flex flex-col">
+                    Export chat
+                    <span className="text-[11px] text-muted">Images and files are not included</span>
+                  </span>
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
