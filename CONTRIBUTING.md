@@ -47,7 +47,12 @@ npm run build:core           # builds the addon for this machine; rerun after an
 ```
 
 Without it the daemon stops at startup with "TurboLLM's native core is not available for this
-system". Rust tests, the Android library, goldens, versioning and releases are described in
+system". On Linux, `cargo xtask` also needs `libssl-dev` and `pkg-config`. The engine
+crates (`turbollm-engine*`) load llama.cpp and LiteRT-LM at run time and sit behind the
+off-by-default `engines`/`llama`/`litert` features, so building the addon needs no C++ toolchain
+and no native engine library; only `cargo xtask build-llama` needs CMake. Real-native engine tests
+skip locally when `TURBOLLM_LLAMA_LIB_DIR`, `TURBOLLM_TEST_GGUF`, `TURBOLLM_LITERT_LIB` or
+`TURBOLLM_TEST_LITERTLM` is unset, and fail on CI; how to set them is in the core README. Rust tests, the Android library, goldens, versioning and releases are described in
 [`turbollm/core/README.md`](turbollm/core/README.md).
 
 ## Before you open a PR

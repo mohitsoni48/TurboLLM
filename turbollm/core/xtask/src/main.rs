@@ -1,5 +1,6 @@
 mod elf;
 mod goldens;
+mod litert;
 mod llama;
 mod uniffi;
 mod version;
@@ -19,7 +20,10 @@ uniffi-kotlin --lib <library> --out <dir>  generate Kotlin bindings from a built
 check-android-elf <file> [--needs <library>]  fail unless every PT_LOAD is 16 KB aligned (and <library> is DT_NEEDED)\n  \
 check-glibc --max <x.y> <file>  fail if the file needs a GLIBC_ symbol version above <x.y>\n  \
 fetch-llama --out <dir>  put the pinned, sha256-checked llama.cpp source at <dir>/llama.cpp\n  \
-build-llama --host [--variant base]  CMake-build turbollm_core_llama_<variant> into target/llama/<host-triple>";
+build-llama --host [--variant base]  CMake-build turbollm_core_llama_<variant> into target/llama/<host-triple>\n  \
+fetch-litert --abis <arm64-v8a,x86_64> --out <dir>  stage the pinned LiteRT-LM library per Android ABI\n  \
+fetch-litert --host --out <dir>  stage the pinned LiteRT-LM library for this OS\n  \
+check-litert-packaged <aar> [--abis <list>]  fail unless the AAR's LiteRT library is byte-identical to the pin";
 const FAILURE_EXIT: u8 = 1;
 const UNKNOWN_COMMAND_EXIT: u8 = 2;
 
@@ -34,6 +38,8 @@ fn main() -> ExitCode {
         "check-glibc" => check_glibc(),
         "fetch-llama" => fetch_llama(),
         "build-llama" => build_llama(),
+        "fetch-litert" => fetch_litert(),
+        "check-litert-packaged" => check_litert_packaged(),
         _ => {
             eprintln!("unknown command {command:?}\n{USAGE}");
             return ExitCode::from(UNKNOWN_COMMAND_EXIT);
@@ -150,6 +156,59 @@ fn build_llama() -> Result<(), String> {
     Ok(())
 }
 
+fn check_litert_packaged() -> Result<(), String> {
+    let request = litert::parse_packaged_request(&command_args())?;
+    let runtime = litert::parse_runtime(&read(&litert_runtime_pin())?)?;
+    let abis = request
+        .abis
+        .unwrap_or_else(|| runtime.android.keys().cloned().collect());
+    for line in litert::check_packaged(&runtime, &read_bytes(&request.aar)?, &abis)? {
+        println!("check-litert-packaged: {line}, ok");
+    }
+    Ok(())
+}
+
+fn fetch_litert() -> Result<(), String> {
+    let request = litert::parse_request(&command_args())?;
+    let runtime = litert::parse_runtime(&read(&litert_runtime_pin())?)?;
+    let mut places = litert::Places {
+        cache_dir: core_dir().join("target").join("cache").join("litert"),
+        out_dir: PathBuf::new(),
+    };
+    let staged = match request {
+        litert::Request::Android { abis, out } => {
+            places.out_dir = out;
+            litert::stage_android(&runtime, &abis, &places, &llama::HttpsFetcher)?
+        }
+        litert::Request::Host { out } => {
+            places.out_dir = out;
+            let key = litert::host_key(env::consts::OS, env::consts::ARCH)?;
+            vec![litert::stage_host(
+                &runtime,
+                key,
+                &places,
+                &llama::HttpsFetcher,
+            )?]
+        }
+    };
+    for library in &staged {
+        println!(
+            "fetch-litert: {} {}: wheel {}, library sha256 {}{}, wrote {}",
+            runtime.version,
+            library.target,
+            library.wheel,
+            library.library_sha256,
+            if library.library_pinned {
+                ""
+            } else {
+                " (not pinned yet: add it to litert-runtime.json)"
+            },
+            library.file.display()
+        );
+    }
+    Ok(())
+}
+
 fn fetched_llama_tree(out_dir: PathBuf) -> Result<PathBuf, String> {
     let source = llama::parse_source(&read(&llama_source_pin())?)?;
     let places = llama::SourcePlaces {
@@ -236,6 +295,13 @@ fn llama_crate_dir() -> PathBuf {
     core_dir().join("crates").join("turbollm-engine-llama")
 }
 
+fn litert_runtime_pin() -> PathBuf {
+    core_dir()
+        .join("crates")
+        .join("turbollm-engine-litert")
+        .join("litert-runtime.json")
+}
+
 fn workspace_manifest() -> PathBuf {
     core_dir().join("Cargo.toml")
 }
@@ -249,4 +315,24 @@ fn package_json() -> PathBuf {
 
 fn read(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::USAGE;
+
+    #[test]
+    fn every_command_line_of_the_usage_text_is_indented_two_spaces_and_none_is_blank() {
+        let commands = USAGE
+            .split_once("commands:\n")
+            .expect("a commands: heading")
+            .1;
+        for line in commands.lines() {
+            assert!(
+                line.starts_with("  ") && !line.trim().is_empty(),
+                "{line:?}"
+            );
+        }
+        assert_eq!(commands.lines().count(), 11, "{commands}");
+    }
 }

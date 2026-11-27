@@ -21,6 +21,9 @@ tar = { version = "=0.4.46", default-features = false }
 # its platform verifier pulls webpki-root-certs, both CDLA-Permissive-2.0, which deny.toml does not allow
 # (plan P-22). On Linux this needs the OpenSSL development headers.
 ureq = { version = "=3.5.2", default-features = false, features = ["native-tls-no-default"] }
+# fetch-litert: read the library out of the pinned LiteRT-LM wheel (plan T21). deflate-flate2 reuses flate2 above and
+# leaves out the default bzip2/lzma/zstd/aes back-ends, which the wheels do not use.
+zip = { version = "=9.8.2", default-features = false, features = ["deflate-flate2"] }
 # build-llama --host: the host's shared-library file name (libloading::library_filename) (plan T13).
 turbollm-platform = { path = "../crates/turbollm-platform" }
 

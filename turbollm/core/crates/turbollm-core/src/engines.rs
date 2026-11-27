@@ -1,6 +1,6 @@
 //! The engine layer as a binding holds it (arch 2.6): each `Engines` handle owns one tokio runtime
 //! and one `EngineManager`; nothing is process-wide (B-5). The catalogue is the native engines this
-//! build compiles in (feature `llama`; LiteRT-LM arrives with `litert`), then the `extra` engines.
+//! build compiles in (feature `llama`, then `litert`), then the `extra` engines.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::task::{JoinError, JoinHandle};
-#[cfg(feature = "llama")]
+#[cfg(any(feature = "llama", feature = "litert"))]
 use turbollm_engine::InProcess;
 use turbollm_engine::{
     Catalog, CatalogEntry, Engine, EngineError, EngineId, EngineManager, LoadJournal,
@@ -167,14 +167,19 @@ fn native_then_extra(
 /// The engines compiled into this build (arch 2.6: llama, then litert), each reading its library
 /// from `library_dir` (Android's `nativeLibraryDir`) or the loader's search path.
 #[cfg_attr(
-    not(feature = "llama"),
+    not(any(feature = "llama", feature = "litert")),
     expect(unused_variables, reason = "no native engine is compiled in")
 )]
 fn native_entries(library_dir: Option<PathBuf>) -> Vec<CatalogEntry> {
     [
         #[cfg(feature = "llama")]
         CatalogEntry::llama_cpp_cpu(Arc::new(InProcess::new(
-            turbollm_engine_llama::LlamaBackend::new(library_dir)
+            turbollm_engine_llama::LlamaBackend::new(library_dir.clone())
+                .with_log(crate::platform_log::platform_log()),
+        ))),
+        #[cfg(feature = "litert")]
+        CatalogEntry::litert_lm(Arc::new(InProcess::new(
+            turbollm_engine_litert::LiteRtBackend::new(library_dir)
                 .with_log(crate::platform_log::platform_log()),
         ))),
     ]
@@ -492,6 +497,67 @@ mod tests {
         assert!(!journal.exists());
     }
 
+    #[cfg(all(feature = "llama", feature = "litert"))]
+    #[test]
+    fn the_catalogue_lists_llama_then_litert_then_the_extra_engines() {
+        let dir = TempDir::new().unwrap();
+        let cfg = config_in(dir.path());
+        let lineup = native_then_extra(
+            cfg.library_dir.clone(),
+            vec![scripted(backend_named("extra-gguf"))],
+        );
+
+        let engines = Engines::hosting(android_host(), lineup, cfg, None).unwrap();
+
+        let hosted = engines.manager().catalog().hosted();
+        let ids: Vec<&str> = hosted.iter().map(|(d, _)| d.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [EngineId::LLAMA_CPP_CPU, EngineId::LITERT_LM, "extra-gguf"]
+        );
+        assert_eq!(
+            hosted[1].1,
+            Availability::Available,
+            "the probe loads no native code"
+        );
+    }
+
+    #[cfg(feature = "litert")]
+    #[tokio::test]
+    async fn a_litert_load_without_its_library_fails_unavailable_and_the_catalogue_marks_it() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config_in(dir.path());
+        let empty = TempDir::new().unwrap();
+        cfg.library_dir = Some(empty.path().to_path_buf());
+        let lineup = native_then_extra(cfg.library_dir.clone(), vec![]);
+        let engines = Engines::hosting(android_host(), lineup, cfg, None).unwrap();
+
+        let failure = load_litertlm(&engines, dir.path(), "org/repo/a")
+            .await
+            .unwrap_err();
+
+        let EngineError::EngineUnavailable {
+            engine,
+            kind,
+            reason,
+        } = failure
+        else {
+            panic!("expected EngineUnavailable, got {failure:?}");
+        };
+        assert_eq!(engine, EngineId::new(EngineId::LITERT_LM));
+        assert_eq!(kind, EngineKind::LitertLm);
+        assert!(
+            reason.starts_with("LiteRT-LM cannot run on this device: "),
+            "{reason}"
+        );
+        let hosted = engines.manager().catalog().hosted();
+        let (_, availability) = hosted
+            .iter()
+            .find(|(d, _)| d.id.as_str() == EngineId::LITERT_LM)
+            .expect("litert-lm is listed");
+        assert_eq!(*availability, Availability::Unavailable { reason });
+    }
+
     #[cfg(feature = "llama")]
     #[test]
     fn with_the_llama_feature_llama_cpp_is_listed_before_the_extra_engines() {
@@ -506,7 +572,8 @@ mod tests {
 
         let hosted = engines.manager().catalog().hosted();
         let ids: Vec<&str> = hosted.iter().map(|(d, _)| d.id.as_str()).collect();
-        assert_eq!(ids, [EngineId::LLAMA_CPP_CPU, "extra-gguf"]);
+        assert_eq!(ids.first(), Some(&EngineId::LLAMA_CPP_CPU));
+        assert_eq!(ids.last(), Some(&"extra-gguf"));
         assert_eq!(
             hosted[0].1,
             Availability::Available,
@@ -553,7 +620,8 @@ mod tests {
 
         let hosted = engines.manager().catalog().hosted();
         let ids: Vec<&str> = hosted.iter().map(|(d, _)| d.id.as_str()).collect();
-        assert_eq!(ids, [EngineId::LLAMA_CPP_CPU]);
+        let llama_rows = ids.iter().filter(|id| **id == EngineId::LLAMA_CPP_CPU);
+        assert_eq!(llama_rows.count(), 1, "one llama.cpp row: {ids:?}");
         assert_eq!(
             record.history(),
             ["open"],
@@ -685,6 +753,22 @@ mod tests {
         id: &str,
     ) -> Result<turbollm_engine::LoadedModelInfo, EngineError> {
         start_load(engines, dir, id).await.unwrap()
+    }
+
+    #[cfg(feature = "litert")]
+    async fn load_litertlm(
+        engines: &Engines,
+        dir: &Path,
+        id: &str,
+    ) -> Result<turbollm_engine::LoadedModelInfo, EngineError> {
+        let target = LoadTarget {
+            format: ModelFormat::Litertlm,
+            engine: EngineId::new(EngineId::LITERT_LM),
+            path: dir.join(format!("{id}.litertlm")),
+            ..target_in(dir, id)
+        };
+        let claim = engines.manager().claim_load(target).unwrap();
+        engines.spawn(claim.run()).await.unwrap()
     }
 
     async fn generate(

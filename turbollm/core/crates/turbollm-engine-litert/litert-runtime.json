@@ -1,0 +1,47 @@
+{
+  "version": "0.19.0",
+  "android": {
+    "arm64-v8a": {
+      "file": "litert_lm_api-0.19.0-py3-none-android_23_arm64_v8a.whl",
+      "url": "https://files.pythonhosted.org/packages/86/99/cdbc6aded2dc6180cc488555c3988521eeca97138b41e1c7850e1cf9d22f/litert_lm_api-0.19.0-py3-none-android_23_arm64_v8a.whl",
+      "sha256": "16fa661fda495154a17e3c726948e81f3ab3e4ad7ea76a4c4f4cca3116d4b837",
+      "member": "litert_lm/liblitert-lm.so",
+      "librarySha256": "28fa8433febc49a99f4bd3ef8cb82c2912457cfe274d97944debeabdeb97fc78",
+      "elfMachine": 183
+    },
+    "x86_64": {
+      "file": "litert_lm_api-0.19.0-py3-none-android_23_x86_64.whl",
+      "url": "https://files.pythonhosted.org/packages/fe/01/34b34e8ee955bca1d628a92d757734f5b44df8729d4d0cf7022ef8b710f6/litert_lm_api-0.19.0-py3-none-android_23_x86_64.whl",
+      "sha256": "6160f13a3ffef8a5a404fb463f2b7542754b4934f7b0a1a0309a936a314f6371",
+      "member": "litert_lm/liblitert-lm.so",
+      "librarySha256": "b9dcd7df99e7a46b0aa0875c267012bdd35e88e28d3501fed0a1dc28eee93e7c",
+      "elfMachine": 62
+    }
+  },
+  "host": {
+    "linux-x86_64": {
+      "file": "litert_lm_api-0.19.0-py3-none-manylinux_2_27_x86_64.whl",
+      "url": "https://files.pythonhosted.org/packages/73/07/f2817c145fd04983607d830259e620700638a426ed7b9dda50722a737c90/litert_lm_api-0.19.0-py3-none-manylinux_2_27_x86_64.whl",
+      "sha256": "c5a8a9538acffbd01530eab812424c0e96a2c193b4b16b8f8df630a8d346be76",
+      "member": "litert_lm/liblitert-lm.so",
+      "librarySha256": "35175c60e0a9becef03b53fd0b3fc0ce3d25a0aa71168f13483ec9d59a9a6465",
+      "elfMachine": 62
+    },
+    "macos-aarch64": {
+      "file": "litert_lm_api-0.19.0-py3-none-macosx_12_0_arm64.whl",
+      "url": "https://files.pythonhosted.org/packages/ce/a1/8686d7c8323d15680c9d3c0a950c6349c03390d4f2c69180095075a1587c/litert_lm_api-0.19.0-py3-none-macosx_12_0_arm64.whl",
+      "sha256": "6f2a517266fe4dcac451ce8f41c45c02ef08078a6589e5e0253197937e1f70a5",
+      "member": "litert_lm/liblitert-lm.dylib",
+      "librarySha256": "0e1eba3a125295322af745502fdfb3f76c57b012696c20744764e83b51baec9e",
+      "elfMachine": null
+    },
+    "windows-x86_64": {
+      "file": "litert_lm_api-0.19.0-py3-none-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/dc/aa/a987eeb80356d7b8550bd6826350cd9b4d1b84ab5d2925d53822b2e23d16/litert_lm_api-0.19.0-py3-none-win_amd64.whl",
+      "sha256": "95d586194883daf7f298be7b97fe1ca16fc7b1c2839d08a7e182b1da48156d63",
+      "member": "litert_lm/litert-lm.dll",
+      "librarySha256": "aece59d4d7939ac551c5f05bb520185553ba594e2a41d3003499fb1adcf2a7dc",
+      "elfMachine": null
+    }
+  }
+}

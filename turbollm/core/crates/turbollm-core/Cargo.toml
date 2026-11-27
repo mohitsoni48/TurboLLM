@@ -12,16 +12,19 @@ rust-version.workspace = true
 engines = ["dep:turbollm-engine", "dep:turbollm-platform", "dep:tokio"]
 # llama.cpp in the catalogue (plan T18); turbollm-ffi turns it on, the napi addon never does.
 llama = ["engines", "dep:turbollm-engine-llama"]
+# LiteRT-LM in the catalogue (plan T25), after llama.cpp; turbollm-ffi turns it on, the napi addon never does.
+litert = ["engines", "dep:turbollm-engine-litert"]
 
 [dependencies]
 turbollm-gguf = { path = "../turbollm-gguf" }
 turbollm-engine = { path = "../turbollm-engine", optional = true }
 turbollm-platform = { path = "../turbollm-platform", optional = true }
 turbollm-engine-llama = { path = "../turbollm-engine-llama", optional = true }
+turbollm-engine-litert = { path = "../turbollm-engine-litert", optional = true }
 tokio = { version = "=1.54.1", features = ["rt", "rt-multi-thread", "time"], optional = true }
 
 [dev-dependencies]
-turbollm-core = { path = ".", features = ["llama"] }
+turbollm-core = { path = ".", features = ["llama", "litert"] }
 turbollm-engine = { path = "../turbollm-engine", features = ["testing"] }
 tempfile = "=3.27.0"
 tokio = { version = "=1.54.1", features = ["macros", "rt", "time"] }

@@ -20,8 +20,7 @@ core/
   rust-toolchain.toml         Rust 1.100.0 + the 3 targets used locally
   .cargo/config.toml          `cargo xtask` alias; 16 KB page alignment for Android; dynamic musl
   deny.toml                   cargo-deny license and advisory policy (run in CI)
-  crates/turbollm-gguf/       pure domain crate: the GGUF header parser
-  crates/turbollm-core/       runtime crate: core_info, re-exports `gguf`
+  crates/                     the crates below
   bindings/node/              napi-rs addon (crate turbollm-node); npm/<target>/ = the 9 platform package templates
   bindings/uniffi/            UniFFI crate turbollm-ffi -> Kotlin (library turbollm_core_ffi)
   bindings/android/           standalone Gradle build of the Android library (AAR) `turbollm-core`
@@ -30,12 +29,49 @@ core/
   xtask/                      repo tasks in Rust (`cargo xtask <command>`)
 ```
 
+## Crates
+
+| Crate | Owns |
+|---|---|
+| `turbollm-gguf` | The GGUF header parser. A pure domain crate with no binding dependencies. |
+| `turbollm-platform` | Host facts: OS, architecture and ABI, CPU feature flags, the default inference thread count, the file name of a shared library on this OS and the order in which to look for one. It starts no processes. |
+| `turbollm-engine` | The engine domain: ids, formats, backends and descriptors; the `Engine` and `LoadedModel` traits; the in-process kind (one OS thread per loaded model); the catalogue and its resolve rules; the `EngineManager` state machine, generation gate, stall watch and load journal; `EngineError`. |
+| `turbollm-engine-llama` | The llama.cpp backend: chooses the library variant, loads `libturbollm_core_llama_<variant>` at run time, and runs the reply loop. Its `native/` folder holds the C++ session and C ABI that CMake builds. |
+| `turbollm-engine-litert` | The LiteRT-LM backend: loads Google's LiteRT-LM C library at run time, shapes the prompt, streams the reply and opens on the GPU before the CPU. |
+| `turbollm-core` | The runtime crate: `core_info`, re-exports `gguf`, and (behind the features below) `engines::Engines`, which builds the catalogue from the compiled backends and owns the tokio runtime for engine tasks. |
+
+`bindings/node` (`turbollm-node`) and `bindings/uniffi` (`turbollm-ffi`) are thin wrappers over `turbollm-core`.
+
+### Cargo features
+
+`turbollm-core` has three features, all off by default:
+
+- `engines`: the engine layer (`turbollm-engine`, `turbollm-platform`, tokio).
+- `llama`: `engines` plus the llama.cpp backend.
+- `litert`: `engines` plus the LiteRT-LM backend.
+
+They are off by default so that the napi addon (the 9 npm binaries and the nodejs-mobile addon) pulls in no engine
+code and no tokio. Only `turbollm-ffi`, the Android library, turns on `llama` and `litert`. To build or test them on
+the host, name them: `cargo test -p turbollm-core --features llama,litert`.
+
+### Native engines are loaded at run time
+
+llama.cpp and LiteRT-LM are `dlopen`ed (through `libloading`) from shared libraries. No crate compiles C++ in a cargo
+build: the llama.cpp library is built by CMake through `cargo xtask build-llama`, and the LiteRT-LM library is
+Google's own binary, fetched and checked against a sha256 pin by `cargo xtask fetch-litert`. `cargo build` and
+`cargo test --workspace` therefore never need a C++ toolchain.
+
 ## Prerequisites
 
 - **Rust 1.100.0 through rustup.** `rust-toolchain.toml` pins it; the first `cargo` command in `core/` installs that
   toolchain with `rustfmt`, `clippy` and the targets `x86_64-pc-windows-msvc`, `aarch64-linux-android`,
   `x86_64-linux-android`. On Windows you also need the MSVC build tools. Other hosts add their own target, for
   example `rustup target add x86_64-unknown-linux-gnu`.
+- **A host build toolchain for `xtask`.** `xtask` downloads over HTTPS with the platform's TLS library: schannel on
+  Windows, Security.framework on macOS, OpenSSL on Linux. On Linux install the OpenSSL headers and pkg-config first
+  (`sudo apt-get install libssl-dev pkg-config`), or no `cargo xtask` command builds. `cargo xtask build-llama`
+  also needs CMake and a C++ compiler (Visual Studio build tools on Windows, Xcode command line tools on macOS,
+  `build-essential` on Linux).
 - **Node 22** for the addon and the scripts (`turbollm/` dependencies installed).
 - **Android only:** an Android SDK (`sdk.dir` in `bindings/android/local.properties`, which is gitignored), NDK
   `27.0.12077973` (the Gradle default; override with `-Pturbollm.ndkVersion=...`), `cargo install cargo-ndk --version
@@ -93,6 +129,59 @@ or directly `node core/scripts/build-node.mjs --flavour nodejs-mobile --libnode-
 [--target android-arm64|android-x64] [--release]`. Each output is checked with `cargo xtask check-android-elf <file>
 --needs libnode.so` (16 KB `PT_LOAD` alignment and the `libnode.so` dependency). This is a different binary from the
 npm `android-arm64` target, which is for Termux.
+
+## Engines: build and test
+
+Three `xtask` commands prepare the native libraries (run from `turbollm/core/`):
+
+```
+cargo xtask fetch-llama --out target/llama/src     # pinned, sha256-checked llama.cpp source at target/llama/src/llama.cpp
+cargo xtask build-llama --host                     # CMake-build turbollm_core_llama_base into target/llama/<host-triple>
+cargo xtask fetch-litert --host --out target/litert   # pinned LiteRT-LM library for this OS
+```
+
+- `fetch-llama` reads the pin in `crates/turbollm-engine-llama/llama-source.json` and does nothing when the tree is
+  already there. `build-llama --host` uses `target/llama/src` as the source folder, so fetch there first. `--variant
+  <name>` picks another variant (default `base`).
+- `fetch-litert --host` supports Linux x86_64, macOS aarch64 and Windows x86_64; the pins are in
+  `crates/turbollm-engine-litert/litert-runtime.json`. Android ABIs use `--abis arm64-v8a,x86_64` instead of
+  `--host`; Gradle runs that for you (below).
+- `check-litert-packaged <aar> [--abis <list>]` fails unless each ABI's LiteRT library inside the AAR hashes to the pin. The
+  module keeps that file's debug symbols (`keepDebugSymbols`), because AGP strips them otherwise. An app that packages
+  the AAR needs the same `packaging { jniLibs { keepDebugSymbols += "**/libturbollm_core_litertlm.so" } }` line, or its
+  own packaging strips the library again.
+
+**Real-native tests** load those libraries and a small model. They read four environment variables:
+
+| Variable | Names |
+|---|---|
+| `TURBOLLM_LLAMA_LIB_DIR` | the folder `build-llama --host` wrote, e.g. `target/llama/<host-triple>` |
+| `TURBOLLM_TEST_GGUF` | a small GGUF model |
+| `TURBOLLM_LITERT_LIB` | the library `fetch-litert --host` staged, e.g. `target/litert/liblitert-lm.so` on Linux |
+| `TURBOLLM_TEST_LITERTLM` | a small `.litertlm` model |
+
+The two models CI uses, with their pinned download URLs and sha256 values, are listed in
+`fixtures/engines/README.md`. A relative path is read from `core/`.
+
+The rule: **a variable that is unset skips its tests locally (they print why) and fails them when `CI=true`**, so a
+native test can never pass vacuously on CI. Run the engine tests one at a time, because only one native engine may be
+loaded at once:
+
+```
+cargo test -p turbollm-engine-llama -- --test-threads=1
+cargo test -p turbollm-engine-litert -- --test-threads=1
+cargo test -p turbollm-core --features llama,litert -- --test-threads=1
+```
+
+`cargo test --workspace` without the variables still passes: the fake-table tests need no native library.
+
+**Android Gradle properties** (`bindings/android/`, `-P<name>=<value>` or `gradle.properties`):
+
+- `turbollm.engines`: whether the library packages the llama.cpp variant libraries and the LiteRT-LM runtime. The
+  build's default is `false`; `bindings/android/gradle.properties` sets it to `true`, so builds from that folder
+  include the engines unless you pass `-Pturbollm.engines=false`.
+- `turbollm.allLlamaVariants`: `true` builds all three llama variants (`base`, `dotprod`, `i8mm`) in Debug builds;
+  otherwise Debug builds only `base`. Release builds always build all three.
 
 ## Goldens and the corpus
 

@@ -20,9 +20,10 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * llama.cpp through the UniFFI engine surface on a device (plan T19; the device half of the old SDK's
- * `LlamaCppEngineTest`): the variant libraries the core module packages, opened by bare name, running the GGUF named
- * by the instrumentation argument `turbollmTestGguf`. Without it the tests are skipped, except on CI, where they fail.
+ * llama.cpp and LiteRT-LM through the UniFFI engine surface on a device (plans T19 and T25; the device half of the
+ * old SDK's `LlamaCppEngineTest` and `LiteRtLmEngineTest`): the libraries the core module packages, opened by bare
+ * name, running the GGUF named by the instrumentation argument `turbollmTestGguf` and the `.litertlm` named by
+ * `turbollmTestLitertlm`, on the CPU. Without its argument a test is skipped, except on CI, where it fails.
  */
 @RunWith(AndroidJUnit4::class)
 class EnginesInstrumentedTest {
@@ -42,6 +43,14 @@ class EnginesInstrumentedTest {
 
         assertEquals(LLAMA_CPP_CPU, first.descriptor.id)
         assertNull(first.unavailableReason)
+    }
+
+    @Test(timeout = TEST_MILLIS)
+    fun liteRtLmIsListedSecondAndAvailable() {
+        val second = core.list()[1]
+
+        assertEquals(LITERT_LM, second.descriptor.id)
+        assertNull(second.unavailableReason)
     }
 
     @Test(timeout = TEST_MILLIS)
@@ -128,6 +137,49 @@ class EnginesInstrumentedTest {
         }
     }
 
+    @Test(timeout = TEST_MILLIS)
+    fun aLiteRtLmReplyStreamsTextAndEndsWithDoneOnTheCpu() = runBlocking {
+        val loaded = core.load(liteRtTarget(testModelPath(LITERT_MODEL_ARGUMENT)))
+
+        val events = core.reply(QUESTION)
+
+        assertEquals(CoreBackend.CPU, loaded.backend)
+        assertIs<CoreEngineEvent.Prefilled>(events.first())
+        assertTrue(events.any { it is CoreEngineEvent.Text }, "the model generated no text")
+        assertIs<CoreEngineEvent.Done>(events.last())
+    }
+
+    @Test(timeout = TEST_MILLIS)
+    fun cancellingALiteRtLmReplyEndsPromptlyAndTheNextReplyWorks() = runBlocking {
+        core.load(liteRtTarget(testModelPath(LITERT_MODEL_ARGUMENT)))
+        val endless = withTimeout(AWAIT_MILLIS) { core.generate(request(maxTokens = ENDLESS_TOKENS)) }
+        try {
+            while (withTimeout(GENERATION_MILLIS) { endless.next() } !is CoreEngineEvent.Text) continue
+        } finally {
+            endless.cancel()
+            endless.close()
+        }
+
+        val next = withTimeout(CANCEL_MILLIS) { core.reply(SHORT) }
+
+        assertIs<CoreEngineEvent.Done>(next.last())
+    }
+
+    @Test(timeout = TEST_MILLIS)
+    fun aLlamaCppModelLoadsAfterALiteRtLmModelWasUnloaded() = runBlocking {
+        val liteRtModel = testModelPath(LITERT_MODEL_ARGUMENT)
+        val ggufModel = testModelPath(MODEL_ARGUMENT)
+        core.load(liteRtTarget(liteRtModel))
+        assertIs<CoreEngineEvent.Done>(core.reply(SHORT).last())
+        withTimeout(AWAIT_MILLIS) { core.unload() }
+        assertIs<CoreEngineState.Idle>(core.snapshot().state)
+
+        core.load(target(ggufModel))
+        val events = core.reply(SHORT)
+
+        assertIs<CoreEngineEvent.Done>(events.last())
+    }
+
     private fun config() = CoreEngineConfig(
         cacheDir = context.cacheDir.path,
         nativeLibraryDir = context.applicationInfo.nativeLibraryDir,
@@ -164,10 +216,10 @@ class EnginesInstrumentedTest {
         while (true) events += next() ?: return events
     }
 
-    private fun testModelPath(): String {
-        val path = InstrumentationRegistry.getArguments().getString(MODEL_ARGUMENT)
-        check(path != null || !onCi()) { "Pass the GGUF path as the instrumentation argument $MODEL_ARGUMENT." }
-        assumeTrue("no $MODEL_ARGUMENT instrumentation argument", path != null)
+    private fun testModelPath(argument: String = MODEL_ARGUMENT): String {
+        val path = InstrumentationRegistry.getArguments().getString(argument)
+        check(path != null || !onCi()) { "Pass the model path as the instrumentation argument $argument." }
+        assumeTrue("no $argument instrumentation argument", path != null)
         return checkNotNull(path)
     }
 
@@ -181,7 +233,9 @@ class EnginesInstrumentedTest {
         const val JOURNAL_POLL_MILLIS = 1L
         const val ENDLESS_TOKENS = 512
         const val MODEL_ARGUMENT = "turbollmTestGguf"
+        const val LITERT_MODEL_ARGUMENT = "turbollmTestLitertlm"
         const val LLAMA_CPP_CPU = "llama.cpp-cpu"
+        const val LITERT_LM = "litert-lm"
         const val LLAMA_LIBRARY_PREFIX = "libturbollm_core_llama_"
         const val GPU_UNAVAILABLE_NOTE = "GPU is not available for llama.cpp in M1; ran on CPU"
 
@@ -213,6 +267,12 @@ class EnginesInstrumentedTest {
             contextSize = 1024,
             threads = 2,
             backend = backend,
+        )
+
+        fun liteRtTarget(model: String) = target(model, CoreBackend.CPU).copy(
+            format = CoreModelFormat.LITERTLM,
+            engineId = LITERT_LM,
+            contextSize = 2048,
         )
     }
 }
