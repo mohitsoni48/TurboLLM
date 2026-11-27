@@ -170,6 +170,22 @@ test('android-library builds the AAR, runs the JVM goldens and minifies the R8 c
   assert.ok(run.includes('chmod +x'), 'gradlew is not executable in git')
 })
 
+// A JNA thread detached under running Java code only prints on a desktop JVM, where the build still passes; ART aborts
+// the app on it (the r8-consumer engine tests on the emulator). The JVM job fails on the message instead.
+test('android-library fails when a JVM test prints that JNA could not detach a thread', () => {
+  const job = jobs['android-library']
+  const build = stepRunning(job, ':turbollm-core:testDebugUnitTest')
+  const check = stepRunning(job, 'JNA: could not detach thread')
+
+  assert.match(String(build.run), /set -o pipefail/, 'a failing Gradle run is hidden behind tee')
+  const log = /2>&1 \| tee "(\$RUNNER_TEMP\/[^"]+)"/.exec(String(build.run))?.[1]
+  assert.ok(log, 'the Gradle run does not keep its output, stderr included, in a log under $RUNNER_TEMP')
+  assert.ok(stepIndex(job, build) < stepIndex(job, check), 'the detach check runs before the Gradle run')
+  assert.ok(String(check.run).includes(`"${log}"`), `the detach check does not read ${log}`)
+  assert.match(String(check.run), /grep -F/)
+  assert.match(String(check.run), /exit 1/)
+})
+
 test('android-library checks the LiteRT library inside the built AAR against the pin, for both ABIs', () => {
   const job = jobs['android-library']
   const build = stepRunning(job, ':turbollm-core:assembleRelease')
