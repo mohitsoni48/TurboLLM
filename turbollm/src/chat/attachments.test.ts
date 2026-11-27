@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { AttachmentStore, attachmentRefId, audioAttachmentFormat, isAttachmentRef, isAudioAttachment } from './attachments'
+import { AttachmentStore, attachmentRefId, audioAttachmentFormat, downloadFileName, isAttachmentRef, isAudioAttachment, isDownloadAttachmentRef, isImageAttachmentRef } from './attachments'
 import { IN_MEMORY_DATA_DIR } from './db'
 import { tmpDir } from '../test-support/tmp'
 
@@ -251,4 +251,114 @@ test('collectGarbage reclaims an unreferenced clip and keeps a referenced one', 
   assert.equal(await store.collectGarbage(new Set([attachmentRefId(kept)!]), 3600_000), 1)
   assert.ok(existsSync(join(folder, attachmentRefId(kept)!)))
   assert.ok(!existsSync(join(folder, attachmentRefId(orphan)!)))
+})
+
+test('isImageAttachmentRef is a stored image only: not a clip, an inline image, or a malformed or other stored file', () => {
+  const hex = 'c'.repeat(64)
+  for (const ext of ['png', 'jpg', 'gif', 'webp', 'bmp', 'avif']) assert.equal(isImageAttachmentRef(`attachment:${hex}.${ext}`), true, ext)
+  for (const other of [`attachment:${hex}.wav`, `attachment:${hex}.mp3`, `attachment:${hex}.csv`, `attachment:${hex}`, 'attachment:../x.png', PNG_URL, ''])
+    assert.equal(isImageAttachmentRef(other), false, other)
+})
+
+test('resolveMedia never sends a clip, another stored file or a malformed reference as an image (GitHub #52)', async () => {
+  const { store } = freshStore()
+  const [clip] = await store.save([`data:audio/wav;base64,${Buffer.from('RIFF0000WAVE').toString('base64')}`])
+  assert.ok(isAudioAttachment(clip) && isAttachmentRef(clip))
+  const messages = [{
+    role: 'user',
+    content: [
+      { type: 'text', text: 'look' },
+      { type: 'image_url', image_url: { url: clip } },
+      { type: 'image_url', image_url: { url: `attachment:${'d'.repeat(64)}.csv` } },
+      { type: 'image_url', image_url: { url: 'attachment:garbage' } },
+    ],
+  }]
+  await store.resolveMedia(messages)
+  assert.deepEqual(messages[0].content, [{ type: 'text', text: 'look' }])
+})
+
+// Files made for download (GitHub #52): CSV, JSON, text and Python from run_python, in through saveFile only.
+
+const CSV_BYTES = Buffer.from('name,total\nada,3\n')
+const CSV_ID = `${createHash('sha256').update(CSV_BYTES).digest('hex')}.csv`
+
+test('save never stores a download type: a text/csv data URL a client sends stays inline', async () => {
+  const { store, dir } = freshStore()
+  const url = `data:text/csv;base64,${CSV_BYTES.toString('base64')}`
+  assert.deepEqual(await store.save([url]), [url])
+  assert.ok(!existsSync(join(dir, 'attachments', CSV_ID)))
+})
+
+test('saveFile stores a download content-addressed, and it is served, never inlined, and collected like any file', async () => {
+  const { store, dir } = freshStore()
+  const ref = await store.saveFile(CSV_BYTES, 'csv')
+  assert.equal(ref, `attachment:${CSV_ID}`)
+  assert.ok(isAttachmentRef(ref!) && isDownloadAttachmentRef(ref!) && !isImageAttachmentRef(ref!) && !isAudioAttachment(ref!))
+  assert.deepEqual(readFileSync(join(dir, 'attachments', CSV_ID)), CSV_BYTES)
+  assert.deepEqual(store.file(CSV_ID), { path: join(dir, 'attachments', CSV_ID), mime: 'text/csv; charset=utf-8' })
+  assert.equal(await store.saveFile(CSV_BYTES, 'csv'), ref, 'the same bytes are the same file')
+  assert.equal(await store.inline(ref!), null)
+  for (const [ext, mime] of [['json', 'application/json; charset=utf-8'], ['txt', 'text/plain; charset=utf-8'], ['py', 'text/x-python; charset=utf-8']]) {
+    const r = await store.saveFile(Buffer.from(`x-${ext}`), ext)
+    assert.equal(store.file(attachmentRefId(r!)!)!.mime, mime, ext)
+  }
+
+  backdate(join(dir, 'attachments', CSV_ID), 2 * 3600_000)
+  assert.equal(await store.collectGarbage(new Set([CSV_ID]), 3600_000), 0, 'kept while a row names it')
+  assert.equal(await store.collectGarbage(new Set(), 3600_000), 1, 'collected once none does')
+  assert.ok(!existsSync(join(dir, 'attachments', CSV_ID)))
+})
+
+test('saveFile takes only the download types, and the store names no page or picture it could serve as one', async () => {
+  const { store } = freshStore()
+  for (const ext of ['html', 'htm', 'svg', 'js', 'png', 'wav', 'CSV', '', '../csv']) assert.equal(await store.saveFile(CSV_BYTES, ext), null, ext)
+  const hex = 'f'.repeat(64)
+  for (const id of [`${hex}.html`, `${hex}.svg`, `${hex}.js`, `${hex}.CSV`]) assert.equal(store.file(id), null, id)
+  assert.equal(await new AttachmentStore(IN_MEMORY_DATA_DIR).saveFile(CSV_BYTES, 'csv'), null, 'an in-memory database has no folder')
+})
+
+test('downloadFileName keeps the name without folders, control characters or quotes, always with the file\'s own extension', () => {
+  const id = CSV_ID
+  const cases: Array<[string, string]> = [
+    ['cleaned.csv', 'cleaned.csv'],
+    ['Cleaned.CSV', 'Cleaned.csv'],
+    ['../../etc/passwd', 'passwd.csv'],
+    ['..\\..\\Windows\\win.ini', 'win.ini.csv'],
+    ['page.html', 'page.html.csv'],
+    ['a\r\nX-Evil: 1.csv', 'a__X-Evil_ 1.csv'],
+    ['say "hi".csv', 'say _hi_.csv'],
+    ['données été.csv', 'données été.csv'],
+    ['report‮fdp.csv', 'report_fdp.csv'],
+    ['zero​width⁦.csv', 'zero_width_.csv'],
+    ['line break.csv', 'line_break.csv'],
+    ['...', 'file.csv'],
+    ['', 'file.csv'],
+    ['.csv', 'file.csv'],
+    [`${'x'.repeat(300)}.csv`, `${'x'.repeat(124)}.csv`],
+  ]
+  for (const [name, want] of cases) assert.equal(downloadFileName(name, id), want, JSON.stringify(name))
+  assert.equal(downloadFileName('data.csv', `${'0'.repeat(64)}.json`), 'data.csv.json')
+})
+
+test('downloadFileName never cuts a character in half, so the name always encodes for Content-Disposition', () => {
+  // 123 x and an emoji: a cut at 124 UTF-16 units would keep the emoji's first half alone. The whole emoji goes.
+  const cutEmoji = downloadFileName(`${'x'.repeat(123)}😀.csv`, CSV_ID)
+  assert.equal(cutEmoji, `${'x'.repeat(123)}.csv`)
+  assert.doesNotThrow(() => encodeURIComponent(cutEmoji))
+  // One that fits whole is kept.
+  assert.equal(downloadFileName(`${'x'.repeat(122)}😀😀.csv`, CSV_ID), `${'x'.repeat(122)}😀.csv`)
+  // A lone half sent as the name goes too.
+  const lone = downloadFileName('a\ud800b.csv', CSV_ID)
+  assert.equal(lone, 'a_b.csv')
+  assert.doesNotThrow(() => encodeURIComponent(lone))
+})
+
+test('read returns the bytes of any stored file, and null for anything that is not a stored reference', async () => {
+  const { store } = freshStore()
+  const csv = await store.saveFile(CSV_BYTES, 'csv')
+  const [png] = await store.save([PNG_URL])
+  assert.deepEqual(await store.read(csv!), CSV_BYTES)
+  assert.deepEqual(await store.read(png), PNG_BYTES)
+  for (const other of [PNG_URL, `attachment:${'9'.repeat(64)}.csv`, 'attachment:../turbollm.db', ''])
+    assert.equal(await store.read(other), null, other)
 })

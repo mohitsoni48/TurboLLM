@@ -5,16 +5,18 @@
 // an interactive call with one runs it (execute-with-approval.ts). Every run asks first, with Allow once only
 // (tool-policy.ts, and the approve route refuses the standing approvals).
 //
-// Files in: the images and documents attached to the message this turn answers. Documents arrive as the text the web
-// client extracted (ChatScreen.tsx joins them as `[Attached: <name>]\n<text>`), so only text formats go in.
-// Files out: PNG and JPEG go to the chat's image store (chat/attachments.ts) and are named on the reply's own row,
-// which is what keeps the attachment janitor from collecting them and what frees them when the chat is deleted. CSV,
-// JSON, text and Python come back to the model as text until chat files land (PR 3).
+// Files in: the images and documents attached in the chat, and in a fresh sandbox the files earlier runs handed back
+// (turnFiles). Documents arrive as the text the web client extracted (ChatScreen.tsx joins them as
+// `[Attached: <name>]\n<text>`), so only text formats go in.
+// Files out: PNG and JPEG are shown in the chat; CSV, JSON, text and Python are given to the user to download and come
+// back to the model as text. All go to the chat's attachment store (chat/attachments.ts) and are named on the reply's
+// own row, which is what keeps the attachment janitor from collecting them and what frees them when the chat is
+// deleted. A chat keeps at most MAX_CHAT_FILES_BYTES of them.
 import type { ToolDefinition } from '../tools/tool-registry'
-import type { AttachmentStore } from '../chat/attachments'
-import type { Message } from '../chat/db'
+import { attachmentRefId, type AttachmentStore } from '../chat/attachments'
+import type { Message, ToolCallRecord, ToolOutput } from '../chat/db'
 import type { SandboxManager } from './sandbox-manager'
-import { SandboxError, RUN_TIMEOUT_MS, type SandboxFile, type SandboxRunResult } from './sandbox-process'
+import { isSandboxName, SandboxError, RUN_TIMEOUT_MS, type SandboxFile, type SandboxRunResult } from './sandbox-process'
 
 export const RUN_PYTHON = 'run_python'
 
@@ -30,7 +32,7 @@ export const RUN_PYTHON_TOOL: ToolDefinition = {
       `Run Python 3 code in a sandbox on this computer (Pyodide). ${PACKAGES} are available, and nothing else can be `
       + 'installed. There is no network and no access to the user\'s own files. Files the user attached in this chat '
       + 'are in the current folder: read them from there, never type their contents into the code. To give the user a file, save it to the current folder: png and jpg files '
-      + 'are shown in the chat; csv, json, txt and py files come back to you as text. Use print() to see values. '
+      + 'are shown in the chat; csv, json, txt and py files are given to the user to download, and come back to you as text. Use print() to see values. '
       + 'Variables and files stay between runs in this chat until it has been idle for 10 minutes. Each run may take '
       + `${RUN_TIMEOUT_MS / 1000} seconds and about 512 MB of memory. The user approves every run before it starts.`,
     parameters: {
@@ -61,7 +63,7 @@ const MAX_INPUT_FILES = 20
 
 /** What a chat turn hands the tool: runs code in this chat's sandbox. */
 export interface SandboxTurn {
-  run(args: Record<string, unknown>, signal: AbortSignal): Promise<{ result: string; files: string[] }>
+  run(args: Record<string, unknown>, signal: AbortSignal): Promise<{ result: string; files: string[]; outputs?: ToolOutput[]; notKept?: string[] }>
 }
 
 /** A file name the sandbox can take: no folders, nothing outside a plain set of characters. */
@@ -94,27 +96,36 @@ type UserFiles = Pick<Message, 'attachments' | 'textAttachments' | 'docContext'>
 /** A row of the chat before the turn's reply, as the run reads it. */
 export type ChatRow = Pick<Message, 'role' | 'toolCalls'> & UserFiles
 
-/** The files user messages carry, oldest message first, as a run starts with them: images (`image-N`, numbered across
- *  the chat) and text documents, under safe names. A name a newer message attaches again is the newer file (the user
- *  sent a new version); two files with one name in the same message keep both (`-2`). Newest first under the caps. */
-export async function turnFiles(rows: UserFiles[], store: Pick<AttachmentStore, 'inline'>): Promise<SandboxFile[]> {
-  const perRow: Array<Array<{ name: string; bytes: Buffer }>> = []
+/** The files a run starts with, oldest row first: from a user row, its images (`image-N`, numbered across the chat)
+ *  and text documents; from a reply, the files its run_python calls handed back (ToolCallRecord.outputs), under the
+ *  names the code gave them (ToolOutput.sandboxName when it has one: `résumé.csv`, not the `resume.csv` shown). All
+ *  under safe names. Names match exactly, as in the sandbox's folder (`Data.csv` and `data.csv` are two files). A name
+ *  a newer row has again is the newer file (the user sent a new version, or later code wrote it again); two files with
+ *  one name in the same user message keep both (`-2`), and in one reply the last run's file wins. Newest first under
+ *  the caps; the names the caps left out go in `leftOut`, newest first. */
+export async function turnFiles(rows: Array<UserFiles & Partial<Pick<ChatRow, 'role' | 'toolCalls'>>>, store: Pick<AttachmentStore, 'inline' | 'read'>, leftOut: string[] = []): Promise<SandboxFile[]> {
+  const perRow: Candidate[][] = []
   let img = 0
   for (const row of rows) {
-    const mine: Array<{ name: string; bytes: Buffer }> = []
+    if (row.role === 'assistant') {
+      perRow.push(outputsOf(row.toolCalls ?? [], store))
+      continue
+    }
+    const mine: Candidate[] = []
     for (const a of row.attachments ?? []) {
       const url = await store.inline(a)
       const m = url ? /^data:image\/(png|jpeg|gif|webp|bmp|avif);base64,(.*)$/.exec(url) : null
       if (!m) continue
       img++
-      mine.push({ name: `image-${img}.${m[1] === 'jpeg' ? 'jpg' : m[1]}`, bytes: Buffer.from(m[2], 'base64') })
+      mine.push(loaded(`image-${img}.${m[1] === 'jpeg' ? 'jpg' : m[1]}`, Buffer.from(m[2], 'base64')))
     }
     for (const doc of documentsFrom(row.docContext, row.textAttachments ?? [])) {
-      if (DOCUMENT_TYPES.test(doc.name)) mine.push({ name: safeName(doc.name, 'document.txt'), bytes: Buffer.from(doc.text, 'utf8') })
+      if (DOCUMENT_TYPES.test(doc.name)) mine.push(loaded(safeName(doc.name, 'document.txt'), Buffer.from(doc.text, 'utf8')))
     }
     perRow.push(mine)
   }
-  // Chosen newest message first (that is who wins a name and the caps), handed over oldest first.
+  // Chosen newest message first (that is who wins a name and the caps), handed over oldest first. A file is read only
+  // once it is chosen: one a newer message replaced, or one over the caps, is never read.
   const chosen: SandboxFile[][] = perRow.map(() => [])
   const taken = new Set<string>()
   let count = 0
@@ -122,26 +133,64 @@ export async function turnFiles(rows: UserFiles[], store: Pick<AttachmentStore, 
   for (let i = perRow.length - 1; i >= 0; i--) {
     const here = new Set<string>()
     for (const f of perRow[i]) {
-      if (taken.has(f.name.toLowerCase())) continue // a newer message has this name
+      if (taken.has(f.name)) continue // a newer message has this name
       let n = f.name
-      for (let k = 2; here.has(n.toLowerCase()); k++) n = f.name.replace(/(\.[^.]*)?$/, (ext) => `-${k}${ext}`)
-      if (count >= MAX_INPUT_FILES || total + f.bytes.length > MAX_INPUT_TOTAL) continue
-      here.add(n.toLowerCase())
-      chosen[i].push({ name: n, bytes: f.bytes })
+      for (let k = 2; here.has(n); k++) n = f.name.replace(/(\.[^.]*)?$/, (ext) => `-${k}${ext}`)
+      const over = (size: number) => count >= MAX_INPUT_FILES || total + size > MAX_INPUT_TOTAL
+      let bytes: Buffer | null = null
+      if (!over(f.size)) {
+        bytes = await f.load()
+        if (!bytes) continue // gone: an older file of this name may come back in its place
+      }
+      // Counted at the larger of its recorded size and what was read: neither alone may slip past the caps.
+      const size = bytes ? Math.max(f.size, bytes.length) : f.size
+      if (!bytes || over(size)) {
+        // Taken all the same: an older, smaller file of this name must not come back in its place.
+        here.add(n)
+        leftOut.push(n)
+        continue
+      }
+      here.add(n)
+      chosen[i].push({ name: n, bytes })
       count++
-      total += f.bytes.length
+      total += size
     }
     for (const n of here) taken.add(n)
   }
   return chosen.flat()
 }
 
-/** Which user rows' files a run starts with. A fresh sandbox gets every file attached in the chat, so a follow-up
- *  question after the sandbox closed still finds them. A warm one has them already, perhaps changed by earlier code:
- *  it gets only the rows since the chat's last run_python call, the ones it has not been sent. */
-export function filesFor(rows: ChatRow[], fresh: boolean): UserFiles[] {
+/** A file a run may start with: its name, its size, and its bytes, read only when it is chosen (null when it is gone). */
+interface Candidate {
+  name: string
+  size: number
+  load(): Promise<Buffer | null>
+}
+
+const loaded = (name: string, bytes: Buffer): Candidate => ({ name, size: bytes.length, load: async () => bytes })
+
+/** The files a reply's run_python calls handed back, by the names the code gave them, the last call's file winning a
+ *  name. Sized by ToolOutput.size, so none is read before turnFiles chooses it. */
+function outputsOf(calls: ToolCallRecord[], store: Pick<AttachmentStore, 'read'>): Candidate[] {
+  const byName = new Map<string, Candidate>()
+  for (const call of calls) {
+    if (call.name !== RUN_PYTHON) continue
+    for (const o of call.outputs ?? []) {
+      const name = isSandboxName(o.sandboxName) ? o.sandboxName : safeName(o.name, 'output')
+      byName.delete(name) // re-added at the end: the last write is the newest
+      byName.set(name, { name, size: o.size, load: () => store.read(o.file) })
+    }
+  }
+  return [...byName.values()]
+}
+
+/** Which rows' files a run starts with. A fresh sandbox gets every file of the chat, the user's and the ones earlier
+ *  code made, so a follow-up question after the sandbox closed still finds them. A warm one has them already, perhaps
+ *  changed by earlier code: it gets only the user rows since the chat's last run_python call, the ones it has not been
+ *  sent. */
+export function filesFor(rows: ChatRow[], fresh: boolean): ChatRow[] {
   const users = (from: number) => rows.slice(from).filter((r) => r.role === 'user')
-  if (fresh) return users(0)
+  if (fresh) return rows.filter((r) => r.role === 'user' || r.role === 'assistant')
   const lastRun = rows.findLastIndex((r) => r.role === 'assistant' && (r.toolCalls ?? []).some((t) => t.name === RUN_PYTHON))
   return users(lastRun + 1)
 }
@@ -166,8 +215,56 @@ export function imageType(bytes: Buffer): 'image/png' | 'image/jpeg' | null {
   return null
 }
 
-/** The tool result the model reads, and the image references the reply row keeps. */
-export async function describeRun(r: SandboxRunResult, store: Pick<AttachmentStore, 'save'>, budget = RESULT_MAX_CHARS): Promise<{ result: string; files: string[] }> {
+/** A cell a spreadsheet may run as a formula: one starting with = + - @, a tab or a carriage return (OWASP's CSV
+ *  injection list), unless it is a plain number such as -5 or +3.2, or that one character alone. */
+function formulaCell(cell: string): boolean {
+  return cell.length > 1 && /^[=+\-@\t\r]/.test(cell) && !/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(cell)
+}
+
+/** Whether a CSV has a cell a spreadsheet may run as a formula. Quoted fields are read unquoted ("=1" is a formula
+ *  cell too); a field with a quote that is never closed runs to the end of the text, as a spreadsheet would read it.
+ *  A leading byte order mark is skipped (Excel drops it and reads the first cell after it), and `;` splits cells as `,`
+ *  does, since Excel reads `;` as the separator where the list separator is `;`. */
+export function csvHasFormulaCells(text: string): boolean {
+  if (text.startsWith('﻿')) text = text.slice(1)
+  const ends = (c: string | undefined) => c === ',' || c === ';' || c === '\n'
+  let i = 0
+  while (i <= text.length) {
+    let cell = ''
+    if (text[i] === '"') {
+      i++
+      while (i < text.length) {
+        if (text[i] === '"' && text[i + 1] === '"') { cell += '"'; i += 2 }
+        else if (text[i] === '"') { i++; break }
+        else cell += text[i++]
+      }
+      while (i < text.length && !ends(text[i])) cell += text[i++]
+    } else {
+      while (i < text.length && !ends(text[i])) cell += text[i++]
+      if (cell.endsWith('\r') && text[i] === '\n') cell = cell.slice(0, -1)
+    }
+    if (formulaCell(cell)) return true
+    i++
+  }
+  return false
+}
+
+/** The files a chat may keep, all its rows together (GitHub #52): images and files for download. */
+export const MAX_CHAT_FILES_BYTES = 500 * 1024 * 1024
+
+/** What a run hands back: the tool result the model reads, the references the reply row keeps, each file as the code
+ *  named it, and the files the chat had no room for. */
+export interface DescribedRun {
+  result: string
+  files: string[]
+  outputs: ToolOutput[]
+  notKept: string[]
+}
+
+/** The tool result the model reads, and the files the reply row keeps. `room` is the bytes the chat may still keep
+ *  (MAX_CHAT_FILES_BYTES less what its rows already name): a file that does not fit is not kept, and both the model
+ *  and the user are told. */
+export async function describeRun(r: SandboxRunResult, store: Pick<AttachmentStore, 'save' | 'saveFile'>, budget = RESULT_MAX_CHARS, room = MAX_CHAT_FILES_BYTES): Promise<DescribedRun> {
   // Shares of the budget: printed output, warnings, each text file, and the lists that come last.
   const OUTPUT_BACK_LIMIT = Math.floor(budget * 0.4)
   const WARNINGS_BACK_LIMIT = Math.floor(budget * 0.1)
@@ -178,28 +275,39 @@ export async function describeRun(r: SandboxRunResult, store: Pick<AttachmentSto
   if (r.stdout.trim()) lines.push(`Output:\n${cutPrinted(r.stdout.trimEnd(), OUTPUT_BACK_LIMIT)}`)
   if (r.stderr.trim()) lines.push(`Warnings:\n${cutPrinted(r.stderr.trimEnd(), WARNINGS_BACK_LIMIT)}`)
   if (!r.ok) lines.push(`Python error:\n${pythonError(r.error ?? 'unknown error')}`)
+  const outputs: ToolOutput[] = []
   const shown: string[] = []
+  const given: string[] = []
+  const noRoom: string[] = []
   const texts: Array<{ name: string; text: string }> = []
+  let left = room
   for (const f of r.files) {
     const ext = f.name.slice(f.name.lastIndexOf('.') + 1).toLowerCase()
-    if (IMAGE_MIME[ext]) {
-      // The bytes decide, not the name: a "chart.png" that is really a web page or an SVG with a script is not kept.
-      // The store would serve it as image/png with nosniff, which browsers obey; this keeps it out of the store anyway.
-      const mime = imageType(f.bytes)
-      if (!mime) {
-        lines.push(`${f.name} is not a PNG or JPEG image, so it was not shown.`)
-        continue
-      }
-      const [saved] = await store.save([`data:${mime};base64,${f.bytes.toString('base64')}`])
-      if (saved?.startsWith('attachment:')) {
-        refs.push(saved)
-        shown.push(f.name)
-      } else {
-        lines.push(`${f.name} could not be saved, so the user cannot see it.`)
-      }
+    const image = Boolean(IMAGE_MIME[ext])
+    // The bytes decide, not the name: a "chart.png" that is really a web page or an SVG with a script is not kept.
+    // The store would serve it as image/png with nosniff, which browsers obey; this keeps it out of the store anyway.
+    const mime = image ? imageType(f.bytes) : null
+    if (image && !mime) {
+      lines.push(`${f.name} is not a PNG or JPEG image, so it was not shown.`)
       continue
     }
-    texts.push({ name: f.name, text: f.bytes.toString('utf8') })
+    if (!image) texts.push({ name: f.name, text: f.bytes.toString('utf8') })
+    if (f.bytes.length > left) {
+      noRoom.push(f.name)
+      continue
+    }
+    const saved = image
+      ? (await store.save([`data:${mime};base64,${f.bytes.toString('base64')}`]))[0]
+      : await store.saveFile(f.bytes, ext)
+    if (!saved?.startsWith('attachment:')) {
+      lines.push(`${f.name} could not be saved, so the user cannot ${image ? 'see' : 'download'} it.`)
+      continue
+    }
+    left -= f.bytes.length
+    refs.push(saved)
+    ;(image ? shown : given).push(f.as === undefined ? f.name : `${f.name} (${f.as} in the folder)`)
+    const formulaCells = ext === 'csv' && csvHasFormulaCells(f.bytes.toString('utf8'))
+    outputs.push({ name: f.name, ...(f.as !== undefined ? { sandboxName: f.as } : {}), file: saved, size: f.bytes.length, ...(formulaCells ? { formulaCells: true as const } : {}) })
   }
   // Text files come back while the result's budget lasts; the rest are named, so the model can read what it needs in
   // another run.
@@ -213,9 +321,11 @@ export async function describeRun(r: SandboxRunResult, store: Pick<AttachmentSto
   }
   if (leftOut.length) lines.push(`Not included, the result would be too long: ${leftOut.join(', ')}. Read what you need from them in another run and print it.`)
   if (shown.length) lines.push(`Shown to the user in the chat: ${shown.join(', ')}`)
+  if (given.length) lines.push(`Given to the user to download: ${given.join(', ')}`)
+  if (noRoom.length) lines.push(`Not kept for the user, this chat's files have reached ${MAX_CHAT_FILES_BYTES / 1024 / 1024} MB: ${noRoom.join(', ')}. Deleting older messages with files makes room.`)
   if (r.skipped.length) lines.push(`Not returned (only png, jpg, csv, json, txt and py files are, up to 20 per run and 25 MB each): ${r.skipped.slice(0, 20).join(', ')}${r.skipped.length > 20 ? `, and ${r.skipped.length - 20} more` : ''}`)
   if (!lines.length) lines.push('(no output; use print() to see values)')
-  return { result: cut(lines.join('\n\n'), budget), files: refs }
+  return { result: cut(lines.join('\n\n'), budget), files: refs, outputs, notKept: noRoom }
 }
 
 /** `text` up to `max` characters, with a note of how long it was when it is cut. */
@@ -234,12 +344,25 @@ function cutPrinted(text: string, max: number): string {
   return kept.length > max ? cut(kept, max, `more than ${kept.length}`) : text
 }
 
+/** The bytes of the stored files a chat's rows name (each file once, however many rows name it), with `more`
+ *  references not on a row yet. A file that is gone counts nothing. */
+export function chatFilesBytes(rows: Array<Pick<Message, 'attachments'>>, more: Iterable<string>, store: Pick<AttachmentStore, 'size'>): number {
+  const ids = new Set<string>()
+  for (const a of [...rows.flatMap((r) => r.attachments ?? []), ...more]) {
+    const id = attachmentRefId(a)
+    if (id) ids.add(id)
+  }
+  let total = 0
+  for (const id of ids) total += store.size(id) ?? 0
+  return total
+}
+
 /** The SandboxTurn for one live chat turn. `history` is read at the call: the chat's active rows before the turn's
  *  reply, oldest first. */
 export function sandboxTurn(o: {
   convId: string
   manager: SandboxManager
-  store: Pick<AttachmentStore, 'inline' | 'save'>
+  store: Pick<AttachmentStore, 'inline' | 'read' | 'save' | 'saveFile' | 'size'>
   history: () => ChatRow[]
   /** The characters a result may take (resultBudget of the loaded model's context), read at each run. */
   resultChars?: () => number
@@ -248,6 +371,9 @@ export function sandboxTurn(o: {
   // run of the same turn in a warm sandbox must not overwrite what the code changed in them.
   let sent = false
   let ranHere = false
+  // Files this turn's runs kept: the reply row names them only once the turn ends, and they count toward the chat's
+  // limit from the moment they are kept.
+  const keptThisTurn = new Set<string>()
   return {
     async run(args, signal) {
       const code = typeof args.code === 'string' ? args.code : ''
@@ -255,16 +381,22 @@ export function sandboxTurn(o: {
       try {
         const fresh = !o.manager.has(o.convId)
         const rows = fresh || !sent ? o.history() : []
-        const files = fresh || !sent ? await turnFiles(filesFor(rows, fresh), o.store) : []
+        const leftOut: string[] = []
+        const files = fresh || !sent ? await turnFiles(filesFor(rows, fresh), o.store, leftOut) : []
         // A new sandbox after earlier runs in this chat: the model may count on variables that are gone.
         const ranBefore = ranHere || rows.some((r) => r.role === 'assistant' && (r.toolCalls ?? []).some((t) => t.name === RUN_PYTHON))
         sent = true
         ranHere = true
         const r = await o.manager.run(o.convId, code, files, signal)
-        const done = await describeRun(r, o.store, o.resultChars?.() ?? RESULT_MAX_CHARS)
-        if (!fresh || !ranBefore) return done
-        const back = files.length ? ` The files attached in this chat are back in the folder: ${files.map((f) => f.name).join(', ')}.` : ''
-        return { ...done, result: `This run started a new sandbox: variables from earlier runs are gone.${back}\n\n${done.result}` }
+        const room = MAX_CHAT_FILES_BYTES - chatFilesBytes(rows.length ? rows : o.history(), keptThisTurn, o.store)
+        const done = await describeRun(r, o.store, o.resultChars?.() ?? RESULT_MAX_CHARS, Math.max(0, room))
+        for (const f of done.files) keptThisTurn.add(f)
+        const notIn = leftOut.length
+          ? `Not in the folder, a run starts with at most ${MAX_INPUT_FILES} files and ${MAX_INPUT_TOTAL / 1024 / 1024} MB, the newest first: ${leftOut.join(', ')}.`
+          : ''
+        if (!fresh || !ranBefore) return notIn ? { ...done, result: `${notIn}\n\n${done.result}` } : done
+        const back = files.length ? ` The files of this chat are back in the folder: ${files.map((f) => f.name).join(', ')}.` : ''
+        return { ...done, result: `This run started a new sandbox: variables from earlier runs are gone.${back}${notIn ? ` ${notIn}` : ''}\n\n${done.result}` }
       } catch (e) {
         // Each of these ended the process: the next run starts a new sandbox.
         const gone = e instanceof SandboxError && (e.code === 'timeout' || e.code === 'crashed' || e.code === 'violation')

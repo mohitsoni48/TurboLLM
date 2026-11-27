@@ -69,6 +69,10 @@ describe('isAudioAttachment / isImageAttachment', () => {
     [`attachment:${HEX}.wav`, true, false],
     [`attachment:${HEX}.mp3`, true, false],
     [`attachment:${HEX}`, false, true],
+    [`attachment:${HEX}.csv`, false, false],
+    [`attachment:${HEX}.json`, false, false],
+    [`attachment:${HEX}.txt`, false, false],
+    [`attachment:${HEX}.py`, false, false],
     ['data:text/plain;base64,AAAA', false, false],
     ['https://example.com/clip.wav', false, false],
   ])('%s: audio %s, image %s', (attachment, audio, image) => {

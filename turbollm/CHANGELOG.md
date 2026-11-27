@@ -54,6 +54,13 @@ published version on npm has a matching `vX.Y.Z` tag in git.
     Stop works within a fraction of a second once the reply is under way, and in about 2.4 s before (while the engine reads
     the recording) on an idle 4-core CPU, longer when the machine is busy, and never more than 30 s. Regenerate and Edit & resend answer in text. An audio request naming a model that is not loaded loads it first.
     llama.cpp returns speech only over its `/v1/realtime` WebSocket, which is what TurboLLM uses.
+- **Files from `run_python` to download.** CSV, JSON, text and Python files a run saves now appear under its card as
+  download chips with their names and sizes, as well as coming back to the model. They are only ever served as
+  downloads, under their own extension, never opened as a page. A CSV with cells a spreadsheet may run as formulas
+  (starting with = + - or @) is marked with a warning. Files the code made come back into a fresh sandbox, so a
+  follow-up still finds `cleaned.csv` after the sandbox closed when idle. A chat keeps at most 500 MB of files;
+  deleting a message or the chat frees its files at the next daily cleanup. An exported chat carries no files and
+  says so, and an imported chat's tool calls cannot point at files.
 
 ## [1.15.2] - 2026-11-15
 

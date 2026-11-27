@@ -13,10 +13,17 @@ export function isAudioAttachment(attachment: string): boolean {
   return attachment.startsWith('data:audio/') || (attachment.startsWith(REF_PREFIX) && /\.(wav|mp3)$/.test(attachment))
 }
 
+/** A stored file made for download (a CSV, JSON, text or Python file a run_python call saved, GitHub #52): shown as a
+ *  file to save, never as a picture. */
+export function isDownloadAttachment(attachment: string): boolean {
+  return attachment.startsWith(REF_PREFIX) && /\.(csv|json|txt|py)$/.test(attachment)
+}
+
 /** An image: every other stored attachment, and an inline image. A stored file used to be an image by definition;
- *  a clip shown as one is a broken picture. */
+ *  a clip or a download shown as one is a broken picture. */
 export function isImageAttachment(attachment: string): boolean {
-  return attachment.startsWith('data:image') || (attachment.startsWith(REF_PREFIX) && !isAudioAttachment(attachment))
+  return attachment.startsWith('data:image')
+    || (attachment.startsWith(REF_PREFIX) && !isAudioAttachment(attachment) && !isDownloadAttachment(attachment))
 }
 
 export type Loaded = { state: 'loading' } | { state: 'ready'; src: string } | { state: 'failed' }

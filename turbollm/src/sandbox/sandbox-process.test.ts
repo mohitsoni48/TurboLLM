@@ -7,7 +7,7 @@ import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpDir } from '../test-support/tmp'
 import { encodeFrame } from './sandbox-frames'
-import { checkResult, denoArgs, denoEnv, SandboxError, SandboxProcess } from './sandbox-process'
+import { checkResult, denoArgs, denoEnv, isSandboxName, SandboxError, SandboxProcess } from './sandbox-process'
 
 // A stand-in host: speaks the frame protocol, misbehaving as its mode says.
 const FAKE_HOST = `
@@ -170,4 +170,14 @@ test('checkResult: refuses every field out of bounds', () => {
   assert.equal(r?.stdout, 'hi')
   assert.equal(r?.files[0].bytes.toString(), 'PNG')
   assert.equal(encodeFrame({ t: 'x' }).length > 4, true)
+})
+
+test('checkResult: an output\'s own name in the sandbox (`as`) is kept when it passes the rule; any other refuses the result', () => {
+  const ok = (as: unknown) => checkResult({ header: { t: 'result', ok: true, stdout: 0, stderr: 0, files: [{ name: 'resume.csv', size: 1, as }], size: 1 }, payload: Buffer.from('x') })
+  assert.equal(ok('résumé.csv')?.files[0].as, 'résumé.csv')
+  assert.equal(ok('données (été) 2026.csv')?.files[0].as, 'données (été) 2026.csv')
+  assert.equal(ok(undefined)?.files[0].as, undefined)
+  for (const bad of ['resume.csv', '', '..', 'a/b.csv', 'a\\b.csv', 'a\nb.csv', 'report‮fdp.csv', 'zero​width.csv', 'x'.repeat(129), 5, null])
+    assert.equal(ok(bad), null, JSON.stringify(bad))
+  assert.equal(isSandboxName('x'.repeat(128)), true)
 })

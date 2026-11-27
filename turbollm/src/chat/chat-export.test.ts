@@ -1,7 +1,7 @@
 // Unit tests for the buildSnapshot pure function (F-023).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { buildSnapshot } from './chat-export.js'
+import { buildSnapshot, withoutFileRefs } from './chat-export.js'
 import type { Conversation, Message } from './db.js'
 import type { Config } from '../config/config.js'
 
@@ -119,6 +119,11 @@ test('buildSnapshot: tool_calls included on assistant turns that used tools', ()
   assert.equal(snap.messages[0].tool_calls![0].name, 'web_search')
 })
 
+test('withoutFileRefs: drops run_python\'s files, outputs and notKept, keeps the rest', () => {
+  const calls = [{ id: 'tc1', name: 'run_python', args: { code: 'x' }, result: 'ok', files: ['attachment:a.png'], outputs: [{ name: 'a.csv', file: 'attachment:a.csv', size: 1 }], notKept: ['big.csv'] }]
+  assert.deepEqual(withoutFileRefs(calls), [{ id: 'tc1', name: 'run_python', args: { code: 'x' }, result: 'ok' }])
+})
+
 test('buildSnapshot: no tool_calls key on messages without tool calls', () => {
   const conv = makeConv({ messages: [makeMsg('user', 'hello')] })
   const snap = buildSnapshot(conv, makeCfg(), VERSION, EXPORTED_AT, 'debug')
@@ -185,4 +190,13 @@ test('buildSnapshot: persona is the chat’s own agent when the daemon kept it, 
   assert.equal(snap({ chatAgentId: 'writer', toolPolicy: 'force_web_search' }).persona, 'writer')
   assert.equal(snap({ chatAgentId: 'blank' }).persona, 'blank')
   assert.equal(snap({ chatAgentId: '', toolPolicy: 'force_web_search' }).persona, 'research', 'an empty id falls back to the guess')
+})
+
+test('buildSnapshot: says files are not included and leaves out the tool calls\' file references (GitHub #52)', () => {
+  const file = `attachment:${'a'.repeat(64)}.png`
+  const toolCalls = [{ id: 'tc1', name: 'run_python', args: { code: 'x' }, result: 'ok', files: [file], outputs: [{ name: 'chart.png', file, size: 8 }] }]
+  const snap = buildSnapshot(makeConv({ messages: [makeMsg('assistant', 'Here', { toolCalls })] }), makeCfg(), VERSION, EXPORTED_AT, 'export')
+  assert.equal(snap.files_included, false)
+  assert.deepEqual(snap.messages[0].tool_calls, [{ id: 'tc1', name: 'run_python', args: { code: 'x' }, result: 'ok' }])
+  assert.equal(toolCalls[0].files.length, 1, 'the chat\'s own record is not changed')
 })
