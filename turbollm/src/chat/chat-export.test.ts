@@ -1,7 +1,7 @@
 // Unit tests for the buildSnapshot pure function (F-023).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { buildSnapshot } from './chat-export.js'
+import { buildSnapshot, withoutFileRefs } from './chat-export.js'
 import type { Conversation, Message } from './db.js'
 import type { Config } from '../config/config.js'
 
@@ -117,6 +117,11 @@ test('buildSnapshot: tool_calls included on assistant turns that used tools', ()
   const snap = buildSnapshot(conv, makeCfg(), VERSION, EXPORTED_AT, 'debug')
   assert.ok(snap.messages[0].tool_calls)
   assert.equal(snap.messages[0].tool_calls![0].name, 'web_search')
+})
+
+test('withoutFileRefs: drops run_python\'s files, outputs and notKept, keeps the rest', () => {
+  const calls = [{ id: 'tc1', name: 'run_python', args: { code: 'x' }, result: 'ok', files: ['attachment:a.png'], outputs: [{ name: 'a.csv', file: 'attachment:a.csv', size: 1 }], notKept: ['big.csv'] }]
+  assert.deepEqual(withoutFileRefs(calls), [{ id: 'tc1', name: 'run_python', args: { code: 'x' }, result: 'ok' }])
 })
 
 test('buildSnapshot: no tool_calls key on messages without tool calls', () => {

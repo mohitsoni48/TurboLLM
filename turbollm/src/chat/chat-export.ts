@@ -48,7 +48,7 @@ export interface ChatSnapshot {
  *  no files, so in an export file such a reference names a file of the chat it came from, or nothing. Export drops
  *  them, and import drops them again, so an imported chat never reaches a file it did not bring. */
 export function withoutFileRefs(calls: ToolCallRecord[]): ToolCallRecord[] {
-  return calls.map(({ files: _files, outputs: _outputs, ...rest }) => rest)
+  return calls.map(({ files: _files, outputs: _outputs, notKept: _notKept, ...rest }) => rest)
 }
 
 /**
