@@ -528,8 +528,18 @@ jobs:
       - name: AAR, JVM goldens and the minified consumer
         run: |
           chmod +x gradlew
-          ./gradlew -Pturbollm.ndkVersion="$NDK_VERSION" :turbollm-core:assembleRelease :turbollm-core:testDebugUnitTest :r8-consumer:assembleRelease
+          set -o pipefail
+          ./gradlew -Pturbollm.ndkVersion="$NDK_VERSION" :turbollm-core:assembleRelease :turbollm-core:testDebugUnitTest :r8-consumer:assembleRelease 2>&1 | tee "$RUNNER_TEMP/android-library-gradle.log"
         working-directory: turbollm/core/bindings/android
+
+      # JNA prints this when a native thread would be detached while its Java code still runs: a desktop JVM refuses
+      # the detach and the tests pass, but ART aborts the app on it (the r8-consumer engine tests on the emulator).
+      - name: No JVM test detached a thread under running code
+        run: |
+          if grep -F 'JNA: could not detach thread' "$RUNNER_TEMP/android-library-gradle.log"; then
+            echo "::error::JNA detached a native thread under running Java code; ART aborts the app on this."
+            exit 1
+          fi
 
       # ADR-482: the LiteRT library in the AAR is the pinned wheel member, byte for byte (AGP strips debug symbols
       # from jniLibs unless the module keeps them).
