@@ -663,3 +663,16 @@ jobs:
             adb push "$TURBOLLM_TEST_LITERTLM" /data/local/tmp/turbollm/Qwen3-0.6B.litertlm
             adb shell chmod -R a+rX /data/local/tmp/turbollm
             ./gradlew -Pturbollm.ndkVersion="$NDK_VERSION" -Pandroid.testInstrumentationRunnerArguments.turbollmTestGguf=/data/local/tmp/turbollm/Qwen3-0.6B-Q4_K_M.gguf -Pandroid.testInstrumentationRunnerArguments.turbollmTestLitertlm=/data/local/tmp/turbollm/Qwen3-0.6B.litertlm :turbollm-core:connectedDebugAndroidTest :r8-consumer:connectedReleaseAndroidTest
+
+      # The Gradle log only says a test class failed to initialise; the device report holds the reason.
+      - name: Keep the device test reports
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: core-android-emulator-reports
+          path: |
+            turbollm/core/bindings/android/turbollm-core/build/reports/androidTests
+            turbollm/core/bindings/android/turbollm-core/build/outputs/androidTest-results
+            turbollm/core/bindings/android/r8-consumer/build/reports/androidTests
+            turbollm/core/bindings/android/r8-consumer/build/outputs/androidTest-results
+          if-no-files-found: warn
