@@ -340,6 +340,19 @@ test('downloadFileName keeps the name without folders, control characters or quo
   assert.equal(downloadFileName('data.csv', `${'0'.repeat(64)}.json`), 'data.csv.json')
 })
 
+test('downloadFileName never cuts a character in half, so the name always encodes for Content-Disposition', () => {
+  // 123 x and an emoji: a cut at 124 UTF-16 units would keep the emoji's first half alone. The whole emoji goes.
+  const cutEmoji = downloadFileName(`${'x'.repeat(123)}😀.csv`, CSV_ID)
+  assert.equal(cutEmoji, `${'x'.repeat(123)}.csv`)
+  assert.doesNotThrow(() => encodeURIComponent(cutEmoji))
+  // One that fits whole is kept.
+  assert.equal(downloadFileName(`${'x'.repeat(122)}😀😀.csv`, CSV_ID), `${'x'.repeat(122)}😀.csv`)
+  // A lone half sent as the name goes too.
+  const lone = downloadFileName('a\ud800b.csv', CSV_ID)
+  assert.equal(lone, 'a_b.csv')
+  assert.doesNotThrow(() => encodeURIComponent(lone))
+})
+
 test('read returns the bytes of any stored file, and null for anything that is not a stored reference', async () => {
   const { store } = freshStore()
   const csv = await store.saveFile(CSV_BYTES, 'csv')

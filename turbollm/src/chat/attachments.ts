@@ -88,10 +88,18 @@ export function isDownloadExtension(ext: string): boolean {
 export function downloadFileName(name: string, id: string): string {
   const ext = id.slice(id.lastIndexOf('.') + 1)
   let base = name.slice(Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\')) + 1)
-  const unsafe = (ch: string) => ch < ' ' || ch === '\u007f' || '"*:<>?|'.includes(ch) || /[\p{Cf}\p{Zl}\p{Zp}]/u.test(ch)
+  // A lone surrogate is unsafe too: encodeURIComponent (Content-Disposition) throws on one.
+  const unsafe = (ch: string) => ch < ' ' || ch === '\u007f' || '"*:<>?|'.includes(ch) || /[\p{Cf}\p{Zl}\p{Zp}\p{Cs}]/u.test(ch)
   base = Array.from(base, (ch) => (unsafe(ch) ? '_' : ch)).join('').replace(/[.\s]+$/, '')
   if (base.toLowerCase().endsWith(`.${ext}`)) base = base.slice(0, -(ext.length + 1))
-  base = base.slice(0, MAX_DOWNLOAD_NAME - ext.length - 1).replace(/^[.\s]+|[.\s]+$/g, '')
+  // Cut by whole characters, never inside a surrogate pair (an emoji cut in half is a lone surrogate).
+  const room = MAX_DOWNLOAD_NAME - ext.length - 1
+  let kept = ''
+  for (const ch of base) {
+    if (kept.length + ch.length > room) break
+    kept += ch
+  }
+  base = kept.replace(/^[.\s]+|[.\s]+$/g, '')
   return `${base || 'file'}.${ext}`
 }
 
