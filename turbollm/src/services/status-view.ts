@@ -84,6 +84,7 @@ export function buildModelStatus(d: Deps): ModelStatusView {
           ctx: ms.model.ctx,
           vision: ms.model.vision,
           ...(ms.model.audio === true ? { audio: true } : {}),
+          ...(ms.model.audioOut === true ? { audioOut: true } : {}),
           loadElapsedMs: ms.loadElapsedMs,
         }
       : null,

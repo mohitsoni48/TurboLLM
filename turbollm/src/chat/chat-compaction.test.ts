@@ -8,6 +8,7 @@ import {
   withCurrentDate, shouldAutoCompact, lastCtxUsage, resolveCompactionCut,
   buildEngineMessages, userTurnContent, VOICE_MESSAGE_PLACEHOLDER, pickCompactionCut, AUTO_COMPACT_THRESHOLD,
   compactConversation, maybeAutoCompact, setAsideFrozenCut,
+  buildAudioReplyInstructions, SPOKEN_REPLY_PLACEHOLDER,
 } from './chat-compaction.js'
 import type { Conversation, Message } from './db.js'
 import type { ChatUpstream } from './chat-upstream.js'
@@ -15,6 +16,7 @@ import { ConversationStore } from './db.js'
 import { rmSync } from 'node:fs'
 import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
+import { estimateTokens } from '../ext/context-limit.js'
 
 function makeMsg(role: 'user' | 'assistant', content: string, overrides: Partial<Message> = {}): Message {
   return {
@@ -1116,4 +1118,70 @@ test('buildEngineMessages: the answered turn carries its clip whether or not the
     const out = buildEngineMessages(makeConv(), [voice], voice.id, { hearsAudio })
     assert.deepEqual(out[0].content, [{ type: 'input_audio', input_audio: { data: CLIP_REF, format: 'wav' } }])
   }
+})
+
+// ── history as text for an audio reply ─────────────────────────────────────────────────
+
+const REPLY_CLIP_REF = `attachment:${'cd'.repeat(32)}.wav`
+
+test('buildAudioReplyInstructions: system prompt with the date, then the summary, then the earlier turns as a text transcript', () => {
+  const m1 = makeMsg('user', 'old question')
+  const m2 = makeMsg('assistant', 'old answer')
+  const m3 = makeMsg('user', 'What is the capital of France?')
+  const m4 = makeMsg('assistant', 'Paris.')
+  const conv = makeConv({ systemPrompt: 'Be brief.', compactionSummary: 'They talked about geography.', compactionUpToMessageId: m2.id })
+  const out = buildAudioReplyInstructions(conv, [m1, m2, m3, m4], 8192)
+  assert.equal(out, [
+    withCurrentDate('Be brief.'),
+    'Earlier conversation summary:\n\nThey talked about geography.',
+    'Earlier conversation (text transcript):\nUser: What is the capital of France?\nAssistant: Paris.',
+  ].join('\n\n'))
+})
+
+test('buildAudioReplyInstructions: nothing to say is an empty string, and no transcript header without turns', () => {
+  assert.equal(buildAudioReplyInstructions(makeConv(), [], 8192), '')
+  assert.equal(buildAudioReplyInstructions(makeConv({ systemPrompt: 'Be brief.' }), [], 8192), withCurrentDate('Be brief.'))
+})
+
+test('buildAudioReplyInstructions: earlier voice messages are [Voice message], a wordless spoken reply is [Spoken reply], and no clip is ever sent', () => {
+  const voice = makeMsg('user', '', { attachments: [CLIP_REF] })
+  const spokenOnly = makeMsg('assistant', '', { attachments: [REPLY_CLIP_REF] })
+  const typed = makeMsg('user', 'and now?')
+  const words = makeMsg('assistant', 'Berlin.', { attachments: [REPLY_CLIP_REF] })
+  const out = buildAudioReplyInstructions(makeConv(), [voice, spokenOnly, typed, words], 8192)
+  assert.equal(out, `Earlier conversation (text transcript):\nUser: ${VOICE_MESSAGE_PLACEHOLDER}\nAssistant: ${SPOKEN_REPLY_PLACEHOLDER}\nUser: and now?\nAssistant: Berlin.`)
+  assert.ok(!out.includes('attachment:'))
+})
+
+test('buildAudioReplyInstructions: a past reply\'s reasoning is left out even when the conversation preserves thinking', () => {
+  const reply = makeMsg('assistant', 'Paris.', { reasoning: 'secret chain of thought' })
+  const out = buildAudioReplyInstructions(makeConv({ preserveThinking: true }), [makeMsg('user', 'q'), reply], 8192)
+  assert.ok(!out.includes('secret'))
+  assert.ok(!out.includes('<think>'))
+})
+
+test('buildAudioReplyInstructions: the transcript fits about half the context, oldest turns dropped first, system prompt kept', () => {
+  const turns: Message[] = []
+  for (let i = 0; i < 20; i++) turns.push(makeMsg(i % 2 ? 'assistant' : 'user', `turn ${i} ${'x'.repeat(200)}`))
+  const conv = makeConv({ systemPrompt: 'Be brief.' })
+  const out = buildAudioReplyInstructions(conv, turns, 1000)
+  assert.ok(out.startsWith(withCurrentDate('Be brief.')))
+  assert.ok(out.includes('turn 19 '), 'the newest turn is kept')
+  assert.ok(!out.includes('turn 0 '), 'the oldest is dropped')
+  const kept = out.split('\n').filter((l) => /^(User|Assistant): turn/.test(l)).map((l) => Number(l.match(/turn (\d+)/)![1]))
+  assert.deepEqual(kept, Array.from({ length: kept.length }, (_, i) => 20 - kept.length + i), 'a contiguous run ending at the newest')
+  assert.ok(estimateTokens([{ role: 'system', content: out }]) <= 500 + 10, 'about half of the 1000-token context')
+  // A window too small for the system prompt alone still sends it, with no turns.
+  assert.equal(buildAudioReplyInstructions(conv, turns, 10), withCurrentDate('Be brief.'))
+})
+
+test('buildEngineMessages: an assistant message that is only a clip is [Spoken reply] for a text model, whether or not it hears audio', () => {
+  const spokenOnly = makeMsg('assistant', '', { attachments: [REPLY_CLIP_REF] })
+  const next = makeMsg('user', 'more')
+  for (const hearsAudio of [true, false, undefined]) {
+    const out = buildEngineMessages(makeConv(), [makeMsg('user', 'q'), spokenOnly, next], next.id, { hearsAudio })
+    assert.equal(out[1].content, SPOKEN_REPLY_PLACEHOLDER)
+  }
+  const withWords = makeMsg('assistant', 'Paris.', { attachments: [REPLY_CLIP_REF] })
+  assert.equal(buildEngineMessages(makeConv(), [makeMsg('user', 'q'), withWords, next], next.id, { hearsAudio: true })[1].content, 'Paris.')
 })

@@ -80,6 +80,9 @@ export type LoadedModel = {
   /** The model takes audio as input: a recording can be sent to it as it is, not only as its transcript. Absent from
    *  daemons that predate voice input. */
   audio?: boolean
+  /** The model answers with speech as well as text: a reply can be asked for as audio. Absent unless true, and from
+   *  daemons that predate audio replies. */
+  audioOut?: boolean
   loadElapsedMs?: number
 }
 

@@ -59,6 +59,7 @@ LM Studio — and 2.2× on forks it can't load** ([the numbers](#speed-turbollm-
 - [Live hardware monitoring](#live-hardware-monitoring)
 - [Quick start](#quick-start)
 - [⭐ Bring any engine — the headline feature](#-bring-any-engine--the-headline-feature)
+- [Audio-to-audio models: a model that answers in speech](#audio-to-audio-models-a-model-that-answers-in-speech)
 - [Run Claude Code on your own GPU](#run-claude-code-on-your-own-gpu)
 - [Use it from any device on your network](#use-it-from-any-device-on-your-network)
 - [Command-line reference](#command-line-reference)
@@ -276,7 +277,9 @@ the detail:
   encoder) can be sent the recording itself instead, so it hears your voice and not only your
   words: TurboLLM asks which you want, once or every time. **Read aloud** on any reply speaks it
   in your device's own voice, picking one for the language the reply is written in, and replies
-  can be read out as they are written.
+  can be read out as they are written. A model that **answers in speech** (LFM3-Audio on llama.cpp)
+  replies with its own voice, in a player on the message: see
+  [Audio-to-audio models](#audio-to-audio-models-a-model-that-answers-in-speech).
 - **Markdown + syntax-highlighted code** with one-click copy — plus **inline Unicode charts**
   the model draws when a comparison, trend, or hierarchy is genuinely worth a visual.
 - **Live artifacts** — `html`, `svg`, and `mermaid` replies render as **sandboxed, offline
@@ -450,6 +453,9 @@ curl http://127.0.0.1:6996/v1/chat/completions \
   a chat model can stay loaded side by side.
 - **Anthropic-compatible** `/v1/messages` — including **tool use and streaming** — which powers
   Claude Code below. No other local host offers this.
+- **Audio output** — `/v1/chat/completions` with `modalities: ["text", "audio"]` returns
+  `message.audio` (base64 WAV and its transcript) from a local model that answers in speech; see
+  [Audio-to-audio models](#audio-to-audio-models-a-model-that-answers-in-speech).
 - **Speech-to-text API** — `POST /v1/audio/transcriptions` and `/v1/audio/translations`, the
   shape of OpenAI's Whisper API (`json`, `text`, `srt`, `vtt`, `verbose_json`), answered by
   whisper.cpp on your machine once it is set up in *Settings → Voice*. WAV, MP3, FLAC and Ogg
@@ -613,6 +619,76 @@ the UI when something fails to load.
 > Why it matters: fork-exclusive features — **speculative decoding (NextN / MTP / draft)**,
 > low-bit KV cache, new quant formats — are usable on day 0, with **zero compiler knowledge**
 > on your part beyond producing the binary (and often not even that).
+
+---
+
+## Audio-to-audio models: a model that answers in speech
+
+Some models take speech in and give speech back directly, with no speech-to-text and text-to-speech
+steps in between. TurboLLM runs one of them today: **[LFM3-Audio-2B](https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF)**
+(the `LFM3-Audio-2B-Q4_K_M.gguf` model and its `mmproj-LFM3-Audio-2B-Q8_0.gguf` projector, kept in
+one folder so they pair) on the **llama.cpp** engine, **build b11960 or newer**. TurboLLM's default llama.cpp
+(b9608) is older and cannot load this model (the engine exits with "unknown model architecture: 'lfm3'"): add a newer
+llama.cpp build on the Engines screen and make it active before you load the model. It is small enough for a CPU.
+
+**Use it.** Load the model. Press the microphone, speak, and choose **Send as audio**. The reply
+comes back as its text with a **player** under it (it never plays by itself), is saved with the chat
+and plays again after a reload. A model that does not answer aloud never shows any of this.
+
+**From the API.** `POST /v1/chat/completions` with `modalities: ["text", "audio"]` answers in OpenAI's
+shape. Send the question as a base64 WAV `input_audio` part, or as text:
+
+```bash
+curl http://127.0.0.1:6996/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local",
+    "modalities": ["text", "audio"],
+    "audio": { "voice": "female", "format": "wav" },
+    "messages": [{ "role": "user", "content": [
+      { "type": "input_audio", "input_audio": { "data": "<base64 WAV>", "format": "wav" } }
+    ] }]
+  }'
+# → choices[0].message.audio = { id, data: "<base64 WAV>", expires_at, transcript }
+```
+
+`audio.format` is `wav` or `pcm16` (raw samples with no header, at the model's own rate: 24 kHz for LFM3-Audio). Send earlier turns back as **text**:
+the ids of earlier audio replies are not stored here, so an assistant message with only an
+`audio: { id }` reaches the model as `[Spoken reply]`, and an earlier `input_audio` part as `[Voice message]`.
+A request that does not ask for audio is untouched.
+
+**Limits, so they are no surprise.**
+
+- **A finished clip, not a stream.** The reply is played once it is complete; `stream: true` with audio
+  is refused (`audio_stream_unsupported`).
+- **At most about 5 minutes of mono audio in one spoken turn** (all its recordings together, with a few seconds of
+  slack for the recorder's own overrun). The page records 16 kHz mono, so a full recording always fits. A WAV with more
+  channels or a higher rate is bounded by its total samples as well: 44.1 or 48 kHz stereo fits only about 3 minutes, so
+  send mono for longer clips. A message over the limit is sent as an ordinary text turn by the page, and refused
+  (`audio_format_unsupported`) by the API.
+- **WAV only.** An MP3 recording is refused (`audio_format_unsupported`); the page records WAV.
+- **A local model only.** A model on a linked machine, or in an extra pool slot, cannot answer aloud
+  (`audio_output_unsupported`), and a request for audio is refused, never answered in text.
+- **One engine slot is held while it speaks.** With one slot (`--parallel 1`), another request waits for the reply to finish.
+- **Stop is quick once the reply is under way, slower before it.** It tells the engine to cancel, which answered in
+  0.14 to 0.26 s once the model was speaking. During the first second or two (the engine reading your recording) the
+  engine can ignore a cancel, so TurboLLM sends it again until the engine ends the reply: in testing that took about
+  2.4 s on an idle 4-core CPU, longer when the machine is busy, and never more than 30 s (after which TurboLLM closes
+  the session anyway). The engine's slot was free about a second after. What arrived is kept, marked stopped.
+- **Regenerate and Edit & resend answer in text.** Only sending a new recording asks for a spoken reply, so a
+  regenerated reply to a spoken message has no player.
+- **An audio request through the API names a model like any request.** With auto-swap on, a request for audio that
+  names a model that is not loaded loads it first, and only then is told whether it can speak. A request that its own body
+  makes unanswerable (`stream: true`, a bad format, an MP3 or empty clip) is refused before any model is loaded.
+- **A spoken reply is capped at about a minute of speech** (1024 tokens, which are 80 ms frames of sound) unless an API
+  request sets `max_tokens`; Settings' text token limit does not apply to it. A reply that reaches the cap ends with
+  `finish_reason: "length"` through the API; the chat, as for a text reply, shows nothing special.
+- Earlier turns are sent as text, trimmed to about half the model's context, oldest first.
+
+**Measured** on a cloud container with 4 vCPUs (Intel Xeon @ 2.10 GHz), 15 GB RAM and **no GPU**, a spoken
+4.4 s question ("What is the capital of France?"): the first sound after 2.6 to 2.8 s and the whole reply
+(2.6 s of speech) in about 6.7 s. A typed question took 0.9 s to the first sound and 4 s in all. The whole
+reply is waited for before it plays, so expect roughly the second figure. No GPU number has been measured yet.
 
 ---
 

@@ -178,11 +178,14 @@ export async function* sendMessage(
   onAccepted?: () => void,
   /** Voice clips for a model that hears audio, as `data:audio/wav` URLs: sent to it as they are, not as text. */
   audio?: string[],
+  /** Ask for the reply as speech: sent only for a recording sent as audio to a local model that answers aloud, and not
+   *  at all otherwise, so every other send's body is what it always was. */
+  replyAudio?: boolean,
 ): AsyncGenerator<ChatFrame> {
   const res = await fetch(`/api/v1/conversations/${encodeURIComponent(convId)}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ content, images: images?.length ? images : undefined, audio: audio?.length ? audio : undefined, docContext: docContext || undefined, textAttachments: textAttachments?.length ? textAttachments : undefined, thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined, model: model || undefined }),
+    body: JSON.stringify({ content, images: images?.length ? images : undefined, audio: audio?.length ? audio : undefined, replyAudio: replyAudio ? true : undefined, docContext: docContext || undefined, textAttachments: textAttachments?.length ? textAttachments : undefined, thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined, model: model || undefined }),
     signal,
   })
   if (!res.ok || !res.body) {

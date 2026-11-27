@@ -97,6 +97,15 @@ describe('VoiceBar', () => {
       expect(screen.getByRole('button', { name: 'Convert to text' })).toBeInTheDocument()
     })
 
+    it('says the model answers aloud only when it does', () => {
+      const { unmount } = render(<VoiceBar voice={makeVoice('choosing')} autoStop answersAloud />)
+      expect(screen.getByText('This model can hear audio and answers aloud.')).toBeInTheDocument()
+      unmount()
+      render(<VoiceBar voice={makeVoice('choosing')} autoStop />)
+      expect(screen.getByText('This model can hear audio.')).toBeInTheDocument()
+      expect(screen.queryByText(/answers aloud/)).toBeNull()
+    })
+
     it('"Send as audio" and "Convert to text" choose without remembering by default', async () => {
       const voice = makeVoice('choosing', { pendingMs: 3000 })
       render(<VoiceBar voice={voice} autoStop />)
