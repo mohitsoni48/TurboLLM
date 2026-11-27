@@ -437,6 +437,7 @@ export function ModelsScreen() {
           setSearch={setSearch}
           filter={filter}
           setFilter={setFilter}
+          answersAloudKey={status?.model?.audioOut === true ? status.model.key : undefined}
           facetCounts={facetCounts}
           listedCount={notHiddenByYou.length}
           hiddenCount={hiddenCount}
@@ -515,6 +516,7 @@ function LibraryTab({
   setSearch,
   filter,
   setFilter,
+  answersAloudKey,
   facetCounts,
   listedCount,
   hiddenCount,
@@ -556,6 +558,8 @@ function LibraryTab({
   setSearch: (s: string) => void
   filter: Filter
   setFilter: (f: Filter) => void
+  /** The key of the loaded model when it answers aloud (status audioOut), read once here so a row does not watch the status. */
+  answersAloudKey: string | undefined
   facetCounts: { vision: number; moe: number; nextn: number; embedding: number }
   /** The models the list can show: all of them but those hidden by hand, unless "Show hidden models" is on. */
   listedCount: number
@@ -772,6 +776,7 @@ function LibraryTab({
                     onDiscover={onDiscover}
                     busy={loadBusy}
                     loadingKey={loadingKey}
+                    answersAloudKey={answersAloudKey}
                     ejecting={actions.eject.isPending}
                     showIncompatible={showIncompatible}
                     isPinned={isPinned}
@@ -863,6 +868,7 @@ function ModelRow({
   onDiscover,
   busy,
   loadingKey,
+  answersAloudKey,
   ejecting,
   showIncompatible,
   isPinned,
@@ -886,6 +892,7 @@ function ModelRow({
   onDiscover: (m: ModelEntry) => void
   busy: boolean
   loadingKey: string | undefined
+  answersAloudKey: string | undefined
   ejecting: boolean
   /** "Show all" or Settings' "Show models for every engine" is on: a row the engine cannot run offers its Load. */
   showIncompatible: boolean
@@ -956,6 +963,11 @@ function ModelRow({
         ))}
         <TextClassificationRuntimeLabel model={m} />
         {m.hasProfile && <CapChip>tuned</CapChip>}
+        {/* Only the model that is loaded now, and only when its engine says it answers with speech (status audioOut):
+            a library row cannot know that before a load, so nothing is shown for any other row. */}
+        {loaded && answersAloudKey === m.key && (
+          <CapChip label="This model answers aloud: replies come back as speech with a player">Answers aloud</CapChip>
+        )}
         {/* Listed by "Show hidden models", or because it is loaded: marked, with its Unhide right here in both layouts
             (the desktop actions column has no room for another button). */}
         {m.hidden && (
@@ -1312,9 +1324,9 @@ function FilterChip({ active, onClick, children }: { active: boolean; onClick: (
 
 /** Quiet capability chip (vision / MoE / embed / NextN / tuned) — muted, never loud;
  *  only problems get a warning color. */
-function CapChip({ children }: { children: ReactNode }) {
+function CapChip({ children, label }: { children: ReactNode; label?: string }) {
   return (
-    <span className="shrink-0 whitespace-nowrap rounded bg-panel-2 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted">
+    <span title={label} aria-label={label} className="shrink-0 whitespace-nowrap rounded bg-panel-2 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted">
       {children}
     </span>
   )

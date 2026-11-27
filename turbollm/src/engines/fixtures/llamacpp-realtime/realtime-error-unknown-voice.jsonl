@@ -1,0 +1,1 @@
+{"type":"error","error":{"type":"invalid_request_error","code":null,"message":"session.update: unknown voice \"robot\", see \"voices\" in GET /props","param":null},"event_id":"event_OIanJqngF0M94pPCooBRkMR47634bR1S"}

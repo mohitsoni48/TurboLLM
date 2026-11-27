@@ -35,6 +35,25 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   that limit yet). Each chat keeps its own sandbox, closed after 10 minutes idle. Not offered to routines, Code
   sessions, the External Chat API, remote-access tokens or keyless LAN callers, and only the host or a caller with an
   API key can allow a run.
+- **Audio-to-audio models.** A model that takes speech in and gives speech back, such as
+  [LFM3-Audio-2B](https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF) on llama.cpp b11960 or newer, can now answer in
+  its own voice.
+  - **In the chat.** When the loaded model answers aloud, a recording sent with **Send as audio** gets a spoken reply: its text
+    with a player under it (never playing by itself), kept with the conversation and replayable after a reload. The clip is stored
+    like a voice message's, so retention and the cleanup of unused files treat it the same, and earlier turns go back to the model as
+    text. Stop cancels the reply in the engine and keeps what had arrived.
+  - **How the app knows.** The loaded model's `audioOut` flag (new, optional, absent on older daemons) on `GET /api/v1/status` comes from
+    the engine's own `GET /v1/models` (`output_modalities` has both `text` and `audio`), not from the model's name. Nothing about
+    spoken replies is shown for a model that does not have it.
+  - **API.** `POST /v1/chat/completions` with `modalities: ["text", "audio"]` and `audio: { voice, format }` returns `message.audio`
+    (base64 `wav` or `pcm16`, with its transcript) in OpenAI's shape. A request that asks for audio is never forwarded to an engine, and is
+    refused with a code when it cannot be answered: `audio_output_unsupported` (a text-only model, a linked machine, an engine with no
+    way to return audio), `audio_stream_unsupported`, `audio_format_unsupported`, or `audio_not_returned` (502) when an engine that
+    should speak sends no audio. A request that does not ask for audio is unchanged.
+  - **Limits.** A finished clip, not a stream; WAV input only; local models only; one engine slot is held while the model speaks.
+    Stop works within a fraction of a second once the reply is under way, and in about 2.4 s before (while the engine reads
+    the recording) on an idle 4-core CPU, longer when the machine is busy, and never more than 30 s. Regenerate and Edit & resend answer in text. An audio request naming a model that is not loaded loads it first.
+    llama.cpp returns speech only over its `/v1/realtime` WebSocket, which is what TurboLLM uses.
 
 ## [1.15.2] - 2026-11-15
 

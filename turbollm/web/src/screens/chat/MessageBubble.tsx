@@ -958,7 +958,10 @@ export function MessageBubble({
   // researchMeta excluded (pre-release review, Finding E): a research-only turn can finish
   // with empty content/reasoning but a real sources panel + confidence badge below — showing
   // "This message is empty." above real, populated content would be self-contradictory.
-  const isEmptyFinish = !message.content?.trim() && !message.reasoning?.trim() && completedToolCalls.length === 0 && !message.researchMeta
+  // A reply spoken by the model: its clip is shown under its words, and is the whole message when it has none.
+  const spokenClips = message.attachments?.filter(isAudioAttachment) ?? []
+  const hasWords = !!message.content?.trim()
+  const isEmptyFinish = !hasWords && !message.reasoning?.trim() && completedToolCalls.length === 0 && !message.researchMeta && spokenClips.length === 0
   // GitHub #177: "empty" and "failed" are not the same thing. An empty row whose generation the
   // DAEMON says is still running is simply not finished yet — show the generating affordance, not
   // a red error card. See isAwaitingGeneration for why all three of its conditions are needed.
@@ -1006,7 +1009,7 @@ export function MessageBubble({
           <Loader2 size={13} className="animate-spin" />
           Generating…
         </div>
-      ) : (
+      ) : (hasWords || spokenClips.length === 0) && (
         <div ref={displayRef} className="prose-tllm text-[15px] leading-[1.7] text-ink">
           {verdicts.length > 0
             ? <AnnotatedReply content={message.content} verdicts={verdicts} />
@@ -1014,6 +1017,9 @@ export function MessageBubble({
           }
         </div>
       )}
+      {!isEditing && !hasError && !stillGenerating && spokenClips.map((attachment, i) => (
+        <AttachmentAudio key={`reply-clip-${i}`} attachment={attachment} label="Spoken reply" />
+      ))}
       {/* F-021: confidence badge */}
       {rm?.confidence !== undefined && (
         <div className="mt-1.5">
@@ -1039,9 +1045,9 @@ export function MessageBubble({
                 useful on a failed/empty message. */}
             {/* `stillGenerating` (GitHub #177) joins hasError here for the same reason: there is
                 no text to copy or edit yet, and the row is about to be rewritten by the daemon. */}
-            {!hasError && !stillGenerating && <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" screen="chat" />}
-            {!hasError && !stillGenerating && <SpeakButton id={message.id} text={message.content} />}
-            {!hasError && !stillGenerating && onEdit && <ActionBtn icon={<Pencil size={12} />} label="Edit" onClick={() => { track('chat', 'open_edit_message'); beginEdit() }} />}
+            {!hasError && !stillGenerating && (hasWords || spokenClips.length === 0) && <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" screen="chat" />}
+            {!hasError && !stillGenerating && (hasWords || spokenClips.length === 0) && <SpeakButton id={message.id} text={message.content} />}
+            {!hasError && !stillGenerating && (hasWords || spokenClips.length === 0) && onEdit && <ActionBtn icon={<Pencil size={12} />} label="Edit" onClick={() => { track('chat', 'open_edit_message'); beginEdit() }} />}
             {isLast && onRegenerate && <ActionBtn icon={<RefreshCw size={12} />} label="Regenerate" onClick={() => { track('chat', 'regenerate_message'); onRegenerate() }} />}
             {!stillGenerating && onFork && <ActionBtn icon={<GitBranch size={12} />} label="Fork from here" onClick={() => { track('chat', 'fork_message'); onFork(message) }} />}
             {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => { track('chat', 'delete_message'); onDelete(message) }} destructive />}

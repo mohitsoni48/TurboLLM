@@ -67,3 +67,12 @@ test('buildModelStatus marks a model that hears audio, and leaves the key out ot
     assert.ok(!('audio' in buildModelStatus(depsLoaded(model)).model!))
   }
 })
+
+test('buildModelStatus marks a model that answers aloud, and leaves the key out otherwise', () => {
+  const base = { key: 'k', name: 'n', quant: 'Q4', ctx: 4096, vision: false }
+  assert.equal(buildModelStatus(depsLoaded({ ...base, audioOut: true })).model?.audioOut, true)
+  // Absent, not false: the page offers a spoken reply on `audioOut` being there.
+  for (const model of [base, { ...base, audioOut: false }]) {
+    assert.ok(!('audioOut' in buildModelStatus(depsLoaded(model)).model!))
+  }
+})
