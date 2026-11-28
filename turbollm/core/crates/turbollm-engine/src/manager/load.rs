@@ -36,25 +36,27 @@ impl EngineManager {
         abandoned: AbortSignal,
     ) -> Result<LoadedModelInfo, EngineError> {
         let manager = self.clone();
-        under_lifecycle(lifecycle, async move {
-            manager.load_and_publish(&target, &abandoned).await
+        under_lifecycle(lifecycle, |lifecycle| async move {
+            manager
+                .load_and_publish(lifecycle, &target, &abandoned)
+                .await
         })
         .await
     }
 
     async fn load_and_publish(
         &self,
+        lifecycle: OwnedMutexGuard<()>,
         target: &LoadTarget,
         abandoned: &AbortSignal,
     ) -> Result<LoadedModelInfo, EngineError> {
         let loaded = catching_panics(self.load(target, abandoned))
             .await
             .unwrap_or_else(|message| Err(EngineError::ModelLoadFailed(message)));
-        match &loaded {
-            _ if abandoned.is_aborted() => self.show_resident_or_idle(),
-            Err(failure) => self.publish_failed(target, failure),
-            Ok(_) => {}
-        }
+        self.settle(lifecycle, || match &loaded {
+            Err(failure) if !abandoned.is_aborted() => self.publish_failed(target, failure),
+            _ => self.show_resident_or_idle(),
+        });
         loaded
     }
 

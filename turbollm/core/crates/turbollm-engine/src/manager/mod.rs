@@ -37,6 +37,9 @@ pub const MODEL_NOT_LOADED: &str = "The model is not loaded.";
 /// `LlamaCppEngine.kt:54`, `LiteRtLmEngine.kt:50`: a second model offered to an engine holding one.
 pub const ALREADY_HOLDS_A_MODEL: &str = "This engine already holds a model.";
 
+#[cfg(any(test, feature = "testing"))]
+type SettleProbe = Arc<dyn Fn() + Send + Sync>;
+
 /// What one manager is built from.
 pub struct ManagerConfig {
     pub catalog: Catalog,
@@ -58,6 +61,14 @@ pub struct EngineManager {
 struct Shared {
     catalog: Catalog,
     lifecycle: Arc<Mutex<()>>,
+    /// Held while a finished lifecycle publishes its outcome and lets go, and while a claim takes
+    /// the lifecycle: a state read as an outcome is then never followed by a refusal for it.
+    /// Publishing runs snapshot wake callbacks synchronously while this is held, so a callback
+    /// must never call `claim_load`.
+    handoff: StdMutex<()>,
+    /// Runs inside `settle` between the publish and the release, so a test can act in that window.
+    #[cfg(any(test, feature = "testing"))]
+    settle_probe: StdMutex<Option<SettleProbe>>,
     resident: StdMutex<Option<Resident>>,
     snapshots: Arc<Snapshots>,
     journal: Option<LoadJournal>,
@@ -85,6 +96,9 @@ impl EngineManager {
             shared: Arc::new(Shared {
                 catalog: config.catalog,
                 lifecycle: Arc::new(Mutex::new(())),
+                handoff: StdMutex::new(()),
+                #[cfg(any(test, feature = "testing"))]
+                settle_probe: StdMutex::new(None),
                 resident: StdMutex::new(None),
                 snapshots: Arc::new(Snapshots::new()),
                 journal: config.journal,
@@ -123,6 +137,7 @@ impl EngineManager {
     /// `Loading` is published before this returns.
     pub fn claim_load(&self, target: LoadTarget) -> Result<LoadClaim, EngineError> {
         self.refuse_when_closed()?;
+        let _handoff = self.handoff();
         let lifecycle = Arc::clone(&self.shared.lifecycle)
             .try_lock_owned()
             .map_err(|_held| EngineError::LoadInProgress)?;
@@ -140,9 +155,11 @@ impl EngineManager {
         let lifecycle = self.lifecycle().await;
         self.refuse_when_closed()?;
         let manager = self.clone();
-        under_lifecycle(lifecycle, async move {
+        under_lifecycle(lifecycle, |lifecycle| async move {
             manager.unload_resident().await;
-            manager.shared.snapshots.publish(EngineState::Idle);
+            manager.settle(lifecycle, || {
+                manager.shared.snapshots.publish(EngineState::Idle);
+            });
             Ok(())
         })
         .await
@@ -157,17 +174,25 @@ impl EngineManager {
         self.start_generation(&gate, req, permit)
     }
 
-    /// Unloads, then refuses everything with `Closed`; a successor waiting on it continues. Once it
-    /// holds the lifecycle, a dropped future no longer stops it.
+    /// Waits for the predecessor to be `Closed`, unloads, then refuses everything with `Closed`; a
+    /// successor waiting on it continues, so a chain of cores closes in order even when this one
+    /// never loaded. A predecessor nobody shuts down keeps this wait (and the lifecycle) forever:
+    /// the owner of a core shuts it down before it builds the next (arch 2.3.5); a predecessor
+    /// dropped without a shutdown is shut down by its owner's `Drop`, which ends the wait. Do not
+    /// add a timeout: a successor would then close while the predecessor still holds a model. Once it holds the
+    /// lifecycle, a dropped future no longer stops it.
     pub async fn shutdown(&self) {
         let lifecycle = self.lifecycle().await;
         if self.shared.snapshots.is_closed() {
             return;
         }
         let manager = self.clone();
-        let closing = under_lifecycle(lifecycle, async move {
+        let closing = under_lifecycle(lifecycle, |lifecycle| async move {
+            manager.await_predecessor_closed().await;
             manager.unload_resident().await;
-            manager.shared.snapshots.publish(EngineState::Closed);
+            manager.settle(lifecycle, || {
+                manager.shared.snapshots.publish(EngineState::Closed);
+            });
             Ok(())
         });
         // Its only failure is a runtime that dropped the task, which leaves nothing to close.
@@ -176,6 +201,48 @@ impl EngineManager {
 
     fn lifecycle(&self) -> impl Future<Output = OwnedMutexGuard<()>> + use<> {
         Arc::clone(&self.shared.lifecycle).lock_owned()
+    }
+
+    /// Publishes the outcome that ends a lifecycle and releases the lifecycle in one step for
+    /// `claim_load`: a claim that finds the outcome published finds the lifecycle free.
+    fn settle(&self, lifecycle: OwnedMutexGuard<()>, publish: impl FnOnce()) {
+        let _handoff = self.handoff();
+        publish();
+        #[cfg(any(test, feature = "testing"))]
+        self.run_settle_probe();
+        drop(lifecycle);
+    }
+
+    /// Runs `probe` inside every later `settle`, after the outcome is published and before the
+    /// lifecycle is released: the window in which a claim must neither be refused nor publish
+    /// `Loading` ahead of that outcome.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_settle_probe(&self, probe: impl Fn() + Send + Sync + 'static) {
+        *self
+            .shared
+            .settle_probe
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(probe));
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    fn run_settle_probe(&self) {
+        let probe = self
+            .shared
+            .settle_probe
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(probe) = probe {
+            probe();
+        }
+    }
+
+    fn handoff(&self) -> MutexGuard<'_, ()> {
+        self.shared
+            .handoff
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn refuse_when_closed(&self) -> Result<(), EngineError> {
@@ -231,7 +298,9 @@ impl EngineManager {
         }
     }
 
-    /// Makes `model` the resident with a fresh gate and publishes it `Ready`.
+    /// Makes `model` the resident with a fresh gate; the load publishes it `Ready` as it ends.
+    /// A generation may start in the instant between this and that publish; the `Ready` folds in
+    /// its occupancy, so nothing observable differs.
     async fn install(
         &self,
         target: &LoadTarget,
@@ -240,14 +309,7 @@ impl EngineManager {
     ) -> Result<LoadedModelInfo, EngineError> {
         let arriving = self.resident_for(target, kind, model);
         let info = arriving.info.clone();
-        let refused = {
-            let mut resident = self.resident();
-            let held = take_residence(&mut resident, arriving);
-            if held.is_ok() {
-                self.show_resident_or_idle_in(&resident);
-            }
-            held
-        };
+        let refused = take_residence(&mut self.resident(), arriving);
         match refused {
             Ok(()) => Ok(info),
             Err((rejected, failure)) => {
@@ -282,13 +344,8 @@ impl EngineManager {
 
     /// Publishes the resident model `Ready`, or `Idle` when none is held.
     fn show_resident_or_idle(&self) {
-        let resident = self.resident();
-        self.show_resident_or_idle_in(&resident);
-    }
-
-    fn show_resident_or_idle_in(&self, resident: &Option<Resident>) {
         let snapshots = &self.shared.snapshots;
-        match resident {
+        match &*self.resident() {
             Some(held) => snapshots.publish_ready(held.epoch, held.info.clone(), held.occupancy()),
             None => snapshots.publish(EngineState::Idle),
         }
@@ -316,19 +373,17 @@ impl Resident {
     }
 }
 
-/// Runs `work` in a task of its own that keeps `lifecycle` until the work ended: a caller that
+/// Runs `work` in a task of its own that owns `lifecycle` and releases it, through `settle` once it
+/// has an outcome to show, or when the work ends or is dropped: a caller that
 /// stops waiting stops only its wait (arch 2.3.5). Work the runtime dropped while shutting down
 /// reads `Closed`.
-async fn under_lifecycle<T, W>(lifecycle: OwnedMutexGuard<()>, work: W) -> Result<T, EngineError>
+async fn under_lifecycle<T, W, F>(lifecycle: OwnedMutexGuard<()>, work: F) -> Result<T, EngineError>
 where
+    F: FnOnce(OwnedMutexGuard<()>) -> W,
     W: Future<Output = Result<T, EngineError>> + Send + 'static,
     T: Send + 'static,
 {
-    let task = tokio::spawn(async move {
-        let ended = work.await;
-        drop(lifecycle);
-        ended
-    });
+    let task = tokio::spawn(work(lifecycle));
     match task.await {
         Ok(ended) => ended,
         Err(stopped) if stopped.is_panic() => std::panic::resume_unwind(stopped.into_panic()),
