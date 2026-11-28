@@ -1161,7 +1161,8 @@ export class Manager {
             exitCode: -1,
             logTail: readTail(this.logPathStr, 20),
           }
-          child.kill('SIGKILL')
+          if (kind === 'strata') this.transport?.kill()
+          else child.kill('SIGKILL')
         }
         return
       }

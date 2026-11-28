@@ -496,10 +496,11 @@ export class Scanner {
         // count matches — a duplicate + a hole would otherwise pass the old length check).
         // ISTA's DeepSeek six-way split has five numbered weight shards. The sixth is the
         // separately named Engram, which multiple quants can share. Keep it out of deletionTargets.
+        const searchDirs = [dir, dirname(dir), dirname(dirname(dir))]
         const separateEngram = total === 6 && isDeepseekSixPart(basename(first.path)) &&
           engramFiles.some(f => {
             const parent = dirname(f.path)
-            return parent === dir || parent === dirname(dir) || dirname(parent) === dirname(dir)
+            return searchDirs.includes(parent) || searchDirs.includes(dirname(parent))
           })
         const weightParts = separateEngram ? 5 : total
         let incomplete = shards.size !== weightParts

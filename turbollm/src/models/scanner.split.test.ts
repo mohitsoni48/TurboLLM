@@ -34,7 +34,7 @@ test('five DeepSeek weights with a shared Engram form one loadable library set',
   const prefix = 'DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-'
   writeShards(weights, Array.from({ length: 5 }, (_, i) => prefix + String(i + 1).padStart(5, '0') + '-of-00006.gguf'))
   assert.equal((await scanOne(root))?.incomplete, true)
-  writeShards(root, ['DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf'])
+  writeShards(join(weights, 'shared'), ['DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf'])
   const scanner = new Scanner(stubStore(root))
   await scanner.rescan()
   const entries = scanner.list().models

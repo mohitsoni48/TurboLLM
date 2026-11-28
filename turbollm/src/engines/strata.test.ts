@@ -41,11 +41,13 @@ test('real Strata GPU streams, cancels a request, serves again and unloads', {
   await manager.load({ engine, modelPath: modelPath!, model: { key: 'live', name: 'live', quant: '', ctx: 8192, vision: false }, extraArgs: [] })
   const target = manager.target()
   assert.ok(target, manager.status().err?.message)
+  const pid = manager.status().pid
+  assert.ok(pid > 0)
   assert.equal((await fetch(target + '/v1/models')).status, 401)
   const headers = engineRequestHeaders('strata', new Headers({ 'content-type': 'application/json' }), undefined, target)
   const chat = (signal?: AbortSignal) => fetch(target + '/v1/chat/completions', {
     method: 'POST', headers, signal,
-    body: JSON.stringify({ model: 'live', stream: true, max_tokens: 48, messages: [{ role: 'user', content: 'Name the capital of France.' }] }),
+    body: JSON.stringify({ model: 'live', stream: true, reasoning_effort: 'none', max_tokens: 48, messages: [{ role: 'user', content: 'Name the capital of France.' }] }),
   })
   const abort = new AbortController()
   const first = await chat(abort.signal)
@@ -55,9 +57,12 @@ test('real Strata GPU streams, cancels a request, serves again and unloads', {
   const second = await chat(AbortSignal.timeout(180_000))
   assert.equal(second.status, 200)
   const stream = await second.text()
-  assert.match(stream, /"delta"/)
+  const text = stream.split(/\r?\n/).filter(line => line.startsWith('data: {'))
+    .map(line => JSON.parse(line.slice(6)).choices?.[0]?.delta?.content ?? '').join('')
+  assert.ok(text.trim(), 'expected assistant text in the stream')
   assert.match(stream, /data: \[DONE\]/)
   await manager.stopAndWait()
   assert.equal(manager.status().state, 'stopped')
+  assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' })
   await assert.rejects(fetch(target + '/health', { signal: AbortSignal.timeout(1500) }))
 })
