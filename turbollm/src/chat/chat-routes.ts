@@ -914,11 +914,13 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   // refetches, AA-1), unless a cut as small was already applied (`unchanged`).
   app.post('/api/v1/conversations/:id/messages/:msgId/heard', async (c) => {
     const { id: convId, msgId } = c.req.param()
+    // The body is read before the message: the turn may save the reply while it arrives, and the row must be read
+    // in the same synchronous stretch as the running check below.
+    const { heardMs } = await body<{ heardMs?: unknown }>(c)
+    if (typeof heardMs !== 'number' || !Number.isFinite(heardMs) || heardMs < 0) return err(c, 400, 'invalid_input', 'heardMs must be a number of milliseconds, 0 or more.')
     if (!db.getConversation(convId)) return err(c, 404, 'not_found', 'Conversation not found.')
     const msg = db.getMessage(msgId)
     if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
-    const { heardMs } = await body<{ heardMs?: unknown }>(c)
-    if (typeof heardMs !== 'number' || !Number.isFinite(heardMs) || heardMs < 0) return err(c, 400, 'invalid_input', 'heardMs must be a number of milliseconds, 0 or more.')
     if (msg.role !== 'assistant') return err(c, 400, 'invalid_input', 'Only a reply is heard.')
     // Checked and noted with no await between: a report lands before the turn's save or after it, never in between.
     if (d.chatTurns.isSpokenReplyRunning(msgId)) {

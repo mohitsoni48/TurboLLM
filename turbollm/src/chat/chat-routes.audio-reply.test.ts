@@ -501,6 +501,50 @@ test('heard while the reply is still running: pending, nothing announced, and th
   assert.equal(decodeWavToPcm16Mono(Buffer.from(await served.arrayBuffer())).pcm16.length, 480 * 2, '20 ms at 24 kHz')
 })
 
+/** A heard request whose JSON body the test sends when it chooses; `reading` resolves once the route starts reading it. */
+function heldHeard(h: Harness, convId: string, msgId: string) {
+  let sendBody!: (json: unknown) => void
+  let markReading!: () => void
+  const reading = new Promise<void>((resolve) => { markReading = resolve })
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      sendBody = (json) => {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify(json)))
+        controller.close()
+      }
+    },
+    pull() { markReading() },
+  }, { highWaterMark: 0 })
+  const init = { method: 'POST', headers: { 'content-type': 'application/json' }, body: stream, duplex: 'half' } as RequestInit
+  const response = Promise.resolve(h.app.request(`/api/v1/conversations/${convId}/messages/${msgId}/heard`, init))
+  return { reading, sendBody, response }
+}
+
+test('a heard report whose body arrives after the reply was saved is applied to the saved row', async (t) => {
+  const h = await harness(t, { engine: { mode: 'held' } })
+  const conv = h.store.createConversation()
+  const sender = sse(await send(h, conv.id, { audio: [WAV_URL], replyAudio: true }))
+  await turnsUntil(() => h.engine.sent.includes('response.output_audio.delta'), 'the reply under way')
+  const replyId = h.d.chatRuns.latestRun(conv.id)!.meta.assistantMessageId
+  const report = heldHeard(h, conv.id, replyId)
+  await report.reading
+  h.engine.release()
+  await sender.rest()
+
+  let res!: Response
+  const announced = await announcedDuring(t, async () => {
+    report.sendBody({ heardMs: 20 })
+    res = await report.response
+  })
+  assert.equal(res.status, 200)
+  assert.deepEqual(await res.json(), { ok: true, applied: 'saved' })
+  assert.deepEqual(announced, [`conversation:${conv.id}`])
+  const reply = h.store.getMessage(replyId)!
+  assert.equal(reply.stats.heardMs, 20)
+  const served = await h.app.request(`/api/v1/attachments/${attachmentRefId(reply.attachments[0])}`)
+  assert.equal(decodeWavToPcm16Mono(Buffer.from(await served.arrayBuffer())).pcm16.length, 480 * 2, 'the cut clip')
+})
+
 test('heard after the reply was saved: the reply is cut, announced once, and a refetch shows the cut; a larger report changes nothing', async (t) => {
   const h = await harness(t)
   const conv = h.store.createConversation()
