@@ -56,10 +56,7 @@ export class VoiceTranscripts {
   enqueue(job: TranscriptJob): void {
     if (this.closed || !this.deps.voice?.available()) return
     this.pending.push({ ...job, yields: 0 })
-    if (this.pending.length > TRANSCRIPT_QUEUE_MAX) {
-      const dropped = this.pending.shift()!
-      this.log(`voice transcript: queue full, dropped message ${dropped.messageId}`)
-    }
+    this.dropOverflowAt(0)
     this.startNext()
   }
 
@@ -118,6 +115,15 @@ export class VoiceTranscripts {
       return
     }
     this.pending.unshift({ ...job, yields })
+    this.dropOverflowAt(1)
+  }
+
+  /** Past TRANSCRIPT_QUEUE_MAX waiting, drops the job at `index`: the oldest waiting one, or after a yielded job is
+   *  put back at the front, the oldest behind it. */
+  private dropOverflowAt(index: number): void {
+    if (this.pending.length <= TRANSCRIPT_QUEUE_MAX) return
+    const [dropped] = this.pending.splice(index, 1)
+    this.log(`voice transcript: queue full, dropped message ${dropped.messageId}`)
   }
 
   /** The job ends when its work does or the moment it is stopped or its deadline passes, whichever is first: a

@@ -444,6 +444,35 @@ test(`a job interrupted by a pause ${TRANSCRIPT_MAX_YIELDS} times is dropped and
   }
 })
 
+test(`a job put back at the front by a pause still keeps the queue to ${TRANSCRIPT_QUEUE_MAX}: the oldest one behind it is dropped`, async () => {
+  const h = harness()
+  try {
+    const yielding = h.voiceMessage()
+    h.queue.enqueue(h.job(yielding.id))
+    await until(() => h.whisper.calls.length === 1)
+    const waiting = Array.from({ length: TRANSCRIPT_QUEUE_MAX }, () => h.voiceMessage())
+    for (const m of waiting) h.queue.enqueue(h.job(m.id))
+    assert.deepEqual(h.logged, [], `${TRANSCRIPT_QUEUE_MAX} waiting is not yet too many`)
+
+    h.queue.pause()
+    await settle()
+    assert.equal(h.logged.length, 1)
+    assert.ok(h.logged[0].includes(waiting[0].id), h.logged[0])
+
+    h.queue.resume()
+    for (let i = 1; i <= TRANSCRIPT_QUEUE_MAX; i++) {
+      await until(() => h.whisper.calls.length === i + 1)
+      h.whisper.calls[i].answer('words')
+    }
+    await h.queue.idle()
+    assert.equal(h.whisper.calls.length, TRANSCRIPT_QUEUE_MAX + 1, 'the yielded job and the 15 kept behind it')
+    assert.equal(h.store.getMessage(yielding.id)!.transcript, 'words')
+    assert.equal(h.store.getMessage(waiting[0].id)!.transcript, undefined)
+  } finally {
+    h.close()
+  }
+})
+
 test('stopAll while paused leaves nothing to resume', async () => {
   const h = harness()
   try {
