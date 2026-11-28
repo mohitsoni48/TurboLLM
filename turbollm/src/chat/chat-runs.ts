@@ -50,6 +50,9 @@ export const MAX_VIEWER_AUDIO_BACKLOG_BYTES = 2 * 1024 * 1024
  *  replay or reattach can deliver an old one. `transient` is its audio's size, what a viewer's backlog counts. */
 type TransientEvent = BufferedEvent & { transient: number }
 
+/** Sends a frame on a run's transient lane (ChatRuns.start). */
+export type TransientSink = (event: string, data: unknown, bytes: number) => void
+
 function transientBytes(ev: BufferedEvent): number | undefined {
   return ev.seq < 0 ? (ev as TransientEvent).transient : undefined
 }
@@ -72,7 +75,7 @@ export class ChatRuns {
    *  the sink the turn emits through. The sink never throws (resilientSink never trips on it) and drops what a turn
    *  emits after end(). `transient` sends a frame to the live viewers that asked for it, in order with the numbered
    *  ones (one emitter, one queue), without numbering or keeping it; `bytes` is what it weighs in a viewer's backlog. */
-  start(convId: string, ac: AbortController, meta: ChatRunMeta): { run: ChatRun; sink: EmitSink; transient: (event: string, data: unknown, bytes: number) => void } {
+  start(convId: string, ac: AbortController, meta: ChatRunMeta): { run: ChatRun; sink: EmitSink; transient: TransientSink } {
     const emitter = new EventEmitter()
     emitter.setMaxListeners(0) // every viewer of the run listens on it (as code-run-manager.ts)
     const run: ChatRun = { convId, meta, ac, buffer: new RingBuffer(this.cap), emitter, ended: false }

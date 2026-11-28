@@ -8,7 +8,8 @@ import { getAdvertisedHost, getLanIp } from '../net'
 import { CHAT_APPROVAL_WAIT_MINUTES } from '../config/config-bounds'
 import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import type { EmitSink } from './emit-sink.js'
-import type { ChatRun, ChatRunMeta } from './chat-runs.js'
+import type { ChatRun, ChatRunMeta, TransientSink } from './chat-runs.js'
+import { emitInvalidation } from '../events/bus.js'
 import type { ChatTurns } from './chat-turns.js'
 import { downloadFileName, isAttachmentRef, isAudioAttachment, isCanonicalDataUrl, isDownloadAttachmentRef, isImageAttachmentRef } from './attachments.js'
 import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent, VOICE_MESSAGE_PLACEHOLDER, type EngineMessage } from './chat-compaction.js'
@@ -27,7 +28,7 @@ import { callChatUpstream, resolveChatUpstream, type ChatUpstream } from './chat
 import { servingEngineKind } from '../engines/serving'
 import { engineTakesReasoningAsField, engineWithholdsVision, VISION_UNAVAILABLE } from '../engines/compat'
 import { runGenerationCore } from './generation-core'
-import { prepareAudioReplyTurn, runAudioReply, type SpokenTurn } from './audio-reply-turn'
+import { applyHeardToSavedReply, prepareAudioReplyTurn, runAudioReply, type SpokenTurn } from './audio-reply-turn'
 import { nonStringField } from '../util/string-fields'
 import { conversationBodyError, CREATE_FIELDS, PATCH_FIELDS, patchFields } from './conversation-body.js'
 import { isSandboxEnabled } from '../sandbox/gate'
@@ -86,10 +87,10 @@ function releasingInflight<T>(turns: ChatTurns, convId: string, ac: AbortControl
  *  response: the body must not read it (runGeneration and maybeAutoCompact take no Context). A
  *  throw before the turn reached runGeneration (which saves on every path) is told to the viewers
  *  as an `error` frame rather than becoming an unhandled rejection. */
-function startDetachedTurn(c: Context, d: Deps, convId: string, ac: AbortController, meta: ChatRunMeta, body: (sink: EmitSink) => Promise<void>): ChatRun {
-  const { run, sink } = d.chatRuns.start(convId, ac, meta)
+function startDetachedTurn(c: Context, d: Deps, convId: string, ac: AbortController, meta: ChatRunMeta, body: (sink: EmitSink, transient: TransientSink) => Promise<void>): ChatRun {
+  const { run, sink, transient } = d.chatRuns.start(convId, ac, meta)
   const release = holdTurn(c, d, () => d.chatTurns.stop(convId, ac))
-  const turn: Promise<void> = releasingInflight(d.chatTurns, convId, ac, body)(sink)
+  const turn: Promise<void> = releasingInflight(d.chatTurns, convId, ac, (s: EmitSink) => body(s, transient))(sink)
     .catch(async (e) => {
       console.error(`[chat] turn for ${convId} failed`, e)
       await sink({ event: 'error', data: { code: 'turn_failed', message: 'The reply could not be generated.' } })
@@ -115,11 +116,13 @@ const KEEPALIVE_MS = 20_000
  *  `synthMeta`: a viewer attaching to a run already under way gets the run's meta first, un-id'd
  *  (as Code's stream does), so it can tell which reply the frames belong to even when frame 0 has
  *  left the window. A viewer that falls too far behind gets a `lagged` frame and is ended: it
- *  resumes from its cursor. `run` null: nothing to attach to, an empty stream. */
-function respondWithChatRun(c: Context, d: Deps, run: ChatRun | null, fromSeq: number, opts: { synthMeta: boolean }): Response {
+ *  resumes from its cursor. `run` null: nothing to attach to, an empty stream.
+ *  `audio`: the viewer also gets the run's transient frames (a spoken reply's `audio_chunk`), live only and without an
+ *  `id:`, so they never move its resume cursor (arch A1). */
+function respondWithChatRun(c: Context, d: Deps, run: ChatRun | null, fromSeq: number, opts: { synthMeta: boolean; audio?: boolean }): Response {
   return streamSSE(c, holdOpen(c, async (stream) => {
     if (!run) return
-    const sub = d.chatRuns.subscribe(run, fromSeq)
+    const sub = d.chatRuns.subscribe(run, fromSeq, { audio: opts.audio })
     stream.onAbort(() => { sub.close() })
     let writing = false
     const write = async (msg: { id?: string; event: string; data: string }) => {
@@ -132,7 +135,10 @@ function respondWithChatRun(c: Context, d: Deps, run: ChatRun | null, fromSeq: n
     keepalive.unref()
     try {
       if (opts.synthMeta && !run.ended) await write({ event: 'meta', data: JSON.stringify(run.meta) })
-      for await (const ev of sub) await write({ id: String(ev.seq), event: ev.event, data: JSON.stringify(ev.data) })
+      for await (const ev of sub) {
+        const data = JSON.stringify(ev.data)
+        await write(ev.seq < 0 ? { event: ev.event, data } : { id: String(ev.seq), event: ev.event, data })
+      }
       if (sub.lagged()) await write({ event: 'lagged', data: '{}' })
     } finally {
       clearInterval(keepalive)
@@ -614,7 +620,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/messages', async (c) => {
     const convId = c.req.param('id')
-    const read = await readCappedJson<{ content?: string; images?: string[]; audio?: string[]; replyAudio?: boolean; docContext?: string; textAttachments?: string[]; thinkingBudget?: number; reasoningEffort?: string; model?: string }>(c.req.raw, MAX_MESSAGE_BODY_BYTES)
+    const read = await readCappedJson<{ content?: string; images?: string[]; audio?: string[]; replyAudio?: boolean; streamAudio?: boolean; docContext?: string; textAttachments?: string[]; thinkingBudget?: number; reasoningEffort?: string; model?: string }>(c.req.raw, MAX_MESSAGE_BODY_BYTES)
     if (!read.ok) return err(c, 413, 'payload_too_large', 'A message with its images and voice clips can be at most about 400 MB.')
     const b = read.value
     // Trimmed here and in resolveChatUpstream (the model): anything but a string threw, a bare 500.
@@ -634,6 +640,10 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // Ask for the reply as speech: absent or false, the turn is the ordinary text turn, untouched.
     if (b.replyAudio != null && typeof b.replyAudio !== 'boolean') return err(c, 400, 'invalid_input', 'replyAudio must be a boolean.')
     const replyAudio = b.replyAudio === true
+    // The spoken reply's audio as it is generated (audio_chunk frames), for a page that plays it as it arrives.
+    if (b.streamAudio != null && typeof b.streamAudio !== 'boolean') return err(c, 400, 'invalid_input', 'streamAudio must be a boolean.')
+    const streamAudio = b.streamAudio === true
+    if (streamAudio && !replyAudio) return err(c, 400, 'invalid_input', 'streamAudio needs replyAudio: there is no spoken reply to stream.')
     const audioRefusal = voiceClipsRefusal(audio)
     if (audioRefusal) return err(c, 400, 'invalid_input', audioRefusal)
     // A clip is told from an image by what it is, not by the field it came in (chat-compaction.ts mediaPart): sent
@@ -709,7 +719,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
     // The turn runs in the daemon (startDetachedTurn); this response is its first viewer. Its
     // `meta` (frame 0) is the run's own, pushed before anything else.
-    const run = startDetachedTurn(c, d, convId, ac, { userMessageId: userMsg.id, assistantMessageId: assistantMsg.id }, async (sink) => {
+    const run = startDetachedTurn(c, d, convId, ac, { userMessageId: userMsg.id, assistantMessageId: assistantMsg.id }, async (sink, transient) => {
       // Auto-compact (ADR-420): checked BEFORE this turn's messages are built, using the
       // history as it stood before this turn's own user+placeholder rows were added —
       // exactly the "last completed turn's usage" the 80% threshold is meant to judge.
@@ -722,7 +732,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       if (spoken) {
         const outcome = await runAudioReply(d, sink, {
           convId, conv: setAsideFrozenCut(db, conv), history: (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id), assistantMsg, upstream, ac, turn: spoken,
-          userMessageId: userMsg.id, clips: storedMedia.filter(isAudioAttachment),
+          userMessageId: userMsg.id, clips: storedMedia.filter(isAudioAttachment), live: streamAudio ? transient : undefined,
         })
         if (!outcome.aborted && outcome.content && conv.title === 'New chat' && d.store.snapshot().daemon.autoGenerateTitles) {
           d.chatTurns.afterReplyCall(convId, 1000, () => autoTitle(d, convId, [{ role: 'user', content: content || VOICE_MESSAGE_PLACEHOLDER }], outcome.content, upstream))
@@ -743,7 +753,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
       await runGeneration(d, sink, { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), userText: content, isCodeAuthorized })
     })
-    return respondWithChatRun(c, d, run, 0, { synthMeta: false })
+    return respondWithChatRun(c, d, run, 0, { synthMeta: false, audio: streamAudio })
   })
 
   // ── continue (regenerate last assistant response for the existing last user
@@ -898,6 +908,29 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     return c.json({ ok: true, stopped: !!target })
   })
 
+  // How much of a spoken reply its listener heard before interrupting it (arch 4.2, A4): the reply is cut to the last
+  // whole sentence heard and to the samples heard. While it is still generating the report is noted and the turn applies
+  // it as it saves (`pending`); once it is saved it is applied to the row (`saved`, announced so every open page
+  // refetches, AA-1), unless a cut as small was already applied (`unchanged`).
+  app.post('/api/v1/conversations/:id/messages/:msgId/heard', async (c) => {
+    const { id: convId, msgId } = c.req.param()
+    if (!db.getConversation(convId)) return err(c, 404, 'not_found', 'Conversation not found.')
+    const msg = db.getMessage(msgId)
+    if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
+    const { heardMs } = await body<{ heardMs?: unknown }>(c)
+    if (typeof heardMs !== 'number' || !Number.isFinite(heardMs) || heardMs < 0) return err(c, 400, 'invalid_input', 'heardMs must be a number of milliseconds, 0 or more.')
+    if (msg.role !== 'assistant') return err(c, 400, 'invalid_input', 'Only a reply is heard.')
+    // Checked and noted with no await between: a report lands before the turn's save or after it, never in between.
+    if (d.chatTurns.isSpokenReplyRunning(msgId)) {
+      d.chatTurns.noteHeard(msgId, heardMs)
+      return c.json({ ok: true, applied: 'pending' })
+    }
+    if (!msg.attachments.some(isAudioAttachment)) return err(c, 409, 'not_spoken_reply', 'This reply was not spoken.')
+    const applied = await applyHeardToSavedReply(d, msg, heardMs)
+    if (applied === 'saved') emitInvalidation(`conversation:${convId}`)
+    return c.json({ ok: true, applied })
+  })
+
   // A viewer of a chat's running reply (the page reopened, reloaded, or on another tab or device),
   // or the rest of one it was following (a dropped connection; ?run=<reply id>&fromSeq=<next seq>).
   // Inherits conversationGate and models:use (auth.ts), as every route under the chat: a caller
@@ -916,7 +949,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const run = runId !== undefined
       ? d.chatRuns.find(convId, runId) ?? null
       : latest && !latest.ended && d.chatTurns.held(convId) === latest.ac ? latest : null
-    return respondWithChatRun(c, d, run, fromSeq, { synthMeta: true })
+    return respondWithChatRun(c, d, run, fromSeq, { synthMeta: true, audio: c.req.query('audio') === '1' })
   })
 
   // ── message actions B2 ─────────────────────────────────────────────────────

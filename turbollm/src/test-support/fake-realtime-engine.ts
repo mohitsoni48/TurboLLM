@@ -22,7 +22,9 @@ export interface FakeRealtimeOptions {
   /** `complete` plays the whole reply; `cancellable` stops after the first audio delta and finishes only when
    *  `response.cancel` arrives (with a cancelled `response.done`); `silent` says nothing after `response.create`
    *  and ignores `response.cancel` too, like an engine that is not answering. */
-  mode?: 'complete' | 'cancellable' | 'silent' | 'prefill' | 'error'
+  mode?: 'complete' | 'cancellable' | 'silent' | 'prefill' | 'error' | 'held'
+  /** `held` mode: plays the reply up to and including its first audio delta, then the rest only when the test calls
+   *  `release()`, so a test can act while a reply is mid-way, with no clock involved. */
   /** `error` mode: the reply gets under way, then the engine reports an error but goes on generating, and ends the reply
    *  (`response.done`, cancelled) only for the second `response.cancel` it receives. */
   /** `prefill` mode: how long after `response.create` the reply gets under way. A `response.cancel` that arrives before
@@ -42,6 +44,8 @@ export interface FakeRealtimeEngine {
   /** How many sockets were opened and how many have closed since. */
   opened: () => number
   closed: () => number
+  /** `held` mode: sends the rest of the reply being held. */
+  release: () => void
   stop: () => Promise<void>
 }
 
@@ -53,6 +57,7 @@ export async function startFakeRealtimeEngine(opts: FakeRealtimeOptions = {}): P
   const sent: string[] = []
   let opened = 0
   let closed = 0
+  let heldRest: (() => void) | null = null
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' })
   await new Promise<void>((resolve) => wss.on('listening', resolve))
 
@@ -94,6 +99,7 @@ export async function startFakeRealtimeEngine(opts: FakeRealtimeOptions = {}): P
         if (mode === 'complete') return reply.forEach(send)
         const firstAudio = reply.findIndex((e) => e.type === 'response.output_audio.delta')
         reply.slice(0, firstAudio + 1).forEach(send)
+        if (mode === 'held') heldRest = () => reply.slice(firstAudio + 1).forEach(send)
         return
       }
       if (msg.type === 'response.cancel' && mode === 'error' && ++cancels === 2) {
@@ -113,6 +119,11 @@ export async function startFakeRealtimeEngine(opts: FakeRealtimeOptions = {}): P
     sent,
     opened: () => opened,
     closed: () => closed,
+    release: () => {
+      const rest = heldRest
+      heldRest = null
+      rest?.()
+    },
     stop: () => new Promise<void>((resolve) => {
       for (const c of wss.clients) c.terminate()
       wss.close(() => resolve())
