@@ -225,6 +225,8 @@ function spokenRequest(ctx: AudioReplyCtx, framer: AudioFramer | undefined): Aud
  *  background, after the reply (ADR-485 D1). A typed question has no clip to read. Never awaited. */
 function queueTranscript(d: Deps, ctx: AudioReplyCtx): void {
   if (ctx.turn.input.kind !== 'audio' || !ctx.clips.length) return
+  // A chat deleted while its reply ran has already cancelled its jobs: there is no row left to write the words to.
+  if (!d.db.getConversation(ctx.convId)) return
   d.transcripts?.enqueue({ convId: ctx.convId, messageId: ctx.userMessageId, clips: ctx.clips })
 }
 

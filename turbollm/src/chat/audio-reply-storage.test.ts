@@ -316,6 +316,16 @@ test('the transcript job is queued after done for a recorded question, whether t
   }
 })
 
+test('no transcript job is queued for a chat deleted while its reply ran', async (t) => {
+  const h = await spokenTurn(t, {
+    reply: async (_req, ctl) => {
+      ctl.store.deleteConversation(ctl.convId)
+      return answered()
+    },
+  })
+  assert.equal(h.events().includes('enqueue'), false)
+})
+
 test('a typed question answered aloud queues no transcript job', async (t) => {
   const h = await spokenTurn(t, { input: 'text', reply: async () => answered() })
   assert.equal(h.events().includes('enqueue'), false)
