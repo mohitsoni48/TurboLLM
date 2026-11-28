@@ -401,6 +401,7 @@ export interface MessageStats {
   ctxMax: number
   model: string
   aborted: boolean
+  heardMs?: number
 }
 
 /** A file a run_python call handed back (GitHub #52). */
@@ -503,6 +504,8 @@ export interface Message {
    *  their names). Kept so a regenerate or edit-and-resend can send the turn again with its
    *  documents. Absent when the turn attached none, and on rows written before v52. */
   docContext?: string
+  /** v57: words of a voice message, from speech-to-text after the turn. */
+  transcript?: string
   /** Tool calls made by this assistant turn (v0.7.0). */
   toolCalls: ToolCallRecord[]
   /** Code, item 6 — ordered text/tool-call interleave. Absent on messages persisted before this
@@ -529,7 +532,7 @@ export interface Message {
 interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; chat_agent_id: string | null; preserve_thinking: number; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; compaction_applied_at: string | null; created_at: string; updated_at: string }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface ExtRunRow { id: string; chat_id: string; message_id: string; tenant: string; owner: string; status: string; event_seq: number; error: string | null; created_at: string; ended_at: string | null }
-interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number; doc_context: string | null }
+interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number; doc_context: string | null; transcript: string | null }
 
 /** A column chat search indexes (v54), and its full-text table `<table>_fts`. */
 interface SearchIndexedColumn { table: 'messages' | 'conversations'; column: 'content' | 'title' }
@@ -597,7 +600,7 @@ function likeSubstring(text: string): string {
 const CONV_LIST_COLUMNS = `id, title, system_prompt, model_key, sampling, expert_mode, tool_policy, kind, folder_id, tool_overrides, agent_id, completed_at, read_scope, agent_mode, skill_ids, allowed_tools, chat_agent_id, preserve_thinking, NULL AS compaction_summary, compaction_upto_message_id, compaction_tokens_before, compaction_applied_at, created_at, updated_at`
 
 /** Message rows for display: every column but doc_context (getMessagesForDisplay). */
-const MSG_DISPLAY_COLUMNS = `id, conv_id, seq, role, content, reasoning, attachments, text_attachments, tool_calls, timeline, stats, model_key, research_meta, created_at, variant_group, is_active, branch_of, edited, NULL AS doc_context`
+const MSG_DISPLAY_COLUMNS = `id, conv_id, seq, role, content, reasoning, attachments, text_attachments, tool_calls, timeline, stats, model_key, research_meta, created_at, variant_group, is_active, branch_of, edited, NULL AS doc_context, transcript`
 
 function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
   if (!s) return {}
@@ -643,6 +646,7 @@ function rowToMsg(r: MsgRow): Message {
   if (r.research_meta) msg.researchMeta = safeJson(r.research_meta) as ResearchMeta
   if (r.timeline) msg.timeline = safeJson(r.timeline) as MessageTimelineBlock[]
   if (r.doc_context) msg.docContext = r.doc_context
+  if (r.transcript !== null) msg.transcript = r.transcript
   return msg
 }
 
@@ -992,6 +996,13 @@ export class ConversationStore {
     return ((this.db.prepare(`UPDATE messages SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
   }
 
+  /** The only writer of a voice message's transcript (ADR-485 D1): user rows only, so a reply can never gain one.
+   *  Whether a row changed. */
+  setMessageTranscript(id: string, text: string): boolean {
+    return ((this.db.prepare(`UPDATE messages SET transcript = $t WHERE id = $id AND role = 'user'`)
+      .run({ $id: id, $t: text } as P) as unknown) as Changes).changes > 0
+  }
+
   deleteMessage(id: string): boolean {
     return ((this.db.prepare(`DELETE FROM messages WHERE id = $id`).run({ $id: id } as P) as unknown) as Changes).changes > 0
   }
@@ -1282,8 +1293,8 @@ export class ConversationStore {
 
       const sourceIds = (this.db.prepare(`SELECT id FROM messages WHERE conv_id = $cid AND is_active = 1 AND seq <= $seq ORDER BY seq ASC`)
         .all({ $cid: sourceId, $seq: upto.seq } as P) as unknown as { id: string }[]).map((r) => r.id)
-      const copyMessage = this.db.prepare(`INSERT INTO messages (id,conv_id,seq,role,content,reasoning,attachments,stats,created_at,model_key,text_attachments,tool_calls,research_meta,is_active,edited,timeline,tenant,owner,status,metadata,doc_context)
-        SELECT $nid,$cid,$seq,role,content,reasoning,attachments,stats,created_at,model_key,text_attachments,tool_calls,research_meta,1,edited,timeline,tenant,owner,status,metadata,doc_context FROM messages WHERE id = $old`)
+      const copyMessage = this.db.prepare(`INSERT INTO messages (id,conv_id,seq,role,content,reasoning,attachments,stats,created_at,model_key,text_attachments,tool_calls,research_meta,is_active,edited,timeline,tenant,owner,status,metadata,doc_context,transcript)
+        SELECT $nid,$cid,$seq,role,content,reasoning,attachments,stats,created_at,model_key,text_attachments,tool_calls,research_meta,1,edited,timeline,tenant,owner,status,metadata,doc_context,transcript FROM messages WHERE id = $old`)
       const copiedIds = new Map<string, string>()
       const readToolCalls = this.db.prepare(`SELECT tool_calls FROM messages WHERE id = $id`)
       const writeToolCalls = this.db.prepare(`UPDATE messages SET tool_calls = $tc WHERE id = $id`)
