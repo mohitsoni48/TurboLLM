@@ -341,6 +341,22 @@ test('a shutdown with a job running logs nothing, not even once the job has unwo
   }
 })
 
+test('a paused queue emptied by deleting its chat is idle', async () => {
+  const h = harness()
+  try {
+    h.queue.pause()
+    h.queue.enqueue(h.job(h.voiceMessage().id))
+    let settled = false
+    void h.queue.idle().then(() => { settled = true })
+    await settle()
+    assert.equal(settled, false, 'a waiting job is not idle')
+    h.queue.cancelConversation(h.conv.id)
+    await until(() => settled)
+  } finally {
+    h.close()
+  }
+})
+
 test('a message deleted before its words arrive gets nothing and announces nothing', async () => {
   const h = harness()
   try {

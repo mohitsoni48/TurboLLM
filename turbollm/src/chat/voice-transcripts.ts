@@ -79,6 +79,7 @@ export class VoiceTranscripts {
   cancelConversation(convId: string): void {
     this.dropPendingWhere((job) => job.convId === convId)
     if (this.running?.job.convId === convId) this.cancelRunning()
+    this.settleIdle()
   }
 
   /** Teardown: nothing is queued, started or written from now on. */
