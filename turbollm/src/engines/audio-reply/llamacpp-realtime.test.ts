@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { startFakeRealtimeEngine, loadRealtimeFixture, type FakeRealtimeEngine } from '../../test-support/fake-realtime-engine'
-import { AudioReplyError, type AudioReplyRequest } from './types'
+import { AudioReplyError, type AudioReply, type AudioReplyRequest } from './types'
 import { createRealtimeCollector, requestRealtimeAudioReply, type RealtimeSocket } from './llamacpp-realtime'
 import { decodeWavToPcm16Mono } from './wav'
 
@@ -386,4 +386,112 @@ test('a close the engine does not answer is followed by terminate; one it answer
   }
   assert.deepEqual(await run(false), ['close', 'terminate'])
   assert.deepEqual(await run(true), ['close'])
+})
+
+// ── streamed audio (onAudio, ADR-485 D4, arch 2.1/2.2) ───────────────────────────────────
+
+const audioDelta = (bytes: number[]) => ({ type: 'response.output_audio.delta', delta: Buffer.from(bytes).toString('base64') })
+
+/** Every chunk onAudio was handed, with the rate it came at. */
+function heardChunks() {
+  const chunks: Array<{ pcm16: Buffer; sampleRate: number }> = []
+  return { chunks, onAudio: (pcm16: Buffer, sampleRate: number) => { chunks.push({ pcm16: Buffer.from(pcm16), sampleRate }) } }
+}
+
+test('collector: the audio handed out as it arrives joins up to the stored clip, at the rate session.created announced', () => {
+  const heard = heardChunks()
+  const c = createRealtimeCollector(Date.now, heard.onAudio)
+  for (const e of loadRealtimeFixture('realtime-text-audio')) c.push(e)
+  const stored = decodeWavToPcm16Mono(c.result().audio!.data).pcm16
+  assert.ok(heard.chunks.length > 1, 'one call per delta')
+  assert.deepEqual(Buffer.concat(heard.chunks.map((x) => x.pcm16)), stored)
+  assert.ok(heard.chunks.every((x) => x.sampleRate === 24000))
+})
+
+test('collector: only whole samples are handed out; an odd byte waits for the next delta; the rate falls back to 24 kHz', () => {
+  const heard = heardChunks()
+  const c = createRealtimeCollector(Date.now, heard.onAudio)
+  c.push(audioDelta([1, 2, 3]))
+  c.push(audioDelta([4, 5, 6]))
+  c.push(audioDelta([7]))
+  assert.deepEqual(heard.chunks.map((x) => [...x.pcm16]), [[1, 2], [3, 4, 5, 6]])
+  assert.ok(heard.chunks.every((x) => x.sampleRate === 24000))
+  assert.deepEqual(decodeWavToPcm16Mono(c.result().audio!.data).pcm16, Buffer.from([1, 2, 3, 4, 5, 6]))
+})
+
+test('collector: the reply is the same with or without onAudio', () => {
+  for (const name of ['realtime-text-audio', 'realtime-audio-only', 'realtime-cancelled'] as const) {
+    const streamed = createRealtimeCollector(() => 5, heardChunks().onAudio)
+    for (const e of loadRealtimeFixture(name)) streamed.push(e)
+    const plain = createRealtimeCollector(() => 5)
+    for (const e of loadRealtimeFixture(name)) plain.push(e)
+    assert.deepEqual(streamed.result(), plain.result(), name)
+  }
+})
+
+/** A reply without its generation time, which the transport reads off the wall clock: two runs differ in it. */
+function untimed(reply: AudioReply): Omit<AudioReply, 'generationMs'> {
+  const { generationMs: _generationMs, ...rest } = reply
+  return rest
+}
+
+/** A reply over a FakeSocket the test drives event by event; `onAudio` records what was streamed. */
+function streamedReply(signal = noAbort(), onAudio: AudioReplyRequest['onAudio'] = undefined) {
+  const pending = requestRealtimeAudioReply('http://127.0.0.1:1', spoken({ onAudio }), signal, { WebSocket: FakeSocket, cancelResendMs: 60_000 })
+  const ws = FakeSocket.last
+  const play = (events: unknown[]) => { for (const e of events) ws.emit('message', JSON.stringify(e)) }
+  return { pending, ws, play }
+}
+
+test('transport: every delta is streamed, in order, and the reply is the one it would be without streaming', async () => {
+  const events = loadRealtimeFixture('realtime-text-audio')
+  const streamed: Buffer[] = []
+  const withStream = streamedReply(noAbort(), (c) => { streamed.push(Buffer.from(c.pcm16)) })
+  withStream.play(events)
+  const reply = await withStream.pending
+  const plain = streamedReply()
+  plain.play(events)
+  assert.deepEqual(untimed(reply), untimed(await plain.pending))
+  assert.deepEqual(Buffer.concat(streamed), decodeWavToPcm16Mono(reply.audio!.data).pcm16)
+})
+
+test('transport: nothing is streamed after response.done, or once the reply has settled', async () => {
+  const events = loadRealtimeFixture('realtime-text-audio')
+  let calls = 0
+  const r = streamedReply(noAbort(), () => { calls++ })
+  r.play(events)
+  const before = calls
+  r.play([audioDelta([1, 2, 3, 4])])
+  await r.pending
+  r.play([audioDelta([5, 6, 7, 8])])
+  assert.equal(calls, before)
+})
+
+test('transport: once a stop has begun nothing more is streamed, though what the engine still sends is kept in the clip', async () => {
+  const events = loadRealtimeFixture('realtime-cancelled')
+  const firstAudio = events.findIndex((e) => e.type === 'response.output_audio.delta')
+  const lastAudio = events.findLastIndex((e) => e.type === 'response.output_audio.delta')
+  assert.ok(lastAudio > firstAudio, 'the fixture has audio after the first delta')
+  const ac = new AbortController()
+  const streamed: Buffer[] = []
+  const r = streamedReply(ac.signal, (c) => { streamed.push(Buffer.from(c.pcm16)) })
+  r.play(events.slice(0, firstAudio + 1))
+  ac.abort()
+  r.play(events.slice(firstAudio + 1))
+  const reply = await r.pending
+  assert.equal(reply.status, 'cancelled')
+  assert.equal(streamed.length, 1, 'only the delta before the stop')
+  assert.ok(decodeWavToPcm16Mono(reply.audio!.data).pcm16.length > Buffer.concat(streamed).length, 'the later deltas are in the clip')
+})
+
+test('transport: an onAudio that throws is logged, and the reply resolves as it would without it', async (t) => {
+  const warned = t.mock.method(console, 'warn', () => {})
+  const events = loadRealtimeFixture('realtime-text-audio')
+  const r = streamedReply(noAbort(), () => { throw new Error('the page went away') })
+  r.play(events)
+  const reply = await r.pending
+  const plain = streamedReply()
+  plain.play(events)
+  assert.deepEqual(untimed(reply), untimed(await plain.pending))
+  assert.ok(warned.mock.callCount() >= 1)
 })

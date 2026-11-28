@@ -2,7 +2,7 @@
 // replay from a cursor, live tail, the end, retention and listener hygiene, unit-tested without the routes.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { ChatRuns, type ChatSubscription } from './chat-runs.js'
+import { ChatRuns, MAX_VIEWER_AUDIO_BACKLOG_BYTES, type ChatSubscription } from './chat-runs.js'
 
 const meta = (id: string) => ({ userMessageId: `u-${id}`, assistantMessageId: id })
 
@@ -149,4 +149,100 @@ test('a viewer that falls more than twice the cap behind is dropped as lagged; o
   assert.deepEqual(await drain(stalled), [], 'its backlog is let go')
   reading.close()
   assert.equal(run.emitter.listenerCount('event'), 0)
+})
+
+// ── the transient lane: a spoken reply's audio_chunk frames (arch 2.4, A1, A2, PG-1) ──────────
+
+const chunk = (index: number) => ({ replyId: 'a1', index })
+
+test('a transient frame is never kept: the buffer holds none, and a viewer that attaches later receives none', async () => {
+  const runs = new ChatRuns()
+  const { run, sink, transient } = runs.start('c1', new AbortController(), meta('a1'))
+  transient('audio_chunk', chunk(0), 100)
+  await sink({ event: 'delta', data: { delta: 'hi' } })
+  transient('audio_chunk', chunk(1), 100)
+  await sink({ event: 'done', data: {} })
+  runs.end(run)
+  assert.deepEqual(run.buffer.since(0).map((e) => e.event), ['meta', 'delta', 'done'])
+  assert.deepEqual(await drain(runs.subscribe(run, 0, { audio: true })), [[0, 'meta'], [1, 'delta'], [2, 'done']])
+})
+
+test('an audio viewer gets the transient frames live, unnumbered, in the order they were produced among the numbered ones', async () => {
+  const runs = new ChatRuns()
+  const { run, sink, transient } = runs.start('c1', new AbortController(), meta('a1'))
+  const viewer = runs.subscribe(run, 0, { audio: true })
+  const frames = drain(viewer)
+  transient('audio_chunk', chunk(0), 100)
+  transient('audio_chunk', chunk(1), 100)
+  await sink({ event: 'audio_end', data: { chunks: 2 } })
+  await sink({ event: 'delta', data: { delta: 'hi' } })
+  await sink({ event: 'done', data: {} })
+  runs.end(run)
+  assert.deepEqual(await frames, [[0, 'meta'], [-1, 'audio_chunk'], [-1, 'audio_chunk'], [1, 'audio_end'], [2, 'delta'], [3, 'done']])
+})
+
+test('a viewer that did not ask for audio sees exactly the frames of a run that streamed none', async () => {
+  const play = async (withChunks: boolean) => {
+    const runs = new ChatRuns()
+    const { run, sink, transient } = runs.start('c1', new AbortController(), meta('a1'))
+    const frames = drain(runs.subscribe(run, 0))
+    if (withChunks) transient('audio_chunk', chunk(0), 100)
+    await sink({ event: 'audio_end', data: { chunks: 1 } })
+    if (withChunks) transient('audio_chunk', chunk(1), 100)
+    await sink({ event: 'done', data: {} })
+    runs.end(run)
+    return frames
+  }
+  assert.deepEqual(await play(true), await play(false))
+})
+
+test(`a stalled audio viewer more than ${MAX_VIEWER_AUDIO_BACKLOG_BYTES} bytes of audio behind is dropped as lagged; one that keeps up is not`, async () => {
+  const runs = new ChatRuns()
+  const { run, transient } = runs.start('c1', new AbortController(), meta('a1'))
+  const stalled = runs.subscribe(run, 0, { audio: true })
+  const reading = runs.subscribe(run, 0, { audio: true })
+  const it = reading[Symbol.asyncIterator]()
+  await it.next()
+  const piece = MAX_VIEWER_AUDIO_BACKLOG_BYTES / 4
+  for (let i = 0; i < 5; i++) {
+    transient('audio_chunk', chunk(i), piece)
+    await it.next()
+  }
+  assert.equal(stalled.lagged(), true)
+  assert.equal(reading.lagged(), false)
+  reading.close()
+})
+
+test('a stalled viewer that did not ask for audio is bounded the same way, though it would never be sent the audio (PG-1)', async () => {
+  const runs = new ChatRuns()
+  const { run, transient } = runs.start('c1', new AbortController(), meta('a1'))
+  const stalled = runs.subscribe(run, 0)
+  for (let i = 0; i < 5; i++) transient('audio_chunk', chunk(i), MAX_VIEWER_AUDIO_BACKLOG_BYTES / 4)
+  assert.equal(stalled.lagged(), true)
+  assert.equal(run.emitter.listenerCount('event'), 0)
+})
+
+test('a non-audio viewer that keeps reading lets go of the audio it skips, and is never dropped for it', async () => {
+  const runs = new ChatRuns()
+  const { run, sink, transient } = runs.start('c1', new AbortController(), meta('a1'))
+  const viewer = runs.subscribe(run, 0)
+  const it = viewer[Symbol.asyncIterator]()
+  await it.next()
+  for (let i = 0; i < 8; i++) {
+    transient('audio_chunk', chunk(i), MAX_VIEWER_AUDIO_BACKLOG_BYTES / 4)
+    await sink({ event: 'delta', data: { i } })
+    await it.next()
+  }
+  assert.equal(viewer.lagged(), false)
+  viewer.close()
+})
+
+test('a transient frame after the run ended is dropped', async () => {
+  const runs = new ChatRuns()
+  const { run, transient } = runs.start('c1', new AbortController(), meta('a1'))
+  runs.end(run)
+  const emitted: unknown[] = []
+  run.emitter.on('event', (ev) => emitted.push(ev))
+  transient('audio_chunk', chunk(0), 100)
+  assert.deepEqual(emitted, [])
 })

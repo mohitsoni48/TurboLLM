@@ -42,6 +42,21 @@ export interface ChatSubscription extends AsyncIterable<BufferedEvent> {
 const DEFAULT_CAP = 6000 // RingBuffer's own default (run-buffer.ts BUFFER_CAP), shared with Code
 const DEFAULT_RETAIN_MS = 30_000 // Code's IDLE_RETAIN_MS: a viewer that reconnects right after the end still gets `done`
 
+/** How much transient audio a viewer may have queued and not yet taken before it is dropped as lagged (arch A2). The
+ *  producer is not paced by the client, so each viewer's backlog is bounded instead: a slow link loses only live audio. */
+export const MAX_VIEWER_AUDIO_BACKLOG_BYTES = 2 * 1024 * 1024
+
+/** A frame of the transient lane (a spoken reply's `audio_chunk`): unnumbered (`seq` -1), never in the buffer, so no
+ *  replay or reattach can deliver an old one. `transient` is its audio's size, what a viewer's backlog counts. */
+type TransientEvent = BufferedEvent & { transient: number }
+
+/** Sends a frame on a run's transient lane (ChatRuns.start). */
+export type TransientSink = (event: string, data: unknown, bytes: number) => void
+
+function transientBytes(ev: BufferedEvent): number | undefined {
+  return ev.seq < 0 ? (ev as TransientEvent).transient : undefined
+}
+
 export class ChatRuns {
   /** Each chat's latest run, live or ended and still retained. */
   private latest = new Map<string, ChatRun>()
@@ -58,8 +73,9 @@ export class ChatRuns {
 
   /** Registers the turn's run, pushes its `meta` as frame 0 (synchronously, so every viewer sees it first), and returns
    *  the sink the turn emits through. The sink never throws (resilientSink never trips on it) and drops what a turn
-   *  emits after end(). */
-  start(convId: string, ac: AbortController, meta: ChatRunMeta): { run: ChatRun; sink: EmitSink } {
+   *  emits after end(). `transient` sends a frame to the live viewers that asked for it, in order with the numbered
+   *  ones (one emitter, one queue), without numbering or keeping it; `bytes` is what it weighs in a viewer's backlog. */
+  start(convId: string, ac: AbortController, meta: ChatRunMeta): { run: ChatRun; sink: EmitSink; transient: TransientSink } {
     const emitter = new EventEmitter()
     emitter.setMaxListeners(0) // every viewer of the run listens on it (as code-run-manager.ts)
     const run: ChatRun = { convId, meta, ac, buffer: new RingBuffer(this.cap), emitter, ended: false }
@@ -67,7 +83,13 @@ export class ChatRuns {
     this.byReply.set(meta.assistantMessageId, run)
     const push = (event: string, data: unknown) => { emitter.emit('event', run.buffer.push(event, data)) }
     push('meta', meta)
-    return { run, sink: (ev) => { if (!run.ended) push(ev.event, ev.data) } }
+    return {
+      run,
+      sink: (ev) => { if (!run.ended) push(ev.event, ev.data) },
+      transient: (event, data, bytes) => {
+        if (!run.ended) emitter.emit('event', { seq: -1, event, data, transient: bytes } satisfies TransientEvent)
+      },
+    }
   }
 
   /** The turn has fully unwound: every viewer gets the rest of its frames and then ends. The run stays retained for
@@ -101,16 +123,23 @@ export class ChatRuns {
    *  - a run that has ended replays what is left and ends (subscribeToBuffer delivers the terminal frame first).
    *  A viewer more than twice `cap` frames behind what the run has pushed (its socket stalled: its replay of at most
    *  the window, plus as many again) is closed and marked lagged, so its backlog stays bounded; its page resumes from
-   *  its cursor. */
-  subscribe(run: ChatRun, fromSeq: number): ChatSubscription {
+   *  its cursor.
+   *  Transient frames go only to a viewer with `audio: true`, from the moment it attached; another viewer skips them.
+   *  Either way they queue until the viewer takes or skips them, so every viewer with more than
+   *  MAX_VIEWER_AUDIO_BACKLOG_BYTES of them waiting is dropped as lagged too (PG-1). They move no cursor. */
+  subscribe(run: ChatRun, fromSeq: number, opts: { audio?: boolean } = {}): ChatSubscription {
     const head = run.buffer.head()
     const oldest = run.buffer.since(0)[0]?.seq ?? head
     const from = fromSeq >= oldest && fromSeq <= head ? fromSeq : oldest
     const inner = subscribeToBuffer(run.buffer, run.emitter, { fromSeq: from, replayFloor: 0, idleAtStart: run.ended })
     let delivered = from - 1
+    let queuedAudio = 0
     let lagged = false
     const onPush = (ev: BufferedEvent) => {
-      if (ev.seq - delivered > 2 * this.cap) { lagged = true; close() }
+      const audio = transientBytes(ev)
+      if (audio !== undefined) queuedAudio += audio
+      const behind = audio !== undefined ? queuedAudio > MAX_VIEWER_AUDIO_BACKLOG_BYTES : ev.seq - delivered > 2 * this.cap
+      if (behind) { lagged = true; close() }
     }
     const close = () => {
       run.emitter.off('event', onPush)
@@ -124,10 +153,20 @@ export class ChatRuns {
       [Symbol.asyncIterator]() {
         return {
           async next(): Promise<IteratorResult<BufferedEvent>> {
-            const r = await it.next()
-            if (r.done) run.emitter.off('event', onPush)
-            else delivered = r.value.seq
-            return r
+            for (;;) {
+              const r = await it.next()
+              if (r.done) {
+                run.emitter.off('event', onPush)
+                return r
+              }
+              const audio = transientBytes(r.value)
+              if (audio === undefined) {
+                delivered = r.value.seq
+                return r
+              }
+              queuedAudio -= audio
+              if (opts.audio) return r
+            }
           },
           async return(): Promise<IteratorResult<BufferedEvent>> {
             close()

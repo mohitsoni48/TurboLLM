@@ -45,8 +45,18 @@ export interface RealtimeCollector {
   result(cancelled?: 'cancelled'): AudioReply
 }
 
-export function createRealtimeCollector(now: () => number = Date.now): RealtimeCollector {
+/** `onAudio` is handed each audio delta as it arrives, as whole samples: a delta of odd length leaves its last byte to
+ *  open the next one. */
+export function createRealtimeCollector(now: () => number = Date.now, onAudio?: (pcm16: Buffer, rate: number) => void): RealtimeCollector {
   let rate = 0
+  let carry: Buffer = Buffer.alloc(0)
+  const handOnWholeSamples = (delta: Buffer) => {
+    if (!onAudio) return
+    const bytes = carry.length ? Buffer.concat([carry, delta]) : delta
+    const whole = bytes.length - (bytes.length % 2)
+    carry = bytes.subarray(whole)
+    if (whole) onAudio(bytes.subarray(0, whole), rate || DEFAULT_OUTPUT_RATE)
+  }
   let text = ''
   let finalText: string | null = null
   const audio: Buffer[] = []
@@ -79,8 +89,10 @@ export function createRealtimeCollector(now: () => number = Date.now): RealtimeC
           break
         case 'response.output_audio.delta':
           if (typeof ev.delta === 'string') {
-            audio.push(Buffer.from(ev.delta, 'base64'))
+            const delta = Buffer.from(ev.delta, 'base64')
+            audio.push(delta)
             firstOutputAt ??= now()
+            handOnWholeSamples(delta)
           }
           break
         case 'response.done': {
@@ -196,7 +208,18 @@ export function requestRealtimeAudioReply(
   if (signal.aborted) return Promise.resolve({ text: '', audio: null, status: 'cancelled' })
 
   return new Promise<AudioReply>((resolve, reject) => {
-    const collector = createRealtimeCollector()
+    // Speech is streamed only while the reply runs: never once it has settled, a stop has begun (the engine goes on
+    // sending until its response.done, and that part is only for the stored clip), or the reply is done. A caller's
+    // throw never fails the reply.
+    const streamAudio = req.onAudio && ((pcm16: Buffer, sampleRate: number) => {
+      if (settled || stopping || collector.done) return
+      try {
+        req.onAudio!({ pcm16, sampleRate })
+      } catch (err) {
+        console.warn(`[audio-reply] streaming a piece of the spoken reply failed: ${(err as Error).message}`)
+      }
+    })
+    const collector = createRealtimeCollector(Date.now, streamAudio)
     let ws: RealtimeSocket
     try {
       ws = new Socket(realtimeUrl(baseUrl))

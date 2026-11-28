@@ -3,8 +3,9 @@
 // The other half of the contract is proved here too: a send that does not ask for audio takes today's text path and
 // never touches the realtime endpoint.
 import assert from 'node:assert/strict'
+import type { EventEmitter } from 'node:events'
 import { rmSync } from 'node:fs'
-import { test } from 'node:test'
+import { test, type TestContext } from 'node:test'
 import { Hono } from 'hono'
 import { registerChatRoutes } from './chat-routes.js'
 import { ConversationStore } from './db.js'
@@ -335,7 +336,7 @@ test('the stored speed is of the generation alone: from the first output to the 
     const runtime = { reply: async () => ({ text: 'hi', audio: null, status: 'completed' as const, ...reply }) }
     await runAudioReply(h.d, () => {}, {
       convId: conv.id, conv: h.store.getConversation(conv.id)!, history: [], assistantMsg: placeholder, upstream, ac: new AbortController(),
-      turn: { runtime, input: { kind: 'text', text: 'q' }, note: '' },
+      turn: { runtime, input: { kind: 'text', text: 'q' }, note: '' }, userMessageId: 'u-none', clips: [],
     })
     return h.store.getMessage(placeholder.id)!.stats
   }
@@ -346,4 +347,233 @@ test('the stored speed is of the generation alone: from the first output to the 
   const untimed = await run({ outputTokens: 40 })
   assert.equal(untimed.genTokens, 40)
   assert.ok(!('genMs' in untimed) && !('tps' in untimed), 'no timing, no speed')
+})
+
+// ── streamed reply audio and the heard report (arch 2.5, 4.2, 4.3; A1, AA-1) ──────────────────────────
+
+/** One SSE block as written: its event, its data, and its `id:` if it had one. */
+interface Block { event: string; data: any; id?: string }
+
+/** Reads an SSE response block by block as it arrives, so a test can act mid-stream. */
+function sse(res: Response) {
+  const reader = res.body!.getReader()
+  const decoder = new TextDecoder()
+  const blocks: Block[] = []
+  let text = ''
+  const pump = async (): Promise<boolean> => {
+    const { value, done } = await reader.read()
+    if (done) return false
+    text += decoder.decode(value, { stream: true })
+    let end: number
+    while ((end = text.indexOf('\n\n')) >= 0) {
+      const raw = text.slice(0, end)
+      text = text.slice(end + 2)
+      if (!raw.trim() || raw.startsWith(':')) continue
+      const lines = raw.split('\n')
+      const field = (name: string) => lines.find((l) => l.startsWith(`${name}:`))?.slice(name.length + 1).trim()
+      blocks.push({ event: field('event')!, data: JSON.parse(field('data')!), ...(field('id') === undefined ? {} : { id: field('id') }) })
+    }
+    return true
+  }
+  return {
+    blocks,
+    async until(seen: (b: Block) => boolean): Promise<void> {
+      while (!blocks.some(seen)) if (!(await pump())) assert.fail('the stream ended first')
+    },
+    async rest(): Promise<Block[]> {
+      while (await pump());
+      return blocks
+    },
+  }
+}
+
+/** What one viewer of a run listens with on its emitter: subscribe's onPush and subscribeToBuffer's live tail. */
+const LISTENERS_PER_VIEWER = 2
+
+/** Resolves once `emitter` has `count` listeners for `event`: on its own newListener event, never on the clock. */
+function listenersReach(emitter: EventEmitter, event: string, count: number): Promise<void> {
+  if (emitter.listenerCount(event) >= count) return Promise.resolve()
+  return new Promise((resolve) => {
+    // newListener fires just before the listener is added, so the count it will reach is one more.
+    const onNew = (name: string | symbol) => {
+      if (name !== event || emitter.listenerCount(event) + 1 < count) return
+      emitter.off('newListener', onNew)
+      resolve()
+    }
+    emitter.on('newListener', onNew)
+  })
+}
+
+const heard = (h: Harness, convId: string, msgId: string, body: unknown) => h.app.request(`/api/v1/conversations/${convId}/messages/${msgId}/heard`, post(body))
+
+/** The invalidation keys announced while `fn` ran. */
+async function announcedDuring(t: TestContext, fn: () => Promise<unknown>): Promise<string[]> {
+  const { eventBus } = await import('../events/bus.js')
+  const emitted: string[] = []
+  const spy = t.mock.method(eventBus, 'emit', (key: string) => { emitted.push(key) })
+  try {
+    await fn()
+  } finally {
+    spy.mock.restore()
+  }
+  return emitted
+}
+
+test('streamAudio must be a boolean, and asks for nothing without replyAudio', async (t) => {
+  const h = await harness(t)
+  const conv = h.store.createConversation()
+  await refused(h, { audio: [WAV_URL], replyAudio: true, streamAudio: 'yes' }, 400, 'invalid_input')
+  await refused(h, { audio: [WAV_URL], streamAudio: true }, 400, 'invalid_input')
+  await refused(h, { audio: [WAV_URL], replyAudio: false, streamAudio: true }, 400, 'invalid_input')
+  assert.equal(h.store.getMessages(conv.id).length, 0)
+})
+
+test('a spoken send that does not ask for streamed audio gets no audio_chunk and no audio_end', async (t) => {
+  const h = await harness(t)
+  const conv = h.store.createConversation()
+  const text = await (await send(h, conv.id, { audio: [WAV_URL], replyAudio: true })).text()
+  assert.ok(!text.includes('audio_chunk') && !text.includes('audio_end'), text.slice(0, 300))
+})
+
+test('with streamAudio: unnumbered audio_chunk frames, then a numbered audio_end, then the text and done; the chunks are the stored clip', async (t) => {
+  const h = await harness(t)
+  const conv = h.store.createConversation()
+  const blocks = await sse(await send(h, conv.id, { audio: [WAV_URL], replyAudio: true, streamAudio: true })).rest()
+  const events = blocks.map((b) => b.event)
+  const chunks = blocks.filter((b) => b.event === 'audio_chunk')
+  assert.ok(chunks.length >= 2, events.join(','))
+  assert.deepEqual(events, ['meta', ...chunks.map(() => 'audio_chunk'), 'audio_end', 'delta', 'done'])
+  assert.ok(chunks.every((b) => b.id === undefined), 'a chunk moves no resume cursor')
+  const end = blocks.find((b) => b.event === 'audio_end')!
+  assert.ok(end.id !== undefined, 'audio_end is numbered')
+  assert.deepEqual(chunks.map((b) => b.data.index), chunks.map((_, i) => i))
+  assert.equal(end.data.chunks, chunks.length)
+
+  const reply = h.store.getMessages(conv.id)[1]
+  const served = await h.app.request(`/api/v1/attachments/${attachmentRefId(reply.attachments[0])}`)
+  const stored = decodeWavToPcm16Mono(Buffer.from(await served.arrayBuffer())).pcm16
+  assert.deepEqual(Buffer.concat(chunks.map((b) => Buffer.from(b.data.pcm16, 'base64'))), stored)
+  assert.equal(end.data.samples, stored.length / 2)
+})
+
+test('a viewer attaching mid-reply gets no audio unless it asks with audio=1, and then only what is produced after it attached', async (t) => {
+  const h = await harness(t, { engine: { mode: 'held' } })
+  const conv = h.store.createConversation()
+  const sender = sse(await send(h, conv.id, { audio: [WAV_URL], replyAudio: true, streamAudio: true }))
+  await sender.until((b) => b.event === 'audio_chunk')
+  const run = h.d.chatRuns.latestRun(conv.id)!
+  const bothAttached = listenersReach(run.emitter, 'event', run.emitter.listenerCount('event') + 2 * LISTENERS_PER_VIEWER)
+  const plain = sse(await h.app.request(`/api/v1/conversations/${conv.id}/stream`))
+  const withAudio = sse(await h.app.request(`/api/v1/conversations/${conv.id}/stream?audio=1`))
+  await bothAttached
+  h.engine.release()
+
+  const sent = (await sender.rest()).filter((b) => b.event === 'audio_chunk').map((b) => b.data.index)
+  const plainBlocks = await plain.rest()
+  const audioBlocks = await withAudio.rest()
+  assert.ok(sent.length >= 2, `${sent}`)
+  assert.equal(plainBlocks.some((b) => b.event === 'audio_chunk'), false)
+  assert.ok(plainBlocks.some((b) => b.event === 'audio_end'), 'audio_end is an ordinary frame')
+  assert.deepEqual(audioBlocks.filter((b) => b.event === 'audio_chunk').map((b) => b.data.index), sent.slice(1), 'not the chunk sent before it attached')
+})
+
+test('heard: 404 for an unknown chat or message or another chat\'s message, 400 for a bad number or a user message, 409 for a reply with no clip', async (t) => {
+  const h = await harness(t)
+  const conv = h.store.createConversation()
+  const other = h.store.createConversation()
+  const user = h.store.addMessage(conv.id, 'user', 'hi')
+  const textReply = h.store.addMessage(conv.id, 'assistant', 'hello')
+  const elsewhere = h.store.addMessage(other.id, 'assistant', 'there')
+  const status = async (res: Response | Promise<Response>) => { const r = await res; return [r.status, (await r.json() as { error?: { code: string } }).error?.code] }
+  assert.deepEqual(await status(heard(h, 'missing', textReply.id, { heardMs: 10 })), [404, 'not_found'])
+  assert.deepEqual(await status(heard(h, conv.id, 'missing', { heardMs: 10 })), [404, 'not_found'])
+  assert.deepEqual(await status(heard(h, conv.id, elsewhere.id, { heardMs: 10 })), [404, 'not_found'])
+  for (const bad of [{}, { heardMs: 'x' }, { heardMs: -1 }, { heardMs: null }]) assert.deepEqual(await status(heard(h, conv.id, textReply.id, bad)), [400, 'invalid_input'], JSON.stringify(bad))
+  assert.deepEqual(await status(heard(h, conv.id, user.id, { heardMs: 10 })), [400, 'invalid_input'])
+  assert.deepEqual(await status(heard(h, conv.id, textReply.id, { heardMs: 10 })), [409, 'not_spoken_reply'])
+})
+
+test('heard while the reply is still running: pending, nothing announced, and the saved reply is cut to it', async (t) => {
+  const h = await harness(t, { engine: { mode: 'held' } })
+  const conv = h.store.createConversation()
+  const sender = sse(await send(h, conv.id, { audio: [WAV_URL], replyAudio: true }))
+  await h.engine.waitFor('response.output_audio.delta')
+  const replyId = h.d.chatRuns.latestRun(conv.id)!.meta.assistantMessageId
+  let answer: unknown
+  const announced = await announcedDuring(t, async () => { answer = await (await heard(h, conv.id, replyId, { heardMs: 20 })).json() })
+  assert.deepEqual(answer, { ok: true, applied: 'pending' })
+  assert.deepEqual(announced, [])
+  h.engine.release()
+  await sender.rest()
+
+  const reply = h.store.getMessage(replyId)!
+  assert.equal(reply.content, '', 'no whole sentence was heard')
+  assert.equal(reply.stats.heardMs, 20)
+  const served = await h.app.request(`/api/v1/attachments/${attachmentRefId(reply.attachments[0])}`)
+  assert.equal(decodeWavToPcm16Mono(Buffer.from(await served.arrayBuffer())).pcm16.length, 480 * 2, '20 ms at 24 kHz')
+})
+
+/** A heard request whose JSON body the test sends when it chooses; `reading` resolves once the route starts reading it. */
+function heldHeard(h: Harness, convId: string, msgId: string) {
+  let sendBody!: (json: unknown) => void
+  let markReading!: () => void
+  const reading = new Promise<void>((resolve) => { markReading = resolve })
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      sendBody = (json) => {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify(json)))
+        controller.close()
+      }
+    },
+    pull() { markReading() },
+  }, { highWaterMark: 0 })
+  const init = { method: 'POST', headers: { 'content-type': 'application/json' }, body: stream, duplex: 'half' } as RequestInit
+  const response = Promise.resolve(h.app.request(`/api/v1/conversations/${convId}/messages/${msgId}/heard`, init))
+  return { reading, sendBody, response }
+}
+
+test('a heard report whose body arrives after the reply was saved is applied to the saved row', async (t) => {
+  const h = await harness(t, { engine: { mode: 'held' } })
+  const conv = h.store.createConversation()
+  const sender = sse(await send(h, conv.id, { audio: [WAV_URL], replyAudio: true }))
+  await h.engine.waitFor('response.output_audio.delta')
+  const replyId = h.d.chatRuns.latestRun(conv.id)!.meta.assistantMessageId
+  const report = heldHeard(h, conv.id, replyId)
+  await report.reading
+  h.engine.release()
+  await sender.rest()
+
+  let res!: Response
+  const announced = await announcedDuring(t, async () => {
+    report.sendBody({ heardMs: 20 })
+    res = await report.response
+  })
+  assert.equal(res.status, 200)
+  assert.deepEqual(await res.json(), { ok: true, applied: 'saved' })
+  assert.deepEqual(announced, [`conversation:${conv.id}`])
+  const reply = h.store.getMessage(replyId)!
+  assert.equal(reply.stats.heardMs, 20)
+  const served = await h.app.request(`/api/v1/attachments/${attachmentRefId(reply.attachments[0])}`)
+  assert.equal(decodeWavToPcm16Mono(Buffer.from(await served.arrayBuffer())).pcm16.length, 480 * 2, 'the cut clip')
+})
+
+test('heard after the reply was saved: the reply is cut, announced once, and a refetch shows the cut; a larger report changes nothing', async (t) => {
+  const h = await harness(t)
+  const conv = h.store.createConversation()
+  await (await send(h, conv.id, { audio: [WAV_URL], replyAudio: true })).text()
+  const before = h.store.getMessages(conv.id)[1]
+
+  let answer: unknown
+  const announced = await announcedDuring(t, async () => { answer = await (await heard(h, conv.id, before.id, { heardMs: 20 })).json() })
+  assert.deepEqual(answer, { ok: true, applied: 'saved' })
+  assert.deepEqual(announced, [`conversation:${conv.id}`])
+
+  const shown = (await (await h.app.request(`/api/v1/conversations/${conv.id}`)).json()) as { messages: Array<{ id: string; content: string; attachments: string[] }> }
+  const cut = shown.messages.find((m) => m.id === before.id)!
+  assert.equal(cut.content, '')
+  assert.notDeepEqual(cut.attachments, before.attachments, 'the new clip')
+
+  const again = await announcedDuring(t, async () => { answer = await (await heard(h, conv.id, before.id, { heardMs: 40 })).json() })
+  assert.deepEqual(answer, { ok: true, applied: 'unchanged' })
+  assert.deepEqual(again, [])
 })
