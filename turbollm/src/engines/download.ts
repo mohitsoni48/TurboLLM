@@ -84,6 +84,7 @@ export function stripMacOsQuarantine(dir: string): void {
 // Pinned known-good upstream build. Bump deliberately after testing.
 export const LLAMA_BUILD = 'b9608'
 const REPO = 'ggml-org/llama.cpp'
+export const OFFICIAL_LLAMA_CPP_REPO = REPO
 // Upstream publishes no Android build (see availableBackends()'s android branch) — TurboLLM
 // cross-compiles it via the Android NDK (manually for now; the CI workflow for this was
 // removed after it never passed) and hosts the archive as a plain file on this Hugging Face
@@ -937,7 +938,7 @@ const TQ_WIN_CUDA13_RUNTIME = 'cudart-llama-bin-win-cuda-13.3-x64.zip'
  *  in only some upstream releases, and riding on LLAMA_BUILD meant an unrelated routine bump
  *  could start 404ing the Windows CUDA 13.3 install with nothing to catch it. The pack is
  *  resolved by NAME out of this tag's asset list, so a rename or removal fails loudly. */
-const TQ_CUDART_TAG = 'b9608'
+export const TQ_CUDART_TAG = 'b9608'
 
 /** "13.4" ≥ "13.0"? Numeric major.minor compare; false for null/garbage. */
 function cudaAtLeast(have: string | null, want: string): boolean {

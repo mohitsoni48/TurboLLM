@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { asDirName } from './build-runner'
+import { findOfficialRuntimePack } from './cuda-runtime'
 import { driverMaxCuda } from './nvidia-smi'
 import { downloadFile, extractArchive, GithubRateLimitError, stripMacOsQuarantine, type ProvisionProgress, type ReleaseAsset } from './download'
 import { probe, ProbeError, type ProbeResult } from './probe'
@@ -135,7 +136,7 @@ export async function installReleaseAsset(
   opts: ReleaseInstallOptions = {},
 ): Promise<ReleaseInstallResult> {
   const release = await releaseByTag(plan.repo, plan.tag, opts.signal, opts.fetchImpl)
-  const parts = chooseParts(release.assets, plan.asset)
+  const parts = await withOfficialRuntime(chooseParts(release.assets, plan.asset), opts)
   const key = assetKey(parts.main.name, plan.tag)
   const slug = opts.slug ?? releaseInstallDirName({ repo: plan.repo, assetKey: key })
   const workDirs = workDirsFor(enginesRoot, slug)
@@ -187,6 +188,16 @@ export async function installReleaseAsset(
       }
     }
   }
+}
+
+/** A Windows CUDA build whose release ships no matching runtime gets the official llama.cpp one (ADR-175). */
+async function withOfficialRuntime(parts: AssetParts, opts: ReleaseInstallOptions): Promise<AssetParts> {
+  const { main } = parts
+  if (parts.companions.length > 0 || main.os !== 'windows' || main.backend !== 'cuda') return parts
+  const runtime = await findOfficialRuntimePack(main, opts.signal, opts.fetchImpl)
+  if (!runtime) return parts
+  rejectOversize(runtime)
+  return { ...parts, companions: [runtime] }
 }
 
 function chooseParts(assets: ReleaseAsset[], assetName: string): AssetParts {
