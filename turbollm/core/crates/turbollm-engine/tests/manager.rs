@@ -1680,3 +1680,27 @@ async fn a_claim_right_after_idle_was_read_is_never_refused_as_load_in_progress(
         next.unwrap().run().await.expect("reload");
     }
 }
+
+#[tokio::test]
+async fn a_shutdown_of_a_core_that_never_loaded_waits_for_its_predecessor_to_close() {
+    let first = fixture(ScriptedBackend::new(vec![]));
+    first.load("org/repo/a").await;
+    let second = Setup::of(ScriptedBackend::new(vec![]))
+        .after(&first.manager)
+        .build();
+    let manager = second.manager.clone();
+    let closing = tokio::spawn(async move { manager.shutdown().await });
+
+    eventually("the shutdown to wait on its predecessor", || {
+        first.manager.parked_snapshot_waiters() == 1
+    })
+    .await;
+    assert_ne!(second.state(), EngineState::Closed);
+    assert!(!closing.is_finished());
+
+    first.manager.shutdown().await;
+    closing.await.unwrap();
+
+    assert_eq!(first.record().history(), ["open", "close"]);
+    assert_eq!(second.state(), EngineState::Closed);
+}

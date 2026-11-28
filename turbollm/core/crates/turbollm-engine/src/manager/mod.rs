@@ -164,8 +164,11 @@ impl EngineManager {
         self.start_generation(&gate, req, permit)
     }
 
-    /// Unloads, then refuses everything with `Closed`; a successor waiting on it continues. Once it
-    /// holds the lifecycle, a dropped future no longer stops it.
+    /// Waits for the predecessor to be `Closed`, unloads, then refuses everything with `Closed`; a
+    /// successor waiting on it continues, so a chain of cores closes in order even when this one
+    /// never loaded. A predecessor nobody shuts down keeps this wait (and the lifecycle) forever:
+    /// the owner of a core shuts it down before it builds the next (arch 2.3.5). Once it holds the
+    /// lifecycle, a dropped future no longer stops it.
     pub async fn shutdown(&self) {
         let lifecycle = self.lifecycle().await;
         if self.shared.snapshots.is_closed() {
@@ -173,6 +176,7 @@ impl EngineManager {
         }
         let manager = self.clone();
         let closing = under_lifecycle(lifecycle, |lifecycle| async move {
+            manager.await_predecessor_closed().await;
             manager.unload_resident().await;
             manager.settle(lifecycle, || {
                 manager.shared.snapshots.publish(EngineState::Closed);
