@@ -60,6 +60,12 @@ export class ChatTurns {
    *  this, a reply running at Quit kept only what its last 10 s save had written. */
   private readonly runningReplySaves = new Set<() => void>()
 
+  /** The spoken replies still generating, by reply id, and the least of them each listener reported hearing (arch
+   *  2.8): the turn applies it when it saves the reply. Apart from the chat slot: a stopped reply is still unwinding
+   *  to its save after its slot is free. */
+  private readonly spokenRunning = new Set<string>()
+  private readonly heard = new Map<string, number>()
+
   // ── the in-flight slot of a chat ─────────────────────────────────────
 
   /** The entry holding `convId`'s slot, or undefined when it is free. */
@@ -254,5 +260,29 @@ export class ChatTurns {
   /** Saves every running reply's text so far into its placeholder now (see runningReplySaves). */
   saveRunningReplies(): void {
     for (const save of this.runningReplySaves) save()
+  }
+
+  // ── how much of a running spoken reply was heard ─────────────────────
+
+  beginSpokenReply(replyId: string): void {
+    this.spokenRunning.add(replyId)
+  }
+
+  isSpokenReplyRunning(replyId: string): boolean {
+    return this.spokenRunning.has(replyId)
+  }
+
+  /** Keeps the smallest value reported: the reply is cut to what every listener heard. Ignored for a reply not running. */
+  noteHeard(replyId: string, heardMs: number): void {
+    if (!this.spokenRunning.has(replyId)) return
+    this.heard.set(replyId, Math.min(heardMs, this.heard.get(replyId) ?? Infinity))
+  }
+
+  /** The reply is being saved: forgets it, and returns the heard value to apply, if any was reported. */
+  finishSpokenReply(replyId: string): number | undefined {
+    const heardMs = this.heard.get(replyId)
+    this.spokenRunning.delete(replyId)
+    this.heard.delete(replyId)
+    return heardMs
   }
 }

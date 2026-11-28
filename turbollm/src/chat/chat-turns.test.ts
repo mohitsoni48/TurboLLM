@@ -148,3 +148,39 @@ test('taking and freeing a chat slot announce that conversation', () => {
   turns.stop('c2', compaction)
   assert.deepEqual(heard.splice(0), ['conversation:c2'])
 })
+
+// ── the spoken-reply registry: how much of a running spoken reply was heard (arch 2.8) ──────────
+
+test('a spoken reply is running from begin to finish, and finish clears it', () => {
+  const turns = new ChatTurns()
+  assert.equal(turns.isSpokenReplyRunning('r1'), false)
+  turns.beginSpokenReply('r1')
+  assert.equal(turns.isSpokenReplyRunning('r1'), true)
+  turns.finishSpokenReply('r1')
+  assert.equal(turns.isSpokenReplyRunning('r1'), false)
+})
+
+test('the smallest heard value reported is kept, and finish hands it back once', () => {
+  const turns = new ChatTurns()
+  turns.beginSpokenReply('r1')
+  turns.noteHeard('r1', 900)
+  turns.noteHeard('r1', 400)
+  turns.noteHeard('r1', 700)
+  assert.equal(turns.finishSpokenReply('r1'), 400)
+  assert.equal(turns.finishSpokenReply('r1'), undefined, 'removed with the reply')
+})
+
+test('a reply nobody reported on finishes with no heard value', () => {
+  const turns = new ChatTurns()
+  turns.beginSpokenReply('r1')
+  assert.equal(turns.finishSpokenReply('r1'), undefined)
+})
+
+test('a heard report for a reply that is not running is ignored', () => {
+  const turns = new ChatTurns()
+  turns.noteHeard('r1', 300)
+  turns.beginSpokenReply('r1')
+  assert.equal(turns.finishSpokenReply('r1'), undefined)
+  turns.noteHeard('r1', 300)
+  assert.equal(turns.finishSpokenReply('r1'), undefined)
+})
