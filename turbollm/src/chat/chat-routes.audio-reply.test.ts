@@ -335,7 +335,7 @@ test('the stored speed is of the generation alone: from the first output to the 
     const runtime = { reply: async () => ({ text: 'hi', audio: null, status: 'completed' as const, ...reply }) }
     await runAudioReply(h.d, () => {}, {
       convId: conv.id, conv: h.store.getConversation(conv.id)!, history: [], assistantMsg: placeholder, upstream, ac: new AbortController(),
-      turn: { runtime, input: { kind: 'text', text: 'q' }, note: '' },
+      turn: { runtime, input: { kind: 'text', text: 'q' }, note: '' }, userMessageId: 'u-none', clips: [],
     })
     return h.store.getMessage(placeholder.id)!.stats
   }

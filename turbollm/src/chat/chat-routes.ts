@@ -722,6 +722,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       if (spoken) {
         const outcome = await runAudioReply(d, sink, {
           convId, conv: setAsideFrozenCut(db, conv), history: (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id), assistantMsg, upstream, ac, turn: spoken,
+          userMessageId: userMsg.id, clips: storedMedia.filter(isAudioAttachment),
         })
         if (!outcome.aborted && outcome.content && conv.title === 'New chat' && d.store.snapshot().daemon.autoGenerateTitles) {
           d.chatTurns.afterReplyCall(convId, 1000, () => autoTitle(d, convId, [{ role: 'user', content: content || VOICE_MESSAGE_PLACEHOLDER }], outcome.content, upstream))
