@@ -29,7 +29,7 @@ const GOLDEN_SCHEMA: Record<number, string> = {
   37: '86dd4e9780ae', 38: '86dd4e9780ae', 39: 'b992d762df09', 40: '26e6a2c17418', 41: '8480fe17ee94', 42: '0011e805c559',
   43: '9e573eb56549', 44: 'c03722433fe1', 45: '9df44ff78234', 46: '7fc1c58de742', 47: '47bdd620e3ae', 48: 'feef3f62778e',
   49: 'd53ce39c853f', 50: 'e2852e43bfa1', 51: 'ec15a80517ce', 52: '68296496f02d', 53: 'b6f75d201e7d', 54: '13a211d3aa4b',
-  55: '6d3d1c989ca3', 56: 'd55c773d9c0c',
+  55: '6d3d1c989ca3', 56: 'd55c773d9c0c', 57: '8f49c681ea17',
 }
 
 /** Runs `fn` with a scratch directory on `backend` (sql.js is selected by the platform check in
@@ -91,7 +91,7 @@ for (const backend of BACKENDS) {
       const fresh = new ConversationStore(freshDir())
       const expected = schemaRows(fresh.handle, false)
       fresh.close()
-      for (const version of [1, 8, 27, 40, 45, 52, 53, 54, 55]) {
+      for (const version of [1, 8, 27, 40, 45, 52, 53, 54, 55, 56]) {
         const dir = freshDir()
         const old = openSqlDb(`${dir}/turbollm.db`)
         runMigrations(old, version)
