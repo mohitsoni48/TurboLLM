@@ -452,7 +452,7 @@ test(`a job put back at the front by a pause still keeps the queue to ${TRANSCRI
     await until(() => h.whisper.calls.length === 1)
     const waiting = Array.from({ length: TRANSCRIPT_QUEUE_MAX }, () => h.voiceMessage())
     for (const m of waiting) h.queue.enqueue(h.job(m.id))
-    assert.deepEqual(h.logged, [], `${TRANSCRIPT_QUEUE_MAX} waiting is not yet too many`)
+    assert.equal(h.logged.length, 0, `${TRANSCRIPT_QUEUE_MAX} waiting is not yet too many`)
 
     h.queue.pause()
     await settle()
