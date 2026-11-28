@@ -39,6 +39,7 @@ const PROGRESS_SILENCE: Duration = Duration::from_secs(3);
 const STALLED_LOAD: &str = "llama.cpp could not load the model: no load progress for 1 s";
 const CANCEL_AFTER: Duration = Duration::from_millis(200);
 const ABORT_LIMIT: Duration = Duration::from_secs(1);
+const UNLOAD_LIMIT: Duration = Duration::from_secs(5);
 const LOAD_UNLOAD_CYCLES: usize = 20;
 const SMALL_CONTEXT: u32 = 512;
 const GREEDY_PROMPT: &str = "Name three colours.";
@@ -149,6 +150,78 @@ fn unloading_frees_the_native_session() {
 }
 
 #[test]
+fn unloading_during_a_prefill_aborts_it_and_frees_the_session_without_a_crash() {
+    on_the_real_library(|host| async move {
+        let manager = host.manager();
+        host.load(&manager, None).await.expect("the model loads");
+        let generation = manager
+            .generate(chat(&long_prompt(), capped(16)))
+            .await
+            .expect("the gate is free");
+        tokio::time::sleep(CANCEL_AFTER).await;
+
+        let unload_ms = time_to_unload(&manager).await;
+        let reply = Reply::read(generation).await;
+
+        assert_eq!(host.live_sessions(), 0, "the session outlived the unload");
+        assert!(reply.ending.is_err(), "the prefill ended normally");
+        assert!(
+            !reply.has_prefilled(),
+            "the prefill ended before the unload"
+        );
+        assert!(unload_ms < UNLOAD_LIMIT, "the unload took {unload_ms:?}");
+        manager
+            .unload()
+            .await
+            .expect("a second unload of an empty engine is fine");
+    });
+}
+
+#[test]
+fn unloading_while_tokens_are_generated_ends_the_reply_and_frees_the_session() {
+    on_the_real_library(|host| async move {
+        let manager = host.manager();
+        host.load(&manager, None).await.expect("the model loads");
+        let mut generation = manager
+            .generate(chat("Count to one thousand.", capped(1024)))
+            .await
+            .expect("the gate is free");
+        let first = generation.next().await;
+        assert!(
+            matches!(first, Ok(Some(EngineEvent::Prefilled { .. }))),
+            "{first:?}"
+        );
+        tokio::time::sleep(CANCEL_AFTER).await;
+
+        let unload_ms = time_to_unload(&manager).await;
+        let reply = Reply::read(generation).await;
+
+        assert_eq!(host.live_sessions(), 0, "the session outlived the unload");
+        assert!(reply.ending.is_err(), "the reply ended normally");
+        assert!(unload_ms < UNLOAD_LIMIT, "the unload took {unload_ms:?}");
+    });
+}
+
+#[test]
+fn a_model_that_does_not_exist_gives_no_session_and_says_why() {
+    on_the_real_library(|host| async move {
+        let manager = host.manager();
+        let missing = host.model.with_file_name("no-such-model.gguf");
+
+        let failure = host
+            .load_target(&manager, host.target_at(&missing, None))
+            .await
+            .err();
+
+        let Some(EngineError::ModelLoadFailed(reason)) = failure else {
+            panic!("expected ModelLoadFailed, got {failure:?}");
+        };
+        assert!(reason.contains("no-such-model.gguf"), "{reason}");
+        assert_eq!(host.live_sessions(), 0);
+    });
+}
+
+#[test]
 fn twenty_load_chat_unload_cycles_leave_no_session_behind() {
     on_the_real_library(|host| async move {
         let manager = host.manager();
@@ -246,8 +319,16 @@ impl Host {
         manager: &EngineManager,
         context_size: Option<u32>,
     ) -> Result<LoadedModelInfo, EngineError> {
+        self.load_target(manager, self.target(context_size)).await
+    }
+
+    async fn load_target(
+        &self,
+        manager: &EngineManager,
+        target: LoadTarget,
+    ) -> Result<LoadedModelInfo, EngineError> {
         manager
-            .claim_load(self.target(context_size))
+            .claim_load(target)
             .expect("nothing else is loading")
             .run()
             .await
@@ -261,12 +342,16 @@ impl Host {
     }
 
     fn target(&self, context_size: Option<u32>) -> LoadTarget {
+        self.target_at(&self.model, context_size)
+    }
+
+    fn target_at(&self, model: &Path, context_size: Option<u32>) -> LoadTarget {
         LoadTarget {
-            model_ref: ModelRef::File(self.model.to_string_lossy().into_owned()),
+            model_ref: ModelRef::File(model.to_string_lossy().into_owned()),
             id: "test-gguf".to_owned(),
             format: ModelFormat::Gguf,
             engine: EngineId::new(EngineId::LLAMA_CPP_CPU),
-            path: self.model.clone(),
+            path: model.to_path_buf(),
             context_size,
             threads: None,
             backend: Backend::Auto,
@@ -292,6 +377,12 @@ fn open_base_library(library_dir: &Path) -> Library {
     let path = library_dir.join(library_file_name(Variant::Base.library_stem()));
     // SAFETY: the library is ours; its initialisers only set up llama.cpp's static state.
     unsafe { Library::new(&path) }.unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+async fn time_to_unload(manager: &EngineManager) -> Duration {
+    let started = Instant::now();
+    manager.unload().await.expect("the model unloads");
+    started.elapsed()
 }
 
 fn manager_with_stall(backend: LlamaBackend, stall: Duration) -> EngineManager {
