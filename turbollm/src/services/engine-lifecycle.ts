@@ -15,6 +15,7 @@ import { isLocalOrAuthenticated } from '../auth'
 import type { Deps } from '../deps'
 import type { ModelInfo, StartOpts } from '../engines/manager'
 import { manualLoadRefusal, readsOnlyLitertlm } from '../engines/compat'
+import { checkStrataModel } from '../engines/strata'
 import { engineForModel } from '../engines/registry'
 import { buildStartOpts } from '../engines/start-opts'
 import type { LoadProfile } from '../models/profile'
@@ -70,6 +71,14 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
   // ComfyUI guard: while ComfyUI is rendering it owns the GPU, so refuse to load a
   // model (it would thrash/OOM VRAM). The guard reloads automatically once idle.
   if (d.comfy?.isBlocked()) return err(c, 409, 'comfyui_busy', 'ComfyUI is rendering — model loading is paused until its queue finishes.')
+  const selectedPath = entry?.path || b.modelPath || cfg.devModel?.modelPath
+  if (active.kind === 'strata' && selectedPath) {
+    try {
+      await checkStrataModel(active.binPath, selectedPath)
+    } catch (e) {
+      return err(c, 409, 'engine_model_mismatch', e instanceof Error ? e.message : String(e))
+    }
+  }
   const sys = getSysInfo()
 
   if (entry) {

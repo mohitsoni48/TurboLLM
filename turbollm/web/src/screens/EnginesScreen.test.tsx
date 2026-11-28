@@ -79,7 +79,7 @@ vi.mock('../lib/queries', async (importOriginal) => {
       const noop = { mutate: vi.fn(), isPending: false }
       return {
         backend: noop, mlx: noop, rapidMlx: noop, mlxVlm: noop, vllm: noop, sglang: noop, litertLm: noop,
-        turboquant: noop, koboldcpp: noop, llamafile: noop,
+        turboquant: noop, strata: noop, koboldcpp: noop, llamafile: noop,
         laya: { mutate: installLayaMutate, isPending: false },
         cancel: noop, remove: noop, enableBackend: noop,
         updateVllm: noop, updateSglang: noop,

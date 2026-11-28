@@ -1,6 +1,22 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { engineRequestHeaders } from './engine-headers'
+import { engineRequestHeaders, registerStrataKey } from './engine-headers'
+
+test('Strata replaces client keys only with the key for this launch and target', () => {
+  const target = 'http://127.0.0.1:8082'
+  const releaseFirst = registerStrataKey(target, 'first')
+  const releaseSecond = registerStrataKey(target, 'second')
+  try {
+    releaseFirst()
+    const headers = engineRequestHeaders('strata', clientHeaders(), {}, target)
+    assert.equal(headers.get('authorization'), 'Bearer second')
+    assert.equal(headers.has('x-api-key'), false)
+    assert.equal(engineRequestHeaders('strata', clientHeaders(), {}, target + '0').has('authorization'), false)
+  } finally {
+    releaseSecond()
+  }
+  assert.equal(engineRequestHeaders('strata', clientHeaders(), {}, target).has('authorization'), false)
+})
 
 const SDK = 'turbollm-sdk'
 

@@ -9,6 +9,7 @@ import { releaseSwapBlockReason } from '../engines/update-apply'
 import { ensureVllmEnv } from '../engines/vllm'
 import { ensureSglangEnv } from '../engines/sglang'
 import { ensureLitertLmEnv } from '../engines/litert-lm'
+import { installStrata, strataPackages, STRATA_VERSION } from '../engines/strata'
 import { ensureKoboldcpp, koboldcppBinPath } from '../engines/koboldcpp'
 import { ensureLlamafile, llamafileBinPath } from '../engines/llamafile'
 import { catalogEngine } from '../engines/catalog'
@@ -20,6 +21,25 @@ import { engineWork, engineWorkBusy, autoTuneUpdateBlock, type EngineJobs } from
 
 /** One-click installs of the vLLM, SGLang, LiteRT-LM, TurboQuant, KoboldCpp and llamafile engines. */
 export function registerEngineInstallRoutes(app: Hono, d: Deps, jobs: EngineJobs): void {
+  app.post('/api/v1/engines/strata', (c) => {
+    const busy = engineWorkBusy(d)
+    if (busy) return err(c, 409, 'engine_already_running', busy)
+    const vendor = primaryVendor(getSysInfo())
+    if (!strataPackages(vendor)) return err(c, 409, 'unsupported_platform', 'Strata requires NVIDIA CUDA 13 on Windows x64 or Linux x64/arm64, or Apple Silicon.')
+    const ac = new AbortController()
+    jobs.provisionAbort = ac
+    d.provision.start('strata', 'user_install')
+    void installStrata(join(d.store.dir(), 'engines'), vendor, p => d.provision.progress(p.phase, p.pct, p.part, p.parts), ac.signal)
+      .then(bin => {
+        const engine = d.registry.addStrata(bin, STRATA_VERSION)
+        d.registry.activate(engine.id)
+        d.provision.done()
+      })
+      .catch(e => ac.signal.aborted ? d.provision.done() : d.provision.fail(`Could not install Strata: ${e.message}`))
+      .finally(() => { if (jobs.provisionAbort === ac) jobs.provisionAbort = null })
+    return c.json({ accepted: true, engine: 'strata' }, 202)
+  })
+
   // Provision the vLLM engine (ADR-044): uv → venv → `uv pip install vllm`, then
   // register as a kind='vllm' engine. 202 + progress via GET /status engineProvision.
   // Not platform-blocked (vLLM fails loudly where unsupported); the catalog marks

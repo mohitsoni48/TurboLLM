@@ -1,6 +1,13 @@
 // The auth headers the daemon sends to a local engine (architecture §6.4). One place decides them, so the in-app SDK's
 // bearer rule cannot drift between the call sites that reach an engine.
 
+const strataKeys = new Map<string, string>()
+
+export function registerStrataKey(target: string, key: string): () => void {
+  strataKeys.set(target, key)
+  return () => { if (strataKeys.get(target) === key) strataKeys.delete(target) }
+}
+
 const TURBOLLM_SDK = 'turbollm-sdk'
 
 /** Sets the auth `headers` a request to a local engine of `engineKind` carries, and returns the same object.
@@ -15,7 +22,15 @@ export function engineRequestHeaders(
   engineKind: string,
   headers: Headers,
   env: NodeJS.ProcessEnv = process.env,
+  target?: string,
 ): Headers {
+  if (engineKind === 'strata') {
+    headers.delete('authorization')
+    headers.delete('x-api-key')
+    const token = target && strataKeys.get(target)
+    if (token) headers.set('authorization', `Bearer ${token}`)
+    return headers
+  }
   if (engineKind !== TURBOLLM_SDK) return headers
   headers.delete('authorization')
   headers.delete('x-api-key')

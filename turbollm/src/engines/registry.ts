@@ -291,6 +291,10 @@ export class Registry {
     return this.store.snapshot().engines.find((e) => e.kind === 'laya')
   }
 
+  addStrata(binPath: string, version: string): Engine {
+    return this.addSingleBinary('strata', `Strata (${version})`, binPath, version)
+  }
+
   /** Register a KoboldCpp engine (kind='koboldcpp'). binPath is the single KoboldCpp
    *  binary, not a llama-server, so llama.cpp capabilities/flags don't apply (it uses
    *  its own CLI flag names — see koboldcppProfileToArgs). */

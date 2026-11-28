@@ -337,6 +337,10 @@ function engineInstallDir(eng: Engine, enginesRoot: string): string | null {
     const d = join(enginesRoot, 'turboquant')
     return inside(d) ? d : null
   }
+  if (eng.kind === 'strata') {
+    const d = join(enginesRoot, 'strata')
+    return inside(d) ? d : null
+  }
   // KoboldCpp single binary (engines/koboldcpp/)
   if (eng.kind === 'koboldcpp') {
     const d = koboldcppDir(enginesRoot)

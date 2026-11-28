@@ -36,7 +36,7 @@ export async function jsonCompletion(
   try {
     const res = await fetch(`${target}/v1/chat/completions`, {
       method: 'POST',
-      headers: engineRequestHeaders(kind, new Headers({ 'Content-Type': 'application/json' })),
+      headers: engineRequestHeaders(kind, new Headers({ 'Content-Type': 'application/json' }), undefined, target),
       body: JSON.stringify(shapeForEngine(kind, b)),
       signal: AbortSignal.timeout(timeoutMs),
     })

@@ -28,6 +28,22 @@ function makeTmpRoot(): string {
   return tmpDir('turbollm-split-test-')
 }
 
+test('five DeepSeek weights with a shared Engram form one loadable library set', async () => {
+  const root = makeTmpRoot()
+  const weights = join(root, 'IQ2_XXS')
+  const prefix = 'DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-'
+  writeShards(weights, Array.from({ length: 5 }, (_, i) => prefix + String(i + 1).padStart(5, '0') + '-of-00006.gguf'))
+  assert.equal((await scanOne(root))?.incomplete, true)
+  writeShards(join(weights, 'shared'), ['DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf'])
+  const scanner = new Scanner(stubStore(root))
+  await scanner.rescan()
+  const entries = scanner.list().models
+  assert.equal(entries.length, 1)
+  assert.equal(entries[0].incomplete, false)
+  rmSync(join(weights, prefix + '00003-of-00006.gguf'))
+  assert.equal((await scanOne(root))?.incomplete, true)
+})
+
 /** Minimal ConfigStore stub: the Scanner only reads dir() (cache location) and
  *  snapshot().modelDirs (what to walk). Cache lives under the same temp root. */
 function stubStore(root: string): ConfigStore {

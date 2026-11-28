@@ -30,6 +30,9 @@ export function modelIncompatibility(
 ): Incompatibility | null {
   const engineKind = engine.kind
   if (entry.format === 'gguf' && entry.arch === GGMLC_ARCH) return GGMLC_GGUF
+  if (engineKind === 'strata' && entry.format === 'gguf' && entry.arch && entry.arch !== 'deepseek41') {
+    return { code: 'format', label: 'Unsupported Strata architecture', message: `This Strata build runs DeepSeek V4.1 Flash sets. This GGUF uses ${entry.arch}.` }
+  }
   if (entry.laya) return engineKind === 'laya' ? null : NEEDS_LAYA
   if (entry.jev && engineKind !== 'vllm') return needsVllm(engineKind)
   if (!engineAcceptsFormat(engine, entry.format)) return formatIncompatibility(engine, entry.format)
@@ -54,7 +57,7 @@ export function manualLoadRefusal(
   engine: EngineFormatRef,
   entry: Parameters<typeof modelIncompatibility>[1],
 ): Incompatibility | null {
-  return entry.laya ? modelIncompatibility(engine, entry) : null
+  return entry.laya || engine.kind === 'strata' ? modelIncompatibility(engine, entry) : null
 }
 
 // The refusal messages state what the selected engine cannot run, and nothing else: no other engine, no "activate",
@@ -68,6 +71,7 @@ export function manualLoadRefusal(
 /** The engine a kind names in a refusal: the selected one, since a refusal is only ever for it. */
 const ENGINE_NAMES: Record<string, string> = {
   'llama-server': 'llama.cpp',
+  strata: 'Strata',
   llamafile: 'llamafile',
   koboldcpp: 'KoboldCpp',
   mlx: 'MLX',
