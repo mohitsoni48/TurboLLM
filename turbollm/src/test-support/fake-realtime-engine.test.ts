@@ -42,3 +42,21 @@ test('held mode stops after the first audio delta and sends the rest of the repl
   await c.seen('response.done')
   assert.ok(c.types.filter((x) => x === 'response.output_audio.delta').length > 1, 'the rest of the audio came after the release')
 })
+
+test('waitFor resolves once the engine has sent an event of that type, at once if it already has', async (t) => {
+  const engine = await startFakeRealtimeEngine({ mode: 'held' })
+  t.after(() => engine.stop())
+  const c = await client(engine.baseUrl)
+  t.after(() => c.ws.terminate())
+  await engine.waitFor('session.created')
+  let doneSent = false
+  const done = engine.waitFor('response.done').then(() => { doneSent = true })
+  c.send({ type: 'session.update', session: {} })
+  await engine.waitFor('session.updated')
+  c.send({ type: 'response.create' })
+  await engine.waitFor('response.output_audio.delta')
+  assert.equal(doneSent, false, 'the reply is held')
+  engine.release()
+  await done
+  assert.ok(engine.sent.includes('response.done'))
+})

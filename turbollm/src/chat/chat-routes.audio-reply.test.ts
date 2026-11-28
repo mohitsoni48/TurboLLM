@@ -3,6 +3,7 @@
 // The other half of the contract is proved here too: a send that does not ask for audio takes today's text path and
 // never touches the realtime endpoint.
 import assert from 'node:assert/strict'
+import type { EventEmitter } from 'node:events'
 import { rmSync } from 'node:fs'
 import { test, type TestContext } from 'node:test'
 import { Hono } from 'hono'
@@ -386,10 +387,21 @@ function sse(res: Response) {
   }
 }
 
-/** Lets the routes' awaits run until `ready` holds; never sleeps. */
-async function turnsUntil(ready: () => boolean, what: string): Promise<void> {
-  for (let i = 0; i < 2000 && !ready(); i++) await new Promise((r) => setImmediate(r))
-  assert.ok(ready(), `never got to ${what}`)
+/** What one viewer of a run listens with on its emitter: subscribe's onPush and subscribeToBuffer's live tail. */
+const LISTENERS_PER_VIEWER = 2
+
+/** Resolves once `emitter` has `count` listeners for `event`: on its own newListener event, never on the clock. */
+function listenersReach(emitter: EventEmitter, event: string, count: number): Promise<void> {
+  if (emitter.listenerCount(event) >= count) return Promise.resolve()
+  return new Promise((resolve) => {
+    // newListener fires just before the listener is added, so the count it will reach is one more.
+    const onNew = (name: string | symbol) => {
+      if (name !== event || emitter.listenerCount(event) + 1 < count) return
+      emitter.off('newListener', onNew)
+      resolve()
+    }
+    emitter.on('newListener', onNew)
+  })
 }
 
 const heard = (h: Harness, convId: string, msgId: string, body: unknown) => h.app.request(`/api/v1/conversations/${convId}/messages/${msgId}/heard`, post(body))
@@ -450,10 +462,10 @@ test('a viewer attaching mid-reply gets no audio unless it asks with audio=1, an
   const sender = sse(await send(h, conv.id, { audio: [WAV_URL], replyAudio: true, streamAudio: true }))
   await sender.until((b) => b.event === 'audio_chunk')
   const run = h.d.chatRuns.latestRun(conv.id)!
-  const listening = run.emitter.listenerCount('event')
+  const bothAttached = listenersReach(run.emitter, 'event', run.emitter.listenerCount('event') + 2 * LISTENERS_PER_VIEWER)
   const plain = sse(await h.app.request(`/api/v1/conversations/${conv.id}/stream`))
   const withAudio = sse(await h.app.request(`/api/v1/conversations/${conv.id}/stream?audio=1`))
-  await turnsUntil(() => run.emitter.listenerCount('event') >= listening + 4, 'both viewers attached')
+  await bothAttached
   h.engine.release()
 
   const sent = (await sender.rest()).filter((b) => b.event === 'audio_chunk').map((b) => b.data.index)
@@ -485,7 +497,7 @@ test('heard while the reply is still running: pending, nothing announced, and th
   const h = await harness(t, { engine: { mode: 'held' } })
   const conv = h.store.createConversation()
   const sender = sse(await send(h, conv.id, { audio: [WAV_URL], replyAudio: true }))
-  await turnsUntil(() => h.engine.sent.includes('response.output_audio.delta'), 'the reply under way')
+  await h.engine.waitFor('response.output_audio.delta')
   const replyId = h.d.chatRuns.latestRun(conv.id)!.meta.assistantMessageId
   let answer: unknown
   const announced = await announcedDuring(t, async () => { answer = await (await heard(h, conv.id, replyId, { heardMs: 20 })).json() })
@@ -524,7 +536,7 @@ test('a heard report whose body arrives after the reply was saved is applied to 
   const h = await harness(t, { engine: { mode: 'held' } })
   const conv = h.store.createConversation()
   const sender = sse(await send(h, conv.id, { audio: [WAV_URL], replyAudio: true }))
-  await turnsUntil(() => h.engine.sent.includes('response.output_audio.delta'), 'the reply under way')
+  await h.engine.waitFor('response.output_audio.delta')
   const replyId = h.d.chatRuns.latestRun(conv.id)!.meta.assistantMessageId
   const report = heldHeard(h, conv.id, replyId)
   await report.reading

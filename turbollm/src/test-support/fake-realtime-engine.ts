@@ -46,6 +46,9 @@ export interface FakeRealtimeEngine {
   closed: () => number
   /** `held` mode: sends the rest of the reply being held. */
   release: () => void
+  /** Resolves once the server has sent an event of `type` (at once if it already has), so a test waits on the
+   *  engine instead of the clock. */
+  waitFor: (type: string) => Promise<void>
   stop: () => Promise<void>
 }
 
@@ -58,6 +61,7 @@ export async function startFakeRealtimeEngine(opts: FakeRealtimeOptions = {}): P
   let opened = 0
   let closed = 0
   let heldRest: (() => void) | null = null
+  const sentWaiters: Array<{ type: string; resolve: () => void }> = []
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' })
   await new Promise<void>((resolve) => wss.on('listening', resolve))
 
@@ -65,7 +69,15 @@ export async function startFakeRealtimeEngine(opts: FakeRealtimeOptions = {}): P
     opened++
     ws.on('close', () => { closed++ })
     ws.on('error', () => {})
-    const send = (e: Json) => { if (ws.readyState === 1) { sent.push(e.type); ws.send(JSON.stringify(e)) } }
+    const send = (e: Json) => {
+      if (ws.readyState !== 1) return
+      sent.push(e.type)
+      ws.send(JSON.stringify(e))
+      for (const w of sentWaiters.filter((x) => x.type === e.type)) {
+        sentWaiters.splice(sentWaiters.indexOf(w), 1)
+        w.resolve()
+      }
+    }
     let replying = false
     let cancels = 0
     send(events[0])
@@ -124,6 +136,7 @@ export async function startFakeRealtimeEngine(opts: FakeRealtimeOptions = {}): P
       heldRest = null
       rest?.()
     },
+    waitFor: (type) => (sent.includes(type) ? Promise.resolve() : new Promise<void>((resolve) => { sentWaiters.push({ type, resolve }) })),
     stop: () => new Promise<void>((resolve) => {
       for (const c of wss.clients) c.terminate()
       wss.close(() => resolve())
