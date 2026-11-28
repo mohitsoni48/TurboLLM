@@ -2,10 +2,18 @@
 // Tests build a snapshot with buildSnapshot(), parse/validate it, then verify
 // the shape the import endpoint would accept, plus error cases and persona fallback.
 import assert from 'node:assert/strict'
+import { rmSync } from 'node:fs'
 import { test } from 'node:test'
+import { Hono } from 'hono'
 import { buildSnapshot } from './chat-export.js'
+import { registerChatRoutes } from './chat-routes.js'
+import { ChatRuns } from './chat-runs.js'
+import { ChatTurns } from './chat-turns.js'
+import { ConversationStore } from './db.js'
 import type { Conversation, Message } from './db.js'
 import type { Config } from '../config/config.js'
+import type { Deps } from '../deps.js'
+import { tmpDir } from '../test-support/tmp'
 
 // ── helpers (same as chat-export.test.ts) ────────────────────────────────────
 
@@ -420,4 +428,81 @@ test('F-036 regression: debug format still detected as turbollm', () => {
   assert.equal(detectImportKind(snap), 'turbollm')
   const result = validateImportPayload(snap)
   assert.equal(result.ok, true)
+})
+
+// ── a voice message's transcript through the real import route (ADR-485 D1) ───────────
+
+/** The import route over a scratch store. */
+function importHarness() {
+  const dir = tmpDir('tllm-chat-import-transcript-')
+  const store = new ConversationStore(dir)
+  const cfg = {
+    modelDefaults: { maxTokens: 0 },
+    gateway: { autoSwap: true },
+    daemon: { autoGenerateTitles: false, experimental: { memory: false }, autoMemoryEnabled: false },
+    tools: { toolPolicies: {}, autoAllowAll: false },
+  }
+  const d = {
+    chatTurns: new ChatTurns(), chatRuns: new ChatRuns(),
+    db: store,
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
+  } as unknown as Deps
+  const app = new Hono()
+  registerChatRoutes(app, d)
+  const importChat = async (body: unknown): Promise<Message[]> => {
+    const res = await app.request('/api/v1/conversations/import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    assert.equal(res.status, 201, await res.clone().text())
+    const { id } = (await res.json()) as { id: string }
+    return store.getMessages(id)
+  }
+  return { store, importChat, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) } }
+}
+
+const VOICE_CLIP = `attachment:${'c'.repeat(64)}.wav`
+
+function exportFile(messages: unknown[]): Record<string, unknown> {
+  return { format: 'export', chat_id: 'c-old', title: 'Voice chat', model: '', messages }
+}
+
+test('import: an exported voice chat comes back with its words, as the message\'s text where it had none', async () => {
+  const h = importHarness()
+  try {
+    const conv = h.store.createConversation({ title: 'Voice chat' })
+    const voiceOnly = h.store.addMessage(conv.id, 'user', '', { attachments: [VOICE_CLIP] })
+    h.store.setMessageTranscript(voiceOnly.id, 'what is the weather')
+    h.store.addMessage(conv.id, 'assistant', 'Sunny.')
+    const withNote = h.store.addMessage(conv.id, 'user', 'my question', { attachments: [VOICE_CLIP] })
+    h.store.setMessageTranscript(withNote.id, 'in Berlin')
+    const snap = buildSnapshot(h.store.getConversation(conv.id, true) as Conversation & { messages: Message[] }, makeCfg(), '0.7.2', '2026-06-19T10:00:00.000Z', 'export')
+
+    const imported = await h.importChat(snap)
+
+    assert.deepEqual(imported.map((m) => [m.content, m.transcript]), [
+      ['what is the weather', 'what is the weather'],
+      ['Sunny.', undefined],
+      ['my question', 'in Berlin'],
+    ])
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('import: an assistant entry\'s transcript is ignored', async () => {
+  const h = importHarness()
+  try {
+    const imported = await h.importChat(exportFile([{ role: 'user', content: 'hi' }, { role: 'assistant', content: '', transcript: 'not mine' }]))
+    assert.deepEqual([imported[1].content, imported[1].transcript], ['', undefined])
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('import: a transcript that is not a string is ignored', async () => {
+  const h = importHarness()
+  try {
+    const imported = await h.importChat(exportFile([{ role: 'user', content: '', transcript: 42 }, { role: 'user', content: 'typed', transcript: { words: 'x' } }]))
+    assert.deepEqual(imported.map((m) => [m.content, m.transcript]), [['', undefined], ['typed', undefined]])
+  } finally {
+    h.cleanup()
+  }
 })
