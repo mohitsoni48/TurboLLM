@@ -101,7 +101,7 @@ export class VoiceTranscripts {
     if (!job) return this.settleIdle()
     const running: RunningJob = { job, stop: new AbortController(), cancelled: false }
     this.running = running
-    void this.run(job, running.stop.signal).finally(() => this.finish(running))
+    void this.run(running).finally(() => this.finish(running))
   }
 
   private finish(running: RunningJob): void {
@@ -121,17 +121,26 @@ export class VoiceTranscripts {
 
   /** The job ends when its work does or the moment it is stopped or its deadline passes, whichever is first: a
    *  whisper that does not stop on its signal never holds the queue, and words that arrive after are never saved. */
-  private async run(job: QueuedJob, stop: AbortSignal): Promise<void> {
-    const ended = AbortSignal.any([stop, this.deadline()])
+  private async run(running: RunningJob): Promise<void> {
+    const { job, stop } = running
+    const ended = AbortSignal.any([stop.signal, this.deadline()])
     try {
       const words = await settledOrAborted(this.transcribe(job, ended), ended)
       if (ended.aborted || this.closed) return
       if (!words) return this.log(`voice transcript: no words in message ${job.messageId}`)
       if (this.deps.db.setMessageTranscript(job.messageId, words)) this.announce(`conversation:${job.convId}`)
     } catch (error) {
-      if (stop.reason === YIELDED) return
-      this.log(`voice transcript: message ${job.messageId} not transcribed: ${error instanceof Error ? error.message : String(error)}`)
+      this.logUnfinished(running, error)
     }
+  }
+
+  /** A job that did not finish: a pause or a shutdown is no failure and says nothing (after a shutdown the store
+   *  may already be closed), a deleted chat is named as such, anything else is a failure. */
+  private logUnfinished(running: RunningJob, error: unknown): void {
+    if (running.stop.signal.reason === YIELDED || this.closed) return
+    const { messageId } = running.job
+    if (running.cancelled) return this.log(`voice transcript: message ${messageId} cancelled with its chat`)
+    this.log(`voice transcript: message ${messageId} not transcribed: ${error instanceof Error ? error.message : String(error)}`)
   }
 
   private async transcribe(job: QueuedJob, ended: AbortSignal): Promise<string> {

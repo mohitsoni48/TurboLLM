@@ -294,6 +294,9 @@ test('cancelling a chat aborts its running job and drops its waiting ones; anoth
     assert.equal(h.store.getMessage(waiting.id)!.transcript, undefined)
     assert.equal(h.store.getMessage(otherChats.id)!.transcript, 'elsewhere')
     assert.equal(h.whisper.calls.length, 2)
+    assert.equal(h.logged.length, 1, h.logged.join('\n'))
+    assert.ok(h.logged[0].includes(running.id) && h.logged[0].includes('cancelled with its chat'), h.logged[0])
+    assert.ok(!h.logged[0].includes('not transcribed'), h.logged[0])
   } finally {
     h.close()
   }
@@ -318,6 +321,21 @@ test('after stopAll a job that still finishes writes nothing, and a later enqueu
     assert.equal(h.store.getMessage(running.id)!.transcript, undefined)
     assert.equal(h.whisper.calls.length, 1)
     assert.deepEqual(h.announced, [])
+  } finally {
+    h.close()
+  }
+})
+
+test('a shutdown with a job running logs nothing, not even once the job has unwound', async () => {
+  const h = harness()
+  try {
+    h.queue.enqueue(h.job(h.voiceMessage().id))
+    h.queue.enqueue(h.job(h.voiceMessage().id))
+    await until(() => h.whisper.calls.length === 1)
+    h.queue.stopAll()
+    await h.queue.idle()
+    await settle()
+    assert.deepEqual(h.logged, [])
   } finally {
     h.close()
   }
