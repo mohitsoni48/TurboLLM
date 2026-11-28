@@ -1630,3 +1630,53 @@ async fn a_reply_whose_engine_stops_before_done_ends_with_an_engine_failure() {
         "{ended:?}"
     );
 }
+
+const RACE_ROUNDS: usize = 300;
+
+/// Reads published states until `reached` holds for one, the way a status poll does.
+async fn wait_for_state(manager: &EngineManager, reached: impl Fn(&EngineState) -> bool) {
+    let mut seen = manager.snapshot();
+    while !reached(&seen.state) {
+        seen = manager.next_snapshot(seen.revision).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_right_after_ready_was_read_is_never_refused_as_load_in_progress() {
+    let f = fixture(ScriptedBackend::new(vec![]));
+    for round in 0..RACE_ROUNDS {
+        let load = tokio::spawn(f.claim("org/repo/a").run());
+        wait_for_state(&f.manager, is_ready).await;
+
+        let next = f.manager.claim_load(f.target("org/repo/a"));
+
+        assert!(
+            next.is_ok(),
+            "round {round}: refused after Ready: {:?}",
+            next.as_ref().err()
+        );
+        load.await.unwrap().expect("load");
+        next.unwrap().abandon();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_right_after_idle_was_read_is_never_refused_as_load_in_progress() {
+    let f = fixture(ScriptedBackend::new(vec![]));
+    f.load("org/repo/a").await;
+    for round in 0..RACE_ROUNDS {
+        let manager = f.manager.clone();
+        let unload = tokio::spawn(async move { manager.unload().await });
+        wait_for_state(&f.manager, |state| *state == EngineState::Idle).await;
+
+        let next = f.manager.claim_load(f.target("org/repo/a"));
+
+        assert!(
+            next.is_ok(),
+            "round {round}: refused after Idle: {:?}",
+            next.as_ref().err()
+        );
+        unload.await.unwrap().expect("unload");
+        next.unwrap().run().await.expect("reload");
+    }
+}

@@ -56,8 +56,8 @@ impl LoadClaim {
 impl Drop for LoadClaim {
     fn drop(&mut self) {
         if let Some(lifecycle) = self.lifecycle.take() {
-            self.manager.show_resident_or_idle();
-            drop(lifecycle);
+            self.manager
+                .settle(lifecycle, || self.manager.show_resident_or_idle());
         }
     }
 }

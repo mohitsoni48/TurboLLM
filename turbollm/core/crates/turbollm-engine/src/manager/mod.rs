@@ -58,6 +58,9 @@ pub struct EngineManager {
 struct Shared {
     catalog: Catalog,
     lifecycle: Arc<Mutex<()>>,
+    /// Held while a finished lifecycle publishes its outcome and lets go, and while a claim takes
+    /// the lifecycle: a state read as an outcome is then never followed by a refusal for it.
+    handoff: StdMutex<()>,
     resident: StdMutex<Option<Resident>>,
     snapshots: Arc<Snapshots>,
     journal: Option<LoadJournal>,
@@ -85,6 +88,7 @@ impl EngineManager {
             shared: Arc::new(Shared {
                 catalog: config.catalog,
                 lifecycle: Arc::new(Mutex::new(())),
+                handoff: StdMutex::new(()),
                 resident: StdMutex::new(None),
                 snapshots: Arc::new(Snapshots::new()),
                 journal: config.journal,
@@ -123,6 +127,7 @@ impl EngineManager {
     /// `Loading` is published before this returns.
     pub fn claim_load(&self, target: LoadTarget) -> Result<LoadClaim, EngineError> {
         self.refuse_when_closed()?;
+        let _handoff = self.handoff();
         let lifecycle = Arc::clone(&self.shared.lifecycle)
             .try_lock_owned()
             .map_err(|_held| EngineError::LoadInProgress)?;
@@ -140,9 +145,11 @@ impl EngineManager {
         let lifecycle = self.lifecycle().await;
         self.refuse_when_closed()?;
         let manager = self.clone();
-        under_lifecycle(lifecycle, async move {
+        under_lifecycle(lifecycle, |lifecycle| async move {
             manager.unload_resident().await;
-            manager.shared.snapshots.publish(EngineState::Idle);
+            manager.settle(lifecycle, || {
+                manager.shared.snapshots.publish(EngineState::Idle);
+            });
             Ok(())
         })
         .await
@@ -165,9 +172,11 @@ impl EngineManager {
             return;
         }
         let manager = self.clone();
-        let closing = under_lifecycle(lifecycle, async move {
+        let closing = under_lifecycle(lifecycle, |lifecycle| async move {
             manager.unload_resident().await;
-            manager.shared.snapshots.publish(EngineState::Closed);
+            manager.settle(lifecycle, || {
+                manager.shared.snapshots.publish(EngineState::Closed);
+            });
             Ok(())
         });
         // Its only failure is a runtime that dropped the task, which leaves nothing to close.
@@ -176,6 +185,21 @@ impl EngineManager {
 
     fn lifecycle(&self) -> impl Future<Output = OwnedMutexGuard<()>> + use<> {
         Arc::clone(&self.shared.lifecycle).lock_owned()
+    }
+
+    /// Publishes the outcome that ends a lifecycle and releases the lifecycle in one step for
+    /// `claim_load`: a claim that finds the outcome published finds the lifecycle free.
+    fn settle(&self, lifecycle: OwnedMutexGuard<()>, publish: impl FnOnce()) {
+        let _handoff = self.handoff();
+        publish();
+        drop(lifecycle);
+    }
+
+    fn handoff(&self) -> MutexGuard<'_, ()> {
+        self.shared
+            .handoff
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn refuse_when_closed(&self) -> Result<(), EngineError> {
@@ -231,7 +255,7 @@ impl EngineManager {
         }
     }
 
-    /// Makes `model` the resident with a fresh gate and publishes it `Ready`.
+    /// Makes `model` the resident with a fresh gate; the load publishes it `Ready` as it ends.
     async fn install(
         &self,
         target: &LoadTarget,
@@ -240,14 +264,7 @@ impl EngineManager {
     ) -> Result<LoadedModelInfo, EngineError> {
         let arriving = self.resident_for(target, kind, model);
         let info = arriving.info.clone();
-        let refused = {
-            let mut resident = self.resident();
-            let held = take_residence(&mut resident, arriving);
-            if held.is_ok() {
-                self.show_resident_or_idle_in(&resident);
-            }
-            held
-        };
+        let refused = take_residence(&mut self.resident(), arriving);
         match refused {
             Ok(()) => Ok(info),
             Err((rejected, failure)) => {
@@ -282,13 +299,8 @@ impl EngineManager {
 
     /// Publishes the resident model `Ready`, or `Idle` when none is held.
     fn show_resident_or_idle(&self) {
-        let resident = self.resident();
-        self.show_resident_or_idle_in(&resident);
-    }
-
-    fn show_resident_or_idle_in(&self, resident: &Option<Resident>) {
         let snapshots = &self.shared.snapshots;
-        match resident {
+        match &*self.resident() {
             Some(held) => snapshots.publish_ready(held.epoch, held.info.clone(), held.occupancy()),
             None => snapshots.publish(EngineState::Idle),
         }
@@ -316,19 +328,17 @@ impl Resident {
     }
 }
 
-/// Runs `work` in a task of its own that keeps `lifecycle` until the work ended: a caller that
+/// Runs `work` in a task of its own that owns `lifecycle` and releases it, through `settle` once it
+/// has an outcome to show, or when the work ends or is dropped: a caller that
 /// stops waiting stops only its wait (arch 2.3.5). Work the runtime dropped while shutting down
 /// reads `Closed`.
-async fn under_lifecycle<T, W>(lifecycle: OwnedMutexGuard<()>, work: W) -> Result<T, EngineError>
+async fn under_lifecycle<T, W, F>(lifecycle: OwnedMutexGuard<()>, work: F) -> Result<T, EngineError>
 where
+    F: FnOnce(OwnedMutexGuard<()>) -> W,
     W: Future<Output = Result<T, EngineError>> + Send + 'static,
     T: Send + 'static,
 {
-    let task = tokio::spawn(async move {
-        let ended = work.await;
-        drop(lifecycle);
-        ended
-    });
+    let task = tokio::spawn(work(lifecycle));
     match task.await {
         Ok(ended) => ended,
         Err(stopped) if stopped.is_panic() => std::panic::resume_unwind(stopped.into_panic()),
