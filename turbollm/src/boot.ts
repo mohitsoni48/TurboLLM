@@ -63,6 +63,7 @@ import { EngineGates } from './agents/gate'
 import { AgentTaskState } from './agents/task-state'
 import { RequestLog } from './observability/request-log'
 import { VoiceService } from './voice/voice-service'
+import { VoiceTranscripts } from './chat/voice-transcripts'
 import { syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
 import { writePidfile, readPidfile, claimDataDir, releaseDataDirClaim, daemonReachHost } from './daemon-pid'
 import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from './server'
@@ -401,6 +402,8 @@ export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
   // transcription and stopped again once it has gone unused, and close() stops it with the engines.
   const voice = new VoiceService({ store })
   deps.voice = voice
+  // A voice message's words, from that same whisper, one job at a time after the reply (ADR-485 D1).
+  deps.transcripts = new VoiceTranscripts({ db, voice })
 
   // App self-update apply state (spec 29 B.1). Two boot-time jobs:
   //  1. Record this daemon's launch identity (execPath/argv/cwd) so the detached update
@@ -1245,6 +1248,7 @@ export async function bootDaemon(opts: BootOptions): Promise<BootedDaemon> {
   //      listener closes, releasing the port.
   function close({ forRestart = false, alsoWaitFor = () => Promise.resolve() }: TeardownOptions = {}): Promise<void> {
     chatTurns.abortAll()
+    deps.transcripts?.stopAll()
     if (forRestart) for (const id of deps.codeRuns?.activeSessionIds() ?? []) deps.codeRuns?.stop(id)
     updateScheduler.stop()
     routineScheduler.stop()

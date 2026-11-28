@@ -8,7 +8,7 @@ import {
   withCurrentDate, shouldAutoCompact, lastCtxUsage, resolveCompactionCut,
   buildEngineMessages, userTurnContent, VOICE_MESSAGE_PLACEHOLDER, pickCompactionCut, AUTO_COMPACT_THRESHOLD,
   compactConversation, maybeAutoCompact, setAsideFrozenCut,
-  buildAudioReplyInstructions, SPOKEN_REPLY_PLACEHOLDER,
+  buildAudioReplyInstructions, SPOKEN_REPLY_PLACEHOLDER, voiceTurnWords,
 } from './chat-compaction.js'
 import type { Conversation, Message } from './db.js'
 import type { ChatUpstream } from './chat-upstream.js'
@@ -1184,4 +1184,97 @@ test('buildEngineMessages: an assistant message that is only a clip is [Spoken r
   }
   const withWords = makeMsg('assistant', 'Paris.', { attachments: [REPLY_CLIP_REF] })
   assert.equal(buildEngineMessages(makeConv(), [makeMsg('user', 'q'), withWords, next], next.id, { hearsAudio: true })[1].content, 'Paris.')
+})
+
+// ── a voice message's transcript in history (ADR-485 D1) ──────────────────────────────
+
+/** Earlier turns of every voice shape, the last user turn being the one answered. */
+function voiceHistory(transcripts: { voiceOnly?: string; withNote?: string } = {}): Message[] {
+  return [
+    makeMsg('user', '', { attachments: [CLIP_REF], transcript: transcripts.voiceOnly }),
+    makeMsg('assistant', '', { attachments: [REPLY_CLIP_REF] }),
+    makeMsg('user', 'my question', { attachments: [CLIP_REF], transcript: transcripts.withNote }),
+    makeMsg('assistant', 'Berlin.', { attachments: [REPLY_CLIP_REF] }),
+    makeMsg('user', 'look', { attachments: ['data:image/png;base64,AAAA'] }),
+    makeMsg('assistant', 'a cat'),
+    makeMsg('user', 'and now?'),
+  ]
+}
+
+/** The summarization prompt's transcript compactConversation sends for a chat that opens with the turns
+ *  `addVoiceTurns` writes. */
+async function summaryTranscript(addVoiceTurns: (db: ConversationStore, convId: string) => void): Promise<string> {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model' })
+    addVoiceTurns(db, conv.id)
+    for (let i = 0; i < 6; i++) db.addMessage(conv.id, i % 2 === 0 ? 'assistant' : 'user', `message ${i} with enough real content to count as real tokens`)
+    const prompts: string[] = []
+    await compactConversation(fakeDeps(db, 200), conv.id, { fetchImpl: recordingFetch(prompts) })
+    return (JSON.parse(prompts[0]) as { messages: { content: string }[] }).messages[1].content
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+}
+
+function addVoiceOnlyAndNotedTurns(db: ConversationStore, convId: string): { voiceOnly: string; withNote: string } {
+  const voiceOnly = db.addMessage(convId, 'user', '', { attachments: [CLIP_REF] }).id
+  db.addMessage(convId, 'assistant', 'ok')
+  const withNote = db.addMessage(convId, 'user', 'my question', { attachments: [CLIP_REF] }).id
+  return { voiceOnly, withNote }
+}
+
+test('history with no transcript is byte-identical to before transcripts existed', async () => {
+  const history = voiceHistory()
+  const answered = history[history.length - 1].id
+  const clip = `{"type":"input_audio","input_audio":{"data":"${CLIP_REF}","format":"wav"}}`
+  const laterTurns = '{"role":"assistant","content":"Berlin."},{"role":"user","content":"look"},{"role":"assistant","content":"a cat"},{"role":"user","content":"and now?"}'
+  const longTurns = [0, 1, 2, 3, 4].map((i) => `${i % 2 === 0 ? 'Assistant' : 'User'}: message ${i} with enough real content to count as real tokens`).join('\n\n')
+
+  assert.equal(JSON.stringify(buildEngineMessages(makeConv(), history, answered, { hearsAudio: false })),
+    `[{"role":"user","content":"[Voice message]"},{"role":"assistant","content":"[Spoken reply]"},{"role":"user","content":"my question"},${laterTurns}]`)
+  assert.equal(JSON.stringify(buildEngineMessages(makeConv(), history, answered, { hearsAudio: true })),
+    `[{"role":"user","content":[${clip}]},{"role":"assistant","content":"[Spoken reply]"},{"role":"user","content":[{"type":"text","text":"my question"},${clip}]},${laterTurns}]`)
+  assert.equal(buildAudioReplyInstructions(makeConv(), history.slice(0, -1), 8192),
+    'Earlier conversation (text transcript):\nUser: [Voice message]\nAssistant: [Spoken reply]\nUser: my question\nAssistant: Berlin.\nUser: look\nAssistant: a cat')
+  assert.equal(await summaryTranscript((db, convId) => { addVoiceOnlyAndNotedTurns(db, convId) }),
+    `User: [Voice message]\n\nAssistant: ok\n\nUser: my question\n\n${longTurns}`)
+})
+
+test('voiceTurnWords: the typed note and the transcript, either alone, or the placeholder for neither', () => {
+  assert.equal(voiceTurnWords({ content: '', transcript: 'what is the weather' }), 'what is the weather')
+  assert.equal(voiceTurnWords({ content: 'my question', transcript: 'what is the weather' }), 'my question\n\nwhat is the weather')
+  assert.equal(voiceTurnWords({ content: 'my question' }), 'my question')
+  assert.equal(voiceTurnWords({ content: '' }), VOICE_MESSAGE_PLACEHOLDER)
+})
+
+test('buildEngineMessages: an engine that does not hear gets an earlier voice turn\'s transcript, after its typed note', () => {
+  const history = voiceHistory({ voiceOnly: 'what is the weather', withNote: 'in Berlin' })
+  const out = buildEngineMessages(makeConv(), history, history[history.length - 1].id, { hearsAudio: false })
+  assert.equal(out[0].content, 'what is the weather')
+  assert.equal(out[2].content, 'my question\n\nin Berlin')
+})
+
+test('buildEngineMessages: an engine that hears still gets the clip, and not the transcript as well', () => {
+  const history = voiceHistory({ voiceOnly: 'what is the weather', withNote: 'in Berlin' })
+  const out = buildEngineMessages(makeConv(), history, history[history.length - 1].id, { hearsAudio: true })
+  assert.deepEqual(out[0].content, [{ type: 'input_audio', input_audio: { data: CLIP_REF, format: 'wav' } }])
+  assert.deepEqual(out[2].content, [{ type: 'text', text: 'my question' }, { type: 'input_audio', input_audio: { data: CLIP_REF, format: 'wav' } }])
+})
+
+test('buildAudioReplyInstructions: an earlier voice turn is its transcript, not [Voice message]', () => {
+  const history = voiceHistory({ voiceOnly: 'what is the weather' })
+  const out = buildAudioReplyInstructions(makeConv(), history.slice(0, -1), 8192)
+  assert.ok(out.startsWith('Earlier conversation (text transcript):\nUser: what is the weather\n'), out)
+})
+
+test('compactConversation: the summary prompt writes a voice turn as its transcript', async () => {
+  const said = await summaryTranscript((db, convId) => {
+    const ids = addVoiceOnlyAndNotedTurns(db, convId)
+    db.setMessageTranscript(ids.voiceOnly, 'what is the weather')
+    db.setMessageTranscript(ids.withNote, 'in Berlin')
+  })
+  assert.ok(said.startsWith('User: what is the weather\n\nAssistant: ok\n\nUser: my question\n\nin Berlin\n\n'), said)
 })

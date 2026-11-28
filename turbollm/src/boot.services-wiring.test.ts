@@ -68,6 +68,19 @@ test('daily_active is re-checked on a recurring timer, not only at boot', async 
   }
 })
 
+// A voice message's words come from a background queue over the daemon's own speech-to-text and chat store
+// (ADR-485 D1); the queue's behaviour is chat/voice-transcripts.test.ts's.
+test('a daemon with speech-to-text has the voice transcript queue', async () => {
+  const { VoiceTranscripts } = await import('./chat/voice-transcripts')
+  const d = await bootTestDaemon()
+  try {
+    assert.ok(d.deps.voice)
+    assert.ok(d.deps.transcripts instanceof VoiceTranscripts)
+  } finally {
+    await d.stop()
+  }
+})
+
 // The chat store the daemon builds announces its writes on the invalidation bus GET /api/v1/events streams
 // (review 4.14), so a reply finished by a detached turn or a routine reaches an open page without its poll.
 // The per-method keys are events/chat-store-announcer.test.ts's.

@@ -186,9 +186,15 @@ export { VOICE_MESSAGE_PLACEHOLDER }
  *  as text alone, every spoken turn would reach the model empty and the conversation would be the assistant talking to
  *  itself. So an engine that hears gets the clips again, and one that does not gets a placeholder where there is no
  *  typed text, which keeps the turn from being an empty message (several chat templates refuse one). */
-function spokenTurnContent(text: string, clips: string[], hearsAudio: boolean): unknown {
+function spokenTurnContent(text: string, clips: string[], hearsAudio: boolean, transcript?: string): unknown {
   if (hearsAudio) return userTurnContent(text, undefined, clips)
-  return text || VOICE_MESSAGE_PLACEHOLDER
+  return voiceTurnWords({ content: text, transcript })
+}
+
+/** What a user's voice message said, for a prompt that cannot carry its audio: its typed note and its transcript,
+ *  or the placeholder when it has neither (ADR-485 D1). */
+export function voiceTurnWords(m: Pick<Message, 'content' | 'transcript'>): string {
+  return [m.content.trim(), (m.transcript ?? '').trim()].filter(Boolean).join('\n\n') || VOICE_MESSAGE_PLACEHOLDER
 }
 
 /** What stands in for an assistant message that was spoken and has no words: a reply from an audio-to-audio model whose
@@ -254,7 +260,7 @@ export function buildEngineMessages(
     const clips = m.role === 'user' ? (m.attachments ?? []).filter(isAudioAttachment) : []
     out.push({
       role: m.role,
-      content: clips.length ? spokenTurnContent(m.content, clips, !!opts.hearsAudio) : effectiveTailText(!!conv.preserveThinking, m),
+      content: clips.length ? spokenTurnContent(m.content, clips, !!opts.hearsAudio, m.transcript) : effectiveTailText(!!conv.preserveThinking, m),
     })
   }
   return out
@@ -402,11 +408,13 @@ const COMPACTION_GATE_TIMEOUT_MS = 60_000
 const SUMMARIZATION_TIMEOUT_MS = 60_000
 
 function buildSummarizationPrompt(priorSummary: string | null, toSummarize: Message[]): { role: string; content: string }[] {
-  // A turn that was only a voice clip has no words to write down: it is named as one, not left an empty line.
+  // A user's voice turn is written as its words; one with none, and a spoken reply with no words, is named as one,
+  // not left an empty line.
   const said = (m: Message): string => {
+    const spoken = (m.attachments ?? []).some(isAudioAttachment)
+    if (spoken && m.role === 'user') return voiceTurnWords(m)
     if (m.content) return m.content
-    if (!(m.attachments ?? []).some(isAudioAttachment)) return ''
-    return m.role === 'user' ? VOICE_MESSAGE_PLACEHOLDER : SPOKEN_REPLY_PLACEHOLDER
+    return spoken ? SPOKEN_REPLY_PLACEHOLDER : ''
   }
   const transcript = toSummarize.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${said(m)}`).join('\n\n')
   const priorBlock = priorSummary ? `Summary of the conversation so far:\n${priorSummary}\n\n---\n\n` : ''

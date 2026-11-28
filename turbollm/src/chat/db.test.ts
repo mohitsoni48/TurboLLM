@@ -379,6 +379,46 @@ for (const backend of BACKENDS) {
   }))
 }
 
+// ── voice transcript (v57, ADR-485 D1) ───────────────────────────────────────────
+
+for (const backend of BACKENDS) {
+  test(`setMessageTranscript: a user row keeps the words, every read returns them (${backend})`, () => withStore(backend, (store) => {
+    const conv = store.createConversation()
+    const spoken = store.addMessage(conv.id, 'user', '', { attachments: ['attachment:clip'] })
+
+    assert.equal(store.setMessageTranscript(spoken.id, 'what is the weather'), true)
+
+    assert.equal(store.getMessage(spoken.id)!.transcript, 'what is the weather')
+    assert.equal(store.getMessages(conv.id)[0].transcript, 'what is the weather')
+    assert.equal(store.getMessagesForDisplay(conv.id)[0].transcript, 'what is the weather')
+  }))
+
+  test(`setMessageTranscript: an assistant row or an unknown id is refused and nothing changes (${backend})`, () => withStore(backend, (store) => {
+    const conv = store.createConversation()
+    const reply = store.addMessage(conv.id, 'assistant', 'sunny')
+
+    assert.equal(store.setMessageTranscript(reply.id, 'not mine'), false)
+    assert.equal(store.setMessageTranscript('missing', 'nobody'), false)
+
+    assert.equal(store.getMessage(reply.id)!.transcript, undefined)
+  }))
+
+  test(`a message with no transcript has none, not null (${backend})`, () => withStore(backend, (store) => {
+    const conv = store.createConversation()
+    const typed = store.addMessage(conv.id, 'user', 'hello')
+
+    assert.equal('transcript' in store.getMessage(typed.id)!, false)
+    assert.equal('transcript' in store.getMessagesForDisplay(conv.id)[0], false)
+  }))
+
+  test(`a reply's stats carry how much of it was heard (${backend})`, () => withStore(backend, (store) => {
+    const conv = store.createConversation()
+    const reply = store.addMessage(conv.id, 'assistant', 'sunny', { stats: { heardMs: 1200 } })
+
+    assert.equal(store.getMessage(reply.id)!.stats.heardMs, 1200)
+  }))
+}
+
 // ── 2.10 memory ───────────────────────────────────────────────────────────────────
 
 for (const backend of BACKENDS) {

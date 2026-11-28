@@ -687,6 +687,11 @@ export const MIGRATIONS: ReadonlyArray<Migration> = [
   (ctx) => {
     if (!ctx.hasColumn('conversations', 'chat_agent_id')) ctx.db.exec(`ALTER TABLE conversations ADD COLUMN chat_agent_id TEXT;`)
   },
+  // ADR-485 D1: the words of a voice message, from speech-to-text after the turn, so the chat can show what was
+  // said while the model still receives the audio itself. Null on text messages and older voice messages.
+  (ctx) => {
+    if (!ctx.hasColumn('messages', 'transcript')) ctx.db.exec(`ALTER TABLE messages ADD COLUMN transcript TEXT;`)
+  },
 ]
 
 function contextFor(db: SqlDb): MigrationContext {

@@ -145,6 +145,19 @@ test('deleting the source leaves the fork whole', () => {
   })
 })
 
+test('a fork keeps a voice message\'s transcript', () => {
+  withStore((db) => {
+    const src = db.createConversation()
+    const spoken = db.addMessage(src.id, 'user', '', { attachments: ['attachment:clip'] })
+    db.setMessageTranscript(spoken.id, 'what is the weather')
+
+    const r = db.forkConversation(src.id, spoken.id)
+    assert.equal(r.ok, true)
+    if (!r.ok) return
+    assert.equal(db.getMessages(r.conversation.id)[0].transcript, 'what is the weather')
+  })
+})
+
 test('a fork names what it could not find, and creates nothing', () => {
   withStore((db) => {
     const src = db.createConversation()

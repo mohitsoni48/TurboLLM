@@ -14,6 +14,8 @@ export interface SnapshotMessage {
   content: string
   tool_calls?: ToolCallRecord[]
   tool_call_id?: string
+  /** A voice message's words (ADR-485 D1); absent when it has none. The clip itself is never exported. */
+  transcript?: string
   ts: string
 }
 
@@ -77,6 +79,7 @@ export function buildSnapshot(
     if (m.toolCalls && m.toolCalls.length > 0) {
       entry.tool_calls = withoutFileRefs(m.toolCalls)
     }
+    if (m.transcript !== undefined) entry.transcript = m.transcript
     return entry
   })
 

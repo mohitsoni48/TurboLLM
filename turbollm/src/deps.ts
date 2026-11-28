@@ -26,6 +26,7 @@ import type { CodeRunManager } from './code/code-run-manager'
 import type { LinkManager } from './link/link-manager'
 import type { RemoteCatalog } from './link/remote-catalog'
 import type { VoiceService } from './voice/voice-service'
+import type { VoiceTranscripts } from './chat/voice-transcripts'
 import type { SandboxRuntime } from './sandbox/runtime-install'
 import type { SandboxManager } from './sandbox/sandbox-manager'
 
@@ -159,4 +160,7 @@ export interface Deps {
   /** Speech-to-text through whisper.cpp (voice/voice-service.ts). Absent from a daemon built without it (a test's):
    *  the voice routes then answer 503 and /v1/audio/* goes to the engine. */
   voice?: VoiceService
+  /** A voice message's words, transcribed in the background after the reply (chat/voice-transcripts.ts, ADR-485 D1).
+   *  Built beside `voice`; absent from a daemon without it. */
+  transcripts?: VoiceTranscripts
 }

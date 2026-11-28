@@ -192,6 +192,36 @@ test('buildSnapshot: persona is the chat’s own agent when the daemon kept it, 
   assert.equal(snap({ chatAgentId: '', toolPolicy: 'force_web_search' }).persona, 'research', 'an empty id falls back to the guess')
 })
 
+const VOICE_CLIP = `attachment:${'c'.repeat(64)}.wav`
+
+test('buildSnapshot: a chat with no transcripts exports byte-identical to before transcripts existed', () => {
+  const toolCalls = [{ id: 'tc1', name: 'web_search', args: { query: 'q' }, result: 'r' }]
+  const conv = makeConv({
+    messages: [
+      makeMsg('user', '', { attachments: [VOICE_CLIP], createdAt: '2026-06-19T00:01:00.000Z' }),
+      makeMsg('assistant', 'Sunny.', { toolCalls, createdAt: '2026-06-19T00:01:05.000Z' }),
+    ],
+  })
+  assert.equal(JSON.stringify(buildSnapshot(conv, makeCfg(), VERSION, EXPORTED_AT, 'export')),
+    '{"turbollm_version":"0.7.2","exported_at":"2026-06-19T10:00:00.000Z","format":"export","chat_id":"conv-1",'
+    + '"title":"Test Chat","model":"qwen3-35b-q4","persona":"default","messages":['
+    + '{"role":"user","content":"","ts":"2026-06-19T00:01:00.000Z"},'
+    + '{"role":"assistant","content":"Sunny.","ts":"2026-06-19T00:01:05.000Z","tool_calls":[{"id":"tc1","name":"web_search","args":{"query":"q"},"result":"r"}]}],'
+    + '"settings_snapshot":{"keepN":2,"autoSwap":true,"tavilyConfigured":true},"files_included":false}')
+})
+
+test('buildSnapshot: a voice message carries its transcript, and a message without one has no transcript key', () => {
+  const conv = makeConv({
+    messages: [
+      makeMsg('user', '', { attachments: [VOICE_CLIP], transcript: 'what is the weather' }),
+      makeMsg('assistant', 'Sunny.'),
+    ],
+  })
+  const snap = buildSnapshot(conv, makeCfg(), VERSION, EXPORTED_AT, 'export')
+  assert.equal(snap.messages[0].transcript, 'what is the weather')
+  assert.equal('transcript' in snap.messages[1], false)
+})
+
 test('buildSnapshot: says files are not included and leaves out the tool calls\' file references (GitHub #52)', () => {
   const file = `attachment:${'a'.repeat(64)}.png`
   const toolCalls = [{ id: 'tc1', name: 'run_python', args: { code: 'x' }, result: 'ok', files: [file], outputs: [{ name: 'chart.png', file, size: 8 }] }]

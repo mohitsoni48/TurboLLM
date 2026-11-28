@@ -470,6 +470,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // from another device) — otherwise it keeps the engine busy, tool rounds and all, for a
     // conversation that no longer exists. Its own unwind releases the in-flight entry.
     d.chatTurns.abort(c.req.param('id'))
+    d.transcripts?.cancelConversation(c.req.param('id'))
     const ok = db.deleteConversation(c.req.param('id'))
     if (!ok) return err(c, 404, 'not_found', 'Conversation not found.')
     return c.json({ ok: true })
@@ -1193,9 +1194,12 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
         const toolCalls = Array.isArray(m.tool_calls)
           ? withoutFileRefs((m.tool_calls as unknown[]).filter((t): t is ToolCallRecord => typeof t === 'object' && t !== null && !Array.isArray(t)))
           : undefined
-        db.addMessage(newConv.id, role as 'user' | 'assistant', content, {
+        // A user's voice message brings its words but not its clip: with no typed text, the words become its text.
+        const transcript = role === 'user' && typeof m.transcript === 'string' ? m.transcript : undefined
+        const created = db.addMessage(newConv.id, role as 'user' | 'assistant', content || (transcript ?? ''), {
           toolCalls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined,
         })
+        if (transcript !== undefined) db.setMessageTranscript(created.id, transcript)
       }
 
       return c.json({ id: newConv.id }, 201)
