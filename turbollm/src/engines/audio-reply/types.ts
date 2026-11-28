@@ -21,6 +21,12 @@ export interface AudioReply {
   generationMs?: number
 }
 
+/** One piece of the reply's speech as the engine sent it: whole PCM16 samples, mono, little-endian. */
+export interface AudioReplyChunk {
+  pcm16: Buffer
+  sampleRate: number
+}
+
 /** What a runtime is asked for: the whole context as text, and one new turn that is either a finished clip or text. */
 export interface AudioReplyRequest {
   /** The conversation so far as text: the system prompt, a summary if any, and the earlier turns as a transcript.
@@ -31,6 +37,9 @@ export interface AudioReplyRequest {
   voice?: string
   /** Always set: an engine's default is unbounded, and a reply nobody can stop holds the engine's only slot. */
   maxOutputTokens: number
+  /** Called for each audio delta as it arrives, in order, never after the reply settled or a stop began. Optional:
+   *  without it a runtime behaves exactly as before. Must not throw (a throw is caught and logged). */
+  onAudio?: (chunk: AudioReplyChunk) => void
 }
 
 export type AudioReplyErrorCode = 'engine_error' | 'engine_unreachable' | 'timeout' | 'invalid_request'
