@@ -24,6 +24,13 @@ test('the teardown stops every running chat reply before anything else, the engi
   assert.match(TEARDOWN, /^function close\([^\n]*\{\n\s*chatTurns\.abortAll\(\)\n/)
 })
 
+// PG-3: a spoken turn stopped by abortAll unwinds later and may queue its transcript job then. The queue is stopped
+// on the very next line, so that late job is never queued, started or written, and before the store closes.
+test('the teardown stops the voice transcript queue right after the chat replies, before the store closes', () => {
+  assert.match(TEARDOWN, /^function close\([^\n]*\{\n\s*chatTurns\.abortAll\(\)\n\s*deps\.transcripts\?\.stopAll\(\)\n/)
+  assert.ok(TEARDOWN.indexOf('deps.transcripts?.stopAll()') < TEARDOWN.indexOf('db.close()'))
+})
+
 test('the teardown waits for the stopped chat turns and the tethered children beside the engine, and closes the store only then', () => {
   assert.match(TEARDOWN, /const stopping: Promise<unknown>\[\] = \[[^\]]*\bmanager\.shutdown\(\)[^\]]*\bstopTethered\(\)[^\]]*\bchatTurns\.turnsEnded\(\)[^\]]*\]/)
   const waited = TEARDOWN.indexOf('void Promise.all(stopping).finally(')

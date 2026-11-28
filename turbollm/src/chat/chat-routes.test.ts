@@ -21,6 +21,7 @@ import { hashKey, lanAuth } from '../auth.js'
 import { defaultConfig } from '../config/config.js'
 import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
+import type { VoiceTranscripts } from './voice-transcripts.js'
 
 // ── stripThinkingBlocks ───────────────────────────────────────────────────────
 
@@ -1347,6 +1348,19 @@ test('deleting a conversation aborts its in-flight generation', async () => {
     assert.deepEqual(h.d.chatTurns.inFlightChatIds(), [])
   } finally {
     engine.restore()
+    h.cleanup()
+  }
+})
+
+test('deleting a conversation cancels its voice transcript jobs', async () => {
+  const h = inFlightHarness()
+  const cancelled: string[] = []
+  h.d.transcripts = { cancelConversation: (id: string) => cancelled.push(id) } as unknown as VoiceTranscripts
+  try {
+    const conv = h.store.createConversation()
+    assert.equal((await h.app.request(`/api/v1/conversations/${conv.id}`, { method: 'DELETE' })).status, 200)
+    assert.deepEqual(cancelled, [conv.id])
+  } finally {
     h.cleanup()
   }
 })

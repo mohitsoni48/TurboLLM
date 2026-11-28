@@ -470,6 +470,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // from another device) — otherwise it keeps the engine busy, tool rounds and all, for a
     // conversation that no longer exists. Its own unwind releases the in-flight entry.
     d.chatTurns.abort(c.req.param('id'))
+    d.transcripts?.cancelConversation(c.req.param('id'))
     const ok = db.deleteConversation(c.req.param('id'))
     if (!ok) return err(c, 404, 'not_found', 'Conversation not found.')
     return c.json({ ok: true })
