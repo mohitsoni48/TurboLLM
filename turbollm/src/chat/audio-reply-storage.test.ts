@@ -148,7 +148,13 @@ type Step = { event: string; data?: any }
 /** A turn on a scripted runtime over a real store, a real ChatTurns and a fake transcript queue. */
 async function spokenTurn(
   t: { after: (fn: () => unknown) => void },
-  o: { live?: boolean; input?: 'audio' | 'text'; reply: (req: AudioReplyRequest, ctl: { signal: AbortSignal; steps: Step[]; replyId: string; turns: ChatTurns; ac: AbortController }) => Promise<AudioReply> },
+  o: {
+    live?: boolean
+    input?: 'audio' | 'text'
+    /** Runs once the question is stored, just before the turn: to stub the store. */
+    beforeRun?: (store: ConversationStore) => void
+    reply: (req: AudioReplyRequest, ctl: { signal: AbortSignal; steps: Step[]; replyId: string; convId: string; store: ConversationStore; turns: ChatTurns; ac: AbortController }) => Promise<AudioReply>
+  },
 ) {
   const dir = tmpDir('tllm-audio-reply-run-')
   const store = new ConversationStore(dir)
@@ -175,9 +181,10 @@ async function spokenTurn(
     reply: (_url, req, signal) => {
       requests.push(req)
       steps.push({ event: 'engine' })
-      return o.reply(req, { signal, steps, replyId: assistantMsg.id, turns, ac })
+      return o.reply(req, { signal, steps, replyId: assistantMsg.id, convId: conv.id, store, turns, ac })
     },
   }
+  o.beforeRun?.(store)
   const outcome = await runAudioReply(d, (ev) => { steps.push(ev) }, {
     convId: conv.id, conv: store.getConversation(conv.id)!, history: [], assistantMsg,
     upstream: { target: 'http://engine.invalid', ctxMax: 8192, modelName: 'Spoken', modelField: 'm' } as ChatUpstream,
@@ -242,6 +249,44 @@ test('a heard report below one sample keeps a zero-sample clip and no text: stil
   assert.equal(wav.length, 44, 'a WAV header and no samples')
   assert.equal(wav.readUInt32LE(40), 0)
   assert.equal(wav.readUInt32LE(24), REPLY_RATE)
+})
+
+/** The turn's frames, without the steps the fakes record. */
+const framesOf = (events: string[]) => events.filter((e) => !['engine', 'pause', 'resume', 'enqueue'].includes(e))
+
+test('a chat deleted after a heard report still ends the turn with done', async (t) => {
+  const h = await spokenTurn(t, {
+    reply: async (_req, ctl) => {
+      ctl.turns.noteHeard(ctl.replyId, 20)
+      ctl.store.deleteConversation(ctl.convId)
+      return answered()
+    },
+  })
+  const frames = framesOf(h.events())
+  assert.equal(frames.at(-1), 'done')
+  assert.equal(frames.includes('error'), false)
+})
+
+test('a heard cut that fails keeps the uncut reply and still sends done', async (t) => {
+  const warned = t.mock.method(console, 'warn', () => {})
+  const h = await spokenTurn(t, {
+    beforeRun: (store) => {
+      const save = store.attachments.save.bind(store.attachments)
+      let saves = 0
+      t.mock.method(store.attachments, 'save', async (refs: string[]) => {
+        if (++saves === 2) throw new Error('the disk is full')
+        return save(refs)
+      })
+    },
+    reply: async (_req, ctl) => { ctl.turns.noteHeard(ctl.replyId, 500); return answered() },
+  })
+  assert.equal(h.saved.content, REPLY_TEXT)
+  assert.equal(h.saved.stats.heardMs, undefined)
+  assert.equal((await h.savedClip()).pcm16.length, REPLY_RATE * 2, 'the original clip')
+  assert.equal(warned.mock.callCount(), 1)
+  const frames = framesOf(h.events())
+  assert.equal(frames.at(-1), 'done')
+  assert.equal(frames.includes('error'), false)
 })
 
 test('the spoken-reply registry is empty after every exit', async (t) => {

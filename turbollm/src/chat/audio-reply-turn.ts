@@ -188,7 +188,16 @@ async function runSpokenTurn(d: Deps, emit: EmitSink, ctx: AudioReplyCtx): Promi
   // Nothing awaits between the two lines, so none is lost (PG-4).
   const heardMs = d.chatTurns.finishSpokenReply(assistantMsg.id)
   db.updateMessage(assistantMsg.id, { content, reasoning: '', toolCalls: [], stats, ...(attachments.length ? { attachments } : {}) })
-  if (heardMs !== undefined && attachments.length) await applyHeardToSavedReply(d, db.getMessage(assistantMsg.id)!, heardMs)
+  // The reply is saved whole either way; a cut that cannot be made (the chat deleted meanwhile, a clip that will not
+  // save) leaves it uncut rather than failing a turn that still ends with `done`.
+  const saved = db.getMessage(assistantMsg.id)
+  if (heardMs !== undefined && attachments.length && saved) {
+    try {
+      await applyHeardToSavedReply(d, saved, heardMs)
+    } catch (e) {
+      console.warn(`[chat] the heard cut of reply ${assistantMsg.id} was not applied: ${(e as Error).message}`)
+    }
+  }
   db.touchConversation(convId)
   if (!failed) {
     try {
