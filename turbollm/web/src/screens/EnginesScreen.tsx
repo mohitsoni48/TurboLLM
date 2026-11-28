@@ -139,6 +139,7 @@ export function catalogIdFor(e: Engine, catalog?: Pick<CatalogEngine, 'id' | 're
   if (e.kind === 'mlx') return 'mlx'
   if (e.kind === 'mlx-vlm') return 'mlx-vlm'
   if (e.kind === 'vllm') return 'vllm'
+  if (e.kind === 'strata') return 'strata'
   if (e.kind === 'koboldcpp') return 'koboldcpp'
   if (e.kind === 'llamafile') return 'llamafile'
   if (e.kind === 'litert-lm') return 'litert-lm'
@@ -161,6 +162,7 @@ function buildContextFor(e: Engine, backends: EngineBackends | undefined): strin
   if (e.kind === 'rapid-mlx') return 'Rapid-MLX · Apple Metal'
   if (e.kind === 'mlx-vlm') return 'MLX-VLM · Apple Metal'
   if (e.kind === 'vllm') return 'vLLM'
+  if (e.kind === 'strata') return 'Strata'
   if (e.kind === 'koboldcpp') return 'KoboldCpp'
   if (e.kind === 'llamafile') return 'llamafile'
   if (e.kind === 'laya') return 'Laya'
@@ -284,6 +286,13 @@ const ENGINE_META: Record<string, EngineMeta> = {
       'Same llama-server + GGUF flow',
     ],
     cons: ['No prebuilts — build from source', 'Backend support depends on your build', 'Fork-only weight formats'],
+  },
+  strata: {
+    icon: Package,
+    tagline: 'DeepSeek V4.1 Flash with a local lookup table',
+    format: 'GGUF',
+    pros: ['Runs supported multi-shard DeepSeek sets', 'Authenticated local chat and streaming'],
+    cons: ['Requires the complete model and companion files', 'First load verifies and prepares the weights'],
   },
   koboldcpp: {
     icon: Feather,
@@ -929,6 +938,7 @@ function EngineGallery({
     install.rapidMlx.isPending ||
     install.mlxVlm.isPending ||
     install.turboquant.isPending ||
+    install.strata.isPending ||
     install.koboldcpp.isPending ||
     install.llamafile.isPending ||
     install.laya.isPending ||
@@ -962,6 +972,7 @@ function EngineGallery({
     if (e.installEndpoint === '/api/v1/engines/rapid-mlx') return install.rapidMlx
     if (e.installEndpoint === '/api/v1/engines/mlx-vlm') return install.mlxVlm
     if (e.installEndpoint === '/api/v1/engines/turboquant') return install.turboquant
+    if (e.id === 'strata') return install.strata
     if (e.installEndpoint === '/api/v1/engines/koboldcpp') return install.koboldcpp
     if (e.installEndpoint === '/api/v1/engines/llamafile') return install.llamafile
     if (e.installEndpoint === '/api/v1/engines/laya') return install.laya
@@ -986,7 +997,7 @@ function EngineGallery({
     if (e.releaseEngineId) return e.releaseEngineId
     if (e.provision === 'pip') return eng.find((x) => x.kind === e.kind)?.id
     if (e.id === 'turboquant') return eng.find((x) => /[\\/]engines[\\/]turboquant[\\/]/.test(x.binPath))?.id
-    if (e.id === 'koboldcpp' || e.id === 'llamafile') return eng.find((x) => x.kind === e.kind)?.id
+    if (e.id === 'strata' || e.id === 'koboldcpp' || e.id === 'llamafile') return eng.find((x) => x.kind === e.kind)?.id
     return undefined
   }
   const doInstall = (e: CatalogEngine) => {

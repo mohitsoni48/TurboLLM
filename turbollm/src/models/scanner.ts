@@ -175,6 +175,14 @@ function attentionLayoutOf(meta: GgufMeta | null): Partial<ModelEntry> {
   return out
 }
 
+function isDeepseekEngram(name: string): boolean {
+  return /^(?:DeepSeek-V4\.1-Flash-)?Engram-IQ4_NL\.gguf$/i.test(name)
+}
+
+function isDeepseekSixPart(name: string): boolean {
+  return /^DeepSeek-V4\.1-Flash-1017-GSQ-RCO-(?:IQ1_M|IQ2_XS|(?:Coder-)?IQ2_XXS)-00001-of-00006\.gguf$/i.test(name)
+}
+
 const SPLIT_RE = /^(.*)-(\d{5})-of-(\d{5})\.gguf$/i
 
 // GGUF architectures that are always embedding models.
@@ -439,10 +447,11 @@ export class Scanner {
     }
 
     const entries: ModelEntry[] = []
+    const engramFiles = files.filter(f => isDeepseekEngram(basename(f.path)))
     const seenSplits = new Set<string>()
     for (const [dir, group] of byDir) {
       const mmprojFiles = group.filter((f) => basename(f.path).toLowerCase().includes('mmproj'))
-      const modelFiles = group.filter((f) => !basename(f.path).toLowerCase().includes('mmproj'))
+      const modelFiles = group.filter((f) => !basename(f.path).toLowerCase().includes('mmproj') && !isDeepseekEngram(basename(f.path)))
 
       // Resolve split groups: prefix+total -> shards, keyed by shard INDEX so a split is
       // judged complete by the distinct part numbers present (1..total), not by the raw
@@ -485,9 +494,17 @@ export class Scanner {
         const totalSize = present.reduce((s, x) => s + x.size, 0)
         // Complete only when every index 1..total is present on disk (not merely when the
         // count matches — a duplicate + a hole would otherwise pass the old length check).
-        let incomplete = shards.size !== total
+        // ISTA's DeepSeek six-way split has five numbered weight shards. The sixth is the
+        // separately named Engram, which multiple quants can share. Keep it out of deletionTargets.
+        const separateEngram = total === 6 && isDeepseekSixPart(basename(first.path)) &&
+          engramFiles.some(f => {
+            const parent = dirname(f.path)
+            return parent === dir || parent === dirname(dir) || dirname(parent) === dirname(dir)
+          })
+        const weightParts = separateEngram ? 5 : total
+        let incomplete = shards.size !== weightParts
         if (!incomplete) {
-          for (let i = 1; i <= total; i++)
+          for (let i = 1; i <= weightParts; i++)
             if (!shards.has(i)) {
               incomplete = true
               break

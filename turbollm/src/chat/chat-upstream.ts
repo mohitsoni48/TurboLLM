@@ -189,7 +189,7 @@ export function callChatUpstream(
       })
     : () => fetchImpl(`${upstream.target}/v1/chat/completions`, {
         method: 'POST',
-        headers: engineRequestHeaders(upstream.engineKind ?? '', new Headers({ 'Content-Type': 'application/json' })),
+        headers: engineRequestHeaders(upstream.engineKind ?? '', new Headers({ 'Content-Type': 'application/json' }), undefined, upstream.target),
         body: payload,
         signal,
         // Required by undici whenever a body is present on some Node versions; harmless for a

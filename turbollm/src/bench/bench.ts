@@ -1386,7 +1386,7 @@ export class BenchRunner {
     try {
       const res = await fetch(`${target}/v1/chat/completions`, {
         method: 'POST',
-        headers: this.engineHeaders(),
+        headers: this.engineHeaders(target),
         body: JSON.stringify({ model: 'bench', messages, max_tokens: 8, temperature: 0, seed: 42, stream: true, return_progress: true }),
         signal: AbortSignal.any(signals),
       })
@@ -1435,9 +1435,9 @@ export class BenchRunner {
   }
 
   /** The JSON request headers for the engine the probe runs on, with the in-app SDK engine's bearer when it is one. */
-  private engineHeaders(): Headers {
+  private engineHeaders(target: string): Headers {
     const engineKind = this.manager.currentOpts()?.engine.kind ?? ''
-    return engineRequestHeaders(engineKind, new Headers({ 'Content-Type': 'application/json' }))
+    return engineRequestHeaders(engineKind, new Headers({ 'Content-Type': 'application/json' }), undefined, target)
   }
 
   /** One non-streaming /v1/chat/completions request. Returns engine-reported tps + ttftMs, or null.
@@ -1448,7 +1448,7 @@ export class BenchRunner {
     if (extraSignal) signals.push(extraSignal)
     const res = await fetch(`${target}/v1/chat/completions`, {
       method: 'POST',
-      headers: this.engineHeaders(),
+      headers: this.engineHeaders(target),
       body: JSON.stringify({
         model: 'bench',
         messages,
@@ -1579,7 +1579,7 @@ export class BenchRunner {
     if (this.abort) signals.push(this.abort.signal)
     const res = await fetch(`${target}/v1/chat/completions`, {
       method: 'POST',
-      headers: this.engineHeaders(),
+      headers: this.engineHeaders(target),
       body: JSON.stringify({
         model: 'bench',
         messages: [{ role: 'user', content }],

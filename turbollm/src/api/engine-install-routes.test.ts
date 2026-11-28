@@ -14,6 +14,7 @@ test('registerEngineInstallRoutes mounts its routes in their registration order'
   const app = new Hono()
   registerEngineInstallRoutes(app, {} as Deps, createEngineJobs())
   assert.deepEqual(routeTable(app), [
+    'POST /api/v1/engines/strata',
     'POST /api/v1/engines/vllm',
     'POST /api/v1/engines/sglang',
     'POST /api/v1/engines/litert-lm',

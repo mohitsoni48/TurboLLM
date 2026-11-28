@@ -16,6 +16,7 @@ import { ensureMlxEnv } from '../engines/mlx'
 import { ensureRapidMlxEnv } from '../engines/rapid-mlx'
 import { installLayaEngine, layaEngineBusy } from '../engines/laya-install'
 import { ensureMlxVlmEnv } from '../engines/mlx-vlm'
+import { strataBinPath } from '../engines/strata'
 import { koboldcppBinPath } from '../engines/koboldcpp'
 import { llamafileBinPath } from '../engines/llamafile'
 import { catalogForPlatform } from '../engines/catalog'
@@ -462,6 +463,9 @@ export function registerEngineRoutes(app: Hono, d: Deps, jobs: EngineJobs): void
         const tqDir = join(enginesRoot, 'turboquant')
         installed = existsSync(tqDir)
         enabled = regEngines.some((x) => /[\\/]engines[\\/]turboquant[\\/]/.test(x.binPath))
+      } else if (e.id === 'strata') {
+        installed = existsSync(strataBinPath(enginesRoot))
+        enabled = regEngines.some(x => x.kind === 'strata')
       } else if (e.id === 'koboldcpp') {
         // KoboldCpp: single binary under engines/koboldcpp/; enabled = a registered
         // engine of kind 'koboldcpp' exists.

@@ -35,6 +35,7 @@ test('registerApi mounts every /api/v1 route in its original registration order'
     'POST /api/v1/build/cancel',
     'POST /api/v1/build/install-prereq',
     'POST /api/v1/build/cuda',
+    'POST /api/v1/engines/strata',
     'POST /api/v1/engines/vllm',
     'POST /api/v1/engines/sglang',
     'POST /api/v1/engines/litert-lm',

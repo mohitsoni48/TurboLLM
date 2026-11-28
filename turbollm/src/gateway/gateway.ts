@@ -561,7 +561,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       const localKind = routeResult.engineKind ?? servingEngineKind(d)
       return fetch(`${target}/v1/chat/completions`, {
         method: 'POST',
-        headers: engineRequestHeaders(localKind, new Headers({ 'Content-Type': 'application/json' })),
+        headers: engineRequestHeaders(localKind, new Headers({ 'Content-Type': 'application/json' }), undefined, target),
         body,
         signal: ac.signal,
       })
@@ -1284,7 +1284,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // app on another origin that posts its JSON as text/plain, and the daemon relayed the 403.
   if (!remote) for (const h of ['cookie', 'x-turbollm-auth', 'x-turbollm-app', 'origin', 'referer']) headers.delete(h)
   // The in-app SDK engine takes only its own bearer, never the client's key (engineRequestHeaders); others are unchanged.
-  if (!remote) engineRequestHeaders(routeResult.engineKind ?? servingEngineKind(d), headers)
+  if (!remote) engineRequestHeaders(routeResult.engineKind ?? servingEngineKind(d), headers, undefined, target)
 
   const maxLimit = d.store.read().modelDefaults.maxTokens ?? 0
   // Cancel the upstream engine request if the client disconnects (same reason as

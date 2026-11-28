@@ -89,6 +89,12 @@ function buildModelDirectoryStartOpts({ entry, engine, cfg, sys, overrides, trig
 function buildGgufStartOpts({ entry, engine, cfg, sys, overrides, trigger }: BuildStartOptsInput): StartOpts {
   const saved = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
   const profile = resolveProfile(entry, sys, saved, overrides, cfg.modelDefaults)
+  if (engine.kind === 'strata') {
+    // The DeepSeek engine accepts 8K to 1M. It manages GPU placement itself.
+    const ctx = Math.max(8192, Math.min(profile.ctx || 8192, 1_048_576))
+    return { engine, model: { key: entry.key, name: entry.name, quant: entry.quant, ctx, vision: false },
+      modelPath: entry.path, extraArgs: [], preferredPort: profile.port, profile: { ...profile, ctx }, trigger }
+  }
   // KoboldCpp is a GGUF engine with its OWN flag names — build its arg-map instead of
   // the llama-server profileToArgs. llamafile IS llama.cpp's server, so it keeps the
   // full profileToArgs flags (the manager only prepends --server --no-webui for it).

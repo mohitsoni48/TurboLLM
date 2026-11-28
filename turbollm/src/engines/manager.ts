@@ -12,6 +12,9 @@ import { RotatingLogStream, readTail } from './engine-log'
 import { rapidMlxServerCommand } from './rapid-mlx'
 import { layaServerCommand } from './laya'
 import { mlxVlmServerCommand } from './mlx-vlm'
+import { randomBytes } from 'node:crypto'
+import { checkStrataModel, strataCommand } from './strata'
+import { registerStrataKey } from './engine-headers'
 import { koboldcppServerCommand } from './koboldcpp'
 import { llamafileServerCommand } from './llamafile'
 import { slotCacheDir } from './slot-cache'
@@ -315,6 +318,7 @@ export class Manager {
     // whole fallback mechanism exists to fix.
     let effectiveOpts = opts
     await Manager.runExclusive(async () => {
+      if (opts.engine.kind === 'strata') await checkStrataModel(opts.engine.binPath, opts.modelPath)
       // Synchronous, and in the same tick as the stop below, so nothing can start on the engine between the two.
       hooks?.beforeStop?.()
       const attempt = { paused: false }
@@ -395,6 +399,7 @@ export class Manager {
       const attempt = report ? { paused: false } : null
       this.reporting = attempt
       try {
+        if (opts.engine.kind === 'strata') await checkStrataModel(opts.engine.binPath, opts.modelPath)
         if (hooks?.beforeStart) await hooks.beforeStart()
         await this.startInternal(opts, undefined, hooks?.beforeSpawn)
         await this.awaitNotStarting()
@@ -429,7 +434,7 @@ export class Manager {
    *  flips the state and surfaces errors; this just keeps the load gate held until
    *  that resolves. */
   private async awaitNotStarting(): Promise<void> {
-    const deadline = loadTiming.now() + READINESS_TIMEOUT_MS + 5_000
+    const deadline = loadTiming.now() + readinessBudget(this.opts?.engine.kind) + 5_000
     while (this.state === 'starting' && loadTiming.now() < deadline) await loadTiming.sleep(200)
   }
 
@@ -559,7 +564,10 @@ export class Manager {
     // POSIX the wrapper is a `/bin/sh` that execs the engine, so a llamafile (an Actually Portable Executable that
     // execve refuses with ENOEXEC) runs through sh as the old shellWrapped did. Windows spawns it as before, in libuv's
     // kill-on-close job.
-    const child = spawnTethered(cmd, args, { cwd: dirname(cmd), windowsHide: true, env: pyEngineEnv(opts.engine.kind, this.store.dir(), opts.engine.binPath) }, { kind: 'engine' })
+    const key = opts.engine.kind === 'strata' ? randomBytes(32).toString('hex') : undefined
+    const env = key ? { ...process.env, STRATA_API_KEY: key } : pyEngineEnv(opts.engine.kind, this.store.dir(), opts.engine.binPath)
+    const child = spawnTethered(cmd, args, { cwd: dirname(cmd), windowsHide: true, env }, { kind: 'engine' })
+    if (key) child.once('close', registerStrataKey(`http://127.0.0.1:${port}`, key))
     // end:false — otherwise whichever of stdout/stderr closes first would end the
     // shared log stream and drop the other's output. We close it in onTerminated.
     child.stdout?.pipe(logStream, { end: false })
@@ -599,7 +607,7 @@ export class Manager {
     this.exited = new Promise<void>((res) => {
       this.resolveExited = res
     })
-    this.transport = new SpawnedTransport(child, port, this.exited)
+    this.transport = new SpawnedTransport(child, port, this.exited, opts.engine.kind === 'strata')
 
     child.on('error', (e) => this.onTerminated(child, -1, logStream, e.message))
     child.on('close', (code) => this.onTerminated(child, code ?? -1, logStream, null))
@@ -1054,7 +1062,8 @@ export class Manager {
 
   private async readiness(child: ChildProcess, port: number): Promise<void> {
     const kind = this.opts?.engine.kind ?? 'llama-server'
-    const deadline = loadTiming.now() + READINESS_TIMEOUT_MS
+    const budget = readinessBudget(kind)
+    const deadline = loadTiming.now() + budget
     // Stall watch (review 4.8): the global load lock is held through this loop, so a hung engine would block every
     // other load for the whole cap. Output and probe-answer changes count as progress; see LoadProgress.
     const stallMs = loadStallMs(kind, this.store.read().engineLoadStallSeconds)
@@ -1086,7 +1095,7 @@ export class Manager {
           return
         }
       }
-      const probe = await loadTiming.probe(port)
+      const probe = kind === 'strata' ? await probeHealth(port, true) : await loadTiming.probe(port)
       if (probe.ready) {
         // LiteRT-LM binds its socket and answers /v1/models before any model is loaded (it loads on the first chat
         // request), so the socket is not readiness: load it with a one-token warm-up, which is also where a bad
@@ -1129,11 +1138,12 @@ export class Manager {
           this.state = 'error'
           this.errInfo = {
             code: 'readiness_timeout',
-            message: `The model did not become ready within ${Math.round(READINESS_TIMEOUT_MS / 1000)} seconds.`,
+            message: `The model did not become ready within ${Math.round(budget / 1000)} seconds.`,
             exitCode: -1,
             logTail: readTail(this.logPathStr, 20),
           }
-          child.kill('SIGKILL')
+          if (kind === 'strata') this.transport?.kill()
+          else child.kill('SIGKILL')
         }
         return
       }
@@ -1221,6 +1231,7 @@ export function engineCommand(opts: StartOpts, port: number, slotSavePath?: stri
     // HF repo id or a local safetensors dir; llama.cpp LoadProfile flags don't apply.
     return sglangServerCommand(opts.engine.binPath, opts.modelPath, port, '127.0.0.1', opts.extraArgs)
   }
+  if (opts.engine.kind === 'strata') return strataCommand(opts.engine.binPath, opts.modelPath, 'serve', port, opts.model.ctx)
   if (opts.engine.kind === 'koboldcpp') {
     // KoboldCpp: a single binary with its OWN flag names. opts.extraArgs carries the
     // KoboldCpp arg-map (koboldcppProfileToArgs) built by the router; no slot-save path
@@ -1243,6 +1254,10 @@ export function engineCommand(opts: StartOpts, port: number, slotSavePath?: stri
  *  Strix Halo APU still hadn't finished loading at 120s). Flat-bumped to 600s for every
  *  kind rather than trying to model disk throughput. */
 const READINESS_TIMEOUT_MS = 600_000
+function readinessBudget(kind?: string): number {
+  // The first Strata load also hashes and packs the local model. Its own engine-ready budget is one hour.
+  return kind === 'strata' ? 2 * 60 * 60_000 : READINESS_TIMEOUT_MS
+}
 
 const TURBOLLM_SDK = 'turbollm-sdk'
 const SDK_ENGINE_LOG_LINE = 'Engine is managed in-app by the TurboLLM SDK; there is no engine log.'
@@ -1510,12 +1525,17 @@ export async function probeReady(port: number): Promise<boolean> {
 
 /** probeReady's verdict plus the probe's answer as a string ('down', '503', '404/200'...), which the load stall watch
  *  compares between polls: a change (the port opening, /health starting to answer) is progress. */
-async function probeHealth(port: number): Promise<ProbeResult> {
+async function probeHealth(port: number, strata = false): Promise<ProbeResult> {
   const base = `http://127.0.0.1:${port}`
   let health: number
   try {
     const r = await fetch(`${base}/health`, { signal: AbortSignal.timeout(1500) })
     health = r.status
+    if (strata) {
+      const info = health === 200 ? await r.json() as { service?: string; loaded?: boolean; api_key?: boolean } : null
+      const ready = info?.service === 'strata' && info.loaded === true && info.api_key === true
+      return { ready, answer: ready ? 'loaded' : String(health) }
+    }
     if (health === 200) return { ready: true, answer: '200' }
     // 404/501 → this engine has no /health route; fall through to /v1/models below.
     // 503 (still loading) or any other status → not ready yet, keep polling.

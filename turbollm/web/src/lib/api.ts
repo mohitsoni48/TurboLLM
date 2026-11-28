@@ -454,6 +454,10 @@ export function installTurboquant(): Promise<{ accepted: true; engine: 'turboqua
   return request('/api/v1/engines/turboquant', { method: 'POST', json: {} })
 }
 
+export function installStrata(): Promise<{ accepted: true; engine: 'strata' }> {
+  return request('/api/v1/engines/strata', { method: 'POST', json: {} })
+}
+
 export function installKoboldcpp(): Promise<{ accepted: true; engine: 'koboldcpp' }> {
   return request('/api/v1/engines/koboldcpp', { method: 'POST', json: {} })
 }

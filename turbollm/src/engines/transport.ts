@@ -26,6 +26,7 @@ export class SpawnedTransport implements EngineTransport {
     private readonly child: ChildProcess,
     private readonly port: number,
     private readonly exited: Promise<void>,
+    private readonly stopGroup = false,
   ) {}
 
   target(): string {
@@ -37,7 +38,7 @@ export class SpawnedTransport implements EngineTransport {
   }
 
   stop(): Promise<void> {
-    return gracefulStop(this.child, this.exited)
+    return gracefulStop(this.child, this.exited, this.stopGroup)
   }
 
   kill(): void {
@@ -180,8 +181,9 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function gracefulStop(child: ChildProcess, exited: Promise<void>): Promise<void> {
-  signalTerm(child)
+async function gracefulStop(child: ChildProcess, exited: Promise<void>, stopGroup: boolean): Promise<void> {
+  if (stopGroup && process.platform !== 'win32') killTetheredTree(child, 'SIGTERM')
+  else signalTerm(child)
   const result = await exitedWithin(exited, 8000)
   if (result === 'timeout') {
     forceKill(child)
