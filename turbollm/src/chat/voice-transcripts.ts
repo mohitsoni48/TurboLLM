@@ -20,8 +20,8 @@ export interface VoiceTranscriptsDeps {
   /** emitInvalidation by default. */
   announce?: (key: string) => void
   log?: (msg: string) => void
-  /** TRANSCRIPT_JOB_TIMEOUT_MS by default; a test sets a short one. */
-  jobTimeoutMs?: number
+  /** A job's deadline, made when it starts: TRANSCRIPT_JOB_TIMEOUT_MS from then by default; a test fires its own. */
+  deadline?: () => AbortSignal
 }
 
 export interface TranscriptJob {
@@ -119,10 +119,13 @@ export class VoiceTranscripts {
     this.pending.unshift({ ...job, yields })
   }
 
+  /** The job ends when its work does or the moment it is stopped or its deadline passes, whichever is first: a
+   *  whisper that does not stop on its signal never holds the queue, and words that arrive after are never saved. */
   private async run(job: QueuedJob, stop: AbortSignal): Promise<void> {
+    const ended = AbortSignal.any([stop, this.deadline()])
     try {
-      const words = await this.transcribe(job, stop)
-      if (stop.aborted || this.closed) return
+      const words = await settledOrAborted(this.transcribe(job, ended), ended)
+      if (ended.aborted || this.closed) return
       if (!words) return this.log(`voice transcript: no words in message ${job.messageId}`)
       if (this.deps.db.setMessageTranscript(job.messageId, words)) this.announce(`conversation:${job.convId}`)
     } catch (error) {
@@ -131,12 +134,15 @@ export class VoiceTranscripts {
     }
   }
 
-  private async transcribe(job: QueuedJob, stop: AbortSignal): Promise<string> {
+  private async transcribe(job: QueuedJob, ended: AbortSignal): Promise<string> {
     const wav = await this.wavOf(job.clips)
-    stop.throwIfAborted()
-    const signal = AbortSignal.any([stop, AbortSignal.timeout(this.deps.jobTimeoutMs ?? TRANSCRIPT_JOB_TIMEOUT_MS)])
-    const { text } = await this.deps.voice!.transcribeText(new Blob([new Uint8Array(wav)]), {}, signal)
+    ended.throwIfAborted()
+    const { text } = await this.deps.voice!.transcribeText(new Blob([new Uint8Array(wav)]), {}, ended)
     return text.trim()
+  }
+
+  private deadline(): AbortSignal {
+    return this.deps.deadline?.() ?? AbortSignal.timeout(TRANSCRIPT_JOB_TIMEOUT_MS)
   }
 
   /** The turn's clips as one WAV, as whisper reads it. */
@@ -174,6 +180,22 @@ export class VoiceTranscripts {
 
   private log(msg: string): void {
     (this.deps.log ?? console.log)(msg)
+  }
+}
+
+/** `work`'s result, or a rejection with `signal`'s reason as soon as it aborts. Work left behind may still settle
+ *  later; Promise.race keeps listening to it, so its rejection is never unhandled. */
+async function settledOrAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  let onAbort = (): void => {}
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason)
+    if (signal.aborted) onAbort()
+    else signal.addEventListener('abort', onAbort, { once: true })
+  })
+  try {
+    return await Promise.race([work, aborted])
+  } finally {
+    signal.removeEventListener('abort', onAbort)
   }
 }
 

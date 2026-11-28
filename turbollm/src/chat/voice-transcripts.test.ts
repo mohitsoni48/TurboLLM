@@ -35,21 +35,40 @@ class FakeWhisper {
   }
 }
 
-/** The queue over an in-memory store, a fake whisper, and recorded announcements and log lines. */
+/** The queue over an in-memory store, a fake whisper, and recorded announcements and log lines. Each job's deadline
+ *  is a controller the test fires itself (`deadlines`, in the order jobs start), so no test waits on the clock. While
+ *  `clipRead.hold` is set, reading a clip waits on it. */
 function harness(over: Partial<VoiceTranscriptsDeps> = {}) {
   const store = new ConversationStore(IN_MEMORY_DATA_DIR)
   const whisper = new FakeWhisper()
   const announced: string[] = []
   const logged: string[] = []
-  const attachments = { inline: async (ref: string) => (ref === GONE_REF ? null : `data:audio/wav;base64,${CLIP_WAV.toString('base64')}`) }
+  const deadlines: AbortController[] = []
+  const clipRead: { hold: Promise<void> | null } = { hold: null }
+  const attachments = {
+    inline: async (ref: string) => {
+      await clipRead.hold
+      return ref === GONE_REF ? null : `data:audio/wav;base64,${CLIP_WAV.toString('base64')}`
+    },
+  }
   const db = Object.assign(Object.create(store) as ConversationStore, { attachments })
+  const deadline = () => {
+    const controller = new AbortController()
+    deadlines.push(controller)
+    return controller.signal
+  }
   const queue = new VoiceTranscripts({
-    db, voice: whisper, announce: (key) => announced.push(key), log: (msg) => logged.push(msg), ...over,
+    db, voice: whisper, announce: (key) => announced.push(key), log: (msg) => logged.push(msg), deadline, ...over,
   })
   const conv = store.createConversation()
   const voiceMessage = (convId = conv.id) => store.addMessage(convId, 'user', '', { attachments: [CLIP_REF] })
   const job = (messageId: string, convId = conv.id, clips = [CLIP_REF]) => ({ convId, messageId, clips })
-  return { store, whisper, announced, logged, queue, conv, voiceMessage, job, close: () => { queue.stopAll(); store.close() } }
+  return { store, whisper, announced, logged, deadlines, clipRead, queue, conv, voiceMessage, job, close: () => { queue.stopAll(); store.close() } }
+}
+
+/** What a deadline aborts with, as AbortSignal.timeout does. */
+function timedOut(): DOMException {
+  return new DOMException('The operation timed out.', 'TimeoutError')
 }
 
 /** Lets the queue's awaits run until `ready` holds. */
@@ -152,20 +171,56 @@ test('a clip that cannot be read writes nothing, never reaches whisper, and the 
   }
 })
 
-test('a job that runs past its time limit is abandoned and the queue moves on', async () => {
-  const h = harness({ jobTimeoutMs: 20 })
+test('a job past its time limit is abandoned at once, even by a whisper that does not stop, and its late words are never saved', async () => {
+  const h = harness()
   try {
+    h.whisper.honorsAbort = false
     const slow = h.voiceMessage()
     const next = h.voiceMessage()
     h.queue.enqueue(h.job(slow.id))
     h.queue.enqueue(h.job(next.id))
     await until(() => h.whisper.calls.length === 1)
-    await new Promise((r) => setTimeout(r, 40))
+
+    h.deadlines[0].abort(timedOut())
     await until(() => h.whisper.calls.length === 2)
-    assert.equal(h.whisper.calls[0].signal.aborted, true)
+    assert.equal(h.whisper.calls[0].signal.aborted, true, 'whisper is told the deadline passed')
+    h.whisper.calls[0].answer('too late')
     h.whisper.calls[1].answer('second')
     await h.queue.idle()
+    await settle()
+
     assert.equal(h.store.getMessage(slow.id)!.transcript, undefined)
+    assert.equal(h.store.getMessage(next.id)!.transcript, 'second')
+    assert.deepEqual(h.announced, [`conversation:${h.conv.id}`])
+    assert.equal(h.logged.length, 1)
+    assert.ok(h.logged[0].includes(slow.id), h.logged[0])
+  } finally {
+    h.close()
+  }
+})
+
+test('a time limit that passes while the clip is still being read means whisper is never asked for that job', async () => {
+  const h = harness()
+  try {
+    let release!: () => void
+    h.clipRead.hold = new Promise((r) => { release = r })
+    const slow = h.voiceMessage()
+    const next = h.voiceMessage()
+    h.queue.enqueue(h.job(slow.id))
+    h.queue.enqueue(h.job(next.id))
+    await until(() => h.deadlines.length === 1)
+
+    h.deadlines[0].abort(timedOut())
+    h.clipRead.hold = null
+    await until(() => h.whisper.calls.length === 1)
+    h.whisper.calls[0].answer('second')
+    release()
+    await h.queue.idle()
+    await settle()
+
+    assert.equal(h.whisper.calls.length, 1, 'only the next job reached whisper')
+    assert.equal(h.store.getMessage(slow.id)!.transcript, undefined)
+    assert.equal(h.store.getMessage(next.id)!.transcript, 'second')
     assert.equal(h.logged.length, 1)
   } finally {
     h.close()
