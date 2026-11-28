@@ -37,6 +37,9 @@ pub const MODEL_NOT_LOADED: &str = "The model is not loaded.";
 /// `LlamaCppEngine.kt:54`, `LiteRtLmEngine.kt:50`: a second model offered to an engine holding one.
 pub const ALREADY_HOLDS_A_MODEL: &str = "This engine already holds a model.";
 
+#[cfg(any(test, feature = "testing"))]
+type SettleProbe = Arc<dyn Fn() + Send + Sync>;
+
 /// What one manager is built from.
 pub struct ManagerConfig {
     pub catalog: Catalog,
@@ -60,7 +63,12 @@ struct Shared {
     lifecycle: Arc<Mutex<()>>,
     /// Held while a finished lifecycle publishes its outcome and lets go, and while a claim takes
     /// the lifecycle: a state read as an outcome is then never followed by a refusal for it.
+    /// Publishing runs snapshot wake callbacks synchronously while this is held, so a callback
+    /// must never call `claim_load`.
     handoff: StdMutex<()>,
+    /// Runs inside `settle` between the publish and the release, so a test can act in that window.
+    #[cfg(any(test, feature = "testing"))]
+    settle_probe: StdMutex<Option<SettleProbe>>,
     resident: StdMutex<Option<Resident>>,
     snapshots: Arc<Snapshots>,
     journal: Option<LoadJournal>,
@@ -89,6 +97,8 @@ impl EngineManager {
                 catalog: config.catalog,
                 lifecycle: Arc::new(Mutex::new(())),
                 handoff: StdMutex::new(()),
+                #[cfg(any(test, feature = "testing"))]
+                settle_probe: StdMutex::new(None),
                 resident: StdMutex::new(None),
                 snapshots: Arc::new(Snapshots::new()),
                 journal: config.journal,
@@ -167,7 +177,9 @@ impl EngineManager {
     /// Waits for the predecessor to be `Closed`, unloads, then refuses everything with `Closed`; a
     /// successor waiting on it continues, so a chain of cores closes in order even when this one
     /// never loaded. A predecessor nobody shuts down keeps this wait (and the lifecycle) forever:
-    /// the owner of a core shuts it down before it builds the next (arch 2.3.5). Once it holds the
+    /// the owner of a core shuts it down before it builds the next (arch 2.3.5); a predecessor
+    /// dropped without a shutdown is shut down by its owner's `Drop`, which ends the wait. Do not
+    /// add a timeout: a successor would then close while the predecessor still holds a model. Once it holds the
     /// lifecycle, a dropped future no longer stops it.
     pub async fn shutdown(&self) {
         let lifecycle = self.lifecycle().await;
@@ -196,7 +208,34 @@ impl EngineManager {
     fn settle(&self, lifecycle: OwnedMutexGuard<()>, publish: impl FnOnce()) {
         let _handoff = self.handoff();
         publish();
+        #[cfg(any(test, feature = "testing"))]
+        self.run_settle_probe();
         drop(lifecycle);
+    }
+
+    /// Runs `probe` inside every later `settle`, after the outcome is published and before the
+    /// lifecycle is released: the window in which a claim must neither be refused nor publish
+    /// `Loading` ahead of that outcome.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_settle_probe(&self, probe: impl Fn() + Send + Sync + 'static) {
+        *self
+            .shared
+            .settle_probe
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(probe));
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    fn run_settle_probe(&self) {
+        let probe = self
+            .shared
+            .settle_probe
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(probe) = probe {
+            probe();
+        }
     }
 
     fn handoff(&self) -> MutexGuard<'_, ()> {
@@ -260,6 +299,8 @@ impl EngineManager {
     }
 
     /// Makes `model` the resident with a fresh gate; the load publishes it `Ready` as it ends.
+    /// A generation may start in the instant between this and that publish; the `Ready` folds in
+    /// its occupancy, so nothing observable differs.
     async fn install(
         &self,
         target: &LoadTarget,

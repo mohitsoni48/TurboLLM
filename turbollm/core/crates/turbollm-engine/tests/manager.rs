@@ -1681,6 +1681,85 @@ async fn a_claim_right_after_idle_was_read_is_never_refused_as_load_in_progress(
     }
 }
 
+type ClaimResult = Result<LoadClaim, EngineError>;
+type ProbedClaim = Arc<Mutex<Option<std::thread::JoinHandle<ClaimResult>>>>;
+
+/// How long the probe gives its claim to finish before it lets the settle go on.
+const PROBE_PATIENCE: Duration = Duration::from_millis(250);
+
+/// Has the next settle try `claim_load` from another thread in the window between its publish and
+/// its release, the window a status poll or a second load request can land in. A manager that
+/// settles correctly makes that claim wait until the settle is over; one that releases first or
+/// lets the claim through early shows it in the claim's result or in the last published state.
+fn claim_inside_next_settle(f: &Fixture) -> ProbedClaim {
+    let probed: ProbedClaim = Arc::new(Mutex::new(None));
+    let (manager, target, slot) = (f.manager.clone(), f.target("org/repo/a"), probed.clone());
+    f.manager.set_settle_probe(move || {
+        let mut slot = slot.lock().unwrap();
+        if slot.is_some() {
+            return;
+        }
+        let (claimer, target) = (manager.clone(), target.clone());
+        let claim = std::thread::spawn(move || claimer.claim_load(target));
+        let deadline = Instant::now() + PROBE_PATIENCE;
+        while !claim.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        *slot = Some(claim);
+    });
+    probed
+}
+
+fn finished_claim(probed: &ProbedClaim) -> ClaimResult {
+    let claim = probed
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the settle ran its probe");
+    claim.join().expect("the claim thread")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_inside_a_load_settle_is_not_refused_and_its_loading_is_the_last_state() {
+    let f = fixture(ScriptedBackend::new(vec![]));
+    let probed = claim_inside_next_settle(&f);
+
+    f.claim("org/repo/a").run().await.expect("load");
+
+    let next = finished_claim(&probed);
+    assert!(
+        next.is_ok(),
+        "refused inside the settle: {:?}",
+        next.as_ref().err()
+    );
+    assert_eq!(
+        f.state(),
+        EngineState::Loading(f.target("org/repo/a").model_ref)
+    );
+    next.unwrap().abandon();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_inside_an_unload_settle_is_not_refused_and_its_loading_is_the_last_state() {
+    let f = fixture(ScriptedBackend::new(vec![]));
+    f.load("org/repo/a").await;
+    let probed = claim_inside_next_settle(&f);
+
+    f.manager.unload().await.expect("unload");
+
+    let next = finished_claim(&probed);
+    assert!(
+        next.is_ok(),
+        "refused inside the settle: {:?}",
+        next.as_ref().err()
+    );
+    assert_eq!(
+        f.state(),
+        EngineState::Loading(f.target("org/repo/a").model_ref)
+    );
+    next.unwrap().abandon();
+}
+
 #[tokio::test]
 async fn a_shutdown_of_a_core_that_never_loaded_waits_for_its_predecessor_to_close() {
     let first = fixture(ScriptedBackend::new(vec![]));
