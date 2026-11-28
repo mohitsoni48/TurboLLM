@@ -195,8 +195,7 @@ async function withOfficialRuntime(parts: AssetParts, opts: ReleaseInstallOption
   const { main } = parts
   if (parts.companions.length > 0 || main.os !== 'windows' || main.backend !== 'cuda') return parts
   const runtime = await findOfficialRuntimePack(main, opts.signal, opts.fetchImpl)
-  if (!runtime) return parts
-  rejectOversize(runtime)
+  if (!runtime || isOversize(runtime)) return parts
   return { ...parts, companions: [runtime] }
 }
 
@@ -213,7 +212,11 @@ function chooseParts(assets: ReleaseAsset[], assetName: string): AssetParts {
 }
 
 function rejectOversize(asset: ClassifiedAsset): void {
-  if (asset.size !== null && asset.size > MAX_ZIP_BYTES) throw tooLarge(asset.name)
+  if (isOversize(asset)) throw tooLarge(asset.name)
+}
+
+function isOversize(asset: ClassifiedAsset): boolean {
+  return asset.size !== null && asset.size > MAX_ZIP_BYTES
 }
 
 function tooLarge(name: string): ZipError {

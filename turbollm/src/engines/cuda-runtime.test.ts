@@ -56,6 +56,7 @@ const onWindows = { skip: process.platform !== 'win32' ? 'the missing-runtime wa
 interface FakeAsset {
   name: string
   bytes: Buffer
+  declaredSize?: number
 }
 const zipOf = (...names: string[]) => buildZipArchive(names.map((name) => ({ name })))
 
@@ -76,7 +77,7 @@ function fakeGithub(releases: Record<string, FakeAsset[]>, officialLookupStatus 
         tag_name: 'tag',
         published_at: '2026-09-25T10:00:00Z',
         prerelease: false,
-        assets: assets.map((a) => ({ name: a.name, browser_download_url: urlOf(a.name), size: a.bytes.length })),
+        assets: assets.map((a) => ({ name: a.name, browser_download_url: urlOf(a.name), size: a.declaredSize ?? a.bytes.length })),
       })
     }
     const file = Object.values(releases).flat().find((a) => urlOf(a.name) === url)
@@ -141,6 +142,20 @@ test('when the official runtime cannot be fetched the install still lands, with 
   assert.equal(result.warning?.code, 'missing_cudart')
   assert.deepEqual(result.provenance.companions, [])
   assert.ok(!existsSync(join(onlyInstalledDir(root), 'cudart64_13.dll')))
+})
+
+test('an official runtime pack over the size cap is skipped and the install still lands', async () => {
+  const root = tmpDir('cudart-')
+  const overCap = 64 * 1024 * 1024 * 1024
+  const gh = fakeGithub({
+    [FORK]: [{ name: MAIN_NO_COMPANION, bytes: zipOf(serverBinName, 'ggml-cuda.dll') }],
+    'ggml-org/llama.cpp': [{ name: OFFICIAL_PACK, bytes: zipOf('cudart64_13.dll'), declaredSize: overCap }],
+  })
+  const result = await installReleaseAsset(root, planFor(MAIN_NO_COMPANION), { probeFn: probeOk, fetchImpl: gh.fetchImpl })
+  assert.equal(result.found, true)
+  if (!result.found) return
+  assert.deepEqual(result.provenance.companions, [])
+  assert.ok(!gh.requested.some((url) => url.endsWith(OFFICIAL_PACK)), 'the oversize pack is never downloaded')
 })
 
 test('the official release has no pack for this CUDA major: the install lands with the warning', onWindows, async () => {

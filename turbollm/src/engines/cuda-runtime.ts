@@ -28,9 +28,11 @@ export function pickOfficialRuntimePack(
   return newestFirst[0] ?? null
 }
 
-/** The official runtime pack for `build`, or null when there is none to offer. Never throws, because a runtime
- *  that cannot be fetched (offline, rate limit, no pack for this major) must not fail an install that otherwise
- *  works: the install lands and the missing-runtime warning stays. Only a cancellation is rethrown. */
+/** The official runtime pack for `build`, or null when there is none to offer. The lookup never throws, because a
+ *  runtime that cannot be found (offline, rate limit, no pack for this major, a pack over the size cap) must not
+ *  fail an install that otherwise works: the install lands and the missing-runtime warning stays. Only a
+ *  cancellation is rethrown. A pack that is found but whose download then fails fails the install, as every
+ *  part of a release install must land or none does (ADR-175). */
 export async function findOfficialRuntimePack(
   build: ClassifiedAsset,
   signal?: AbortSignal,
